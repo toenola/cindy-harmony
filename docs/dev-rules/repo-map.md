@@ -11,7 +11,7 @@
 
 | 路径 | 说明 |
 |---|---|
-| `apps/` | 终端产品（desktop、mobile）与随包分发的二进制资产 |
+| `apps/` | 终端产品（desktop、mobile、harmony）与随包分发的二进制资产 |
 | `packages/` | 客户端共享能力包（与 render／main 解耦，详见下表） |
 | `cindy-protocol/` | git submodule：客户端与服务端共享 wire protocol 的唯一权威源（`device-link-protocol` 中继层协议、`slack-hook-protocol` 任务协议）；升级规则见 [`protocol-and-submodules.md`](protocol-and-submodules.md) |
 | `config/` | 运行期端点清单（`endpoint.json` / `endpoint.dev.json` / `endpoint.global.json`：auth、device-link 等线上 base URL） |
@@ -25,6 +25,7 @@
 |---|---|
 | `apps/desktop` | Cindy 桌面客户端（Electron + Vite），源码分 `main/`（主进程：业务逻辑、maker-host／maker-ipc、localDb、device-link、mcp-integrations、cindy-brain 等）、`renderer/`（纯渲染 UI：features、panels、themes、i18n 等）、`preload/`（最小桥接层）、`shared/`（主／渲染共享类型与常量）；SQLite migration 在 `apps/desktop/drizzle/` |
 | `apps/mobile` | Cindy 手机客户端（Expo / React Native）：同账号登录、发现并远程控制桌面设备、镜像会话 |
+| `apps/harmony` | Cindy HarmonyOS 原生客户端（ArkUI + ArkTS）：远程控制桌面 Cindy；独立 DevEco 工程，第一期聚焦认证、Device Link、任务消息、图片附件和核心交互 |
 | `apps/claude-code-bin`、`apps/codex-bin`、`apps/ripgrep-bin` | 随桌面端分发的预编译 CLI 二进制（按平台分目录）。不是构建包、不进 git 历史；版本由 `tools/<kind>/latest.json` pin，`pnpm install` postinstall 按需下载 |
 | `apps/android-platform-tools-bin` | Android platform-tools（adb 等）二进制，当前仅 win32-x64，用于连接安卓设备 |
 

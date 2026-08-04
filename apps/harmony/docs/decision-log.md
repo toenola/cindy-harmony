@@ -1,0 +1,56 @@
+# Harmony 决策记录
+
+## D-001：采用独立 `apps/harmony`
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：Harmony 客户端放在 `apps/harmony`，不改造成 `apps/mobile` 的第三个平台。
+- 原因：ArkUI + ArkTS 拥有独立 DevEco 工程、原生依赖、资源、构建和发布边界；避免影响 iOS / Android。
+
+## D-002：采用 ArkUI + ArkTS
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：使用 ArkUI 原生 UI 和 ArkTS，不追求仓颉路线。
+- 原因：稳定性、工具链和 ArkUI 集成优先；现有 Cindy 共享逻辑主要是 TypeScript，ArkTS 的迁移和理解成本更低。
+
+## D-003：Harmony 端是远程控制端
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：Agent、工作目录、数据库、CLI、MCP 和插件继续运行在电脑端。
+- 原因：一期目标是鸿蒙手机远程控制桌面 Cindy，不移植桌面执行环境。
+
+## D-004：核心消息和 AI 交互一期完整实现
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：任务详情、历史消息、消息流、图片上传、Permission、Ask User、Plan Review 不做半套。
+- 原因：历史消息包含结构化 Tool、Thinking、Todo、媒体和交互状态；事后补齐会导致历史数据无法可靠恢复。
+
+## D-005：Device Link 不重新设计
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：Harmony 端实现平台适配和必要的 ArkTS Client，继续兼容当前 Device Link。
+- 原因：保持桌面端和现有 Mobile 的互操作，避免维护第二套远程协议。
+
+## D-006：ArkWeb 只用于复杂内容
+
+- 日期：2026-08-04
+- 状态：已决定
+- 决策：整体 UI 使用 ArkUI；Mermaid、Math 和复杂 HTML/媒体内容可以局部使用 ArkWeb。
+- 原因：既保持 Harmony 原生页面结构，又避免为复杂文档格式重复实现浏览器排版。
+
+## D-007：第一期暂不做 Issue Confirm 手机提交
+
+- 日期：2026-08-04
+- 状态：沿用现有策略
+- 决策：Harmony 端识别 `issue_confirm` 并提示回桌面处理，不提供 GitHub Issue 编辑和提交表单。
+- 原因：它不是普通 AI 交互闭环；当前 Mobile 已采用相同的安全降级策略。
+
+## D-008：空工程构建通过，暂不承诺真机验证
+
+- 日期：2026-08-04
+- 状态：部分完成
+- 决策：DevEco 空工程的 `entry:assembleHap` 已构建成功；在模拟器或真机实际安装运行前，不宣称 Harmony 运行验证通过。

@@ -28,6 +28,12 @@ __pycache__/
 *.keystore
 *.mobileprovision
 
+# ── Harmony / DevEco 本地构建与依赖产物 ──────────────────────
+**/.hvigor/
+apps/harmony/oh_modules/
+apps/harmony/local.properties
+apps/harmony/entry/build/
+
 # ── Electron / desktop 构建与暂存产物 ────────────────────────
 out/
 .vite/
