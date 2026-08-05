@@ -26,10 +26,7 @@ import {
   validateGhostManifest,
   type GhostManifest,
 } from '../../shared/ghost.js';
-import {
-  GHOST_MANIFEST_MAX_BYTES,
-  readBoundedFileNoFollow,
-} from '../utils/readBoundedFile.js';
+import { GHOST_MANIFEST_MAX_BYTES, readBoundedFileNoFollow } from '../utils/readBoundedFile.js';
 import { validateGhostLocaleResourcesInDirectory } from './ghostLocaleFiles.js';
 import { GHOST_SIGNATURE_FILE } from './ghostSignature.js';
 import { checkSkillMdConsistency } from './skillSlot.js';
@@ -426,7 +423,11 @@ export async function scaffoldGhostDir(
   const resolved = path.resolve(input.dir);
   const workdir = options?.sessionWorkdir;
   if (!workdir) {
-    return { ok: false, errorCode: 'INVALID_INPUT', message: '没有会话工作目录,无法确定骨架输出位置' };
+    return {
+      ok: false,
+      errorCode: 'INVALID_INPUT',
+      message: '没有会话工作目录,无法确定骨架输出位置',
+    };
   }
   // 字面 startsWith 不设防软链:工作目录里若有 out -> /tmp/out 之类的
   // 软链祖先,字面在内、实际在外。两边都按 realpath 对账——目标还不存在,
@@ -435,7 +436,11 @@ export async function scaffoldGhostDir(
   try {
     realWorkdir = await fs.promises.realpath(path.resolve(workdir));
   } catch {
-    return { ok: false, errorCode: 'INVALID_INPUT', message: '会话工作目录不存在,无法确定骨架输出位置' };
+    return {
+      ok: false,
+      errorCode: 'INVALID_INPUT',
+      message: '会话工作目录不存在,无法确定骨架输出位置',
+    };
   }
   let realAncestor = resolved;
   const pendingSegments: string[] = [];
@@ -725,7 +730,10 @@ async function buildGhostPackage(
     const maxFiles = manifest.node ? MAX_NODE_FILES : MAX_BASIC_FILES;
     const maxTotalBytes = manifest.node ? MAX_NODE_TOTAL_BYTES : MAX_BASIC_TOTAL_BYTES;
     const seenPackPaths = new Set<string>();
-    const walk = async (cur: string, relBase: string): Promise<Exclude<ForgePackResult, { ok: true }> | null> => {
+    const walk = async (
+      cur: string,
+      relBase: string,
+    ): Promise<Exclude<ForgePackResult, { ok: true }> | null> => {
       const entries = await fs.promises.readdir(cur, { withFileTypes: true });
       for (const e of entries) {
         if (shouldSkip(e.name)) continue;
@@ -780,7 +788,8 @@ async function buildGhostPackage(
       return {
         ok: false,
         errorCode: 'MANIFEST_INVALID',
-        message: '已签名插件不能使用 AI 图标覆盖；请保留原图标，或先修改源码图标再由正式发布流水线重新签名',
+        message:
+          '已签名插件不能使用 AI 图标覆盖；请保留原图标，或先修改源码图标再由正式发布流水线重新签名',
       };
     }
     const foldedAiIconPath = FORGE_AI_ICON_PATH.toLowerCase();
@@ -1064,7 +1073,6 @@ my-ghost/
   // (仅检查插件启用状态与 tools 声明)。除非你的插件完全靠 panel 或 subscribe 驱动,
   // 否则请始终声明一个 command。
   "tools": [ /* 见 §3 */ ],
-  "atResourceProvider": { "tool": "search_resources" }, // 可选:把一个已声明、无副作用的搜索工具接入 @,见 §3.1
   "cindy": { "image": ["generate", "edit"] },   // 声明了 cindy 槽时必写:能力详单,见下
   // 三个类目:image / video 的动作是 "generate" | "edit";media 的动作只有
   // "deposit"(把你手里的媒体字节寄存进总仓换指纹,见 §4.0.1)。按需申请,
@@ -1174,6 +1182,9 @@ Claude Code 与 Codex 都能发现,见 §4.16)、\`workspace\`(请主机为项�
 要把任务交给 Agent 干并**取回结果**(而不是发进用户的会话),另写
 \`"agent": { "errand": true }\`(可与 background 并存),见 §4.11.1;同样是装入
 确认框单列的高风险档。
+要请用户新建一条**自动化**(让插件里的内容定期自己刷新),另写
+\`"agent": { "schedule": true }\`(可与前两项并存),见 §4.11.2。它只能打开预填好的
+创建面板,任务由用户选好模型后亲手保存才存在;装入确认框单列一档。
 
 **node 工作进程详单**(声明 node 槽时必写,详见 §4.12):
 
@@ -1238,7 +1249,7 @@ node 详单**不接受** \`command\` / \`args\` / \`shell\` / \`env\` 或其它�
   "secrets": [{                                     // 可选 0–4 条:需要用户填的凭证(你只声明名字和注入位置,值用户填、主机保管)
     "key": "api_token",                             // 小写字母开头,小写/数字/下划线,1–32;禁用宿主保留键(见 §2.1)
     "label": "Example API Token",                   // 给用户看的名称(设置页/确认框)
-    "source": "user",                               // 可选:凭证值来源。"user"(缺省)=用户可在调用前的主机 Setup 卡内填写,也可在你的 settingsHtml 里长期管理/替换/清除(当前仍要求同时声明 settingsHtml,见 §4.7);"login-email"=主机登录邮箱自动派生(用户不填;声明它时不允许再写 url,见 §4.7);"oauth"=主机托管 OAuth 授权,值 = 授权换来的 access token(必须同时声明 oauth 详单,见 §4.7 与下方 oauth 字段)
+    "source": "user",                               // 可选:凭证值来源。"user"(缺省)=用户可在调用前的主机 Setup 卡内填写,也可在你的 settingsHtml 里长期管理/替换/清除(当前仍要求同时声明 settingsHtml,见 §4.7);"login-email"=主机登录邮箱自动派生(用户不填;声明它时不允许再写 url,见 §4.7);"oauth"=主机托管 OAuth 授权,值 = 授权换来的 access token(必须同时声明 oauth 详单,见 §4.7 与下方 oauth 字段);"oidc-token"=主机为当前企业 Membership 按需签发短时 Connection JWT(插件不可读取,必须显式限制 inject.hosts,固定 Authorization: Bearer {value},见 §4.7)
     "hint": "在控制台生成后粘贴",                     // 可选提示(主机 Setup 卡与 settingsHtml 都会用到)
     "url": "https://example.com/settings/keys",     // 可选:控制台/申请地址(仅 https)。调用前缺凭证时,主机 Setup 卡会在输入框旁展示本地化的「获取凭证」入口；settingsHtml 也可用 <a href> 逐字引用它,点击经主机转系统浏览器打开(见 §4.8「外链」)
     "inject": {                                     // 必填:这条凭证怎么进请求
@@ -1259,7 +1270,7 @@ node 详单**不接受** \`command\` / \`args\` / \`shell\` / \`env\` 或其它�
       "clientId": "xxx.apps.example.com",           // 可选:内置 OAuth 客户端 ID(用户零配置开箱即用;用户在设置页自填的覆盖内置,清除自填即回落)
       "clientIdAlternatives": ["xxx-global.apps.example.com"],  // 可选 ≤8 条:仅 tokenBroker 模式;意识按 app-context 选 App 时,connect 只接受默认值或这里声明的公开 ID
       "clientSecret": "xxx",                        // 可选(须与 clientId 成对):内置 client 的 secret;桌面应用的 client 凭证本非机密,纯 PKCE 服务商可省略
-      "scopes": ["read.a", "write.b"],              // 可选 ≤32 条:申请的权限范围(确认框逐条展示给用户)
+      "scopes": ["read.a", "write.b"],              // 可选 ≤48 条:申请的权限范围(确认框逐条展示给用户)
       "scopeDelimiter": ",",                        // 可选:authorize URL 的 scope 拼接分隔符;缺省空格(OAuth 标准),Slack 这类逗号分隔的服务商声明 ","(目前只认这一个值)
       "pkce": true,                                 // 可选:PKCE(S256)开关,缺省 true
       "extraAuthorizeParams": { "access_type": "offline", "prompt": "consent" },  // 可选 ≤8 条:服务商特有授权参数(协议保留参数禁写)
@@ -1328,41 +1339,10 @@ node 详单**不接受** \`command\` / \`args\` / \`shell\` / \`env\` 或其它�
 写行为规则(如"用户原话透传,不要扩写"、"仅当用户显式说 X 才传 Y")——AI 会照做。
 这是你影响 AI 行为的**唯一合法通道**,不要试图在别处塞指令。
 
-### 3.1 可选:接入 @ 业务资源搜索
+### 3.1 @ 插件入口
 
-插件可把一个**已经声明并经过权限确认**的工具接到 Composer 的 \`@\` 面板：
-
-\`\`\`json
-"atResourceProvider": { "tool": "search_resources" }
-\`\`\`
-
-本入口复用已有的 \`"tool"\` 槽，不新增 slot；\`tool\` 必须逐字引用 \`tools[].name\`。这不会增加
-底层工具权限，但新增了一个明确的调用入口，因此会在安装/更新确认中单独披露。裸 \`@\` 只展示插件入口，
-不会调用工具。用户明确选中你的插件后，宿主才只向这个工具发送：
-
-\`\`\`json
-{ "query": "用户输入", "limit": 20 }
-\`\`\`
-
-工具必须无副作用，并在 4 秒内返回固定摘要结构：
-
-\`\`\`json
-{
-  "items": [{
-    "id": "业务对象的不透明稳定 ID",
-    "label": "单行展示名",
-    "description": "可选的单行摘要"
-  }]
-}
-\`\`\`
-
-同一个工具还必须支持把某条返回项的完整 \`id\` 作为 \`query\` 精确解析，并把
-该对象放在结果首项；这样 Agent 收到不透明 ID 后可以按需读取最新信息。
-
-最多返回 20 项；\`id\` 最长 256 字符，\`label\` 最长 128 字符，
-\`description\` 最长 256 字符。不要返回正文、凭证、HTML、指令或自定义调用参数；
-宿主只保留 ID 和可读摘要，并用固定格式投影给 Agent。插件 locale 不增加本字段的
-翻译，入口展示名直接复用已本地化的插件 \`name\`。
+Composer 的 \`@\` 面板只展示已安装且可用的插件入口；插件作者无需声明资源搜索字段。
+历史的 \`manifest.atResourceProvider\` 已移除且不再生效，不能通过该字段接入资源搜索。
 
 ## 3.5 工具面设计:直接声明,还是两段式目录
 
@@ -2110,6 +2090,21 @@ BroadcastChannel、日志或任何自存路径(review 必查)。凭证只会注�
 照"请重新登录"画)——确认框已如实披露,除展示外别拿它做别的;对该 key 的
 PUT/DELETE 一律 405(派生身份不可配置)。
 
+**Cindy 企业身份断言(source:"oidc-token",可选)**:适用于接入 Cindy Connection
+Auth 的企业服务。主机只在当前登录账号属于组织 Membership、且该插件拥有当前组织的
+Plugin Market organization 安装记录、安装 manifest digest 未被篡改并声明了目标服务域名时,
+按需向 auth-server 换取短时 Connection JWT;audience 与组织身份由主机推导,插件清单和
+运行时代码都不能选择、读取或保存 audience/token。该凭证必须固定声明
+\`"inject": { "header": "Authorization", "format": "Bearer {value}", "hosts": [...] }\`,
+且 \`hosts\` 必须是非空的显式子集,只允许把断言发给列出的企业服务域名。
+\`oidc-token\` 的 \`inject.hosts\` 只接受精确域名,不允许 \`*.example.com\` 通配；Host
+会从通过 digest 校验的市场 manifest 读取这些声明,目标请求必须精确命中声明域名才会签发并注入。
+它没有用户输入、\`url\`、\`exchange\` 或 \`oauth\` 详单,也不要放进 \`setup.requires\`;没有企业
+身份时 cindy.fetch 会 fail-closed 并返回结构化错误。企业服务应使用 Connection JWT
+中的 \`sub\`、\`email\` 或 \`identities\` 等声明自行选择业务身份,不要要求 Cindy 客户端先把
+令牌交给插件代码。上游返回 401 时,Host 只对 GET / HEAD / OPTIONS 自动换令牌重试一次；
+POST / PUT / PATCH / DELETE 和上传请求只作废令牌缓存、不自动重放,避免重复业务写入。
+
 **key 换令牌二段式(exchange,可选)**:有些服务的 API key 不直接当请求凭证,要先
 POST 一个交换端点换临时令牌(令牌才进 Authorization)。在凭证上声明 \`exchange\`
 (字段见 §2),主机就照单代办整个流程:换取 → 按 ttlSeconds 缓存 → \`inject.format\`
@@ -2136,8 +2131,9 @@ settingsHtml 里自填**(用户用自己注册的 OAuth 应用,配额风控归�
 \`\`\`js
 // 状态回查(哪些 oauth 凭证槽、client 配没配、连了哪些账号;零令牌字节):
 const list = await (await fetch('/oauth')).json();
-// → [{ key:'acct', clientConfigured:true, clientCustom:false, accounts:[{ id, label, status:'connected'|'expired', isDefault, createdAt, avatarDataUrl }] }]
+// → [{ key:'acct', clientConfigured:true, clientCustom:false, accounts:[{ id, label, status:'connected'|'expired', isDefault, createdAt, avatarDataUrl, scopeStale }] }]
 // avatarDataUrl = 头像 data URL(声明了 identity.avatarPath 且主机下载成功才有,否则 null;<img src> 直接用)
+// scopeStale = true 表示该账号有真实权限错误证据,或其全量授权快照未包含插件后来新增的 scope;账号仍可用,设置页应显示非阻塞提示并复用现有重新连接动作
 // clientConfigured = 自填或内置任一在场;clientCustom = 用户自填过(UI 显示"内置应用身份/已自定义")
 // client 凭证只写入库(和 /secrets 同纪律,存入后拿不回;clientSecret 可省略 = 纯 PKCE):
 await fetch('/oauth/acct/client', { method:'PUT', body: JSON.stringify({ clientId, clientSecret }) });  // 204 即入库
@@ -2155,6 +2151,11 @@ const r = await (await fetch('/oauth/acct/connect', connectInit)).json();
 // 断开账号 / 设默认账号:
 await fetch('/oauth/acct/accounts/<accountId>', { method:'DELETE' });          // 204(幂等)
 await fetch('/oauth/acct/default', { method:'POST', body: JSON.stringify({ accountId }) });  // 204
+// 真实 API 返回缺失 scope 时可 fire-and-forget 上报；只接受清单 oauth.scopes 内的值,
+// 任一越界整包 400 拒绝。主机会据此在对话流与详情页非阻塞引导用户重新连接。
+// 证据只记默认账号:带 authAccount 指定非默认账号的调用报错时不要上报,
+// 否则会引导用户重连错账号:
+await fetch('/oauth/acct/insufficient-scopes', { method:'POST', body: JSON.stringify({ scopes:['write.b'] }) });  // 204
 \`\`\`
 
 多账号:每个 oauth 凭证槽最多 8 个账号;cindy.fetch 可带 \`authAccount: '<账号id>'\`
@@ -2628,6 +2629,79 @@ const q = await cindy.agent.queryErrand({ jobId: r.jobId });
   \`'NO_CANDIDATE'\` 不存在于此——但会话创建/派发失败有 \`'SESSION_UNAVAILABLE'\`,
   超时有 \`'TIMEOUT'\`(任务可能仍在会话里继续,提示用户打开会话查看)。
 - 这个能力必然产生模型费用且耗时分钟级:能用快问快答(§4.0.2)解决的,不要派活。
+
+### 4.11.2 请用户新建一条自动化(agent.schedule 加档)
+
+**这是"让插件里的内容自己保持新鲜"的正路。** 你的插件自己跑不了业务逻辑——沙箱只在
+被唤起时活着,也没有定时器。要做出「每小时帮我看一眼,有事就点亮插件入口」这种效果,
+正确的分工是:
+
+    插件不是执行者,而是**定时任务的目标**。执行者是 Cindy 的 AI。
+
+完整回路(以「Codex 重置提醒」为例):
+
+1. 用户在你的面板上点一个选项,比如「重置时间快到了提醒我」;
+2. 你调 \`cindy.agent.requestSchedule(...)\`,请主机**打开预填好的新建自动化面板**;
+3. 用户在面板上选个模型(或就用默认)→ **亲手点保存**。任务这才存在;
+4. 到点了,Cindy 起一轮 AI 去干活:查本机重置时间、看 X 上的相关发帖、**判断**要不要
+   提醒——这些判断是 AI 做的,不是你做的;
+5. 那一轮 AI **调用你申报的 tool**(§3)把结果交给你,你在 tool 里更新自己的数据;
+6. 你顺手发一个未读角标(§4.9.1),用户的插件入口和图标上就亮起点;
+7. 用户回来点开面板,看到刷新后的内容。
+
+所以你需要的是三样东西的组合:\`agent.schedule\` 加档(第 2 步)+ 一个 \`tool\`(第 5 步)
++ \`badge\` 槽(第 6 步)。三者缺一,回路就断在那里。
+
+需声明 \`"slots": [..., "agent", "tool", "badge"]\` + \`"agent": { "schedule": true }\`
+(装入确认里单列一档,文案会告诉用户"任务由你亲手保存、跑起来会产生模型费用")。
+
+\`\`\`js
+// 用户在面板上点了「提醒我」之后:
+const r = await cindy.agent.requestSchedule({
+  name: 'Codex 重置提醒',            // 预填的自动化名称(≤60 字)
+  prompt: [                          // 到点了让 AI 干什么——用自然语言写清楚,
+    '检查本机 Codex 的限额重置时间。',  // 包含"什么情况下才值得提醒我"
+    '再看一眼 X 上 @tobi 最近有没有相关发帖。',
+    '如果重置时间在 2 小时内,调用 codex-reset-planner 插件的 update_status 工具',
+    '把最新状态写回去;否则什么都不用做。',
+  ].join('\\n'),                      // (≤2000 字)
+  intervalMs: 60 * 60 * 1000,        // 可选:建议每小时一次。**最小 30 分钟**,
+                                     // 低于此值主机会自动上调
+});
+// { ok: true } = 请求已被接受并投递(**不保证面板真开了,更不代表用户存了**)
+// { ok:false, errorCode:'PERMISSION_DENIED' | 'INVALID_REQUEST'
+//            | 'RATE_LIMITED' | 'HOST_NOT_READY' | 'INTERNAL', message }
+\`\`\`
+
+主机强制的边界(都不是建议):
+
+- **你只能打开面板,不能创建任务。** 没有任何"直接建一条自动化"的接口——主机这一侧
+  压根没接调度存储,不是"忍着不用"。用户不点保存,什么都不会发生;
+- **本版没有回执。** \`ok:true\` 只表示请求被接受并投递给了主壳窗口:用户当时可能正开着
+  另一个自动化表单在编辑,那种情况下本次草稿会被**丢弃**(保护他没保存的输入),他看到
+  一句提示、面板不换内容。即使面板正常打开,任务也要他亲手点保存才落库。所以你的 UI
+  **不要**显示"已开启"这类完成态,写"已为你打开创建面板,请确认"才准确;
+  想确认用户是否照做了,当前唯一可信的信号是任务真的跑起来调了你的 tool。
+  **后续版本会补上**:任务与发起插件的**绑定关系**,以及你查询 / 管理**自己绑定的那条
+  任务**(是否有效、下次运行时间、频率,以及改时间 / 暂停 / 关掉)。届时你就能在自己面板
+  上显示"已开启 · 每小时 · 下次 15:00"并让用户就地改。绑定本身即授权边界:你只能看和改
+  自己请求创建的那条,看不到用户的其它自动化;
+- \`prompt\` 里要**自己说清楚该调你哪个工具**(见上面示例第 3 行)。AI 不会自动猜到
+  "跑完要更新哪个插件";
+- 预填内容会**净化 + 截断**(去控制字符,名称 60 字 / prompt 2000 字);净化后为空一律
+  \`INVALID_REQUEST\`;
+- \`intervalMs\` 低于 **30 分钟**会被自动上调。这不是权限闸门(用户自己在面板上改成
+  1 分钟是他的自由),是不让你预填出一个每分钟烧一次模型额度的任务;
+- 同一插件两次请求至少隔 **15 秒**(\`RATE_LIMITED\`)。这个面板是打断式的——它会把
+  用户从当前页带到自动化页,别拿它刷屏;
+- 面板上会显示**是你在请求**(插件名由主机填,你伪装不了),用户永远知道在替谁保存;
+- **面板会开在主窗口**,不是你的面板窗。用户把你的面板拉成独立窗口后点这个入口时,
+  创建表单出现在主窗口里(独立面板窗挂的是轻壳,承载不了自动化页)——文案上别写
+  "将在此处打开",写"去自动化页确认"之类更准;
+- 一个都没有主窗口时(极端情况)→ \`HOST_NOT_READY\`。
+
+什么时候**不该**用它:一次性的、当场就要结果的事,用快问快答(§4.0.2)或派活取件
+(§4.11.1)。这个加档是给"长期定期刷新"用的,每条任务都会反复产生模型费用。
 
 ## 4.12 随包 Node 工作进程与 stdio MCP(node 槽)
 
@@ -3259,15 +3333,15 @@ if (r.ok && r.confirmed) {
 - panel.systemButtons 格式错(不是对象、未知键、值非布尔,或 position:"tab" 时声明——插件页内面板没有标准头)
 - keywords(已废弃字段,旧包兼容保留,新意识别写)有单字词 · kind 写了但不是 "chip"(可省略) · schemaVersion 不是 2
 - cindy 详单格式错(未知类目/动作、空数组、有详单但 slots 没有 "cindy")
-- agent 详单格式错(有详单但 slots 没有 "agent"，或 background / errand 都不是 true；只需点击触发时应省略 agent 字段)
+- agent 详单格式错(有详单但 slots 没有 "agent"，或 background / errand / schedule 都不是 true；只需点击触发时应省略 agent 字段)
 - node 详单格式错(槽/详单不成对、entry 不是包内 CommonJS .js/.cjs、protocol 不在 json-rpc-stdio / mcp-stdio、
   写了 command/args/shell/env、resident 又写 idleTimeoutSeconds)
 - id 用了 \`cindy-\` / \`filo-\` / \`xd-\` 前缀(官方保留,正式版用户通道拒装;给自己的意识换个前缀)
 - network 详单格式错(hosts 缺失/裸 TLD/IP/带端口/通配不在最左、secret 缺 inject、
   inject.format 没有 {value} 占位、inject.header 用了 Host/Cookie 等协议关键头、
   inject.hosts 不是 hosts 声明条目的子集、有详单但 slots 没有 "network"、
-  secret.source 不是 "user"/"login-email"/"oauth"、
-  source:"login-email" 还声明了 url 或 exchange、
+  secret.source 不是 "user"/"login-email"/"oauth"/"oidc-token"、
+  source:"login-email" 或 source:"oidc-token" 声明了 url 或 exchange、
   声明了 user 凭证但没声明 settingsHtml、遗留 input 字段值不是 "ghost")
 - exchange 声明格式错(url 非 https/域名不在 hosts 白名单、bodyFormat 不是恰含一个
   {value}、contentType 不在白名单、tokenPath 不是点分路径、ttlSeconds 越界)
