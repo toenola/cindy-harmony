@@ -1,6 +1,7 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { AppServices } from '../core/AppServices';
 
 const DOMAIN = 0x0000;
 
@@ -39,6 +40,8 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     // Ability has brought to foreground
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onForeground');
+    // 回前台：立即重连（后台期间 WS 可能已断），并触发重连后的订阅恢复。
+    AppServices.instance.onAppForeground();
   }
 
   onBackground(): void {

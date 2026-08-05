@@ -1,0 +1,210 @@
+/**
+ * 附件上传（ArkTS 移植 mobileAttachmentUpload.ts 语义）。
+ *
+ * 链路：SHA-256 → presign（POST /api/device-link/media/presign-put）→
+ * PUT OSS（presign URL 自带签名，无需 token）→ 生成 OSS 引用串 → RemoteImageRef。
+ * 上传失败时 best-effort 删除中转对象（避免 OSS 孤儿）。
+ */
+
+import { cryptoFramework } from '@kit.CryptoArchitectureKit';
+import { AppConfig } from '../../AppConfig';
+import { HarmonyHttp } from '../../network/HarmonyHttp';
+import {
+  AttachmentPresignResult, ImageAttachmentCandidate, RemoteImageRef,
+  MAX_ATTACHMENT_BYTES,
+} from './AttachmentModels';
+import { AttachmentOssRef, buildAttachmentOssRef } from './AttachmentOssRef';
+import { preprocessImage } from './ImagePreprocess';
+
+export class AttachmentUploadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AttachmentUploadError';
+  }
+}
+
+/** SHA-256（小写 hex）。 */
+export async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  const md = cryptoFramework.createMd('SHA256');
+  await md.update({ data: new Uint8Array(bytes) });
+  const out = await md.digest();
+  let hex = '';
+  for (let i = 0; i < out.data.length; i++) {
+    hex += out.data[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+/** presign：向 relay 申请 OSS 预签名上传。 */
+export async function presignUpload(
+  size: number,
+  contentType: string,
+  ext: string,
+  token: string,
+): Promise<AttachmentPresignResult> {
+  const http = new HarmonyHttp();
+  const headers: Record<string, string> = {};
+  headers['Authorization'] = `Bearer ${token}`;
+  const body = JSON.stringify({
+    size: size,
+    contentType: contentType,
+    ext: ext,
+  });
+  const res = await http.requestJson(
+    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-put`,
+    'POST',
+    headers,
+    body,
+  );
+  if (res.statusCode >= 300) {
+    throw new AttachmentUploadError(`presign failed: ${res.statusCode}`);
+  }
+  let obj: Record<string, Object>;
+  try {
+    obj = JSON.parse(res.body) as Record<string, Object>;
+  } catch (e) {
+    throw new AttachmentUploadError('presign: invalid response');
+  }
+  const putUrl = obj['putUrl'];
+  const key = obj['key'];
+  if (typeof putUrl !== 'string' || putUrl.length === 0 ||
+    typeof key !== 'string' || key.length === 0) {
+    throw new AttachmentUploadError('presign: missing putUrl/key');
+  }
+  const out = new AttachmentPresignResult();
+  out.putUrl = putUrl;
+  out.key = key;
+  const expiresAt = obj['expiresAt'];
+  out.expiresAt = typeof expiresAt === 'string' ? expiresAt : '';
+  return out;
+}
+
+/** PUT 字节到 presign URL。 */
+export async function putUpload(
+  putUrl: string,
+  bytes: ArrayBuffer,
+  mimeType: string,
+): Promise<void> {
+  const http = new HarmonyHttp();
+  const headers: Record<string, string> = {};
+  headers['Content-Type'] = mimeType.length > 0 ? mimeType : 'application/octet-stream';
+  headers['x-oss-object-acl'] = 'private';
+  const res = await http.uploadBytes(putUrl, 'PUT', headers, bytes);
+  if (res < 200 || res >= 300) {
+    throw new AttachmentUploadError(`upload failed: ${res}`);
+  }
+}
+
+/** 获取 OSS 下载 URL（历史图片加载用；cindy-oss-attach 引用 → presign-get → OSS GET URL）。 */
+export async function presignGet(key: string, token: string): Promise<string> {
+  const http = new HarmonyHttp();
+  const headers: Record<string, string> = {};
+  headers['Authorization'] = `Bearer ${token}`;
+  const body = JSON.stringify({ key: key });
+  const res = await http.requestJson(
+    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-get`,
+    'POST',
+    headers,
+    body,
+  );
+  if (res.statusCode >= 300) {
+    throw new AttachmentUploadError(`presign-get failed: ${res.statusCode}`);
+  }
+  let obj: Record<string, Object>;
+  try {
+    obj = JSON.parse(res.body) as Record<string, Object>;
+  } catch (e) {
+    throw new AttachmentUploadError('presign-get: invalid response');
+  }
+  const getUrl = obj['getUrl'];
+  if (typeof getUrl !== 'string' || getUrl.length === 0) {
+    throw new AttachmentUploadError('presign-get: missing getUrl');
+  }
+  return getUrl;
+}
+
+/** 删除中转对象（上传失败/移除附件时回收，best-effort）。 */
+export async function deleteUpload(
+  ossKey: string,
+  token: string,
+): Promise<void> {
+  const http = new HarmonyHttp();
+  const headers: Record<string, string> = {};
+  headers['Authorization'] = `Bearer ${token}`;
+  const body = JSON.stringify({ key: ossKey });
+  const res = await http.requestJson(
+    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media`,
+    'DELETE',
+    headers,
+    body,
+  );
+  if (res.statusCode >= 300) {
+    throw new AttachmentUploadError(`delete failed: ${res.statusCode}`);
+  }
+}
+
+/** 从文件名提取扩展名（不带点，小写；无则 'bin'）。 */
+export function uploadExtForName(name: string): string {
+  const dotIdx = name.lastIndexOf('.');
+  if (dotIdx >= 0 && dotIdx < name.length - 1) {
+    const ext = name.slice(dotIdx + 1).toLowerCase();
+    if (ext.length > 0 && ext.length <= 10) return ext;
+  }
+  return 'bin';
+}
+
+/**
+ * 完整上传一张图：压缩 → sha256 → presign → PUT → 生成 RemoteImageRef。
+ * 任一步失败抛 AttachmentUploadError（调用方展示失败态并允许重试）。
+ */
+export async function uploadImage(
+  candidate: ImageAttachmentCandidate,
+  token: string,
+): Promise<RemoteImageRef> {
+  if (candidate.size > MAX_ATTACHMENT_BYTES) {
+    throw new AttachmentUploadError('图片超过大小限制');
+  }
+  const processed = await preprocessImage(
+    candidate.uri,
+    candidate.mimeType,
+    candidate.size,
+    candidate.width,
+    candidate.height,
+  );
+  const sha = await sha256Hex(processed.bytes);
+  const presigned = await presignUpload(
+    processed.size,
+    processed.mimeType,
+    uploadExtForName(candidate.name),
+    token,
+  );
+  try {
+    await putUpload(presigned.putUrl, processed.bytes, processed.mimeType);
+  } catch (e) {
+    // 上传失败：回收中转对象（best-effort）。
+    try {
+      await deleteUpload(presigned.key, token);
+    } catch (e2) {
+      // 忽略回收失败
+    }
+    if (e instanceof Error) {
+      throw e;
+    }
+    throw new AttachmentUploadError('upload failed');
+  }
+  const ref = new AttachmentOssRef();
+  ref.ossKey = presigned.key;
+  ref.mimeType = processed.mimeType;
+  ref.originalName = candidate.name;
+  ref.size = processed.size;
+  ref.sha256 = sha;
+  const refStr = buildAttachmentOssRef(ref);
+
+  const imageRef = new RemoteImageRef();
+  imageRef.url = refStr;
+  imageRef.originalName = candidate.name;
+  imageRef.mimeType = processed.mimeType;
+  imageRef.size = processed.size;
+  imageRef.sha256 = sha;
+  return imageRef;
+}

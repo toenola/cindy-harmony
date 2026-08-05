@@ -2,7 +2,67 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#000000"
+      "value": "#2A2828"
+    },
+    {
+      "name": "text_primary",
+      "value": "#D4D4D4"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#A3A3A3"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#BFC1C4"
+    },
+    {
+      "name": "bg_page",
+      "value": "#2A2828"
+    },
+    {
+      "name": "bg_card",
+      "value": "#312F2F"
+    },
+    {
+      "name": "bg_chip",
+      "value": "#2F2D2D"
+    },
+    {
+      "name": "bg_code",
+      "value": "#2D2D2D"
+    },
+    {
+      "name": "code_text",
+      "value": "#D4D4D4"
+    },
+    {
+      "name": "code_accent",
+      "value": "#E06C75"
+    },
+    {
+      "name": "accent",
+      "value": "#93C5FD"
+    },
+    {
+      "name": "danger",
+      "value": "#FF6B6B"
+    },
+    {
+      "name": "success",
+      "value": "#6F6"
+    },
+    {
+      "name": "warn",
+      "value": "#D9A83C"
+    },
+    {
+      "name": "border",
+      "value": "#434343"
+    },
+    {
+      "name": "overlay",
+      "value": "#66000000"
     }
   ]
 }

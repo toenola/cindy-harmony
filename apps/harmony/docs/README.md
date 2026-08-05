@@ -7,7 +7,8 @@
 ## 文档列表
 
 - [一期产品范围](./product-scope.md)：本期必须实现和明确排除的功能
-- [实施计划](./implementation-plan.md)：按依赖关系拆分的工作包和完成条件
+- [实施计划](./implementation-plan.md)：按垂直切片拆分，每个切片以真机可见成果收尾
+- [行为对齐 Mobile（必读）](./mobile-alignment.md)：实现消息 / 交互行为前先读对应 iOS/Android 源码
 - [架构方案](./architecture.md)：ArkUI、ArkTS、业务层、Device Link 和消息管线
 - [开发环境](./dev-environment.md)：DevEco Studio、API 24+、构建和运行准备
 - [Device Link 适配](./device-link-adaptation.md)：WebSocket、握手、重连和 invoke/push

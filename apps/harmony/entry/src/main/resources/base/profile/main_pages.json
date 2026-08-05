@@ -1,5 +1,10 @@
 {
   "src": [
-    "pages/Index"
+    "pages/Index",
+    "pages/LoginPage",
+    "pages/HomePage",
+    "pages/TaskListPage",
+    "pages/TaskPage",
+    "pages/SettingsPage"
   ]
 }

@@ -1,23 +1,56 @@
+/**
+ * 入口页：初始化服务 + 会话恢复 → 路由到登录页或首页。
+ */
+
+import { router } from '@kit.ArkUI';
+import { AppServices } from '../core/AppServices';
+
 @Entry
 @Component
 struct Index {
-  @State message: string = 'Cindy Harmony';
+  @State booting: boolean = true;
+  @State bootError: string = '';
+
+  aboutToAppear(): void {
+    this.bootstrap();
+  }
+
+  private async bootstrap(): Promise<void> {
+    try {
+      await AppServices.instance.init(getContext(this));
+      const restored = await AppServices.instance.auth.restoreSession();
+      if (restored) {
+        // 已有本地会话：直接连 relay（token 自动刷新）。
+        AppServices.instance.client.start();
+        router.replaceUrl({ url: 'pages/HomePage' });
+      } else {
+        router.replaceUrl({ url: 'pages/LoginPage' });
+      }
+    } catch (e) {
+      this.bootError = '启动失败，请重试';
+      this.booting = false;
+    }
+  }
 
   build() {
-    RelativeContainer() {
-      Text(this.message)
-        .id('HelloWorld')
-        .fontSize($r('app.float.page_text_font_size'))
+    Column({ space: 16 }) {
+      Text('Cindy Harmony')
+        .fontSize(24)
         .fontWeight(FontWeight.Bold)
-        .alignRules({
-          center: { anchor: '__container__', align: VerticalAlign.Center },
-          middle: { anchor: '__container__', align: HorizontalAlign.Center }
-        })
-        .onClick(() => {
-          this.message = 'Cindy Harmony';
-        })
+      if (this.booting) {
+        LoadingProgress()
+          .width(40)
+          .height(40)
+      }
+      if (this.bootError.length > 0) {
+        Text(this.bootError)
+          .fontSize(14)
+          .fontColor($r('app.color.danger'))
+      }
     }
-    .height('100%')
     .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.bg_page'))
   }
 }

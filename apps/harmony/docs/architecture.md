@@ -108,6 +108,11 @@ Store 负责：
 - `packages/auth-client` 是认证 API 和错误语义参考。
 - `apps/mobile` 是已有控制端行为、fixture 和资源参考。
 
+**用户可见行为一律以 `apps/mobile`（iOS / Android）为行为准绳**：实现任何
+消息 / 交互 / 渲染 / 加载行为前，先读对应 Mobile 或共享纯逻辑源码确认语义，
+再写 ArkTS（详见 `mobile-alignment.md`）。不照搬 RN 页面与组件，只对齐
+行为语义（判定逻辑、阈值、状态机、数据模型）。
+
 如果后续确认某段纯 TypeScript 可被 ArkTS 稳定使用，再单独抽取共享；不要先建立复杂的 JS/ArkTS bridge。
 
 ## 7. 消息数据不变量
