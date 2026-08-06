@@ -63,6 +63,62 @@
     {
       "name": "overlay",
       "value": "#66000000"
+    },
+    {
+      "name": "chat_header_surface",
+      "value": "#CC252323"
+    },
+    {
+      "name": "chat_header_divider",
+      "value": "#0DFFFFFF"
+    },
+    {
+      "name": "chat_text_secondary",
+      "value": "#6F6F6F"
+    },
+    {
+      "name": "chat_bubble_border",
+      "value": "#BFC1C4"
+    },
+    {
+      "name": "composer_surface",
+      "value": "#353333"
+    },
+    {
+      "name": "composer_border",
+      "value": "#505050"
+    },
+    {
+      "name": "chat_cta",
+      "value": "#EEEEEE"
+    },
+    {
+      "name": "chat_cta_text",
+      "value": "#252222"
+    },
+    {
+      "name": "chat_status_accent",
+      "value": "#EA6B17"
+    },
+    {
+      "name": "chat_input_caret",
+      "value": "#417CDD"
+    },
+    {
+      "name": "chat_fab_surface",
+      "value": "#C72A2828"
+    },
+    {
+      "name": "chat_fab_border",
+      "value": "#9E434343"
+    },
+    {
+      "name": "chat_overlay_surface",
+      "value": "#E6000000"
+    },
+    {
+      "name": "chat_overlay_text",
+      "value": "#FFFFFF"
     }
   ]
 }

@@ -89,8 +89,11 @@ export class RemoteSession {
   workingDir: string = '';
   workspaceKind: string = 'project';
   model: string = '';
+  /** 当前模型显式使用的供应商来源；空值表示跟随主机默认路由。 */
+  providerId: string = '';
   effort: string = '';
   permissionMode: string = '';
+  planModeEnabled: boolean = false;
   fastMode: boolean = false;
   status: string = 'active'; // 'active' | 'archived' | 'deleted'
   /** 'cc' | 'codex' | 'pi'（被控端 mapper 透出） */
@@ -114,8 +117,10 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.workspaceKind = readStr(raw, 'workspaceKind');
   if (s.workspaceKind.length === 0) s.workspaceKind = 'project';
   s.model = readStr(raw, 'model');
+  s.providerId = readStr(raw, 'providerId');
   s.effort = readStr(raw, 'effort');
   s.permissionMode = readStr(raw, 'permissionMode');
+  s.planModeEnabled = readBool(raw, 'planModeEnabled', false);
   s.fastMode = readBool(raw, 'fastMode', false);
   s.status = readStr(raw, 'status');
   if (s.status.length === 0) s.status = 'active';
@@ -167,7 +172,8 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
   m.toolUseId = readStr(raw, 'toolUseId');
   m.systemCardType = readStr(raw, 'systemCardType');
   m.systemCardData = readObj(raw, 'systemCardData');
-  // 自动化注入消息：agentMeta.origin 非空（调度任务模板 prompt，折叠阈值更紧）。
+  // 自动化注入消息：仅接受 scheduler origin 的完整结构，和 Mobile
+  // readAutomationOrigin 同源；其它 origin 不能误用自动化的 4 行收起阈值。
   const agentMeta = readObj(raw, 'agentMeta');
   m.agentMeta = agentMeta;
   const turnUsageDetails = readObj(agentMeta, 'turnUsageDetails');
@@ -187,7 +193,9 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
       || readBool(content, 'isStreaming', false)
       || readBool(content, 'streaming', false);
   }
-  m.automationOrigin = readStr(agentMeta, 'origin').length > 0;
+  const origin = readObj(agentMeta, 'origin');
+  m.automationOrigin = readStr(origin, 'kind') === 'scheduler'
+    && readStr(origin, 'scheduleId').length > 0;
   // createdAt 两种形态都要兼容：
   // - history:messages 返回 DB 原始 integer（unix ms，见 desktop chatHistoryReader
   //   `createdAt: r.m.createdAt`）；

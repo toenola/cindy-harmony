@@ -24,6 +24,10 @@
 
 - 首次接触本仓、需要定位功能代码位置或判断新代码归属模块时，先读仓库地图
   `docs/dev-rules/repo-map.md`。
+- 新增或修改 `apps/harmony` 的**用户可见行为**（消息渲染、长消息折叠、滚动分页、
+  发送状态、附件、交互确认等）前，必须先读
+  `apps/harmony/docs/mobile-alignment.md`：以 Mobile（iOS/Android）实现为行为
+  准绳，先读对应源码确认语义再写 ArkTS，禁止凭猜测发明行为（已踩坑案例见该文档）。
 - 首次安装、修复依赖或准备新 worktree 时，必须先读
   `docs/dev-rules/environment-setup.md`。
 - 启动、调试或验证 Desktop 时，必须先读 `docs/dev-rules/desktop-development.md`。

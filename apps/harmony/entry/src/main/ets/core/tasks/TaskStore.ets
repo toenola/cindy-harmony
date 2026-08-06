@@ -210,8 +210,10 @@ export class TaskStore {
     merged.workingDir = base.workingDir;
     merged.workspaceKind = base.workspaceKind;
     merged.model = base.model;
+    merged.providerId = base.providerId;
     merged.effort = base.effort;
     merged.permissionMode = base.permissionMode;
+    merged.planModeEnabled = base.planModeEnabled;
     merged.fastMode = base.fastMode;
     merged.status = base.status;
     merged.agentKind = base.agentKind;
@@ -236,8 +238,10 @@ export class TaskStore {
     out['workingDir'] = s.workingDir;
     out['workspaceKind'] = s.workspaceKind;
     out['model'] = s.model;
+    out['providerId'] = s.providerId;
     out['effort'] = s.effort;
     out['permissionMode'] = s.permissionMode;
+    out['planModeEnabled'] = s.planModeEnabled;
     out['fastMode'] = s.fastMode;
     out['status'] = s.status;
     out['agentKind'] = s.agentKind;

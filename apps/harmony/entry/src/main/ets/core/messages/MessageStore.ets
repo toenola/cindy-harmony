@@ -39,6 +39,8 @@ export class StreamingToolRow {
   inputText: string = '';
   /** true = tool_result 事件已到（或收到 done）。 */
   settled: boolean = false;
+  /** tool_result 明确标记失败。 */
+  hasError: boolean = false;
 }
 
 /** 流式 assistant 消息（maker:event 增量累积，落库后清除）。 */
@@ -160,13 +162,16 @@ export class MessageStore {
   // ─── 打开 / 关闭 ────────────────────────────────────────────────────────────
 
   /** 打开会话：确保控制链路 → 拉历史（优先）→ 订阅实时流（并行，失败不阻塞）。 */
-  async openSession(deviceId: string, sessionId: string): Promise<void> {
+  async openSession(deviceId: string, sessionId: string): Promise<boolean> {
     const client = this.client;
-    if (!client) return;
+    if (!client) {
+      this.loadFailedBySession.set(sessionId, true);
+      this.notify();
+      return false;
+    }
     if (this.subscribed.get(sessionId) === deviceId) {
       // 已打开：重新拉一次历史（重进页面恢复用）。
-      await this.loadInitial(deviceId, sessionId);
-      return;
+      return this.loadInitial(deviceId, sessionId);
     }
     // 先确保控制链路（link-open），否则 subscribe / history 会挂起或失败。
     if (this.linkOpener !== undefined) {
@@ -180,7 +185,7 @@ export class MessageStore {
     // 订阅实时流（并行，失败不阻塞历史）。
     client.subscribe(deviceId, [sessionTopic(sessionId)]).catch(() => {
     });
-    await this.loadInitial(deviceId, sessionId);
+    return this.loadInitial(deviceId, sessionId);
   }
 
   /** 关闭会话：注销订阅并清内存（页面退出时调用）。 */
@@ -190,6 +195,7 @@ export class MessageStore {
     this.messagesBySession.delete(sessionId);
     this.hasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
+    this.loadFailedBySession.delete(sessionId);
     if (deviceId !== undefined) {
       const client = this.client;
       if (client) {
@@ -299,6 +305,8 @@ export class MessageStore {
         const row = s.tools.find((t: StreamingToolRow) => t.toolUseId === toolUseId);
         if (row !== undefined) {
           row.settled = true;
+          row.hasError = readBool(data, 'isError', false)
+            || readBool(data, 'is_error', false);
         }
       }
       this.notify();
@@ -408,6 +416,20 @@ export class MessageStore {
       }
       tm.content = content;
       tmp.push(tm);
+      if (t.settled) {
+        const result = new RemoteMessage();
+        result.id = `streaming-result-${t.toolUseId}`;
+        result.role = 'tool_result';
+        result.toolUseId = t.toolUseId;
+        result.createdAt = s.createdAt;
+        result.isStreaming = true;
+        const resultContent: Record<string, Object> = {};
+        resultContent['toolUseId'] = t.toolUseId;
+        resultContent['isError'] = t.hasError;
+        resultContent['text'] = '';
+        result.content = resultContent;
+        tmp.push(result);
+      }
     }
     if (s.text.length > 0) {
       const tm = new RemoteMessage();
@@ -431,9 +453,9 @@ export class MessageStore {
     }
   }
 
-  private async loadInitial(deviceId: string, sessionId: string): Promise<void> {
+  private async loadInitial(deviceId: string, sessionId: string): Promise<boolean> {
     const client = this.client;
-    if (!client) return;
+    if (!client) return false;
     try {
       // 对齐 iOS：历史走 local-db:messages:list（返回完整行含 clientId，最新在前）。
       const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
@@ -458,6 +480,7 @@ export class MessageStore {
       hilog.info(DOMAIN, TAG, 'history loaded total=%{public}d user=%{public}d assistant=%{public}d other=%{public}d hasMore=%{public}s',
         page.items.length, userCount, assistantCount, otherCount, page.hasMore ? 'true' : 'false');
       this.notify();
+      return true;
     } catch (e) {
       // 加载失败：标记失败（页面提供重试），不保持空列表假装成功。
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -465,6 +488,7 @@ export class MessageStore {
         sessionId.slice(0, 8), msg);
       this.loadFailedBySession.set(sessionId, true);
       this.notify();
+      return false;
     }
   }
 

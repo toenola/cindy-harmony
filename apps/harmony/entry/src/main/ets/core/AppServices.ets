@@ -22,6 +22,7 @@ import { TaskStore } from './tasks/TaskStore';
 import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
+import { GoalStore } from './goals/GoalStore';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
@@ -40,6 +41,7 @@ export class AppServices {
   readonly tasks: TaskStore = new TaskStore();
   readonly messages: MessageStore = new MessageStore();
   readonly interactions: InteractionStore = new InteractionStore();
+  readonly goals: GoalStore = new GoalStore();
   readonly client: DlClient;
   private readonly http: HarmonyHttp = new HarmonyHttp();
   private statusListeners: Array<(status: string) => void> = [];
@@ -57,7 +59,9 @@ export class AppServices {
     this.tasks.attach(this.client);
     this.messages.attach(this.client);
     this.interactions.attach(this.client);
+    this.goals.attach(this.client);
     this.messages.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
   }
 
   /**
@@ -263,6 +267,9 @@ export class AppServices {
         break;
       case 'maker:interaction-dismissed':
         this.interactions.handleInteractionDismissed(payload);
+        break;
+      case 'maker:goal:status-changed':
+        this.goals.handleStatusChanged(payload);
         break;
       default:
         // 未识别的 push channel 忽略（切片 2+ 逐步接入）。

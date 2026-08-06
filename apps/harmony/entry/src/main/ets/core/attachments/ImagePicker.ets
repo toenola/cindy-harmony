@@ -2,6 +2,8 @@
  * 图片选择（PhotoViewPicker）+ 候选构建（读取尺寸 / 大小 / 真实 mime）。
  */
 
+import { common } from '@kit.AbilityKit';
+import { camera, cameraPicker } from '@kit.CameraKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { image } from '@kit.ImageKit';
 import { fileIo } from '@kit.CoreFileKit';
@@ -9,6 +11,9 @@ import { ImageAttachmentCandidate } from './AttachmentModels';
 
 /** 从相册选图（多选），返回 photo uri 列表。 */
 export async function pickImageUris(maxCount: number): Promise<string[]> {
+  if (maxCount <= 0) {
+    return [];
+  }
   const picker = new photoAccessHelper.PhotoViewPicker();
   const options: photoAccessHelper.PhotoSelectOptions = {
     MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
@@ -16,6 +21,40 @@ export async function pickImageUris(maxCount: number): Promise<string[]> {
   };
   const result = await picker.select(options);
   return result.photoUris;
+}
+
+/** 从系统截图目录选图；无法定位截图目录时显式失败，不退化为普通照片。 */
+export async function pickScreenshotUris(context: common.Context, maxCount: number): Promise<string[]> {
+  if (maxCount <= 0) {
+    return [];
+  }
+  const helper = photoAccessHelper.getPhotoAccessHelper(context);
+  const albumId = await helper.getAlbumIdByLpath('/Pictures/Screenshots');
+  const filter = new photoAccessHelper.OperationItem();
+  filter.operationType = photoAccessHelper.OperationType.EQUAL_TO;
+  filter.field = photoAccessHelper.PhotoKeys.OWNER_ALBUM_ID;
+  filter.value = [albumId];
+  const picker = new photoAccessHelper.PhotoViewPicker();
+  const options: photoAccessHelper.PhotoSelectOptions = {
+    MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
+    maxSelectNumber: maxCount,
+    assetFilter: [filter],
+  };
+  const result = await picker.select(options);
+  return result.photoUris;
+}
+
+/** 拉起系统相机 picker 拍照；取消或失败返回空串。 */
+export async function takePhotoUri(context: common.Context): Promise<string> {
+  const profile: cameraPicker.PickerProfile = {
+    cameraPosition: camera.CameraPosition.CAMERA_POSITION_BACK,
+  };
+  const result = await cameraPicker.pick(
+    context,
+    [cameraPicker.PickerMediaType.PHOTO],
+    profile,
+  );
+  return result.resultCode === 0 ? result.resultUri : '';
 }
 
 /** 读文件前 N 字节，嗅探真实图片 mime（photoAccessHelper 不直接给 mime）。 */

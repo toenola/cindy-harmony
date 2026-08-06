@@ -65,47 +65,64 @@ struct LoginPage {
   }
 
   build() {
-    Column({ space: 16 }) {
-      Image($r('app.media.login_wordmark'))
-        .width(160)
-        .height(55)
+    Stack({ alignContent: Alignment.TopStart }) {
+      // 与 MobileLoginHandoffStage 同源的登录立绘，作为品牌层置于表单后方。
+      Image($r('app.media.mobile_login_hero_3x'))
+        .width('100%')
+        .height('48%')
         .objectFit(ImageFit.Contain)
-        .margin({ top: 120 })
-      Image($r('app.media.login_slogan'))
-        .width(150)
-        .height(43)
-        .objectFit(ImageFit.Contain)
+        .position({ x: 0, y: 12 })
 
-      TextInput({ placeholder: '手机号', text: this.phone })
-        .type(InputType.PhoneNumber)
-        .onChange((v: string) => {
-          this.phone = v;
-        })
+      Column({ space: 16 }) {
+        Image($r('app.media.login_wordmark'))
+          .width(160)
+          .height(55)
+          .objectFit(ImageFit.Contain)
+        Image($r('app.media.login_slogan'))
+          .width(150)
+          .height(43)
+          .objectFit(ImageFit.Contain)
+
+        Column({ space: 16 }) {
+          TextInput({ placeholder: '手机号', text: this.phone })
+            .type(InputType.PhoneNumber)
+            .onChange((v: string) => {
+              this.phone = v;
+            })
+            .width('100%')
+
+          Row({ space: 8 }) {
+            TextInput({ placeholder: '验证码', text: this.code })
+              .type(InputType.Number)
+              .onChange((v: string) => {
+                this.code = v;
+              })
+              .layoutWeight(1)
+            Button(this.codeSent && this.countdown > 0 ? `${this.countdown}s` : '获取验证码')
+              .enabled(!this.sending && this.countdown <= 0)
+              .onClick(() => this.sendCode())
+          }
+          .width('100%')
+
+          if (this.error.length > 0) {
+            Text(this.error)
+              .fontSize(12)
+              .fontColor($r('app.color.danger'))
+              .width('100%')
+          }
+
+          Button(this.submitting ? '登录中…' : '登录')
+            .enabled(!this.submitting && this.phone.length >= 6 && this.code.length >= 4)
+            .width('100%')
+            .onClick(() => this.login())
+        }
         .width('85%')
-
-      Row({ space: 8 }) {
-        TextInput({ placeholder: '验证码', text: this.code })
-          .type(InputType.Number)
-          .onChange((v: string) => {
-            this.code = v;
-          })
-          .layoutWeight(1)
-        Button(this.codeSent && this.countdown > 0 ? `${this.countdown}s` : '获取验证码')
-          .enabled(!this.sending && this.countdown <= 0)
-          .onClick(() => this.sendCode())
+        .margin({ top: 32 })
       }
-      .width('85%')
-
-      if (this.error.length > 0) {
-        Text(this.error)
-          .fontSize(12)
-          .fontColor($r('app.color.danger'))
-      }
-
-      Button(this.submitting ? '登录中…' : '登录')
-        .enabled(!this.submitting && this.phone.length >= 6 && this.code.length >= 4)
-        .width('85%')
-        .onClick(() => this.login())
+      .width('100%')
+      .height('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ top: 136, left: 16, right: 16, bottom: 24 })
     }
     .width('100%')
     .height('100%')

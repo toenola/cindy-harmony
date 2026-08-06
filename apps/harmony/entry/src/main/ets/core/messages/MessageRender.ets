@@ -86,6 +86,8 @@ export class RenderToolItem {
   /** 配对 result 的预览文本；空 = 未到达（running）。 */
   resultText: string = '';
   hasResult: boolean = false;
+  /** result 明确表示失败；settled 不等于成功。 */
+  hasError: boolean = false;
   /** 精确 tool_result 的落库时间；邻接兜底不伪造结束时间。 */
   settledAt: string = '';
   /** 调用发起时间 ISO（work_group 时长计算用）。 */
@@ -210,6 +212,17 @@ export function toolResultUseId(message: RemoteMessage): string {
     }
   }
   return '';
+}
+
+export function toolResultHasError(message: RemoteMessage): boolean {
+  const content = message.content;
+  if (content !== undefined && typeof content === 'object' && !Array.isArray(content)) {
+    const record = content as Record<string, Object>;
+    return record['isError'] === true || record['is_error'] === true;
+  }
+  // 历史 tool_result 通常只有纯文本正文；正文可能本身就在讨论 error，
+  // 没有结构化信号时宁可不标失败，避免假阳性。
+  return false;
 }
 
 /** 判断工具调用是否是 todo 载体（TodoWrite / update_plan / Task*）。 */
@@ -398,6 +411,17 @@ function parseUserContent(content: Object | undefined): ParsedUserContent {
   return out;
 }
 
+/** 手打消息收起后保留的正文行数，对齐 mobile userMessageCollapse.ts。 */
+export const LONG_USER_MESSAGE_COLLAPSED_LINES = 10;
+/** 自动化消息收起后保留的正文行数。 */
+export const AUTOMATION_USER_MESSAGE_COLLAPSED_LINES = 3;
+
+export function collapsedUserMessageLineLimit(isAutomation: boolean): number {
+  return isAutomation
+    ? AUTOMATION_USER_MESSAGE_COLLAPSED_LINES
+    : LONG_USER_MESSAGE_COLLAPSED_LINES;
+}
+
 /** 手打消息收起阈值（视觉行），对齐 mobile userMessageCollapse.ts。 */
 const LONG_USER_MESSAGE_VISUAL_LINE_THRESHOLD = 14;
 /** 自动化注入消息收起阈值。 */
@@ -507,8 +531,10 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
   const toolNameByUseId = new Map<string, string>();
   const resultByUseId = new Map<string, string>();
   const resultAtByUseId = new Map<string, string>();
+  const resultErrorByUseId = new Map<string, boolean>();
   const settledUseIds = new Set<string>();
   const adjacentResultByMessageId = new Map<string, string>();
+  const adjacentErrorMessageIds = new Set<string>();
   const adjacentSettledMessageIds = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
@@ -526,6 +552,7 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     if (useId.length === 0) continue;
     settledUseIds.add(useId);
     resultAtByUseId.set(useId, m.createdAt);
+    if (toolResultHasError(m)) resultErrorByUseId.set(useId, true);
     const preview = summarizeText(contentPreview(m.content));
     if (!shouldHideToolResult(toolNameByUseId.get(useId) ?? '', preview)) {
       resultByUseId.set(useId, preview);
@@ -541,6 +568,7 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     const resultUseId = toolResultUseId(result);
     if (resultUseId.length > 0 && resultUseId !== useInfo.toolUseId) continue;
     adjacentSettledMessageIds.add(use.id);
+    if (toolResultHasError(result)) adjacentErrorMessageIds.add(use.id);
     const preview = summarizeText(contentPreview(result.content));
     if (!shouldHideToolResult(useInfo.toolName, preview)) {
       adjacentResultByMessageId.set(use.id, preview);
@@ -603,10 +631,12 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
       if (item.toolUseId.length > 0 && settledUseIds.has(item.toolUseId)) {
         item.resultText = resultByUseId.get(item.toolUseId) ?? '';
         item.hasResult = true;
+        item.hasError = resultErrorByUseId.get(item.toolUseId) ?? false;
         item.settledAt = resultAtByUseId.get(item.toolUseId) ?? '';
       } else if (adjacentSettledMessageIds.has(m.id)) {
         item.resultText = adjacentResultByMessageId.get(m.id) ?? '';
         item.hasResult = true;
+        item.hasError = adjacentErrorMessageIds.has(m.id);
       }
       item.createdAt = m.createdAt;
       if (pendingTools.length === 0) pendingFirstKey = m.id;
@@ -680,7 +710,43 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     items.push(item);
   }
   flushTools();
+  scopeUnsettledToolsToActiveTail(items);
   return groupMessageWorkRuns(items, isSessionStreaming);
+}
+
+/**
+ * 对齐 Mobile scopeUnsettledToolsToActiveTail：被中断的旧轮次可能永久缺少
+ * tool_result，只有最后一条真实用户消息后的 active tail 可以保持运行态。
+ */
+function scopeUnsettledToolsToActiveTail(items: RenderItem[]): void {
+  let lastUserIndex = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].type === 'message' && (items[i] as RenderMessageItem).kind === 'user') {
+      lastUserIndex = i;
+      break;
+    }
+  }
+  if (lastUserIndex < 0) return;
+
+  let settleBeforeIndex = lastUserIndex;
+  for (let i = items.length - 1; i > lastUserIndex; i--) {
+    if (items[i].type !== 'message') continue;
+    const messageItem = items[i] as RenderMessageItem;
+    if (messageItem.kind === 'assistant'
+      && messageItem.body.trim().length > 0
+      && messageItem.message !== undefined
+      && !messageItem.message.isStreaming) {
+      settleBeforeIndex = i;
+      break;
+    }
+  }
+  for (let i = 0; i < settleBeforeIndex; i++) {
+    if (items[i].type !== 'tool_group') continue;
+    const tools = (items[i] as RenderToolGroupItem).tools;
+    for (let j = 0; j < tools.length; j++) {
+      if (!tools[j].hasResult) tools[j].hasResult = true;
+    }
+  }
 }
 
 const HISTORY_GAP_SPLIT_MS = 30 * 60 * 1000;
