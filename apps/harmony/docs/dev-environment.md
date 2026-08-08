@@ -1,6 +1,6 @@
 # Harmony 开发环境
 
-> 状态：待实机确认
+> 状态：模拟器签名安装已确认，真机仍待确认
 
 ## 1. 目标
 
@@ -57,13 +57,21 @@ oh-package.json5
 
 - DevEco Studio 已生成标准 Stage + ArkTS 工程。
 - 目标和兼容 SDK 为 `6.1.1(24)`。
-- `entry:assembleHap` 空工程构建成功。
-- 已生成 unsigned HAP；当前没有 signing config，因此尚未生成 signed HAP。
+- `entry:assembleHap` 已构建成功。
+- `apps/harmony/build-profile.json5` 已配置 `signingConfigs.default`，可生成 `entry-default-signed.hap`。
+- signed HAP 已通过 `install -r` 覆盖安装到模拟器；未卸载应用、未清理应用数据。
+
+## 6. 签名安装与数据保护
+
+- 设备或模拟器上已有 Cindy 时，只使用 `entry/build/default/outputs/default/entry-default-signed.hap`。
+- 不要使用 unsigned HAP 覆盖已安装应用；签名不一致会导致安装失败。
+- 不要为了绕过签名错误执行 `uninstall`、清理应用数据或重置模拟器；这些操作会丢失登录态和本地数据。
+- 如果签名材料不可读、signed HAP 不存在，或 `install -r` 报 `install sign info inconsistent`，停止并让用户在 DevEco Studio 中选择正确签名。
 
 仍未验证：
 
 - ArkTS 对现有 TypeScript 包的直接复用边界。
 - Harmony WebSocket 自定义 Header 行为。
-- 真机或模拟器安装、前后台切换、弱网重连和大消息传输。
+- 真机安装、前后台切换、弱网重连和大消息传输。
 - Token 安全存储、图片选择和图片 URI 读取。
-- 最终 bundleName、签名配置和发布身份。
+- 发布签名和正式发布身份。

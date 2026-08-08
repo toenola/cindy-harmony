@@ -57,15 +57,11 @@ worktree 会话契约、直推 `main` 的额外门禁与 review 严重度口径�
     改这个脚本时不要放宽 name／邮箱比对，否则会出现「本地绿、PR 红」。
   - 漏签不要重新造一份提交：用 `git commit --amend -s --no-edit` 或
     `git rebase --signoff <base>` 补签后 `git push --force-with-lease`。
-- **提交前测试门禁（硬性要求）**：无论是提 PR 还是直接 commit，提交前都必须在本地跑完
-  仓库根 `pnpm test:unit`（全部单元测试），并对本次改动涉及的每个 package 跑
-  `pnpm --filter <包名> run --if-present typecheck`（`<包名>` 用该 package 在
-  `package.json` 里的 `name`，如 `desktop`、`@cindy/maker-core`；没有 `typecheck`
-  script 的 package 该步自动跳过），全部通过后才允许提交；任何一项失败都不得提交，
-  必须先修复。worktree 会话内的 commit 同样适用。唯一例外是**防丢数据的兜底保存**：
-  宿主删除／归档会话时自动存的内容快照（见第 1 节），以及会话必须收尾、测试却来不及
-  修好时的收尾 commit——后者 commit message 必须标注 `WIP`，且在门禁通过前不得
-  push、不得提 PR。
+- **提交前测试门禁**：默认在本地跑完仓库根 `pnpm test:unit`（全部单元测试），并对本次
+  改动涉及的每个 package 跑 `pnpm --filter <包名> run --if-present typecheck`；但在 fork
+  的个人开发分支上，若维护者明确指定只验证某个端或模块，可跳过不适用的根级测试。
+  这种情况下不要求 `WIP` 标记，也不禁止 push；提交或 PR 说明必须如实记录未执行的验证，
+  并保留与改动范围匹配的局部验证。worktree 会话内的 commit 同样适用。
   - **完整单测的外层超时**：`pnpm test:unit` 是全仓完整门禁，正常执行可能超过数分钟。
     调用它的 agent／自动化工具不得使用 120 秒或更短的绝对超时；未知当前耗时时，外层
     兜底超时至少设为 15 分钟。工具支持后台运行或 yielded process handle 时优先使用该

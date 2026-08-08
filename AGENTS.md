@@ -32,6 +32,11 @@
   发送状态、附件、交互确认等）前，必须先读
   `apps/harmony/docs/mobile-alignment.md`：以 Mobile（iOS/Android）实现为行为
   准绳，先读对应源码确认语义再写 ArkTS，禁止凭猜测发明行为（已踩坑案例见该文档）。
+- 处理任何 `apps/harmony` 任务（包括代码、UI、构建、模拟器/设备验证）前，必须先读
+  `apps/harmony/项目鸿蒙端开发指南.md`。构建和安装必须遵循该指南使用现有签名配置生成并安装
+  `entry-default-signed.hap`；禁止用 unsigned HAP 覆盖已有应用，禁止为绕过签名错误卸载应用、
+  清理数据或重置模拟器。签名材料不可用、signed HAP 不存在或 `install -r` 报签名不一致时，
+  必须停止并交给用户在 DevEco Studio 中处理，不得自行修改签名配置。
 - 首次安装、修复依赖或准备新 worktree 时，必须先读
   `docs/dev-rules/environment-setup.md`。
 - 启动、调试或验证 Desktop 时，必须先读 `docs/dev-rules/desktop-development.md`。
@@ -152,13 +157,10 @@
   瞬时 commit（不存在于本仓库、GitHub 上查不到该 SHA）；对这类合成 SHA 跑
   `check:dco` 的失败结果不构成缺签证据，不要据此报告 DCO 问题。判定 DCO 是否通过，
   一律以 PR 上的 DCO App check 与真实提交范围（`origin/main..PR head`）的结果为准。
-- **提交前测试门禁（硬性要求）**：无论是提 PR 还是直接 commit，提交前都必须在本地
-  跑完仓库根 `pnpm test:unit`（全部单元测试），并对本次改动涉及的每个 package 跑
-  `pnpm --filter <包名> run --if-present typecheck`（`<包名>` 用该 package 在
-  `package.json` 里的 `name`，如 `desktop`、`@cindy/maker-core`；没有 `typecheck`
-  script 的 package 该步自动跳过），全部通过后才允许提交；任何一项失败都不得提交，
-  必须先修复。细则与唯一例外（防丢数据的兜底保存）见
-  `docs/dev-rules/development-workflow.md`。
+- **提交前测试门禁**：默认按 `docs/dev-rules/development-workflow.md` 执行仓库根
+  `pnpm test:unit` 和涉及 package 的 typecheck；但在 fork 的个人开发分支上，若维护者明确
+  指定只验证某个端或模块，可跳过不适用的根级测试，不要求用 `WIP` 标记提交或禁止 push。
+  必须在交付说明中如实记录未执行的验证；DCO 签名和与改动范围匹配的验证仍然适用。
 - 在上述门禁之上按风险追加验证：跨模块、高风险或基础设施改动追加更广泛验证（如
   `pnpm test:all`），最终以 CI 门禁为准。不得通过跳过、删除或弱化测试制造通过。
 

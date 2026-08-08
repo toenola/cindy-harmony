@@ -2559,7 +2559,6 @@ export struct TaskPageContent {
                   .fontColor($r('app.color.text_secondary'))
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .layoutWeight(1)
                 if (this.currentModelEffortLabel().length > 0) {
                   Text('·')
                     .fontSize(taskDetailFontSize(12))
@@ -2574,11 +2573,9 @@ export struct TaskPageContent {
                   .fontSize(taskDetailFontSize(13))
                   .fontColor([$r('app.color.text_secondary')])
               }
-              .width('100%')
               .alignItems(VerticalAlign.Center)
             }
             .height(30)
-            .width(180)
             .constraintSize({ minWidth: 100, maxWidth: 180 })
             .padding({ left: 8, right: 8 })
             .borderRadius(8)
