@@ -191,7 +191,12 @@ export class TaskStore {
     if (sessionId.length === 0) return;
     const patch = readObj(p, 'patch');
     const list = this.sessionsByDevice.get(deviceId);
-    if (!list) return;
+    // push 可能在首次快照、重连快照或 created push 之前到达；active 行不能静默丢掉，
+    // 由桌面端权威列表补齐。Mobile 对未知 active 会话也走 reseed。
+    if (!list) {
+      if (readStr(patch, 'status') === 'active') void this.loadSessions(deviceId);
+      return;
+    }
     let changed = false;
     for (let i = 0; i < list.length; i++) {
       if (list[i].id === sessionId) {
@@ -199,6 +204,10 @@ export class TaskStore {
         changed = true;
         break;
       }
+    }
+    if (!changed && readStr(patch, 'status') === 'active') {
+      void this.loadSessions(deviceId);
+      return;
     }
     if (changed) {
       list.sort(sortSessionsByUpdatedAt);
@@ -214,7 +223,10 @@ export class TaskStore {
     const detail = readStr(p, 'compactDetail');
     if (detail.length > 0) this.rememberActivity(deviceId, sessionId, detail);
     const list = this.sessionsByDevice.get(deviceId);
-    if (!list) return;
+    if (!list) {
+      void this.loadSessions(deviceId);
+      return;
+    }
     let changed = false;
     for (let i = 0; i < list.length; i++) {
       if (list[i].id === sessionId) {
@@ -222,6 +234,10 @@ export class TaskStore {
         changed = true;
         break;
       }
+    }
+    if (!changed) {
+      void this.loadSessions(deviceId);
+      return;
     }
     if (changed) this.notify();
   }

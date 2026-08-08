@@ -7,7 +7,7 @@
 
 import { display, router } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
-import { PresenceSnapshot, SESSIONS_TOPIC } from '../core/device-link/DlProtocol';
+import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
 import { TaskPageContent } from './TaskPage';
 import {
@@ -71,14 +71,6 @@ struct TaskListPage {
   @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   @State dividerActive: boolean = false;
 
-  private subscribedDeviceGenerations: Map<string, number> = new Map();
-  private deviceOperationGenerations: Map<string, number> = new Map();
-  private subscriptionRetryCounts: Map<string, number> = new Map();
-  private subscriptionRetryTimers: Map<string, number> = new Map();
-  private snapshotRetryCounts: Map<string, number> = new Map();
-  private snapshotRetryTimers: Map<string, number> = new Map();
-  private subscriptionGeneration: number = 0;
-  private pageActive: boolean = false;
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
   private clockTimer: number = -1;
@@ -91,8 +83,6 @@ struct TaskListPage {
   };
 
   aboutToAppear(): void {
-    this.pageActive = true;
-    this.subscriptionGeneration += 1;
     if (!this.routeParamsInitialized) {
       const params = (router.getParams() ?? {}) as Record<string, Object>;
       this.selectedDeviceId = readStr(params, 'deviceId');
@@ -105,29 +95,19 @@ struct TaskListPage {
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
-      this.syncOpenableDevices();
     }));
     this.unsubs.push(AppServices.instance.onStatus((status: string) => {
       this.connectionStatus = status;
-      // relay 状态切换后远端订阅均视为失效；设备操作仍串行等待旧链自行收尾。
-      this.subscriptionGeneration += 1;
-      this.subscribedDeviceGenerations.clear();
-      this.clearAllRetries();
-      if (status === 'online') {
-        this.syncOpenableDevices();
-      }
     }));
 
     this.refreshProjection();
-    this.syncOpenableDevices();
+    AppServices.instance.syncSessionSubscriptions();
     this.clockTimer = setInterval(() => {
       this.now = Date.now();
     }, 60_000);
   }
 
   aboutToDisappear(): void {
-    this.pageActive = false;
-    this.subscriptionGeneration += 1;
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
     }
@@ -136,8 +116,6 @@ struct TaskListPage {
       clearInterval(this.clockTimer);
       this.clockTimer = -1;
     }
-    this.clearAllRetries();
-    this.teardownAllSubscriptions();
     this.stopFoldStatusObservation();
     this.scopeMenuOpen = false;
     this.filterMenuOpen = false;
@@ -269,200 +247,6 @@ struct TaskListPage {
     }
     if (event.type === TouchType.Up) {
       this.dividerActive = false;
-    }
-  }
-
-  private syncOpenableDevices(): void {
-    if (!this.pageActive || this.connectionStatus !== 'online') return;
-
-    const devices = AppServices.instance.tasks.deviceList;
-    const desiredDeviceIds: Set<string> = new Set();
-    for (let i = 0; i < devices.length; i++) {
-      if (this.deviceCanOpen(devices[i])) desiredDeviceIds.add(devices[i].deviceId);
-      else this.clearDeviceRetries(devices[i].deviceId);
-    }
-
-    const staleSubscriptions: string[] = [];
-    this.subscribedDeviceGenerations.forEach((generation: number, deviceId: string) => {
-      if (!desiredDeviceIds.has(deviceId)) staleSubscriptions.push(deviceId);
-    });
-    for (let i = 0; i < staleSubscriptions.length; i++) {
-      this.startUnsubscribe(staleSubscriptions[i]);
-    }
-
-    for (let i = 0; i < devices.length; i++) {
-      const deviceId = devices[i].deviceId;
-      if (!desiredDeviceIds.has(deviceId)
-        || this.subscribedDeviceGenerations.has(deviceId)
-        || this.deviceOperationGenerations.has(deviceId)
-        || this.subscriptionRetryTimers.has(deviceId)) {
-        continue;
-      }
-      const generation = this.subscriptionGeneration;
-      this.deviceOperationGenerations.set(deviceId, generation);
-      void this.subscribeDevice(deviceId, generation);
-    }
-  }
-
-  private async subscribeDevice(deviceId: string, generation: number): Promise<void> {
-    let subscribed = false;
-    try {
-      await AppServices.instance.openLink(deviceId);
-      if (!this.subscriptionStillNeeded(deviceId, generation)) {
-        this.finishDeviceOperation(deviceId, generation);
-        return;
-      }
-      await AppServices.instance.client.subscribe(deviceId, [SESSIONS_TOPIC]);
-      subscribed = true;
-      if (!this.subscriptionStillNeeded(deviceId, generation)) {
-        await this.unsubscribeDevice(deviceId);
-        this.finishDeviceOperation(deviceId, generation);
-        return;
-      }
-
-      this.subscribedDeviceGenerations.set(deviceId, generation);
-      this.clearSubscriptionRetry(deviceId);
-      this.finishDeviceOperation(deviceId, generation);
-      const loaded = await AppServices.instance.tasks.loadSessions(deviceId);
-      if (!loaded && this.snapshotStillNeeded(deviceId, generation)) {
-        this.scheduleSnapshotRetry(deviceId, generation);
-      } else if (loaded) {
-        this.clearSnapshotRetry(deviceId);
-      }
-    } catch (e) {
-      if (subscribed) await this.unsubscribeDevice(deviceId);
-      if (this.subscriptionStillNeeded(deviceId, generation)) {
-        // 订阅失败时也拉一次快照；operation 标记防止 Store notify 触发紧密重试。
-        await AppServices.instance.tasks.loadSessions(deviceId);
-        if (this.subscriptionStillNeeded(deviceId, generation)) {
-          this.scheduleSubscriptionRetry(deviceId, generation);
-        }
-      }
-      this.finishDeviceOperation(deviceId, generation);
-    }
-  }
-
-  private finishDeviceOperation(deviceId: string, generation: number): void {
-    if (this.deviceOperationGenerations.get(deviceId) === generation) {
-      this.deviceOperationGenerations.delete(deviceId);
-    }
-    if (this.pageActive) this.syncOpenableDevices();
-  }
-
-  private teardownAllSubscriptions(): void {
-    const deviceIds: string[] = [];
-    this.subscribedDeviceGenerations.forEach((generation: number, deviceId: string) => {
-      deviceIds.push(deviceId);
-    });
-    for (let i = 0; i < deviceIds.length; i++) this.startUnsubscribe(deviceIds[i]);
-  }
-
-  private startUnsubscribe(deviceId: string): void {
-    this.subscribedDeviceGenerations.delete(deviceId);
-    this.clearDeviceRetries(deviceId);
-    if (this.deviceOperationGenerations.has(deviceId)) return;
-    const generation = this.subscriptionGeneration;
-    this.deviceOperationGenerations.set(deviceId, generation);
-    void this.runUnsubscribe(deviceId, generation);
-  }
-
-  private async runUnsubscribe(deviceId: string, generation: number): Promise<void> {
-    await this.unsubscribeDevice(deviceId);
-    this.finishDeviceOperation(deviceId, generation);
-  }
-
-  private subscriptionStillNeeded(deviceId: string, generation: number): boolean {
-    if (!this.pageActive || generation !== this.subscriptionGeneration
-      || this.connectionStatus !== 'online') {
-      return false;
-    }
-    const devices = AppServices.instance.tasks.deviceList;
-    for (let i = 0; i < devices.length; i++) {
-      if (devices[i].deviceId === deviceId) return this.deviceCanOpen(devices[i]);
-    }
-    return false;
-  }
-
-  private snapshotStillNeeded(deviceId: string, generation: number): boolean {
-    return this.subscriptionStillNeeded(deviceId, generation)
-      && this.subscribedDeviceGenerations.get(deviceId) === generation;
-  }
-
-  private retryDelay(retryCount: number): number {
-    return Math.min(30_000, 2_000 * Math.pow(2, Math.min(retryCount, 4)));
-  }
-
-  private scheduleSubscriptionRetry(deviceId: string, generation: number): void {
-    if (this.subscriptionRetryTimers.has(deviceId)) return;
-    const retryCount = this.subscriptionRetryCounts.get(deviceId) ?? 0;
-    this.subscriptionRetryCounts.set(deviceId, retryCount + 1);
-    const timer = setTimeout(() => {
-      this.subscriptionRetryTimers.delete(deviceId);
-      if (this.subscriptionStillNeeded(deviceId, generation)) {
-        this.syncOpenableDevices();
-      } else if (this.pageActive) {
-        // generation 已变化时立即让当前页面重新收敛，不能被旧 timer 卡住。
-        this.syncOpenableDevices();
-      }
-    }, this.retryDelay(retryCount));
-    this.subscriptionRetryTimers.set(deviceId, timer);
-  }
-
-  private scheduleSnapshotRetry(deviceId: string, generation: number): void {
-    if (this.snapshotRetryTimers.has(deviceId)) return;
-    const retryCount = this.snapshotRetryCounts.get(deviceId) ?? 0;
-    this.snapshotRetryCounts.set(deviceId, retryCount + 1);
-    const timer = setTimeout(() => {
-      this.snapshotRetryTimers.delete(deviceId);
-      if (this.snapshotStillNeeded(deviceId, generation)) {
-        void this.retrySnapshot(deviceId, generation);
-      }
-    }, this.retryDelay(retryCount));
-    this.snapshotRetryTimers.set(deviceId, timer);
-  }
-
-  private async retrySnapshot(deviceId: string, generation: number): Promise<void> {
-    const loaded = await AppServices.instance.tasks.loadSessions(deviceId);
-    if (loaded) {
-      this.clearSnapshotRetry(deviceId);
-    } else if (this.snapshotStillNeeded(deviceId, generation)) {
-      this.scheduleSnapshotRetry(deviceId, generation);
-    }
-  }
-
-  private clearSubscriptionRetry(deviceId: string): void {
-    const timer = this.subscriptionRetryTimers.get(deviceId);
-    if (timer !== undefined) clearTimeout(timer);
-    this.subscriptionRetryTimers.delete(deviceId);
-    this.subscriptionRetryCounts.delete(deviceId);
-  }
-
-  private clearSnapshotRetry(deviceId: string): void {
-    const timer = this.snapshotRetryTimers.get(deviceId);
-    if (timer !== undefined) clearTimeout(timer);
-    this.snapshotRetryTimers.delete(deviceId);
-    this.snapshotRetryCounts.delete(deviceId);
-  }
-
-  private clearDeviceRetries(deviceId: string): void {
-    this.clearSubscriptionRetry(deviceId);
-    this.clearSnapshotRetry(deviceId);
-  }
-
-  private clearAllRetries(): void {
-    this.subscriptionRetryTimers.forEach((timer: number) => clearTimeout(timer));
-    this.snapshotRetryTimers.forEach((timer: number) => clearTimeout(timer));
-    this.subscriptionRetryTimers.clear();
-    this.subscriptionRetryCounts.clear();
-    this.snapshotRetryTimers.clear();
-    this.snapshotRetryCounts.clear();
-  }
-
-  private async unsubscribeDevice(deviceId: string): Promise<void> {
-    try {
-      await AppServices.instance.client.unsubscribe(deviceId, [SESSIONS_TOPIC]);
-    } catch (e) {
-      // teardown 与单设备状态收敛均为 best-effort，不能关闭共享 relay。
     }
   }
 

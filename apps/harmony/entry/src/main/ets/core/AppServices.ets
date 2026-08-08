@@ -17,7 +17,9 @@ import { HarmonyWsAdapter } from '../network/HarmonyWsAdapter';
 import { HarmonyHttp } from '../network/HarmonyHttp';
 import { AuthStore } from './auth/AuthStore';
 import { DlClient, DlClientOptions, DlEvents, DlOpenLinkOptions } from './device-link/DlClient';
-import { HelloPayload, HelloAckPayload, PresenceSnapshot, DlChannels } from './device-link/DlProtocol';
+import {
+  HelloPayload, HelloAckPayload, PresenceSnapshot, DlChannels, SESSIONS_TOPIC,
+} from './device-link/DlProtocol';
 import { TaskStore } from './tasks/TaskStore';
 import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
@@ -47,6 +49,14 @@ export class AppServices {
   private statusListeners: Array<(status: string) => void> = [];
   /** 已建立控制链路的设备（openLink 幂等去重）。 */
   private linkedDevices: Set<string> = new Set();
+  /** 应用级 sessions topic 订阅；不能绑在任务列表页面，否则离开页面就漏实时更新。 */
+  private sessionSubscribedDevices: Set<string> = new Set();
+  private sessionSubscriptionOperations: Set<string> = new Set();
+  private sessionSubscriptionRetryCounts: Map<string, number> = new Map();
+  private sessionSubscriptionRetryTimers: Map<string, number> = new Map();
+  private sessionSnapshotRetryCounts: Map<string, number> = new Map();
+  private sessionSnapshotRetryTimers: Map<string, number> = new Map();
+  private sessionSubscriptionGeneration: number = 0;
 
   private constructor() {
     const opts = new DlClientOptions();
@@ -57,6 +67,9 @@ export class AppServices {
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
     this.tasks.attach(this.client);
+    this.tasks.onChanged(() => {
+      this.syncSessionSubscriptions();
+    });
     this.messages.attach(this.client);
     this.interactions.attach(this.client);
     this.goals.attach(this.client);
@@ -116,6 +129,48 @@ export class AppServices {
     }
   }
 
+  /**
+   * 让所有可控桌面保持 sessions 列表订阅和权威快照同步。
+   *
+   * 这是应用级同步，不依赖 TaskListPage 的生命周期：用户切到会话详情、后台再回前台，
+   * 或者桌面端在列表页之外创建任务，都不会丢掉 sessions:created push。
+   */
+  syncSessionSubscriptions(): void {
+    if (this.client.getStatus() !== 'online') return;
+
+    const desiredDeviceIds: Set<string> = new Set();
+    const devices = this.tasks.deviceList;
+    for (let i = 0; i < devices.length; i++) {
+      if (devices[i].online && devices[i].remoteControlEnabled) {
+        desiredDeviceIds.add(devices[i].deviceId);
+      }
+    }
+
+    const staleDeviceIds: string[] = [];
+    this.sessionSubscribedDevices.forEach((deviceId: string) => {
+      if (!desiredDeviceIds.has(deviceId)) staleDeviceIds.push(deviceId);
+    });
+    for (let i = 0; i < staleDeviceIds.length; i++) {
+      const deviceId = staleDeviceIds[i];
+      this.sessionSubscribedDevices.delete(deviceId);
+      this.clearSessionRetries(deviceId);
+      void this.unsubscribeSessions(deviceId);
+    }
+
+    for (let i = 0; i < devices.length; i++) {
+      const deviceId = devices[i].deviceId;
+      if (!desiredDeviceIds.has(deviceId)
+        || this.sessionSubscribedDevices.has(deviceId)
+        || this.sessionSubscriptionOperations.has(deviceId)
+        || this.sessionSubscriptionRetryTimers.has(deviceId)) {
+        continue;
+      }
+      const generation = this.sessionSubscriptionGeneration;
+      this.sessionSubscriptionOperations.add(deviceId);
+      void this.subscribeSessions(deviceId, generation);
+    }
+  }
+
   // ─── 内部 ───────────────────────────────────────────────────────────────────
 
   private buildHello(): HelloPayload {
@@ -137,6 +192,11 @@ export class AppServices {
         // 重连成功：重新订阅已打开会话并 gap healing，刷新设备快照。
         this.messages.resubscribeAll();
         void this.loadDevices();
+      } else {
+        // relay 重连后旧 topic registry 已失效；让下一次 online 重新订阅。
+        // link-open 也是连接级状态，不能沿用旧 socket 上的已建立标记。
+        this.linkedDevices.clear();
+        this.resetSessionSubscriptions();
       }
       for (const l of this.statusListeners) {
         l(status);
@@ -232,6 +292,7 @@ export class AppServices {
       }
       hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
       this.tasks.mergeServerDevices(views);
+      this.syncSessionSubscriptions();
       for (let i = 0; i < views.length; i++) {
         if (views[i].online && views[i].remoteControlEnabled) {
           void this.messages.hydrateActiveSessions(views[i].deviceId);
@@ -286,5 +347,123 @@ export class AppServices {
         // 未识别的 push channel 忽略（切片 2+ 逐步接入）。
         break;
     }
+  }
+
+  private async subscribeSessions(deviceId: string, generation: number): Promise<void> {
+    try {
+      await this.openLink(deviceId);
+      if (!this.sessionSubscriptionStillNeeded(deviceId, generation)) return;
+      await this.client.subscribe(deviceId, [SESSIONS_TOPIC]);
+      if (!this.sessionSubscriptionStillNeeded(deviceId, generation)) {
+        await this.unsubscribeSessions(deviceId);
+        return;
+      }
+      this.sessionSubscribedDevices.add(deviceId);
+      this.clearSessionSubscriptionRetry(deviceId);
+      const loaded = await this.tasks.loadSessions(deviceId);
+      if (loaded) {
+        this.clearSessionSnapshotRetry(deviceId);
+      } else if (this.sessionSubscriptionStillNeeded(deviceId, generation)) {
+        this.scheduleSessionSnapshotRetry(deviceId, generation);
+      }
+    } catch (e) {
+      if (this.sessionSubscriptionStillNeeded(deviceId, generation)) {
+        this.scheduleSessionSubscriptionRetry(deviceId, generation);
+      }
+    } finally {
+      this.sessionSubscriptionOperations.delete(deviceId);
+      this.syncSessionSubscriptions();
+    }
+  }
+
+  private sessionSubscriptionStillNeeded(deviceId: string, generation: number): boolean {
+    if (generation !== this.sessionSubscriptionGeneration || this.client.getStatus() !== 'online') {
+      return false;
+    }
+    const devices = this.tasks.deviceList;
+    for (let i = 0; i < devices.length; i++) {
+      if (devices[i].deviceId === deviceId) {
+        return devices[i].online && devices[i].remoteControlEnabled;
+      }
+    }
+    return false;
+  }
+
+  private scheduleSessionSubscriptionRetry(deviceId: string, generation: number): void {
+    if (this.sessionSubscriptionRetryTimers.has(deviceId)) return;
+    const retryCount = this.sessionSubscriptionRetryCounts.get(deviceId) ?? 0;
+    this.sessionSubscriptionRetryCounts.set(deviceId, retryCount + 1);
+    const timer = setTimeout(() => {
+      this.sessionSubscriptionRetryTimers.delete(deviceId);
+      if (this.sessionSubscriptionStillNeeded(deviceId, generation)) {
+        this.syncSessionSubscriptions();
+      }
+    }, this.sessionRetryDelay(retryCount));
+    this.sessionSubscriptionRetryTimers.set(deviceId, timer);
+  }
+
+  private scheduleSessionSnapshotRetry(deviceId: string, generation: number): void {
+    if (this.sessionSnapshotRetryTimers.has(deviceId)) return;
+    const retryCount = this.sessionSnapshotRetryCounts.get(deviceId) ?? 0;
+    this.sessionSnapshotRetryCounts.set(deviceId, retryCount + 1);
+    const timer = setTimeout(() => {
+      this.sessionSnapshotRetryTimers.delete(deviceId);
+      if (this.sessionSubscriptionStillNeeded(deviceId, generation)
+        && this.sessionSubscribedDevices.has(deviceId)) {
+        void this.retrySessionSnapshot(deviceId, generation);
+      }
+    }, this.sessionRetryDelay(retryCount));
+    this.sessionSnapshotRetryTimers.set(deviceId, timer);
+  }
+
+  private async retrySessionSnapshot(deviceId: string, generation: number): Promise<void> {
+    const loaded = await this.tasks.loadSessions(deviceId);
+    if (loaded) {
+      this.clearSessionSnapshotRetry(deviceId);
+    } else if (this.sessionSubscriptionStillNeeded(deviceId, generation)) {
+      this.scheduleSessionSnapshotRetry(deviceId, generation);
+    }
+  }
+
+  private sessionRetryDelay(retryCount: number): number {
+    return Math.min(30_000, 2_000 * Math.pow(2, Math.min(retryCount, 4)));
+  }
+
+  private async unsubscribeSessions(deviceId: string): Promise<void> {
+    try {
+      await this.client.unsubscribe(deviceId, [SESSIONS_TOPIC]);
+    } catch (e) {
+      // 设备离线或链路已失效时退订只是 best-effort。
+    }
+  }
+
+  private clearSessionSubscriptionRetry(deviceId: string): void {
+    const timer = this.sessionSubscriptionRetryTimers.get(deviceId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.sessionSubscriptionRetryTimers.delete(deviceId);
+    this.sessionSubscriptionRetryCounts.delete(deviceId);
+  }
+
+  private clearSessionSnapshotRetry(deviceId: string): void {
+    const timer = this.sessionSnapshotRetryTimers.get(deviceId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.sessionSnapshotRetryTimers.delete(deviceId);
+    this.sessionSnapshotRetryCounts.delete(deviceId);
+  }
+
+  private clearSessionRetries(deviceId: string): void {
+    this.clearSessionSubscriptionRetry(deviceId);
+    this.clearSessionSnapshotRetry(deviceId);
+  }
+
+  private resetSessionSubscriptions(): void {
+    this.sessionSubscriptionGeneration += 1;
+    this.sessionSubscribedDevices.clear();
+    this.sessionSubscriptionRetryTimers.forEach((timer: number) => clearTimeout(timer));
+    this.sessionSnapshotRetryTimers.forEach((timer: number) => clearTimeout(timer));
+    this.sessionSubscriptionRetryTimers.clear();
+    this.sessionSubscriptionRetryCounts.clear();
+    this.sessionSnapshotRetryTimers.clear();
+    this.sessionSnapshotRetryCounts.clear();
   }
 }
