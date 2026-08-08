@@ -5,7 +5,7 @@
 > 之前
 
 本文细化根 [`../../AGENTS.md`](../../AGENTS.md) 的「通用工作流程」「Git 与交付」两节，补上
-worktree 会话契约、直推 `main` 的额外门禁与 review 严重度口径，不重复根文件已有的通用
+  worktree 会话契约、fork 分支推送、原仓库 `main` 的额外门禁与 review 严重度口径，不重复根文件已有的通用
 流程。
 
 ## 1. Dogfooding：在本仓 worktree 会话里工作
@@ -19,8 +19,8 @@ worktree 会话契约、直推 `main` 的额外门禁与 review 严重度口径�
   命令超时）。
 - **你的编辑对运行中的 app 无效**：Vite HMR 只 watch 启动 dev 实例的那个 checkout，
   worktree 下的改动既不热更也不随重启生效。「改了没反应」不是 bug。开发过程中的增量验证在本
-  worktree 内跑 `pnpm --filter desktop typecheck` / 定向 `vitest run`；**提交前仍须通过
-  第 2 节的提交前测试门禁**。需要运行时验证时 commit + push 后交用户（你无法重启宿主）。
+  worktree 内跑 `pnpm --filter desktop typecheck` / 定向 `vitest run`；需要运行时验证时
+  commit + push 后交用户（你无法重启宿主）。测试门禁按第 2 节的 fork / 原仓库分流执行。
 - **宿主 app 日志不在你的 cwd 下**：dev 日志在启动 checkout（通常是 baseRepo）的
   `apps/desktop/logs/`，读日志时拼 baseRepo 的绝对路径。
 - **结束前必须 commit**：会话被删除或归档时脏 worktree 会先存内容快照再删目录。**PR
@@ -32,10 +32,13 @@ worktree 会话契约、直推 `main` 的额外门禁与 review 严重度口径�
   prebundle 报 `does not provide an export named X` 白屏——需要受影响实例完整重启
   （re-optimize），提醒用户即可，不要误诊为自己的代码问题。
 
-## 2. 提 PR 与直推 `main`
+## 2. Fork 分支推送、提 PR 与原仓库 `main`
 
-- 本仓默认 **PR-first**：代码和文档通常从非默认分支通过 PR 进入 `main`；直推 `main` 只由
-  具备 bypass 权限的维护者明确选择，并执行本节的额外门禁。
+- 用户自己的 fork 开发分支不受原仓库 PR-first 约定限制。用户明确要求推送到自己的
+  `origin/<branch>` 后，Agent 可以按用户指定的分支直接 push；不要求改成 `WIP`，也不要求
+  先向原仓库提 PR。仍需如实报告验证结果，并保留 DCO 签名。
+- 涉及 `upstream`、原仓库 `main` 或向原仓库提 PR 时，继续使用 PR-first；直推原仓库 `main`
+  只由具备 bypass 权限的维护者明确选择，并执行本节的额外门禁。
 - PR 的 Title／Description 以 [`../../.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md)
   为准（这次改了什么／怎么验证的／风险）；涉及 SQLite migration、system prompt、协议、
   原生层或跨平台差异时必须在「风险」里说明；涉及 UI 时必须在「UI 变化」注明引用的

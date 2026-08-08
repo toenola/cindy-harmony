@@ -139,10 +139,11 @@
 
 ## Git 与交付
 
-- 本仓默认 PR-first。代码和文档通常从非默认分支通过 PR 进入 `main`；只有仓库
-  维护者明确选择例外时才允许直推主干。
-- commit、push 和创建 PR 的执行时机由开发者或 Codex、Claude Code、Cindy 等宿主
-  工作流决定；仓库规则本身不额外授权外部写操作。
+- 本仓对**用户自己 fork 的远端**与原仓库协作分开处理：用户明确指定 fork 的开发分支时，
+  commit、push 和分支选择由用户决定，不因原仓库的 PR-first 约定而阻塞；涉及原仓库
+  `upstream`、原仓库 `main` 或向原仓库提 PR 时，才遵循下方 PR 模板、CI 和 review 规则。
+- Agent 仍需得到用户对 push、发布、合并等外部写操作的明确授权；用户已明确授权后，不能再
+  把原仓库的 PR-first 或主干门禁套用到用户自己的 fork 开发分支。
 - 提交 PR 时遵循 `.github/PULL_REQUEST_TEMPLATE.md`，如实说明改动、验证和风险。
 - 非 fork 的非 draft PR 会触发自动 code review（`.github/workflows/pr-code-review.yml`），
   审阅口径见根目录 `REVIEW.md`。它是**建议性**检查，不替代人工 review，也不替代
