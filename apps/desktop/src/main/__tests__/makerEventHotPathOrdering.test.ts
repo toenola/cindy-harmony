@@ -146,6 +146,26 @@ describe('maker:event hot path ordering', () => {
     );
   });
 
+  it('persists a terminal Codex plan before clearing its turn-owned lookup maps', () => {
+    const wireSessionSource = extractWireSessionSource();
+    const persistIndex = wireSessionSource.indexOf('persistCodexPlanOnDone(');
+    const barrierIndex = wireSessionSource.indexOf(
+      'markTurnEndedAfterPersistDrain(session.id);',
+      persistIndex,
+    );
+    const resetIndex = wireSessionSource.indexOf('resetTurnPersistState(session.id);', barrierIndex);
+
+    expect(persistIndex).toBeGreaterThanOrEqual(0);
+    expect(barrierIndex).toBeGreaterThan(persistIndex);
+    expect(resetIndex).toBeGreaterThan(barrierIndex);
+    expect(wireSessionSource.slice(persistIndex - 800, persistIndex)).toContain(
+      'isContinuationBoundary',
+    );
+    expect(wireSessionSource.slice(persistIndex - 500, persistIndex)).toContain(
+      '!isContinuationBoundary',
+    );
+  });
+
   it('defers remote auth island errors until the renderer reports retry failure', () => {
     const wireSessionSource = extractWireSessionSource();
     const deferredHandler = source.match(
@@ -316,6 +336,8 @@ describe('maker:event hot path ordering', () => {
     expectOrder(boundaryBlock, 'consumeLastAssistantPersistId(session.id);', 'consumeLastTopLevelAssistantPersistId(session.id);');
     expectOrder(boundaryBlock, 'consumeLastTopLevelAssistantPersistId(session.id);', 'flushOrphanToolResults(session.id, eventAgentMeta);');
     expect(boundaryBlock).toContain("event.type === 'done'");
+    expect(boundaryBlock).toContain("event.source !== 'codex'");
+    expect(boundaryBlock).toContain('isSuccessfulCodexDoneEventData(event.data)');
     expect(boundaryBlock).toContain('markAssistantTurnCompleted(session.id, turnBoundaryAssistantPersistId)');
     expect(boundaryBlock).toContain('markAssistantTurnFailed(session.id, turnBoundaryAssistantPersistId)');
     expect(boundaryBlock).toContain('pendingFailedTurnAssistantPersistId.get(session.id)');
@@ -324,6 +346,11 @@ describe('maker:event hot path ordering', () => {
       boundaryBlock,
       'isPairedFailedTurnDone = true',
       "else if (!isPairedFailedTurnDone)",
+    );
+    expectOrder(
+      boundaryBlock,
+      'isSuccessfulCodexDoneEventData(event.data)',
+      'markAssistantTurnFailed(session.id, turnBoundaryAssistantPersistId)',
     );
   });
 
@@ -358,7 +385,28 @@ describe('maker:event hot path ordering', () => {
     expect(closedBlock).toContain('gitSnapshotCoordinator?.onSessionClosed(session.id);');
     expectOrder(
       closedBlock,
-      'agentInputCoordinatorHolder?.onSessionClosed(session.id);',
+      'agentInputCoordinatorHolder?.onSessionClosed(session.id, {',
+      'gitSnapshotCoordinator?.onSessionClosed(session.id);',
+    );
+  });
+
+  it('preserves coordinator input boundary inside the rehydrate suppression window (#1930)', () => {
+    const wireSessionSource = extractWireSessionSource();
+    const closedBlock = wireSessionSource.slice(wireSessionSource.indexOf("if (status === 'closed') {"));
+
+    // rehydrate / 凭证切换 close-rebuild 期间同一逻辑会话进程内重建:窗口内
+    // onSessionClosed 传 preserveInputBoundary(true)保留 input boundary(不 abort
+    // 驱动本次重建的 signal → #1930),但**其余清理必须照常执行**(不能整体跳过
+    // onSessionClosed,否则 rebuild 失败/close 后不 rebuild 时 coordinator 残留)。
+    expect(closedBlock).toContain(
+      'agentInputCoordinatorHolder?.onSessionClosed(session.id, {',
+    );
+    expect(closedBlock).toContain(
+      'preserveInputBoundary: rehydrateCloseSuppression.isSuppressed(session.id),',
+    );
+    expectOrder(
+      closedBlock,
+      'agentInputCoordinatorHolder?.onSessionClosed(session.id, {',
       'gitSnapshotCoordinator?.onSessionClosed(session.id);',
     );
   });
