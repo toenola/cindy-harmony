@@ -87,6 +87,8 @@ export class RemoteSession {
   userId: string = '';
   title: string = '';
   workingDir: string = '';
+  /** SSH 会话的被控端 host alias；本地会话为空。 */
+  remoteHostId: string = '';
   workspaceKind: string = 'project';
   model: string = '';
   /** 当前模型显式使用的供应商来源；空值表示跟随主机默认路由。 */
@@ -114,6 +116,7 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.userId = readStr(raw, 'userId');
   s.title = readStr(raw, 'title');
   s.workingDir = readStr(raw, 'workingDir');
+  s.remoteHostId = readStr(raw, 'remoteHostId');
   s.workspaceKind = readStr(raw, 'workspaceKind');
   if (s.workspaceKind.length === 0) s.workspaceKind = 'project';
   s.model = readStr(raw, 'model');
@@ -192,6 +195,11 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
     m.isStreaming = m.isStreaming
       || readBool(content, 'isStreaming', false)
       || readBool(content, 'streaming', false);
+  }
+  // 持久化 turn seal 比遗留 isStreaming 标志更权威；已封口的 assistant 不应
+  // 让详情页在重进或滚动后重新显示停止按钮。
+  if (m.turnCompleted) {
+    m.isStreaming = false;
   }
   const origin = readObj(agentMeta, 'origin');
   m.automationOrigin = readStr(origin, 'kind') === 'scheduler'

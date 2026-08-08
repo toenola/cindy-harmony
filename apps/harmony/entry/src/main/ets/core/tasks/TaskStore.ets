@@ -21,6 +21,8 @@ export class TaskStore {
   private listeners: Array<() => void> = [];
   private devices: Map<string, PresenceSnapshot> = new Map();
   private sessionsByDevice: Map<string, RemoteSession[]> = new Map();
+  private sessionLoadRevisions: Map<string, number> = new Map();
+  private pendingActivityByDevice: Map<string, Map<string, string>> = new Map();
   /** 本机 deviceId（hello-ack 返回）；presence / REST 里的自己一律不进列表。 */
   private selfDeviceId: string = '';
 
@@ -100,6 +102,9 @@ export class TaskStore {
       snap.remoteControlEnabled = v.remoteControlEnabled;
       snap.lastSeenAt = v.lastSeenAt;
       this.devices.set(v.deviceId, snap);
+      if (!snap.remoteControlEnabled) {
+        this.invalidateSessions(v.deviceId);
+      }
     }
     this.notify();
   }
@@ -109,33 +114,52 @@ export class TaskStore {
     if (snap.deviceId === this.selfDeviceId) return; // 自己不进设备列表
     if (!isDesktopPlatform(snap.platform)) return; // 只展示桌面电脑
     this.devices.set(snap.deviceId, snap);
-    if (!snap.online) {
-      // 离线设备仍保留条目（显示离线态），不清会话缓存。
+    if (!snap.remoteControlEnabled) {
+      // 显式关闭远程控制立即丢弃任务镜像；短暂离线仍保留最近快照。
+      this.invalidateSessions(snap.deviceId);
     }
     this.notify();
   }
 
   // ─── 会话 ───────────────────────────────────────────────────────────────────
 
+  private invalidateSessions(deviceId: string): void {
+    const revision = (this.sessionLoadRevisions.get(deviceId) ?? 0) + 1;
+    this.sessionLoadRevisions.set(deviceId, revision);
+    this.sessionsByDevice.delete(deviceId);
+    this.pendingActivityByDevice.delete(deviceId);
+  }
+
   getSessions(deviceId: string): RemoteSession[] {
     return this.sessionsByDevice.get(deviceId) ?? [];
   }
 
-  /** 拉取某设备的会话列表（打开设备时调用）。 */
-  async loadSessions(deviceId: string): Promise<void> {
+  /** 拉取某设备的 active 任务列表；false 表示失败或结果已过期。 */
+  async loadSessions(deviceId: string): Promise<boolean> {
     const client = this.client;
-    if (!client) return;
+    if (!client) return false;
+    const revision = (this.sessionLoadRevisions.get(deviceId) ?? 0) + 1;
+    this.sessionLoadRevisions.set(deviceId, revision);
     try {
       const opts = new DlInvokeOptions();
       opts.channel = DlChannels.SESSIONS_LIST;
-      opts.args = [];
+      const includePinned: Record<string, Object> = {};
+      includePinned['includePinned'] = true;
+      opts.args = [200, 'active', includePinned];
       const env = await client.invoke(deviceId, opts);
+      if (this.sessionLoadRevisions.get(deviceId) !== revision) return false;
+      const device = this.devices.get(deviceId);
+      if (device !== undefined && !device.remoteControlEnabled) return false;
       const result = unwrapInvokeResult(env);
       const sessions = this.parseSessionList(result);
+      this.applyPendingActivity(deviceId, sessions);
       this.sessionsByDevice.set(deviceId, sessions);
+      this.pendingActivityByDevice.delete(deviceId);
       this.notify();
+      return true;
     } catch (e) {
-      // 拉取失败：保留旧列表；调用方（页面）负责提示重试。
+      // 调用方根据 false 做有界退避；旧列表继续保留。
+      return false;
     }
   }
 
@@ -188,6 +212,7 @@ export class TaskStore {
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
     const detail = readStr(p, 'compactDetail');
+    if (detail.length > 0) this.rememberActivity(deviceId, sessionId, detail);
     const list = this.sessionsByDevice.get(deviceId);
     if (!list) return;
     let changed = false;
@@ -201,6 +226,24 @@ export class TaskStore {
     if (changed) this.notify();
   }
 
+  private rememberActivity(deviceId: string, sessionId: string, detail: string): void {
+    let pending = this.pendingActivityByDevice.get(deviceId);
+    if (pending === undefined) {
+      pending = new Map<string, string>();
+      this.pendingActivityByDevice.set(deviceId, pending);
+    }
+    pending.set(sessionId, detail);
+  }
+
+  private applyPendingActivity(deviceId: string, sessions: RemoteSession[]): void {
+    const pending = this.pendingActivityByDevice.get(deviceId);
+    if (pending === undefined) return;
+    for (let i = 0; i < sessions.length; i++) {
+      const detail = pending.get(sessions[i].id);
+      if (detail !== undefined) sessions[i].preview = detail;
+    }
+  }
+
   private mergeSession(base: RemoteSession, patch: Record<string, Object>): RemoteSession {
     // 以 base 为底，patch 覆盖已知字段（未知字段忽略，等待下次整表重拉）。
     const merged = new RemoteSession();
@@ -208,6 +251,7 @@ export class TaskStore {
     merged.userId = base.userId;
     merged.title = base.title;
     merged.workingDir = base.workingDir;
+    merged.remoteHostId = base.remoteHostId;
     merged.workspaceKind = base.workspaceKind;
     merged.model = base.model;
     merged.providerId = base.providerId;
@@ -236,6 +280,7 @@ export class TaskStore {
     out['userId'] = s.userId;
     out['title'] = s.title;
     out['workingDir'] = s.workingDir;
+    out['remoteHostId'] = s.remoteHostId;
     out['workspaceKind'] = s.workspaceKind;
     out['model'] = s.model;
     out['providerId'] = s.providerId;

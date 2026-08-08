@@ -5,8 +5,8 @@
  *   limit=50），再反转为升序渲染。
  * - push：`local-db:messages:created` 逐条追加（按 id 去重）、
  *   `local-db:messages:deleted` 按 clientId 移除。
- * - 发送：invoke maker:send（createOpts 由会话字段构造）；不乐观插入，
- *   真实消息由 push 确认追加，避免与消息流去重冲突。
+ * - 发送：invoke maker:send（createOpts 由会话字段构造，persistUserMessage 由 Harmony 生成）；
+ *   Desktop accepted 事务先落库，再由 push/发送后重拉进入渲染，不直接乐观插入。
  * - 桌面端是权威来源；断线补齐（gap healing）属于切片 5。
  *
  * ArkTS 约束：对象字面量一律先声明 Record 再逐键赋值；调用 DlInvokeOptions
@@ -31,6 +31,11 @@ const TAG = 'CindyMsg';
 // 工具结果可能还要经过压缩/裁页；100 条会让特殊会话在一次响应和 UI 重建中卡很久。
 const HISTORY_PAGE_LIMIT = 50;
 
+function hasTurnContinuation(event: Record<string, Object>): boolean {
+  const value = event['turnContinuationId'];
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 /** 流式 tool 行（maker:event tool_use 增量，落库后由真实行替代）。 */
 export class StreamingToolRow {
   toolUseId: string = '';
@@ -51,6 +56,8 @@ export class StreamingMessage {
   /** 流式 tool 行（tool_use 事件增量，按 toolUseId 去重）。 */
   tools: StreamingToolRow[] = [];
   createdAt: string = '';
+  /** 终态事件已到，但持久化 assistant 行可能尚未通过 push 回来。 */
+  finished: boolean = false;
 }
 
 /** history:messages 一页响应（messages:list 复用）。 */
@@ -62,9 +69,7 @@ class HistoryPage {
 /** maker:send 的 user 消息形态（对齐 mobile chatMessage）。 */
 class UserMessageArgs {
   type: string = 'user';
-  content: string = '';
-  quotesEncoded: boolean = false;
-  images: RemoteImageRef[] = [];
+  content: string | Object[] = '';
 }
 
 /** maker:send 的 createOpts（由会话字段构造）。 */
@@ -88,8 +93,14 @@ export class MessageStore {
   private messageCountBySession: Map<string, number> = new Map();
   /** 流式 assistant 消息（maker:event 累积）。 */
   private streamingBySession: Map<string, StreamingMessage> = new Map();
+  /** maker 权威运行态；与临时正文投影分开，避免终态事件丢失时 Composer 卡住。 */
+  private runningBySession: Map<string, boolean> = new Map();
+  /** 远程运行态查询的代次，防止旧快照覆盖在途 maker 事件。 */
+  private runningStateRevisions: Map<string, number> = new Map();
   /** 历史加载失败标记（TaskPage 显示重试入口）。 */
   private loadFailedBySession: Map<string, boolean> = new Map();
+  /** 发送消息的客户端 id；同时作为 Desktop transcript 的幂等键。 */
+  private sendSequence: number = 0;
   /** 打开会话前先确保控制链路（AppServices 注入，内部做 link-open + 幂等）。 */
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
 
@@ -123,17 +134,18 @@ export class MessageStore {
     return this.messagesBySession.get(sessionId) ?? [];
   }
 
-  /** 当前会话是否仍有 maker:event 的临时投影。 */
+  /** 当前会话是否仍在执行；maker 运行态优先于历史投影。 */
   isSessionStreaming(sessionId: string): boolean {
+    if (this.runningBySession.get(sessionId) === true) return true;
     const s = this.streamingBySession.get(sessionId);
-    if (s !== undefined && (s.text.length > 0 || s.tools.length > 0)) return true;
+    if (s !== undefined && !s.finished && (s.text.length > 0 || s.tools.length > 0)) return true;
     // 历史/断线恢复可能只留下 agentMeta.isStreaming 投影；只检查最后一个 user
     // 之后的尾部，避免旧 turn 的残留标记把整段历史当成正在运行。
     const messages = this.messagesBySession.get(sessionId) ?? [];
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.role === 'user') break;
-      if (message.isStreaming) return true;
+      if (message.isStreaming && !message.turnCompleted) return true;
     }
     return false;
   }
@@ -171,7 +183,9 @@ export class MessageStore {
     }
     if (this.subscribed.get(sessionId) === deviceId) {
       // 已打开：重新拉一次历史（重进页面恢复用）。
-      return this.loadInitial(deviceId, sessionId);
+      const loaded = await this.loadInitial(deviceId, sessionId);
+      void this.refreshSessionRunningState(deviceId, sessionId);
+      return loaded;
     }
     // 先确保控制链路（link-open），否则 subscribe / history 会挂起或失败。
     if (this.linkOpener !== undefined) {
@@ -185,7 +199,9 @@ export class MessageStore {
     // 订阅实时流（并行，失败不阻塞历史）。
     client.subscribe(deviceId, [sessionTopic(sessionId)]).catch(() => {
     });
-    return this.loadInitial(deviceId, sessionId);
+    const loaded = await this.loadInitial(deviceId, sessionId);
+    void this.refreshSessionRunningState(deviceId, sessionId);
+    return loaded;
   }
 
   /** 关闭会话：注销订阅并清内存（页面退出时调用）。 */
@@ -196,6 +212,9 @@ export class MessageStore {
     this.hasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
     this.loadFailedBySession.delete(sessionId);
+    this.streamingBySession.delete(sessionId);
+    this.runningBySession.delete(sessionId);
+    this.runningStateRevisions.delete(sessionId);
     if (deviceId !== undefined) {
       const client = this.client;
       if (client) {
@@ -207,6 +226,15 @@ export class MessageStore {
       }
     }
     this.notify();
+  }
+
+  /** 生成本端唯一的 transcript clientId；不依赖额外原生 UUID API。 */
+  private nextSendClientId(): string {
+    this.sendSequence += 1;
+    const timestamp = Date.now().toString(36);
+    const randomPart = Math.random().toString(36).slice(2, 10);
+    const sequence = this.sendSequence.toString(36);
+    return `harmony-${timestamp}-${randomPart}-${sequence}`;
   }
 
   // ─── 历史加载 ───────────────────────────────────────────────────────────────
@@ -235,6 +263,7 @@ export class MessageStore {
       this.messagesBySession.set(sessionId, merged);
       this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.notify();
+      void this.refreshSessionRunningState(deviceId, sessionId);
     } catch (e) {
       // healing 失败：保持现有消息，等下一次重连恢复。
     }
@@ -242,12 +271,48 @@ export class MessageStore {
 
   /** 重连 online 后，对所有已打开会话做恢复（AppServices 调用）。 */
   resubscribeAll(): void {
+    const devices = new Set<string>();
     this.subscribed.forEach((deviceId: string, sessionId: string) => {
+      devices.add(deviceId);
       void this.resubscribeAndHeal(deviceId, sessionId);
+    });
+    devices.forEach((deviceId: string) => {
+      void this.hydrateActiveSessions(deviceId);
     });
   }
 
-  /** maker:event 处理：text delta 累积成流式消息；done/error 结束清空。 */
+  /** 从被控端 active 快照恢复已存在的运行态；终态清理仍由显式 session 探针负责。 */
+  async hydrateActiveSessions(deviceId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    const opts = new DlInvokeOptions();
+    opts.channel = DlChannels.MAKER_LIST_ACTIVE;
+    opts.args = [];
+    try {
+      const env = await client.invoke(deviceId, opts);
+      const result = unwrapInvokeResult(env);
+      if (!Array.isArray(result)) return;
+      let changed = false;
+      const active: Object[] = result as Object[];
+      for (let i = 0; i < active.length; i++) {
+        const row = active[i];
+        if (row === undefined || typeof row !== 'object' || Array.isArray(row)) continue;
+        const record = row as Record<string, Object>;
+        const sessionId = readStr(record, 'sessionId');
+        if (sessionId.length === 0 || !readBool(record, 'isTurnRunning', false)) continue;
+        this.bumpRunningStateRevision(sessionId);
+        if (this.runningBySession.get(sessionId) !== true) {
+          this.markSessionRunning(sessionId, true);
+          changed = true;
+        }
+      }
+      if (changed) this.notify();
+    } catch (e) {
+      // 老版本 Desktop 或暂时断链时由单会话探针 / maker:event 兜底。
+    }
+  }
+
+  /** maker:event 处理：运行态按终态语义收口，流式正文保留到持久化行回流。 */
   handleMakerEvent(sessionId: string, event: Object | undefined): void {
     if (event === undefined || typeof event !== 'object') {
       return;
@@ -255,14 +320,16 @@ export class MessageStore {
     const ev = event as Record<string, Object>;
     const type = readStr(ev, 'type');
     const data = readObj(ev, 'data');
+    this.bumpRunningStateRevision(sessionId);
+
     if (type === 'compact_boundary') {
-      // Desktop/Mobile 都把压缩边界作为一个 system card 插入消息流，而不是
-      // 把它当成普通 user/assistant 消息。否则它会被工作组聚合吞掉，压缩前后的
-      // turn 也会继续错误地合并成同一个“已工作”区段。
+      // 压缩边界结束旧投影，但通常仍属于同一产品 turn；后续事件会重新建立新投影。
+      this.markSessionRunning(sessionId, true);
       this.appendCompactBoundary(sessionId, data);
       return;
     }
     if (type === 'text') {
+      this.markSessionRunning(sessionId, true);
       const delta = readStr(data, 'text');
       if (delta.length === 0) {
         return;
@@ -273,6 +340,7 @@ export class MessageStore {
       return;
     }
     if (type === 'tool_use') {
+      this.markSessionRunning(sessionId, true);
       const toolUseId = readStr(data, 'toolUseId');
       if (toolUseId.length === 0) {
         return;
@@ -295,9 +363,11 @@ export class MessageStore {
       return;
     }
     if (type === 'tool_result' || type === 'tool_result_full') {
+      this.markSessionRunning(sessionId, true);
       // 结果事件：标记对应 tool 行完成（正文继续流式，落库行稍后到达）。
       const s = this.streamingBySession.get(sessionId);
       if (s === undefined) {
+        this.notify();
         return;
       }
       const toolUseId = readStr(data, 'toolUseId');
@@ -313,26 +383,60 @@ export class MessageStore {
       return;
     }
     if (type === 'thinking') {
-      // 对齐 iOS：thinking 不增量——由落库行（role=thinking）push 驱动整行渲染。
+      this.markSessionRunning(sessionId, true);
+      // thinking 不增量；由落库行（role=thinking）驱动正文渲染。
+      this.notify();
       return;
     }
-    if (type === 'done' || type === 'error') {
-      // 流式结束：临时行保留直到落库 push 到达（由 appendCreated 清），
-      // 避免 push 未到时的窗口期闪没。
+    if (type === 'status') {
+      const isRunning = ev['data'] !== undefined && typeof data['isRunning'] === 'boolean'
+        ? data['isRunning'] as boolean
+        : undefined;
+      if (isRunning === true) {
+        this.markSessionRunning(sessionId, true);
+      } else if (isRunning === false) {
+        if (hasTurnContinuation(ev)) {
+          // provider segment ends, but the product turn continues.
+          this.markSessionRunning(sessionId, true);
+        } else {
+          this.finalizeSessionStreaming(sessionId);
+        }
+      }
+      this.notify();
+      return;
+    }
+    if (type === 'done') {
       const s = this.streamingBySession.get(sessionId);
       if (s !== undefined) {
         s.tools.forEach((t: StreamingToolRow) => {
           t.settled = true;
         });
       }
+      if (hasTurnContinuation(ev)) {
+        // SDK segment 结束但产品 turn 仍会继续，不能把 Composer 切回停止态。
+        this.markSessionRunning(sessionId, true);
+      } else {
+        this.finalizeSessionStreaming(sessionId);
+      }
+      this.notify();
+      return;
+    }
+    if (type === 'error') {
+      const terminal = readBool(data, 'isTerminal', !readBool(data, 'willRetry', false));
+      if (terminal) {
+        this.finalizeSessionStreaming(sessionId);
+      } else {
+        this.markSessionRunning(sessionId, true);
+      }
       this.notify();
     }
   }
 
+
   /** 取或建流式消息。 */
   private ensureStreaming(sessionId: string): StreamingMessage {
     let s = this.streamingBySession.get(sessionId);
-    if (s === undefined) {
+    if (s === undefined || s.finished) {
       s = new StreamingMessage();
       s.sessionId = sessionId;
       s.createdAt = new Date().toISOString();
@@ -340,6 +444,108 @@ export class MessageStore {
     }
     return s;
   }
+
+  private bumpRunningStateRevision(sessionId: string): number {
+    const next = (this.runningStateRevisions.get(sessionId) ?? 0) + 1;
+    this.runningStateRevisions.set(sessionId, next);
+    return next;
+  }
+
+  private markSessionRunning(sessionId: string, running: boolean): void {
+    if (running) {
+      this.runningBySession.set(sessionId, true);
+    } else {
+      this.runningBySession.delete(sessionId);
+    }
+  }
+
+  /** 终态收口：保留临时正文用于最终渲染，但去掉所有运行标记。 */
+  private finalizeSessionStreaming(sessionId: string): void {
+    this.runningBySession.delete(sessionId);
+    this.finishStreamingProjection(sessionId);
+  }
+
+  /** 收口当前 provider 段的临时投影，但保留产品级 running 状态（交互/续跑）。 */
+  private finishStreamingProjection(sessionId: string): void {
+    const s = this.streamingBySession.get(sessionId);
+    if (s !== undefined) {
+      s.finished = true;
+      s.tools.forEach((t: StreamingToolRow) => {
+        t.settled = true;
+      });
+    }
+    const messages = this.messagesBySession.get(sessionId);
+    if (messages !== undefined) {
+      for (let i = 0; i < messages.length; i++) {
+        messages[i].isStreaming = false;
+      }
+    }
+  }
+
+  /** maker session status push：closed 是 session 生命周期终态，也要收口本地运行投影。 */
+  handleMakerStatusChanged(payload: Object | undefined): void {
+    if (payload === undefined || typeof payload !== 'object') return;
+    const p = payload as Record<string, Object>;
+    const sessionId = readStr(p, 'sessionId');
+    if (sessionId.length === 0 || readStr(p, 'status') !== 'closed') return;
+    this.bumpRunningStateRevision(sessionId);
+    this.finalizeSessionStreaming(sessionId);
+    this.notify();
+  }
+
+  /** maker:event 之外的 sessions 活动态是漏终态时的第二条收口路径。 */
+  handleSessionActivity(payload: Object | undefined): void {
+    if (payload === undefined || typeof payload !== 'object') return;
+    const p = payload as Record<string, Object>;
+    const sessionId = readStr(p, 'sessionId');
+    if (sessionId.length === 0) return;
+    const phase = readStr(p, 'phase');
+    const rawRunning = p['isRunning'];
+    this.bumpRunningStateRevision(sessionId);
+    // phase 是 Desktop activity 协议的权威字段；只有旧版本没有 phase 时才回退
+    // 到 isRunning，避免 completed/error 携带陈旧 true 时把 Composer 重新点亮。
+    if (phase === 'running' || phase === 'needs-interaction') {
+      this.markSessionRunning(sessionId, true);
+      if (phase === 'needs-interaction') {
+        this.finishStreamingProjection(sessionId);
+      }
+    } else if (phase === 'completed' || phase === 'error') {
+      this.finalizeSessionStreaming(sessionId);
+    } else if (rawRunning === true) {
+      this.markSessionRunning(sessionId, true);
+    } else if (rawRunning === false) {
+      this.finalizeSessionStreaming(sessionId);
+    } else {
+      return;
+    }
+    this.notify();
+  }
+
+  /** 打开/重连时向被控端核实 live session，避免历史 isStreaming 标记永久卡住。 */
+  private async refreshSessionRunningState(deviceId: string, sessionId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    const revision = this.runningStateRevisions.get(sessionId) ?? 0;
+    const opts = new DlInvokeOptions();
+    opts.channel = DlChannels.MAKER_SESSION_IN_TURN;
+    opts.args = [sessionId];
+    try {
+      const env = await client.invoke(deviceId, opts);
+      if ((this.runningStateRevisions.get(sessionId) ?? 0) !== revision) return;
+      const result = unwrapInvokeResult(env);
+      if (typeof result !== 'boolean') return;
+      this.bumpRunningStateRevision(sessionId);
+      if (result) {
+        this.markSessionRunning(sessionId, true);
+      } else {
+        this.finalizeSessionStreaming(sessionId);
+      }
+      this.notify();
+    } catch (e) {
+      // 老版本 Desktop 未提供该只读探针时，继续依赖 maker:event / activity。
+    }
+  }
+
 
   /**
    * maker:event compact_boundary 的本地投影（对齐 mobile remoteSessionStore）。
@@ -396,6 +602,7 @@ export class MessageStore {
     if (s === undefined || (s.text.length === 0 && s.tools.length === 0)) {
       return base;
     }
+    const isStreaming = !s.finished;
     const tmp: RemoteMessage[] = [];
     for (let i = 0; i < s.tools.length; i++) {
       const t = s.tools[i];
@@ -404,7 +611,7 @@ export class MessageStore {
       tm.role = 'tool_use';
       tm.toolUseId = t.toolUseId;
       tm.createdAt = s.createdAt;
-      tm.isStreaming = true;
+      tm.isStreaming = isStreaming;
       const content: Record<string, Object> = {};
       content['toolUseId'] = t.toolUseId;
       content['toolName'] = t.toolName;
@@ -422,7 +629,7 @@ export class MessageStore {
         result.role = 'tool_result';
         result.toolUseId = t.toolUseId;
         result.createdAt = s.createdAt;
-        result.isStreaming = true;
+        result.isStreaming = isStreaming;
         const resultContent: Record<string, Object> = {};
         resultContent['toolUseId'] = t.toolUseId;
         resultContent['isError'] = t.hasError;
@@ -437,7 +644,7 @@ export class MessageStore {
       tm.role = 'assistant';
       tm.createdAt = s.createdAt;
       tm.content = s.text;
-      tm.isStreaming = true;
+      tm.isStreaming = isStreaming;
       tmp.push(tm);
     }
     return base.concat(tmp);
@@ -618,6 +825,9 @@ export class MessageStore {
         }
         break;
       }
+      case 'local-db:sessions:activity':
+        this.handleSessionActivity(payload);
+        break;
       default:
         break;
     }
@@ -638,6 +848,7 @@ export class MessageStore {
       fresh.push(message);
       fresh.sort(sortMessagesAsc);
       this.messagesBySession.set(sessionId, fresh);
+      this.clearStreamingIfAssistant(sessionId, message);
       this.notify();
       return;
     }
@@ -742,11 +953,9 @@ export class MessageStore {
     const client = this.client;
     if (!client) return;
 
+    const clientId = this.nextSendClientId();
     const message = new UserMessageArgs();
-    message.content = text;
-    message.quotesEncoded = false;
-    message.images = images ?? [];
-
+    message.content = buildAgentUserContent(text, images ?? []);
     const createOpts = new CreateOptsArgs();
     createOpts.agentKind = mapAgentKind(session.agentKind);
     createOpts.workingDir = session.workingDir;
@@ -756,6 +965,12 @@ export class MessageStore {
     createOpts.fastMode = session.fastMode;
 
     const sendOpts: Record<string, Object> = {};
+    sendOpts['messageUuid'] = clientId;
+    const persistUserMessage: Record<string, Object> = {};
+    persistUserMessage['clientId'] = clientId;
+    persistUserMessage['content'] = buildPersistedUserContent(text, images ?? []);
+    persistUserMessage['delivery'] = 'turn';
+    sendOpts['persistUserMessage'] = persistUserMessage;
 
     const args: Object[] = [session.id, message, createOpts, sendOpts];
     const opts = new DlInvokeOptions();
@@ -768,6 +983,9 @@ export class MessageStore {
       const reason = readStr(result, 'reason');
       throw new Error(reason.length > 0 ? reason : 'send not accepted');
     }
+    // accepted 的 onAccepted 已先写入 Desktop DB；主动重拉一次兜住 topic push
+    // 丢失或订阅建立竞态，保证当前 Harmony 页面立即看到自己的消息。
+    await this.loadInitial(deviceId, session.id);
   }
 
   /** 停止当前执行。 */
@@ -848,6 +1066,64 @@ export class MessageStore {
     });
     return out;
   }
+}
+
+/** 取图片引用的可发送地址；兼容历史只保存 base64 的 content.images。 */
+function imageRefUrl(image: RemoteImageRef): string {
+  if (image.url.length > 0) return image.url;
+  if (image.base64.length === 0) return '';
+  const mimeType = image.mimeType.length > 0 ? image.mimeType : 'image/png';
+  return mimeType.toLowerCase().startsWith('image/')
+    ? `data:${mimeType};base64,${image.base64}`
+    : '';
+}
+
+/** 生成送给 Desktop Agent 的 user content；图片必须是 content 内的 image block。 */
+export function buildAgentUserContent(text: string, images: RemoteImageRef[]): string | Object[] {
+  if (images.length === 0) return text;
+  const blocks: Object[] = [];
+  if (text.length > 0) {
+    const textBlock: Record<string, Object> = {};
+    textBlock['type'] = 'text';
+    textBlock['text'] = text;
+    blocks.push(textBlock);
+  }
+  for (let i = 0; i < images.length; i++) {
+    const image = images[i];
+    const imageUrl = imageRefUrl(image);
+    if (imageUrl.length === 0) continue;
+    const imageBlock: Record<string, Object> = {};
+    imageBlock['type'] = 'image';
+    imageBlock['path'] = imageUrl;
+    if (image.mimeType.length > 0) imageBlock['mimeType'] = image.mimeType;
+    if (image.originalName.length > 0) imageBlock['originalName'] = image.originalName;
+    blocks.push(imageBlock);
+  }
+  return blocks.length === 0 ? text : blocks;
+}
+
+/** 生成 Desktop transcript 使用的 JSON content，保留图片历史引用。 */
+export function buildPersistedUserContent(text: string, images: RemoteImageRef[]): string {
+  const persistedImages: Object[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const image = images[i];
+    const imageUrl = imageRefUrl(image);
+    if (imageUrl.length === 0) continue;
+    const ref: Record<string, Object> = {};
+    ref['url'] = imageUrl;
+    if (image.originalName.length > 0) ref['originalName'] = image.originalName;
+    if (image.mimeType.length > 0) ref['mimeType'] = image.mimeType;
+    if (image.size > 0) ref['size'] = image.size;
+    if (image.sha256.length > 0) ref['sha256'] = image.sha256;
+    if (image.base64.length > 0) ref['base64'] = image.base64;
+    persistedImages.push(ref);
+  }
+  const persisted: Record<string, Object> = {};
+  const persistedFiles: Object[] = [];
+  persisted['text'] = text;
+  persisted['images'] = persistedImages;
+  persisted['files'] = persistedFiles;
+  return JSON.stringify(persisted);
 }
 
 /** 返回可以交给 Desktop local-db 游标的最早真实消息 id。 */

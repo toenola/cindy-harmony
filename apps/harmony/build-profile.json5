@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/Users/eno/.ohos/config/default_harmony_yuYstY5Wz0evdOf61ouDzf3xJ4yirTfREecQCUJv9yM=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B6CD8BA534285C498549EAD41ABDFBEB75D6263C3A704F47C5520DC9ADF953D410177B059E3CC60",
+          "profile": "/Users/eno/.ohos/config/default_harmony_yuYstY5Wz0evdOf61ouDzf3xJ4yirTfREecQCUJv9yM=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/eno/.ohos/config/default_harmony_yuYstY5Wz0evdOf61ouDzf3xJ4yirTfREecQCUJv9yM=.p12",
+          "storePassword": "0000001BAD8347074BB32929D70A6F51868C5646D40BE8D9F30300BA4DA3874F32036E7DBF898590B4C5EB"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",

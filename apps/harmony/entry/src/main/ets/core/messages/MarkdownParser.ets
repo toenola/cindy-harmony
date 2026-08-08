@@ -16,9 +16,11 @@ let inlineSeq = 0;
 
 export class InlineToken {
   seq: number = 0;
-  kind: string = ''; // 'text' | 'code' | 'strong' | 'link'
+  kind: string = ''; // 'text' | 'code' | 'strong' | 'link' | 'image'
   value: string = '';
   url: string = '';
+  width: number = 0;
+  height: number = 0;
 }
 
 function isEscapedAt(value: string, index: number): boolean {
@@ -47,6 +49,29 @@ function findCodeClose(value: string, contentStart: number, runLength: number): 
   return -1;
 }
 
+function isBlockedImageScheme(url: string): boolean {
+  return /^\s*(?:javascript|vbscript):/i.test(url);
+}
+
+/** 图片只能使用可被 Harmony 消费的协议，或绑定当前任务工作目录的路径。 */
+function isSupportedImageSource(url: string): boolean {
+  const value = url.trim();
+  if (value.length === 0 || isBlockedImageScheme(value)) return false;
+  if (/^data:image\//i.test(value)) return true;
+  if (/^(?:https?|xdt-image|cindy-media|xdt-file|file|cindy-oss-attach|xdt-oss-attach):\/\//i.test(value)) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')) return true;
+  return !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value);
+}
+
+function normalizeImageScheme(url: string): string {
+  return url.replace(
+    /^(https?|data|xdt-image|cindy-media|xdt-file|file|cindy-oss-attach|xdt-oss-attach):/i,
+    (scheme: string) => scheme.toLowerCase(),
+  );
+}
+
 function findStrongClose(value: string, contentStart: number): number {
   let cursor = contentStart;
   while (cursor < value.length - 1) {
@@ -62,7 +87,7 @@ function findStrongClose(value: string, contentStart: number): number {
   return -1;
 }
 
-/** 解析行内 token：`code`、**strong**、[text](url)。 */
+/** 解析行内 token：`code`、**strong**、![image](url)、安全的 <img>、[text](url)。 */
 export function tokenizeInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   let plainStart = 0;
@@ -86,6 +111,61 @@ export function tokenizeInline(text: string): InlineToken[] {
 
   while (cursor < text.length) {
     const ch = text[cursor];
+    // 图片必须先于普通链接识别，否则 ![alt](url) 的 [alt](url) 子串会被吞成链接。
+    if (ch === '!' && text[cursor + 1] === '[' && !isEscapedAt(text, cursor)) {
+      const labelEnd = text.indexOf(']', cursor + 2);
+      if (labelEnd > cursor + 2 && text[labelEnd + 1] === '(') {
+        const urlEnd = text.indexOf(')', labelEnd + 2);
+        if (urlEnd > labelEnd + 2) {
+          const url = text.slice(labelEnd + 2, urlEnd).trim();
+          if (url.length > 0 && isSupportedImageSource(url)) {
+            flushPlain(cursor);
+            pushToken('image', text.slice(cursor + 2, labelEnd), normalizeImageScheme(url));
+            cursor = urlEnd + 1;
+            plainStart = cursor;
+            continue;
+          }
+        }
+      }
+    }
+    // 只把单个 img 标签转换成图片 token；其它 HTML 保持字面文本，避免把任意
+    // HTML 当成可执行/可交互内容。地址的实际可用性由详情页的媒体解析器校验。
+    if (ch === '<' && !isEscapedAt(text, cursor)) {
+      const tagMatch = /^<img(?=[\s/>])[^<>]*\/?>/i.exec(text.slice(cursor));
+      if (tagMatch !== null) {
+        const tag = tagMatch[0];
+        const attrs = /([A-Za-z_:][A-Za-z0-9:._-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+        let src = '';
+        let alt = '';
+        let width = 0;
+        let height = 0;
+        let attr = attrs.exec(tag);
+        while (attr !== null) {
+          const name = attr[1].toLowerCase();
+          const value = attr[2] ?? attr[3] ?? attr[4] ?? '';
+          if (name === 'src') src = value;
+          else if (name === 'alt') alt = value;
+          else if (name === 'width' && /^\d{1,4}$/.test(value)) width = Number(value);
+          else if (name === 'height' && /^\d{1,4}$/.test(value)) height = Number(value);
+          attr = attrs.exec(tag);
+        }
+        if (src.length > 0 && isSupportedImageSource(src)) {
+          flushPlain(cursor);
+          const token = new InlineToken();
+          token.seq = inlineSeq;
+          inlineSeq += 1;
+          token.kind = 'image';
+          token.value = alt;
+          token.url = normalizeImageScheme(src);
+          token.width = width;
+          token.height = height;
+          tokens.push(token);
+          cursor += tag.length;
+          plainStart = cursor;
+          continue;
+        }
+      }
+    }
     if (ch === '`' && !isEscapedAt(text, cursor)) {
       let runLength = 1;
       while (text[cursor + runLength] === '`') {
@@ -112,7 +192,7 @@ export function tokenizeInline(text: string): InlineToken[] {
         continue;
       }
     }
-    if (ch === '[') {
+    if (ch === '[' && !(cursor > 0 && text[cursor - 1] === '!' && !isEscapedAt(text, cursor - 1))) {
       const linkEnd = text.indexOf(']', cursor + 1);
       if (linkEnd > cursor + 1 && text[linkEnd + 1] === '(') {
         const parenEnd = text.indexOf(')', linkEnd + 2);
@@ -147,12 +227,17 @@ export class MdBlock {
   seq: number = 0;
   level: number = 0;
   text: string = '';
+  /** 文本块的行内结构；包含图片时由渲染端走富内容路径。 */
+  inlineTokens: InlineToken[] = [];
   items: string[] = [];
+  itemTokens: InlineToken[][] = [];
   ordered: boolean = false;
   lang: string = '';
   code: string = '';
   headers: string[] = [];
+  headerTokens: InlineToken[][] = [];
   rows: string[][] = [];
+  rowTokens: InlineToken[][][] = [];
 }
 
 function isTableSeparator(line: string): boolean {
@@ -228,9 +313,16 @@ export function parseMarkdown(text: string): MdBlock[] {
       const block = makeBlock();
       block.type = 'table';
       block.headers = splitTableRow(line);
+      for (let h = 0; h < block.headers.length; h++) {
+        block.headerTokens.push(tokenizeInline(block.headers[h]));
+      }
       i += 2;
       while (i < lines.length && lines[i].includes('|') && !isTableSeparator(lines[i])) {
-        block.rows.push(splitTableRow(lines[i]));
+        const row = splitTableRow(lines[i]);
+        block.rows.push(row);
+        const tokens: InlineToken[][] = [];
+        for (let c = 0; c < row.length; c++) tokens.push(tokenizeInline(row[c]));
+        block.rowTokens.push(tokens);
         i += 1;
       }
       blocks.push(block);
@@ -244,6 +336,7 @@ export function parseMarkdown(text: string): MdBlock[] {
       block.type = 'heading';
       block.level = heading[1].length;
       block.text = heading[2];
+      block.inlineTokens = tokenizeInline(block.text);
       blocks.push(block);
       i += 1;
       continue;
@@ -264,6 +357,7 @@ export function parseMarkdown(text: string): MdBlock[] {
         }
       }
       block.text = quoteLines.join(' ');
+      block.inlineTokens = tokenizeInline(block.text);
       blocks.push(block);
       continue;
     }
@@ -281,6 +375,7 @@ export function parseMarkdown(text: string): MdBlock[] {
         const m = ordered ? /^(\s*)\d+[.)]\s+(.*)$/.exec(t) : /^(\s*)[-*+]\s+(.*)$/.exec(t);
         if (m !== null) {
           block.items.push(m[2]);
+          block.itemTokens.push(tokenizeInline(m[2]));
           i += 1;
         } else if (t.trim().length === 0) {
           // 列表结束（空行分隔）；简单起见空行即止
@@ -329,6 +424,7 @@ export function parseMarkdown(text: string): MdBlock[] {
       i += 1;
     }
     block.text = paraLines.join(' ');
+    block.inlineTokens = tokenizeInline(block.text);
     blocks.push(block);
   }
 

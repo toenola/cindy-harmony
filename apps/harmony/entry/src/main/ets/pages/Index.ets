@@ -22,7 +22,7 @@ struct Index {
       if (restored) {
         // 已有本地会话：直接连 relay（token 自动刷新）。
         AppServices.instance.client.start();
-        router.replaceUrl({ url: 'pages/HomePage' });
+        router.replaceUrl({ url: 'pages/TaskListPage' });
       } else {
         router.replaceUrl({ url: 'pages/LoginPage' });
       }

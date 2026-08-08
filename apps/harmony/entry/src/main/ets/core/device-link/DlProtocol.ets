@@ -178,6 +178,10 @@ export class DlChannels {
   /** 发送消息 / 停止执行。 */
   static readonly MAKER_SEND = 'maker:send';
   static readonly MAKER_ABORT = 'maker:abort-session';
+  /** 当前被控端处于 turn 中的会话快照。 */
+  static readonly MAKER_LIST_ACTIVE = 'maker:list-active';
+  /** 指定会话是否处于 turn 中。 */
+  static readonly MAKER_SESSION_IN_TURN = 'maker:session-in-turn';
 
   /** 从被控桌面取回历史消息里的本地媒体。 */
   static readonly MEDIA_FETCH = 'device-link:media:fetch';

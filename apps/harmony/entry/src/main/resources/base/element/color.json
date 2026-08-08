@@ -65,6 +65,34 @@
       "value": "#66000000"
     },
     {
+      "name": "task_list_row_surface",
+      "value": "#F6F6F6"
+    },
+    {
+      "name": "task_list_group_surface",
+      "value": "#EAEAEA"
+    },
+    {
+      "name": "task_list_menu_surface",
+      "value": "#F8F8F8"
+    },
+    {
+      "name": "task_list_overlay",
+      "value": "#59262626"
+    },
+    {
+      "name": "task_list_fab_surface",
+      "value": "#3C3F43"
+    },
+    {
+      "name": "task_list_fab_border",
+      "value": "#003C3F43"
+    },
+    {
+      "name": "task_list_fab_icon",
+      "value": "#FCFCFC"
+    },
+    {
       "name": "chat_header_surface",
       "value": "#E6F6F6F6"
     },

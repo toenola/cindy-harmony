@@ -28,7 +28,7 @@ import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readNum, readObj, readStr } from '../core/tasks/TaskModels';
 import {
   RenderItem, RenderMessageItem, RenderThinkingItem,
-  RenderToolGroupItem, RenderToolItem, RenderTodoCardItem, RenderTodoItem,
+  RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
 } from '../core/messages/MessageRender';
@@ -72,7 +72,22 @@ class ComposerModelOption {
 }
 
 const MAX_COMPOSER_IMAGES = 20;
+const TASK_DETAIL_FONT_SCALE = 0.84;
+const TASK_DETAIL_MIN_FONT_SIZE = 8;
+const TASK_DETAIL_MIN_LINE_HEIGHT = 10;
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
+
+function taskDetailFontSize(base: number): number {
+  return Math.max(TASK_DETAIL_MIN_FONT_SIZE, Math.round(base * TASK_DETAIL_FONT_SCALE));
+}
+
+function taskDetailLineHeight(base: number): number {
+  return Math.max(TASK_DETAIL_MIN_LINE_HEIGHT, Math.round(base * TASK_DETAIL_FONT_SCALE));
+}
+
+function taskDetailDimension(base: number): number {
+  return Math.max(1, Math.round(base * TASK_DETAIL_FONT_SCALE));
+}
 
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
@@ -98,11 +113,41 @@ function createRecentPickerOptions(): PickerOptions {
   options.singleLineConfig = singleLine;
   return options;
 }
+function queryValue(query: string, key: string): string {
+  const pairs = query.split('&');
+  for (let i = 0; i < pairs.length; i++) {
+    const eq = pairs[i].indexOf('=');
+    if (eq <= 0 || pairs[i].slice(0, eq) !== key) continue;
+    try {
+      return decodeURIComponent(pairs[i].slice(eq + 1));
+    } catch (e) {
+      return '';
+    }
+  }
+  return '';
+}
+
+function isAbsoluteMediaPath(value: string): boolean {
+  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
+}
+
+function normalizeImageUrlScheme(value: string): string {
+  return value.replace(
+    /^(https?|data|xdt-image|cindy-media|xdt-file|file|cindy-oss-attach|xdt-oss-attach):/i,
+    (scheme: string) => scheme.toLowerCase(),
+  );
+}
+
+function isImageMimeType(value: string): boolean {
+  return value.toLowerCase().startsWith('image/');
+}
 
 
-@Entry
 @Component
-struct TaskPage {
+export struct TaskPageContent {
+  /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
+  @Prop paneDeviceId: string = '';
+  @Prop paneSessionId: string = '';
   @State items: RenderItem[] = [];
   @State input: string = '';
   @State sending: boolean = false;
@@ -194,6 +239,7 @@ struct TaskPage {
   private permissionModeBeforePlan: string = 'default';
   /** 历史图片：ref.url → 可加载的 OSS URL（懒解析 + 缓存）。 */
   @State imageSources: Map<string, string> = new Map();
+  private imageResolutions: Map<string, Promise<string>> = new Map();
   private ossUrlCache: Map<string, string> = new Map();
   /** 全屏预览中的图片 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
@@ -212,8 +258,12 @@ struct TaskPage {
   aboutToAppear(): void {
     this.stopWorkClock();
     const params = router.getParams() as Record<string, Object>;
-    this.deviceId = readStr(params, 'deviceId');
-    this.sessionId = readStr(params, 'sessionId');
+    this.deviceId = this.paneDeviceId.length > 0
+      ? this.paneDeviceId
+      : readStr(params, 'deviceId');
+    this.sessionId = this.paneSessionId.length > 0
+      ? this.paneSessionId
+      : readStr(params, 'sessionId');
     this.initialScrolled = false;
     this.initialScrollSettling = true;
     this.initialScrollGeneration += 1;
@@ -309,6 +359,10 @@ struct TaskPage {
       }
     }
     return false;
+  }
+
+  private isEmbedded(): boolean {
+    return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
   }
 
   private session(): RemoteSession | undefined {
@@ -760,13 +814,21 @@ struct TaskPage {
     return false;
   }
 
+  private effortOptionLabel(id: string, fallback: string): string {
+    const options = this.visibleEffortOptions();
+    for (let i = 0; i < options.length; i++) {
+      if (options[i].id === id && options[i].label.length > 0) return options[i].label;
+    }
+    return this.effortLabel(id, fallback);
+  }
+
   private modelEffortText(option: ComposerModelOption): string {
     const session = this.session();
     const effort = this.modelOptionIsCurrent(option) && session !== undefined
       ? session.effort
       : option.defaultEffort;
     if (effort.length === 0) return '';
-    return option.effortDisplayNames[effort] ?? this.effortLabel(effort, effort);
+    return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
   }
 
   private currentModelKey(): string {
@@ -809,6 +871,18 @@ struct TaskPage {
       return option.label;
     }
     return this.session()?.model ?? '';
+  }
+
+  private currentModelEffortLabel(): string {
+    const option = this.currentModelOption();
+    if (option !== null) {
+      const selectedEffort = this.session()?.effort ?? '';
+      const effort = selectedEffort.length > 0 ? selectedEffort : option.defaultEffort;
+      if (effort.length === 0) return '';
+      return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
+    }
+    const effort = this.session()?.effort ?? '';
+    return effort.length > 0 ? this.effortOptionLabel(effort, effort) : '';
   }
 
   private currentModelEffortOptions(): ComposerChoiceOption[] {
@@ -1517,7 +1591,11 @@ struct TaskPage {
       const tools = (item as RenderToolGroupItem).tools;
       if (tools.length === 0) return `${item.key}:tools:0`;
       const tool = tools[tools.length - 1];
-      return `${item.key}:tools:${tools.length}:${tool.hasResult ? '1' : '0'}:${tool.resultText.length}`;
+      return `${item.key}:tools:${tools.length}:${tool.hasResult ? '1' : '0'}:${tool.resultText.length}:${tool.media.length}`;
+    }
+    if (item.type === 'tool_media') {
+      const media = item as RenderToolMediaItem;
+      return `${item.key}:media:${media.images.length}`;
     }
     if (item.type === 'thinking') {
       return `${item.key}:thinking:${(item as RenderThinkingItem).body.length}`;
@@ -1904,6 +1982,14 @@ struct TaskPage {
       }
       return text;
     }
+    if (item.type === 'tool_media') {
+      const media = item as RenderToolMediaItem;
+      let text = '';
+      for (let i = 0; i < media.images.length; i++) {
+        text += ` ${media.images[i].originalName} ${media.images[i].url}`;
+      }
+      return text;
+    }
     if (item.type === 'todo') {
       const todos = (item as RenderTodoCardItem).todos;
       let text = '';
@@ -1945,6 +2031,10 @@ struct TaskPage {
     this.searchActiveIndex = 0;
   }
 
+  private hasComposerContent(): boolean {
+    return this.input.trim().length > 0 || this.composerImages.length > 0;
+  }
+
   private canSend(): boolean {
     if (this.sending || this.deviceDisabled) return false;
     let hasReadyImage = false;
@@ -1982,7 +2072,7 @@ struct TaskPage {
 
       if (this.error.length > 0) {
         Text(this.error)
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
           .constraintSize({ maxWidth: 760 })
@@ -1992,7 +2082,7 @@ struct TaskPage {
 
       if (this.deviceDisabled) {
         Text('设备已关闭远程控制，仅可查看')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.chat_text_secondary'))
           .textAlign(TextAlign.Center)
           .width('100%')
@@ -2011,7 +2101,7 @@ struct TaskPage {
             .height('100%')
             .objectFit(ImageFit.Contain)
           Text('×')
-            .fontSize(22)
+            .fontSize(taskDetailFontSize(22))
             .fontColor($r('app.color.chat_overlay_text'))
             .backgroundColor($r('app.color.overlay'))
             .width(36)
@@ -2036,6 +2126,7 @@ struct TaskPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
       detents: [SheetSize.MEDIUM, SheetSize.LARGE],
       dragBar: true,
@@ -2050,23 +2141,25 @@ struct TaskPage {
   @Builder
   taskHeader() {
     Row({ space: 4 }) {
-      Button() {
-        SymbolGlyph($r('sys.symbol.chevron_left'))
-          .fontSize(20)
-          .fontColor([$r('app.color.text_primary')])
+      if (!this.isEmbedded()) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(taskDetailFontSize(20))
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .width(44)
+        .height(44)
+        .borderRadius(22)
+        .backgroundColor(Color.Transparent)
+        .padding(0)
+        .margin({ left: -8 })
+        .onClick(() => router.back())
       }
-      .width(44)
-      .height(44)
-      .borderRadius(22)
-      .backgroundColor(Color.Transparent)
-      .padding(0)
-      .margin({ left: -8 })
-      .onClick(() => router.back())
 
       Column({ space: 1 }) {
         Text(this.sessionTitle())
-          .fontSize(16)
-          .lineHeight(22)
+          .fontSize(taskDetailFontSize(16))
+          .lineHeight(taskDetailLineHeight(22))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -2074,8 +2167,8 @@ struct TaskPage {
           .width('100%')
         if (this.headerNotice().length > 0) {
           Text(this.headerNotice())
-            .fontSize(11)
-            .lineHeight(16)
+            .fontSize(taskDetailFontSize(11))
+            .lineHeight(taskDetailLineHeight(16))
             .fontColor(this.sessionStreaming
               ? $r('app.color.chat_status_accent')
               : $r('app.color.chat_text_secondary'))
@@ -2091,7 +2184,7 @@ struct TaskPage {
       if ((this.session()?.workingDir ?? '').length > 0) {
         Button() {
           SymbolGlyph($r('sys.symbol.folder'))
-            .fontSize(20)
+            .fontSize(taskDetailFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
         .width(38)
@@ -2105,7 +2198,7 @@ struct TaskPage {
       if (this.items.length > 0) {
         Button() {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(20)
+            .fontSize(taskDetailFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
         .width(38)
@@ -2121,7 +2214,7 @@ struct TaskPage {
 
       Button() {
         SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-          .fontSize(20)
+          .fontSize(taskDetailFontSize(20))
           .fontColor([$r('app.color.text_primary')])
       }
       .width(38)
@@ -2134,8 +2227,10 @@ struct TaskPage {
     .width('100%')
     .constraintSize({ minHeight: 50 })
     .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-    .backgroundColor($r('app.color.chat_header_surface'))
-    .backgroundBlurStyle(BlurStyle.Thin)
+    .backgroundColor(this.isEmbedded()
+      ? $r('app.color.bg_page')
+      : $r('app.color.chat_header_surface'))
+    .backgroundBlurStyle(this.isEmbedded() ? BlurStyle.NONE : BlurStyle.Thin)
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.chat_header_divider') } })
   }
 
@@ -2144,7 +2239,7 @@ struct TaskPage {
     Row({ space: 4 }) {
       Search({ value: this.searchQuery, placeholder: '搜索消息' })
         .height(36)
-        .textFont({ size: 15 })
+        .textFont({ size: taskDetailFontSize(15) })
         .layoutWeight(1)
         .backgroundColor($r('app.color.bg_card'))
         .borderRadius(18)
@@ -2156,14 +2251,14 @@ struct TaskPage {
         Text(this.searchHitIndices().length === 0
           ? '0/0'
           : `${this.searchActiveIndex + 1}/${this.searchHitIndices().length}`)
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.chat_text_secondary'))
           .constraintSize({ minWidth: 32 })
           .textAlign(TextAlign.Center)
       }
       Button() {
         SymbolGlyph($r('sys.symbol.chevron_up'))
-          .fontSize(16)
+          .fontSize(taskDetailFontSize(16))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2175,7 +2270,7 @@ struct TaskPage {
       .onClick(() => this.moveSearch(-1))
       Button() {
         SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(16)
+          .fontSize(taskDetailFontSize(16))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2187,7 +2282,7 @@ struct TaskPage {
       .onClick(() => this.moveSearch(1))
       Button() {
         SymbolGlyph($r('sys.symbol.xmark'))
-          .fontSize(15)
+          .fontSize(taskDetailFontSize(15))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2199,7 +2294,9 @@ struct TaskPage {
     }
     .width('100%')
     .padding({ left: 12, right: 8, top: 6, bottom: 6 })
-    .backgroundColor($r('app.color.chat_header_surface'))
+    .backgroundColor(this.isEmbedded()
+      ? $r('app.color.bg_page')
+      : $r('app.color.chat_header_surface'))
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.chat_header_divider') } })
   }
 
@@ -2210,11 +2307,11 @@ struct TaskPage {
         Column({ space: 8 }) {
           if (this.loadFailed) {
             Text('加载失败，请检查连接后重试')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.danger'))
             Button('重试')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontColor($r('app.color.text_primary'))
               .height(32)
               .padding({ left: 12, right: 12 })
@@ -2227,12 +2324,12 @@ struct TaskPage {
               .height(14)
               .color($r('app.color.text_tertiary'))
             Text('正在同步')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_tertiary'))
           } else if (this.initialLoadResolved) {
             Text('暂无消息')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_tertiary'))
           }
@@ -2247,7 +2344,7 @@ struct TaskPage {
           if (AppServices.instance.messages.hasMore(this.sessionId)) {
             ListItem() {
               Button(this.loadingOlder ? '加载中' : '加载更早消息')
-                .fontSize(12)
+                .fontSize(taskDetailFontSize(12))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_tertiary'))
                 .height(32)
@@ -2299,7 +2396,7 @@ struct TaskPage {
         Button() {
           Stack({ alignContent: Alignment.Center }) {
             SymbolGlyph($r('sys.symbol.chevron_down'))
-              .fontSize(20)
+              .fontSize(taskDetailFontSize(20))
               .fontColor([$r('app.color.chat_text_secondary')])
             if (this.hasNewMessages) {
               Circle()
@@ -2331,7 +2428,7 @@ struct TaskPage {
   /** Mobile 同款 Composer：活动状态独立于 50vp 输入胶囊，焦点态再展开为卡片。 */
   @Builder
   composerBar() {
-    Column({ space: 4 }) {
+    Column({ space: taskDetailDimension(4) }) {
       if (this.sessionStreaming) {
         Row({ space: 6 }) {
           LoadingProgress()
@@ -2339,8 +2436,8 @@ struct TaskPage {
             .height(12)
             .color($r('app.color.chat_status_accent'))
           Text('正在工作…')
-            .fontSize(12)
-            .lineHeight(18)
+            .fontSize(taskDetailFontSize(12))
+            .lineHeight(taskDetailLineHeight(18))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.chat_status_accent'))
         }
@@ -2348,7 +2445,7 @@ struct TaskPage {
         .padding({ left: 12, right: 12 })
       }
 
-      Column({ space: 6 }) {
+      Column({ space: taskDetailDimension(6) }) {
         if (this.composerImages.length > 0) {
           List() {
             ForEach(this.composerImages, (img: ComposerImage) => {
@@ -2359,27 +2456,27 @@ struct TaskPage {
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
-          .height(70)
+          .height(taskDetailDimension(70))
         }
 
         if (this.composerFocused) {
           Row() {
             Divider()
-              .width(40)
-              .strokeWidth(4)
+              .width(taskDetailDimension(40))
+              .strokeWidth(taskDetailDimension(4))
               .color($r('app.color.composer_border'))
-              .borderRadius(2)
+              .borderRadius(taskDetailDimension(2))
           }
-          .height(10)
+          .height(taskDetailDimension(10))
           .width('100%')
           .justifyContent(FlexAlign.Center)
         }
 
-        Row({ space: 6 }) {
+        Row({ space: taskDetailDimension(6) }) {
           if (this.composerFocused || this.composerImages.length > 0) {
             Button() {
               SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(20)
+                .fontSize(taskDetailFontSize(20))
                 .fontColor([$r('app.color.text_primary')])
             }
             .width(34)
@@ -2393,7 +2490,7 @@ struct TaskPage {
             if (this.permissionOptions.length > 0) {
               Button() {
                 SymbolGlyph($r('sys.symbol.lock'))
-                  .fontSize(18)
+                  .fontSize(taskDetailFontSize(18))
                   .fontColor([this.effectivePermissionMode() === 'bypassPermissions'
                     || this.effectivePermissionMode() === 'auto'
                     ? $r('app.color.danger')
@@ -2411,7 +2508,7 @@ struct TaskPage {
             if (this.planModeEnabled) {
               Button('计划')
                 .height(30)
-                .fontSize(12)
+                .fontSize(taskDetailFontSize(12))
                 .fontColor($r('app.color.chat_cta'))
                 .backgroundColor($r('app.color.bg_chip'))
                 .borderRadius(8)
@@ -2425,14 +2522,22 @@ struct TaskPage {
 
           TextArea({ placeholder: '输入远程消息', text: this.input })
             .id('task-composer-input')
-            .fontSize(15)
-            .lineHeight(22)
+            .fontSize(taskDetailFontSize(15))
+            .placeholderFont({ size: taskDetailFontSize(15) })
+            .lineHeight(taskDetailLineHeight(22))
             .fontColor($r('app.color.text_primary'))
             .placeholderColor($r('app.color.text_tertiary'))
             .caretColor($r('app.color.chat_input_caret'))
             .backgroundColor(Color.Transparent)
-            .padding({ left: 4, right: 4, top: 3, bottom: 3 })
-            .height(this.composerFocused || this.input.includes('\n') ? 56 : 28)
+            .align(Alignment.Center)
+            .textAlign(TextAlign.Start)
+            .padding({
+              left: taskDetailDimension(4),
+              right: taskDetailDimension(4),
+            })
+            .height(this.composerFocused || this.input.includes('\n')
+              ? taskDetailDimension(56)
+              : taskDetailDimension(40))
             .layoutWeight(1)
             .onFocus(() => {
               this.composerFocused = true;
@@ -2448,14 +2553,33 @@ struct TaskPage {
           if ((this.composerFocused || this.composerImages.length > 0)
             && this.modelOptions.length > 0 && this.currentModelLabel().length > 0) {
             Button() {
-              Text(this.currentModelLabel())
-                .fontSize(12)
-                .fontColor($r('app.color.text_secondary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Row({ space: taskDetailDimension(4) }) {
+                Text(this.currentModelLabel())
+                  .fontSize(taskDetailFontSize(12))
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+                if (this.currentModelEffortLabel().length > 0) {
+                  Text('·')
+                    .fontSize(taskDetailFontSize(12))
+                    .fontColor($r('app.color.text_tertiary'))
+                  Text(this.currentModelEffortLabel())
+                    .fontSize(taskDetailFontSize(12))
+                    .fontColor($r('app.color.text_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                SymbolGlyph($r('sys.symbol.chevron_down'))
+                  .fontSize(taskDetailFontSize(13))
+                  .fontColor([$r('app.color.text_secondary')])
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
             }
             .height(30)
-            .constraintSize({ maxWidth: 88 })
+            .width(180)
+            .constraintSize({ minWidth: 100, maxWidth: 180 })
             .padding({ left: 8, right: 8 })
             .borderRadius(8)
             .backgroundColor($r('app.color.bg_chip'))
@@ -2469,17 +2593,17 @@ struct TaskPage {
                 .width(15)
                 .height(15)
                 .color($r('app.color.chat_cta_text'))
-            } else if (this.sessionStreaming) {
+            } else if (this.sessionStreaming && !this.hasComposerContent()) {
               SymbolGlyph($r('sys.symbol.square'))
-                .fontSize(12)
+                .fontSize(taskDetailFontSize(12))
                 .fontColor([$r('app.color.chat_cta_text')])
             } else if (this.canSend()) {
               SymbolGlyph($r('sys.symbol.arrow_up'))
-                .fontSize(18)
+                .fontSize(taskDetailFontSize(18))
                 .fontColor([$r('app.color.chat_cta_text')])
             } else {
               SymbolGlyph($r('sys.symbol.mic'))
-                .fontSize(20)
+                .fontSize(taskDetailFontSize(20))
                 .fontColor([$r('app.color.chat_text_secondary')])
             }
           }
@@ -2487,12 +2611,12 @@ struct TaskPage {
           .height(34)
           .padding(0)
           .borderRadius(17)
-          .backgroundColor(this.sessionStreaming || this.canSend()
+          .backgroundColor(this.sessionStreaming && !this.hasComposerContent() || this.canSend()
             ? $r('app.color.chat_cta')
             : Color.Transparent)
           .enabled(!this.sending)
           .onClick(() => {
-            if (this.sessionStreaming) {
+            if (this.sessionStreaming && !this.hasComposerContent()) {
               this.abort();
             } else if (this.canSend()) {
               this.send();
@@ -2506,24 +2630,31 @@ struct TaskPage {
           })
         }
         .width('100%')
-        .alignItems(this.composerFocused ? VerticalAlign.Top : VerticalAlign.Bottom)
+        .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .constraintSize({ minHeight: 50 })
+      .constraintSize({ minHeight: taskDetailDimension(34) })
       .padding({
-        left: 12,
-        right: 12,
-        top: this.composerFocused ? 8 : 10,
-        bottom: this.composerFocused ? 8 : 10,
+        left: taskDetailDimension(12),
+        right: taskDetailDimension(12),
+        top: this.composerFocused ? taskDetailDimension(4) : taskDetailDimension(3),
+        bottom: this.composerFocused ? taskDetailDimension(4) : taskDetailDimension(3),
       })
       .backgroundColor($r('app.color.composer_surface'))
       .border({ width: 1, color: $r('app.color.composer_border') })
-      .borderRadius(this.composerFocused || this.composerImages.length > 0 ? 8 : 28)
+      .borderRadius(this.composerFocused || this.composerImages.length > 0
+        ? taskDetailDimension(8)
+        : taskDetailDimension(28))
     }
     .width('100%')
     .constraintSize({ maxWidth: 760 })
     .alignSelf(ItemAlign.Center)
-    .padding({ left: 12, right: 12, top: 8, bottom: 4 })
+    .padding({
+      left: taskDetailDimension(12),
+      right: taskDetailDimension(12),
+      top: taskDetailDimension(4),
+      bottom: taskDetailDimension(2),
+    })
   }
 
   /** iOS 加号同层级：原生可拖拽 Sheet，主视图与目标模式二级视图共用。 */
@@ -2534,7 +2665,7 @@ struct TaskPage {
         if (this.contextSheetPage !== 'main') {
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(20)
+              .fontSize(taskDetailFontSize(20))
               .fontColor([$r('app.color.text_primary')])
           }
           .width(36)
@@ -2557,8 +2688,8 @@ struct TaskPage {
               : this.contextSheetPage === 'model'
                 ? '模型'
                 : '上下文')
-          .fontSize(17)
-          .lineHeight(24)
+          .fontSize(taskDetailFontSize(17))
+          .lineHeight(taskDetailLineHeight(24))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .textAlign(TextAlign.Center)
@@ -2611,7 +2742,7 @@ struct TaskPage {
           Button(`加入对话 (${this.contextSelectedUris.length})`)
             .width('calc(100% - 32vp)')
             .height(42)
-            .fontSize(15)
+            .fontSize(taskDetailFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(8)
@@ -2626,12 +2757,12 @@ struct TaskPage {
             this.contextRowIcon($r('sys.symbol.list_bullet'))
             Column({ space: 2 }) {
               Text('计划模式')
-                .fontSize(16)
-                .lineHeight(22)
+                .fontSize(taskDetailFontSize(16))
+                .lineHeight(taskDetailLineHeight(22))
                 .fontColor($r('app.color.text_primary'))
               Text('先生成计划，确认后再执行')
-                .fontSize(12)
-                .lineHeight(18)
+                .fontSize(taskDetailFontSize(12))
+                .lineHeight(taskDetailLineHeight(18))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -2684,13 +2815,13 @@ struct TaskPage {
             this.contextRowIcon($r('sys.symbol.lock'))
             Column({ space: 2 }) {
               Text(option.label)
-                .fontSize(16)
-                .lineHeight(22)
+                .fontSize(taskDetailFontSize(16))
+                .lineHeight(taskDetailLineHeight(22))
                 .fontColor($r('app.color.text_primary'))
               if (option.description.length > 0) {
                 Text(option.description)
-                  .fontSize(12)
-                  .lineHeight(18)
+                  .fontSize(taskDetailFontSize(12))
+                  .lineHeight(taskDetailLineHeight(18))
                   .fontColor($r('app.color.text_tertiary'))
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2700,7 +2831,7 @@ struct TaskPage {
             .alignItems(HorizontalAlign.Start)
             if (option.id === this.effectivePermissionMode()) {
               SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(18)
+                .fontSize(taskDetailFontSize(18))
                 .fontColor([$r('app.color.chat_cta')])
             }
           }
@@ -2722,7 +2853,7 @@ struct TaskPage {
   @Builder
   modelAgentMark(kind: string, active: boolean) {
     Text(kind === 'claude-code' ? '♟' : kind === 'codex' ? '✣' : 'π')
-      .fontSize(kind === 'pi' ? 20 : 18)
+      .fontSize(taskDetailFontSize(kind === 'pi' ? 20 : 18))
       .fontWeight(FontWeight.Medium)
       .fontColor(active ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
       .width(24)
@@ -2734,21 +2865,21 @@ struct TaskPage {
   modelProviderMark(option: ComposerModelOption) {
     if (this.modelProviderKind(option) === 'claude') {
       Text('♟')
-        .fontSize(22)
+        .fontSize(taskDetailFontSize(22))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
         .textAlign(TextAlign.Center)
     } else if (this.modelProviderKind(option) === 'deepseek') {
       Text('◉')
-        .fontSize(22)
+        .fontSize(taskDetailFontSize(22))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
         .textAlign(TextAlign.Center)
     } else if (this.modelProviderKind(option) === 'openai') {
       Text('✣')
-        .fontSize(21)
+        .fontSize(taskDetailFontSize(21))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
@@ -2758,7 +2889,7 @@ struct TaskPage {
           Text(option.providerName.length > 0
           ? option.providerName.charAt(0).toUpperCase()
           : 'S')
-          .fontSize(16)
+          .fontSize(taskDetailFontSize(16))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_secondary'))
       }
@@ -2777,7 +2908,7 @@ struct TaskPage {
           Row({ space: 7 }) {
             this.modelAgentMark(kind, this.modelAgentIsActive(kind))
             Text(modelAgentLabel(kind))
-              .fontSize(16)
+              .fontSize(taskDetailFontSize(16))
               .fontWeight(this.modelAgentIsActive(kind) ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(this.modelAgentIsActive(kind)
                 ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
@@ -2815,15 +2946,15 @@ struct TaskPage {
       Column({ space: 1 }) {
         Row({ space: 8 }) {
           Text(option.label)
-            .fontSize(17)
-            .lineHeight(23)
+            .fontSize(taskDetailFontSize(17))
+            .lineHeight(taskDetailLineHeight(23))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           if (option.subscription) {
             Text('订阅')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.bg_chip'))
               .borderRadius(8)
@@ -2831,8 +2962,8 @@ struct TaskPage {
           }
           if (this.modelEffortText(option).length > 0) {
             Text(this.modelEffortText(option))
-              .fontSize(15)
-              .lineHeight(22)
+              .fontSize(taskDetailFontSize(15))
+              .lineHeight(taskDetailLineHeight(22))
               .fontColor($r('app.color.text_secondary'))
           }
         }
@@ -2843,13 +2974,13 @@ struct TaskPage {
       .alignItems(HorizontalAlign.Start)
       if (this.modelOptionIsCurrent(option)) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(20)
+          .fontSize(taskDetailFontSize(20))
           .fontColor([$r('app.color.text_primary')])
           .margin({ right: 2 })
       }
       Button() {
         SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(20)
+          .fontSize(taskDetailFontSize(20))
           .fontColor([$r('app.color.text_secondary')])
       }
       .width(38)
@@ -2882,10 +3013,10 @@ struct TaskPage {
 
         Row({ space: 8 }) {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(20)
+            .fontSize(taskDetailFontSize(20))
             .fontColor([$r('app.color.text_secondary')])
           TextInput({ placeholder: '搜索模型...', text: this.modelSearchQuery })
-            .fontSize(15)
+            .fontSize(taskDetailFontSize(15))
             .fontColor($r('app.color.text_primary'))
             .placeholderColor($r('app.color.text_secondary'))
             .backgroundColor(Color.Transparent)
@@ -2906,7 +3037,7 @@ struct TaskPage {
         Column() {
           if (this.filteredModelOptions().length === 0) {
             Text(this.contextRpcBusy ? '正在加载模型...' : '没有匹配的模型')
-              .fontSize(14)
+              .fontSize(taskDetailFontSize(14))
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
               .textAlign(TextAlign.Center)
@@ -2935,11 +3066,11 @@ struct TaskPage {
             this.modelProviderMark(this.modelOptionsTarget()[0])
             Column({ space: 2 }) {
               Text(this.modelOptionsTarget()[0].label)
-                .fontSize(19)
+                .fontSize(taskDetailFontSize(19))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
               Text('选择推理强度')
-                .fontSize(13)
+                .fontSize(taskDetailFontSize(13))
                 .fontColor($r('app.color.text_secondary'))
             }
             .layoutWeight(1)
@@ -2952,7 +3083,7 @@ struct TaskPage {
         if (this.currentModelEffortOptions().length > 0) {
           Column({ space: 8 }) {
             Text('推理强度')
-              .fontSize(14)
+              .fontSize(taskDetailFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
               .width('100%')
@@ -2960,7 +3091,7 @@ struct TaskPage {
               ForEach(this.currentModelEffortOptions(), (option: ComposerChoiceOption) => {
                 Button(option.label)
                   .height(38)
-                  .fontSize(14)
+                  .fontSize(taskDetailFontSize(14))
                   .fontColor(this.modelOptionEffortSelected(option)
                     ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
                   .backgroundColor(this.modelOptionEffortSelected(option)
@@ -2985,10 +3116,10 @@ struct TaskPage {
             this.contextRowIcon($r('sys.symbol.bolt'))
             Column({ space: 2 }) {
               Text('Fast 模式')
-                .fontSize(16)
+                .fontSize(taskDetailFontSize(16))
                 .fontColor($r('app.color.text_primary'))
               Text('使用当前模型的快速服务通道')
-                .fontSize(12)
+                .fontSize(taskDetailFontSize(12))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -3014,7 +3145,7 @@ struct TaskPage {
   contextRowIcon(symbol: Resource) {
     Stack({ alignContent: Alignment.Center }) {
       SymbolGlyph(symbol)
-        .fontSize(22)
+        .fontSize(taskDetailFontSize(22))
         .fontColor([$r('app.color.text_primary')])
     }
     .width(36)
@@ -3029,13 +3160,13 @@ struct TaskPage {
       this.contextRowIcon(symbol)
       Column({ space: 2 }) {
         Text(title)
-          .fontSize(16)
-          .lineHeight(22)
+          .fontSize(taskDetailFontSize(16))
+          .lineHeight(taskDetailLineHeight(22))
           .fontColor($r('app.color.text_primary'))
         if (subtitle.length > 0) {
           Text(subtitle)
-            .fontSize(12)
-            .lineHeight(18)
+            .fontSize(taskDetailFontSize(12))
+            .lineHeight(taskDetailLineHeight(18))
             .fontColor($r('app.color.text_tertiary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3044,7 +3175,7 @@ struct TaskPage {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
       SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(14)
+        .fontSize(taskDetailFontSize(14))
         .fontColor([$r('app.color.text_tertiary')])
     }
     .width('100%')
@@ -3060,12 +3191,13 @@ struct TaskPage {
         Column({ space: 14 }) {
           Column({ space: 6 }) {
             Text('目标')
-              .fontSize(13)
+              .fontSize(taskDetailFontSize(13))
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
             TextArea({ placeholder: '描述要持续推进的结果', text: this.goalObjective })
-              .fontSize(15)
-              .lineHeight(22)
+              .fontSize(taskDetailFontSize(15))
+              .placeholderFont({ size: taskDetailFontSize(15) })
+              .lineHeight(taskDetailLineHeight(22))
               .fontColor($r('app.color.text_primary'))
               .placeholderColor($r('app.color.text_tertiary'))
               .caretColor($r('app.color.chat_input_caret'))
@@ -3083,17 +3215,17 @@ struct TaskPage {
           .alignItems(HorizontalAlign.Start)
 
           Text('可选限制')
-            .fontSize(13)
+            .fontSize(taskDetailFontSize(13))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           Row({ space: 8 }) {
             Column({ space: 5 }) {
-              Text('最大轮数').fontSize(12).fontColor($r('app.color.text_tertiary'))
+              Text('最大轮数').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalMaxTurns })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(14)
+                .fontSize(taskDetailFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3105,11 +3237,11 @@ struct TaskPage {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('token 预算').fontSize(12).fontColor($r('app.color.text_tertiary'))
+              Text('token 预算').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalBudgetTokens })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(14)
+                .fontSize(taskDetailFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3121,11 +3253,11 @@ struct TaskPage {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('无进展轮数').fontSize(12).fontColor($r('app.color.text_tertiary'))
+              Text('无进展轮数').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '3', text: this.goalNoProgressLimit })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(14)
+                .fontSize(taskDetailFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3141,7 +3273,7 @@ struct TaskPage {
           Button(this.goalActionBusy ? '正在启动…' : '开始目标')
             .width('100%')
             .height(44)
-            .fontSize(15)
+            .fontSize(taskDetailFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(8)
@@ -3162,29 +3294,29 @@ struct TaskPage {
                 ? $r('app.color.chat_status_accent')
                 : $r('app.color.text_tertiary'))
             Text(this.goalStatusText(this.goalState.status))
-              .fontSize(14)
+              .fontSize(taskDetailFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
           }
           .width('100%')
 
           Text(this.goalState.objective)
-            .fontSize(17)
-            .lineHeight(25)
+            .fontSize(taskDetailFontSize(17))
+            .lineHeight(taskDetailLineHeight(25))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .width('100%')
 
           Text(`${this.goalState.currentTurns} 轮 · ${this.goalState.cumulativeTokens} tokens`)
-            .fontSize(13)
-            .lineHeight(20)
+            .fontSize(taskDetailFontSize(13))
+            .lineHeight(taskDetailLineHeight(20))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           if (this.goalState.lastReason.length > 0) {
             Text(this.goalState.lastReason)
-              .fontSize(13)
-              .lineHeight(20)
+              .fontSize(taskDetailFontSize(13))
+              .lineHeight(taskDetailLineHeight(20))
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
           }
@@ -3241,10 +3373,63 @@ struct TaskPage {
       this.thinkingBlock(item as RenderThinkingItem)
     } else if (item.type === 'tool_group') {
       this.toolGroupBlock(item as RenderToolGroupItem)
+    } else if (item.type === 'tool_media') {
+      this.toolMediaBlock(item as RenderToolMediaItem)
     } else if (item.type === 'todo') {
       this.todoBlock(item as RenderTodoCardItem)
     } else if (item.type === 'work_group') {
       this.workGroupBlock(item as RenderWorkGroupItem)
+    }
+  }
+
+  /** 工具产出的图片：独立于工作过程折叠块，保留完整可见结果。 */
+  @Builder
+  toolMediaBlock(item: RenderToolMediaItem) {
+    Column({ space: 6 }) {
+      Text('媒体结果')
+        .fontSize(taskDetailFontSize(12))
+        .fontColor($r('app.color.text_tertiary'))
+      List({ space: 8 }) {
+        ForEach(item.images, (ref: RemoteImageRef) => {
+          ListItem() {
+            this.toolMediaImage(ref)
+          }
+        }, (ref: RemoteImageRef) => `${item.key}-${ref.url}`)
+      }
+      .listDirection(Axis.Horizontal)
+      .height(176)
+      .width('100%')
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ top: 4, bottom: 4 })
+  }
+
+  @Builder
+  toolMediaImage(ref: RemoteImageRef) {
+    if ((this.imageSources.get(ref.url) ?? '').length > 0) {
+      Image(this.imageSources.get(ref.url) ?? '')
+        .width(220)
+        .height(165)
+        .borderRadius(8)
+        .objectFit(ImageFit.Contain)
+        .onClick(() => this.openImagePreview(ref))
+    } else {
+      Row({ space: 6 }) {
+        LoadingProgress()
+          .width(16)
+          .height(16)
+        Text(ref.originalName.length > 0 ? ref.originalName : '图片')
+          .fontSize(taskDetailFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width(220)
+      .height(165)
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(8)
     }
   }
 
@@ -3263,24 +3448,24 @@ struct TaskPage {
             .color($r('app.color.text_tertiary'))
         } else {
           SymbolGlyph($r('sys.symbol.layer'))
-            .fontSize(14)
+            .fontSize(taskDetailFontSize(14))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         }
         Text(this.workGroupTitle(item))
-          .fontSize(14)
-          .lineHeight(20)
+          .fontSize(taskDetailFontSize(14))
+          .lineHeight(taskDetailLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
           .layoutWeight(1)
         if (item.isStreaming) {
           Text(this.formatDuration(this.workElapsedMs(item)))
-            .fontSize(12)
+            .fontSize(taskDetailFontSize(12))
             .fontColor($r('app.color.text_tertiary'))
         }
         SymbolGlyph(this.isIn(this.expandedWorkGroups, item.key)
           ? $r('sys.symbol.chevron_down')
           : $r('sys.symbol.chevron_right'))
-          .fontSize(13)
+          .fontSize(taskDetailFontSize(13))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       }
@@ -3328,17 +3513,17 @@ struct TaskPage {
     Row({ space: 6 }) {
       if (row.kind === 'thinking') {
         SymbolGlyph($r('sys.symbol.wand_and_stars'))
-          .fontSize(14)
+          .fontSize(taskDetailFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       } else if (row.error) {
         SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-          .fontSize(15)
+          .fontSize(taskDetailFontSize(15))
           .fontColor([$r('app.color.danger')])
           .width(16)
       } else if (row.done) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(14)
+          .fontSize(taskDetailFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       } else {
@@ -3349,8 +3534,8 @@ struct TaskPage {
           .margin({ left: 1, right: 1 })
       }
       Text(row.text)
-        .fontSize(14)
-        .lineHeight(20)
+        .fontSize(taskDetailFontSize(14))
+        .lineHeight(taskDetailLineHeight(20))
         .fontStyle(row.kind === 'thinking' ? FontStyle.Italic : FontStyle.Normal)
         .fontColor($r('app.color.chat_text_secondary'))
         .maxLines(1)
@@ -3382,10 +3567,10 @@ struct TaskPage {
         .layoutWeight(1)
       Row({ space: 4 }) {
         SymbolGlyph($r('sys.symbol.layer'))
-          .fontSize(11)
+          .fontSize(taskDetailFontSize(11))
           .fontColor([$r('app.color.text_tertiary')])
         Text(this.compactBoundaryLabel(item))
-          .fontSize(11)
+          .fontSize(taskDetailFontSize(11))
           .fontColor($r('app.color.text_tertiary'))
       }
       .padding({ left: 9, right: 9, top: 5, bottom: 5 })
@@ -3422,7 +3607,7 @@ struct TaskPage {
       this.planReviewCard(item)
     } else {
       Text(`交互请求（${item.kind}）`)
-        .fontSize(13)
+        .fontSize(taskDetailFontSize(13))
         .fontColor($r('app.color.text_secondary'))
         .width('100%')
         .padding(12)
@@ -3436,24 +3621,24 @@ struct TaskPage {
   permissionCard(item: PendingInteraction) {
     Column({ space: 6 }) {
       Text('权限请求')
-        .fontSize(13)
+        .fontSize(taskDetailFontSize(13))
         .fontWeight(FontWeight.Bold)
       Text(this.permissionToolName(item))
-        .fontSize(14)
+        .fontSize(taskDetailFontSize(14))
       Text(this.permissionInputSummary(item))
-        .fontSize(12)
+        .fontSize(taskDetailFontSize(12))
         .fontColor($r('app.color.text_secondary'))
       Row({ space: 8 }) {
         Button('拒绝')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .backgroundColor($r('app.color.text_secondary'))
           .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'deny')))
         Button('允许一次')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')))
         if (this.permissionCanAlwaysAllow(item)) {
           Button('始终允许')
-            .fontSize(12)
+            .fontSize(taskDetailFontSize(12))
             .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')))
         }
       }
@@ -3471,16 +3656,16 @@ struct TaskPage {
   askUserCard(item: PendingInteraction) {
     Column({ space: 6 }) {
       Text(this.askQuestion(item))
-        .fontSize(14)
+        .fontSize(taskDetailFontSize(14))
         .fontWeight(FontWeight.Medium)
       if (this.askOptions(item).length > 0) {
         ForEach(this.askOptions(item), (opt: string) => {
           Row({ space: 6 }) {
             Text(this.isAskSelected(item, opt) ? '☑' : '☐')
-              .fontSize(13)
+              .fontSize(taskDetailFontSize(13))
               .fontColor(this.isAskSelected(item, opt) ? $r('app.color.accent') : $r('app.color.text_secondary'))
             Text(opt)
-              .fontSize(13)
+              .fontSize(taskDetailFontSize(13))
           }
           .width('100%')
           .onClick(() => this.toggleAskSelection(item, opt))
@@ -3493,15 +3678,15 @@ struct TaskPage {
             next.set(item.requestId, v);
             this.askCustomInputs = next;
           })
-          .fontSize(13)
+          .fontSize(taskDetailFontSize(13))
       }
       Row({ space: 8 }) {
         Button('跳过')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .backgroundColor($r('app.color.text_secondary'))
           .onClick(() => this.resolveInteraction(item, this.askSkip(item)))
         Button('提交')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .onClick(() => this.resolveInteraction(item, this.askDecision(item)))
       }
       .width('100%')
@@ -3518,20 +3703,20 @@ struct TaskPage {
   planReviewCard(item: PendingInteraction) {
     Column({ space: 6 }) {
       Text('计划审批')
-        .fontSize(13)
+        .fontSize(taskDetailFontSize(13))
         .fontWeight(FontWeight.Bold)
       Text(this.planText(item))
-        .fontSize(12)
+        .fontSize(taskDetailFontSize(12))
         .fontColor($r('app.color.code_text'))
         .maxLines(8)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
       Row({ space: 8 }) {
         Button('拒绝')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .backgroundColor($r('app.color.text_secondary'))
           .onClick(() => this.resolveInteraction(item, this.planDecision(item, false, '')))
         Button('批准')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .onClick(() => this.resolveInteraction(item, this.planDecision(item, true, this.planText(item))))
       }
       .width('100%')
@@ -3554,7 +3739,7 @@ struct TaskPage {
           .borderRadius(6)
           .objectFit(ImageFit.Cover)
         Text('✕')
-          .fontSize(10)
+          .fontSize(taskDetailFontSize(10))
           .fontColor($r('app.color.chat_overlay_text'))
           .backgroundColor($r('app.color.overlay'))
           .width(16)
@@ -3565,16 +3750,16 @@ struct TaskPage {
       }
       if (img.status === 'uploading') {
         Text('上传中…')
-          .fontSize(10)
+          .fontSize(taskDetailFontSize(10))
           .fontColor($r('app.color.text_secondary'))
       } else if (img.status === 'failed') {
         Text('重试')
-          .fontSize(10)
+          .fontSize(taskDetailFontSize(10))
           .fontColor($r('app.color.danger'))
           .onClick(() => this.retryComposerImage(img))
       } else {
         Text('✓')
-          .fontSize(10)
+          .fontSize(taskDetailFontSize(10))
           .fontColor($r('app.color.success'))
       }
     }
@@ -3638,14 +3823,14 @@ struct TaskPage {
   @Builder
   collapsedPlainUserMessage(item: RenderMessageItem) {
     Text(item.body)
-      .fontSize(17)
-      .lineHeight(26)
+      .fontSize(taskDetailFontSize(17))
+      .lineHeight(taskDetailLineHeight(26))
       .maxLines(this.collapsedMessageLines(item))
       .textOverflow({ overflow: TextOverflow.Ellipsis })
       .width('100%')
     Text('展开全文')
-      .fontSize(12)
-      .lineHeight(18)
+      .fontSize(taskDetailFontSize(12))
+      .lineHeight(taskDetailLineHeight(18))
       .fontColor($r('app.color.accent'))
       .onClick(() => {
         this.expandedTextBlocks = this.toggleExpanded(
@@ -3663,11 +3848,11 @@ struct TaskPage {
         && item.message.automationOrigin) {
         Row({ space: 4 }) {
           SymbolGlyph($r('sys.symbol.timer'))
-            .fontSize(12)
+            .fontSize(taskDetailFontSize(12))
             .fontColor([$r('app.color.text_tertiary')])
           Text('由自动化发送')
-            .fontSize(12)
-            .lineHeight(16)
+            .fontSize(taskDetailFontSize(12))
+            .lineHeight(taskDetailLineHeight(16))
             .fontColor($r('app.color.text_tertiary'))
         }
         .width('86%')
@@ -3696,10 +3881,10 @@ struct TaskPage {
           if (item.kind !== 'user' && item.kind !== 'assistant') {
             Row({ space: 8 }) {
               Text(item.label)
-                .fontSize(11)
+                .fontSize(taskDetailFontSize(11))
                 .fontColor(this.labelColor(item.kind))
               Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-                .fontSize(11)
+                .fontSize(taskDetailFontSize(11))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .width('100%')
@@ -3725,8 +3910,8 @@ struct TaskPage {
           if (this.shouldCollapsePlainUserMessage(item)
             && this.isIn(this.expandedTextBlocks, this.plainMessageExpandKey(item))) {
             Text('收起')
-              .fontSize(12)
-              .lineHeight(18)
+              .fontSize(taskDetailFontSize(12))
+              .lineHeight(taskDetailLineHeight(18))
               .fontColor($r('app.color.accent'))
               .onClick(() => {
                 this.expandedTextBlocks = this.toggleExpanded(
@@ -3740,7 +3925,7 @@ struct TaskPage {
             && item.message !== undefined
             && item.message.isStreaming) {
             Text('生成中')
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.chat_text_secondary'))
               .opacity(0.72)
@@ -3768,14 +3953,14 @@ struct TaskPage {
         Row({ space: 2 }) {
           if (item.kind === 'user') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(12)
-              .lineHeight(24)
+              .fontSize(taskDetailFontSize(12))
+              .lineHeight(taskDetailLineHeight(24))
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ right: 2 })
           }
           Button() {
             SymbolGlyph($r('sys.symbol.rectangle_on_rectangle'))
-              .fontSize(14)
+              .fontSize(taskDetailFontSize(14))
               .fontColor([$r('app.color.chat_text_secondary')])
           }
           .width(24)
@@ -3787,7 +3972,7 @@ struct TaskPage {
           if (this.canFork(item)) {
             Button() {
               SymbolGlyph($r('sys.symbol.split'))
-                .fontSize(14)
+                .fontSize(taskDetailFontSize(14))
                 .fontColor([$r('app.color.chat_text_secondary')])
             }
             .width(24)
@@ -3799,7 +3984,7 @@ struct TaskPage {
           }
           Button() {
             SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-              .fontSize(14)
+              .fontSize(taskDetailFontSize(14))
               .fontColor([$r('app.color.chat_text_secondary')])
           }
           .width(24)
@@ -3810,14 +3995,14 @@ struct TaskPage {
           .onClick(() => this.showMessageActions(item))
           if (item.kind === 'assistant') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(12)
-              .lineHeight(24)
+              .fontSize(taskDetailFontSize(12))
+              .lineHeight(taskDetailLineHeight(24))
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ left: 2 })
             if (this.turnTokensLabel(item).length > 0) {
               Text(this.turnTokensLabel(item))
-                .fontSize(12)
-                .lineHeight(24)
+                .fontSize(taskDetailFontSize(12))
+                .lineHeight(taskDetailLineHeight(24))
                 .fontColor($r('app.color.chat_text_secondary'))
             }
           }
@@ -3836,16 +4021,16 @@ struct TaskPage {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text('▤')
-          .fontSize(14)
+          .fontSize(taskDetailFontSize(14))
           .fontColor($r('app.color.text_tertiary'))
         Text(seg.display.length > 0 ? seg.display : `已粘贴文本（${seg.text.length} 字）`)
-          .fontSize(13)
+          .fontSize(taskDetailFontSize(13))
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         Text(this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`) ? '▾' : '▸')
-          .fontSize(11)
+          .fontSize(taskDetailFontSize(11))
           .fontColor($r('app.color.text_tertiary'))
       }
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
@@ -3859,7 +4044,7 @@ struct TaskPage {
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
         this.mdBlocks(seg.mdBlocks)
         Text('收起')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -3877,7 +4062,7 @@ struct TaskPage {
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
         this.mdBlocks(seg.mdBlocks)
         Text('收起')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -3885,8 +4070,8 @@ struct TaskPage {
       } else {
         // 自动化消息使用更紧的 4/3 行策略；手打消息保持 14/10。
         Text(seg.text)
-          .fontSize(17)
-          .lineHeight(26)
+          .fontSize(taskDetailFontSize(17))
+          .lineHeight(taskDetailLineHeight(26))
           .maxLines(this.collapsedMessageLines(item))
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
@@ -3894,7 +4079,7 @@ struct TaskPage {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
           })
         Text('展开全文')
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -3912,12 +4097,12 @@ struct TaskPage {
         SymbolGlyph(this.isIn(this.expandedThinking, item.key)
           ? $r('sys.symbol.chevron_down')
           : $r('sys.symbol.chevron_right'))
-          .fontSize(13)
+          .fontSize(taskDetailFontSize(13))
           .fontColor([$r('app.color.chat_text_secondary')])
           .width(16)
         Text(this.thinkingTitle(item))
-          .fontSize(14)
-          .lineHeight(20)
+          .fontSize(taskDetailFontSize(14))
+          .lineHeight(taskDetailLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
       }
       .onClick(() => {
@@ -3927,14 +4112,14 @@ struct TaskPage {
       if (this.isIn(this.expandedThinking, item.key)) {
         if (item.redacted) {
           Text('思考内容已隐藏')
-            .fontSize(12)
+            .fontSize(taskDetailFontSize(12))
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.text_secondary'))
         } else if (item.body.trim().length > 0) {
           // Thinking 正文使用 12/18 斜体小字和 2vp rail，不继承普通消息 17/26 档。
           Text(item.body)
-            .fontSize(12)
-            .lineHeight(18)
+            .fontSize(taskDetailFontSize(12))
+            .lineHeight(taskDetailLineHeight(18))
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.chat_text_secondary'))
             .width('100%')
@@ -3976,12 +4161,12 @@ struct TaskPage {
       Row({ space: 6 }) {
         if (t.hasError) {
           SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-            .fontSize(15)
+            .fontSize(taskDetailFontSize(15))
             .fontColor([$r('app.color.danger')])
             .width(16)
         } else if (t.hasResult) {
           SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(14)
+            .fontSize(taskDetailFontSize(14))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         } else {
@@ -3992,8 +4177,8 @@ struct TaskPage {
             .margin({ left: 1, right: 1 })
         }
         Text(this.toolRowLabel(t))
-          .fontSize(14)
-          .lineHeight(20)
+          .fontSize(taskDetailFontSize(14))
+          .lineHeight(taskDetailLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -4002,7 +4187,7 @@ struct TaskPage {
           SymbolGlyph(this.isIn(this.expandedTools, this.toolKey(t))
             ? $r('sys.symbol.chevron_down')
             : $r('sys.symbol.chevron_right'))
-            .fontSize(13)
+            .fontSize(taskDetailFontSize(13))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         }
@@ -4020,18 +4205,18 @@ struct TaskPage {
         Column({ space: 4 }) {
           if (t.inputText.length > 0) {
             Text(t.inputText)
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontFamily('monospace')
               .fontColor($r('app.color.chat_text_secondary'))
-              .lineHeight(18)
+              .lineHeight(taskDetailLineHeight(18))
               .width('100%')
           }
           if (t.hasResult && t.resultText.length > 0) {
             Text(t.resultText)
-              .fontSize(12)
+              .fontSize(taskDetailFontSize(12))
               .fontFamily('monospace')
               .fontColor($r('app.color.chat_text_secondary'))
-              .lineHeight(18)
+              .lineHeight(taskDetailLineHeight(18))
               .width('100%')
           }
         }
@@ -4052,7 +4237,7 @@ struct TaskPage {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text(this.todoTitle(item))
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -4064,14 +4249,14 @@ struct TaskPage {
       ForEach(item.todos, (t: RenderTodoItem) => {
         Row({ space: 6 }) {
           Text(this.todoMark(t.status))
-            .fontSize(13)
+            .fontSize(taskDetailFontSize(13))
             .fontColor(this.todoColor(t.status))
           Text(t.content)
-            .fontSize(13)
+            .fontSize(taskDetailFontSize(13))
             .fontColor(t.status === 'completed' ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
           if (t.status === 'in_progress') {
             Text('…')
-              .fontSize(13)
+              .fontSize(taskDetailFontSize(13))
               .fontColor($r('app.color.warn'))
           }
         }
@@ -4090,6 +4275,68 @@ struct TaskPage {
 
   // ─── Markdown 渲染 ──────────────────────────────────────────────────────────
 
+  private hasImageToken(tokens: InlineToken[]): boolean {
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].kind === 'image') return true;
+    }
+    return false;
+  }
+
+  private markdownImageWidth(token: InlineToken): number {
+    return Math.min(token.width > 0 ? token.width : 220, 260);
+  }
+
+  private markdownImageHeight(token: InlineToken): number {
+    const width = this.markdownImageWidth(token);
+    if (token.width > 0 && token.height > 0) {
+      return Math.min(260, Math.max(1, Math.round(width * token.height / token.width)));
+    }
+    return token.height > 0 ? Math.min(token.height, 260) : Math.round(width * 0.75);
+  }
+
+  @Builder
+  mdInlineContent(tokens: InlineToken[]) {
+    Column({ space: 4 }) {
+      ForEach(tokens, (token: InlineToken) => {
+        if (token.kind === 'image') {
+          this.mdInlineImage(token)
+        } else {
+          this.inlineText(token.value)
+        }
+      }, (token: InlineToken) => `${token.seq}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  mdInlineImage(token: InlineToken) {
+    if ((this.imageSources.get(token.url) ?? '').length > 0) {
+      Image(this.imageSources.get(token.url) ?? '')
+        .width(this.markdownImageWidth(token))
+        .height(this.markdownImageHeight(token))
+        .objectFit(ImageFit.Contain)
+        .borderRadius(8)
+        .onClick(() => this.openInlineImagePreview(token.url))
+    } else {
+      Row({ space: 6 }) {
+        LoadingProgress()
+          .width(14)
+          .height(14)
+        Text(token.value.length > 0 ? token.value : '图片')
+          .fontSize(taskDetailFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width(this.markdownImageWidth(token))
+      .height(32)
+      .padding({ left: 8, right: 8 })
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(8)
+    }
+  }
+
   @Builder
   mdBlocks(blocks: MdBlock[]) {
     ForEach(blocks, (b: MdBlock) => {
@@ -4100,22 +4347,34 @@ struct TaskPage {
   @Builder
   mdBlock(b: MdBlock) {
     if (b.type === 'heading') {
-      Text(b.text)
-        .fontSize(b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17))
-        .fontWeight(FontWeight.Medium)
-        .width('100%')
-        .lineHeight(b.level <= 2 ? 28 : 26)
-        .padding({ top: 4, bottom: 4 })
+      if (this.hasImageToken(b.inlineTokens)) {
+        this.mdInlineContent(b.inlineTokens)
+      } else {
+        Text(b.text)
+          .fontSize(taskDetailFontSize(b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17)))
+          .fontWeight(FontWeight.Medium)
+          .width('100%')
+          .lineHeight(taskDetailLineHeight(b.level <= 2 ? 28 : 26))
+          .padding({ top: 4, bottom: 4 })
+      }
     } else if (b.type === 'paragraph') {
-      this.inlineText(b.text)
+      if (this.hasImageToken(b.inlineTokens)) {
+        this.mdInlineContent(b.inlineTokens)
+      } else {
+        this.inlineText(b.text)
+      }
     } else if (b.type === 'list') {
       Column({ space: 2 }) {
         ForEach(b.items, (it: string, idx?: number) => {
           Row({ space: 6 }) {
             Text(b.ordered ? `${(idx ?? 0) + 1}.` : '•')
-              .fontSize(17)
+              .fontSize(taskDetailFontSize(17))
               .fontColor($r('app.color.text_secondary'))
-            this.inlineText(it)
+            if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
+              this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [])
+            } else {
+              this.inlineText(it)
+            }
           }
           .width('100%')
           .alignItems(VerticalAlign.Top)
@@ -4123,20 +4382,29 @@ struct TaskPage {
       }
       .padding({ top: 2, bottom: 2 })
     } else if (b.type === 'quote') {
-      Text(b.text)
-        .fontSize(14)
-        .fontColor($r('app.color.text_secondary'))
-        .lineHeight(22)
+      if (this.hasImageToken(b.inlineTokens)) {
+        Row() {
+          this.mdInlineContent(b.inlineTokens)
+        }
+        .width('100%')
         .padding({ left: 10 })
         .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
-        .width('100%')
+      } else {
+        Text(b.text)
+          .fontSize(taskDetailFontSize(14))
+          .fontColor($r('app.color.text_secondary'))
+          .lineHeight(taskDetailLineHeight(22))
+          .padding({ left: 10 })
+          .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
+          .width('100%')
+      }
     } else if (b.type === 'code') {
       Column({ space: 4 }) {
         Text(b.code)
-          .fontSize(12)
+          .fontSize(taskDetailFontSize(12))
           .fontFamily('monospace')
           .fontColor($r('app.color.code_text'))
-          .lineHeight(18)
+          .lineHeight(taskDetailLineHeight(18))
           .padding(10)
           .backgroundColor($r('app.color.bg_code'))
           .border({ width: 1, color: $r('app.color.border') })
@@ -4155,6 +4423,15 @@ struct TaskPage {
     }
   }
 
+  private tableHeaderTokens(b: MdBlock, index: number): InlineToken[] {
+    return b.headerTokens[index] ?? [];
+  }
+
+  private tableRowCellTokens(b: MdBlock, rowIndex: number, cellIndex: number): InlineToken[] {
+    const row = b.rowTokens[rowIndex];
+    return row === undefined ? [] : (row[cellIndex] ?? []);
+  }
+
   private tableContentWidth(b: MdBlock): number {
     return Math.max(320, b.headers.length * 140);
   }
@@ -4166,7 +4443,11 @@ struct TaskPage {
         Row() {
           ForEach(b.headers, (h: string, hIndex?: number) => {
             Row() {
-              this.inlineText(h)
+              if (this.hasImageToken(this.tableHeaderTokens(b, hIndex ?? 0))) {
+                this.mdInlineContent(this.tableHeaderTokens(b, hIndex ?? 0))
+              } else {
+                this.inlineText(h)
+              }
             }
             .width(140)
             .padding({ left: 8, right: 8, top: 6, bottom: 6 })
@@ -4179,7 +4460,11 @@ struct TaskPage {
           Row() {
             ForEach(row, (cell: string, cellIndex?: number) => {
               Row() {
-                this.inlineText(cell)
+                if (this.hasImageToken(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex ?? 0))) {
+                  this.mdInlineContent(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex ?? 0))
+                } else {
+                  this.inlineText(cell)
+                }
               }
               .width(140)
               .padding({ left: 8, right: 8, top: 6, bottom: 6 })
@@ -4227,8 +4512,8 @@ struct TaskPage {
         }
       }, (t: InlineToken) => `${t.seq}`)
     }
-    .fontSize(17)
-    .lineHeight(26)
+    .fontSize(taskDetailFontSize(17))
+    .lineHeight(taskDetailLineHeight(26))
     .textAlign(TextAlign.Start)
   }
 
@@ -4492,29 +4777,135 @@ struct TaskPage {
 
   // ─── 历史图片（懒解析 OSS URL / 缩略图 / 全屏预览）─────────────────────────
 
-  /** 遍历当前消息流的图片引用，补齐缺失的可加载 URL。 */
+  /** 遍历当前消息流的图片引用，补齐附件和 Markdown 图片的可加载 URL。 */
   private ensureImageUrls(): void {
     for (let i = 0; i < this.items.length; i++) {
       const item = this.items[i];
-      if (item.type !== 'message') {
+      if (item.type === 'tool_media') {
+        const media = item as RenderToolMediaItem;
+        for (let j = 0; j < media.images.length; j++) {
+          const ref = media.images[j];
+          this.ensureImageSource(ref.url, ref);
+        }
         continue;
       }
-      const m = item as RenderMessageItem;
-      for (let j = 0; j < m.images.length; j++) {
-        const ref = m.images[j];
-        if (this.imageSources.has(ref.url)) {
-          continue;
+      if (item.type !== 'message') continue;
+      const message = item as RenderMessageItem;
+      for (let j = 0; j < message.images.length; j++) {
+        const ref = message.images[j];
+        this.ensureImageSource(ref.url, ref);
+      }
+      const blocks: MdBlock[] = [];
+      if (message.segments.length > 0) {
+        for (let j = 0; j < message.segments.length; j++) {
+          const segment = message.segments[j];
+          for (let k = 0; k < segment.mdBlocks.length; k++) blocks.push(segment.mdBlocks[k]);
         }
-        this.resolveImageUrl(ref).then((url: string) => {
-          if (url.length === 0) {
-            return;
+      } else {
+        for (let j = 0; j < message.mdBlocks.length; j++) blocks.push(message.mdBlocks[j]);
+      }
+      for (let j = 0; j < blocks.length; j++) {
+        const block = blocks[j];
+        this.ensureInlineImageSources(block.inlineTokens);
+        for (let k = 0; k < block.itemTokens.length; k++) {
+          this.ensureInlineImageSources(block.itemTokens[k]);
+        }
+        for (let k = 0; k < block.headerTokens.length; k++) {
+          this.ensureInlineImageSources(block.headerTokens[k]);
+        }
+        for (let k = 0; k < block.rowTokens.length; k++) {
+          const rowTokens = block.rowTokens[k];
+          for (let c = 0; c < rowTokens.length; c++) {
+            this.ensureInlineImageSources(rowTokens[c]);
           }
-          const next = new Map(this.imageSources);
-          next.set(ref.url, url);
-          this.imageSources = next;
-        });
+        }
       }
     }
+  }
+
+  private ensureInlineImageSources(tokens: InlineToken[]): void {
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.kind !== 'image' || token.url.length === 0) continue;
+      const ref = this.markdownImageRef(token);
+      this.ensureImageSource(token.url, ref);
+    }
+  }
+
+  private ensureImageSource(key: string, ref: RemoteImageRef): void {
+    if (key.length === 0 || this.imageSources.has(key) || this.imageResolutions.has(key)) return;
+    const pending = this.resolveImageUrl(ref);
+    this.imageResolutions.set(key, pending);
+    pending.then((url: string) => {
+      if (url.length > 0) {
+        const next = new Map(this.imageSources);
+        next.set(key, url);
+        this.imageSources = next;
+      }
+      this.imageResolutions.delete(key);
+    }).catch(() => {
+      this.imageResolutions.delete(key);
+    });
+  }
+
+  private markdownImageRef(token: InlineToken): RemoteImageRef {
+    const ref = new RemoteImageRef();
+    ref.url = this.normalizeMarkdownImageUrl(token.url);
+    ref.originalName = token.value;
+    return ref;
+  }
+
+  /**
+   * Markdown 图片地址只在被控端媒体链路消费点解析：相对路径绑定当前 session
+   * workingDir，SSH 上下文绑定当前 session 的 remoteHostId，绝不把远端绝对路径
+   * 当成 Harmony 本机路径。
+   */
+  private normalizeMarkdownImageUrl(raw: string): string {
+    const url = normalizeImageUrlScheme(raw.trim());
+    if (url.startsWith('http://') || url.startsWith('https://')
+      || /^data:image\//i.test(url) || parseAttachmentOssRef(url) !== null
+      || url.startsWith('xdt-image://') || url.startsWith('cindy-media://')) {
+      return url;
+    }
+    // 绝对 Windows / UNC 路径不是 URI scheme；其它显式 scheme（尤其
+    // javascript:/vbscript:）不能降级成 workingDir 下的相对文件名。
+    if (!isAbsoluteMediaPath(url) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(url)
+      && !url.startsWith('file://') && !url.startsWith('xdt-file://')) {
+      return '';
+    }
+    const session = this.session();
+    const workingDir = session !== undefined ? session.workingDir : '';
+    const remoteHostId = session !== undefined ? session.remoteHostId : '';
+    let path = url;
+    if (url.startsWith('xdt-file://')) {
+      const query = url.indexOf('?');
+      const encodedPath = query >= 0 ? queryValue(url.slice(query + 1), 'path') : '';
+      if (encodedPath.length === 0) return '';
+      path = encodedPath;
+    } else if (url.startsWith('file://')) {
+      path = url.slice('file://'.length);
+      if (path.startsWith('localhost/')) path = path.slice('localhost'.length);
+      try {
+        path = decodeURIComponent(path);
+      } catch (e) {
+        return '';
+      }
+    }
+    if (!isAbsoluteMediaPath(path)) {
+      if (workingDir.length === 0) return '';
+      const relative = path.startsWith('./') ? path.slice(2) : path;
+      path = workingDir.endsWith('/') || workingDir.endsWith('\\')
+        ? `${workingDir}${relative}`
+        : `${workingDir}/${relative}`;
+    }
+    let normalized = `xdt-file://open?path=${encodeURIComponent(path)}`;
+    if (remoteHostId.length > 0) {
+      if (workingDir.length === 0) return '';
+      normalized += `&sessionId=${encodeURIComponent(this.sessionId)}`
+        + `&remoteHostId=${encodeURIComponent(remoteHostId)}`
+        + `&workdir=${encodeURIComponent(workingDir)}`;
+    }
+    return normalized;
   }
 
   /**
@@ -4524,11 +4915,11 @@ struct TaskPage {
    * - Desktop 本地媒体引用走 device-link:media:fetch，再兼容 inline 缩略图和 OSS。
    */
   private resolveImageUrl(ref: RemoteImageRef): Promise<string> {
-    const url = ref.url;
+    const url = normalizeImageUrlScheme(ref.url.trim());
     if (url.startsWith('http://') || url.startsWith('https://')) {
       return Promise.resolve(url);
     }
-    if (url.startsWith('data:image/')) {
+    if (/^data:image\//i.test(url)) {
       return Promise.resolve(url);
     }
     const parsed = parseAttachmentOssRef(url);
@@ -4547,6 +4938,7 @@ struct TaskPage {
           const mimeType = fetched.mimeType.length > 0
             ? fetched.mimeType
             : (ref.mimeType.length > 0 ? ref.mimeType : 'image/webp');
+          if (!isImageMimeType(mimeType)) return '';
           return `data:${mimeType};base64,${fetched.inlineBase64}`;
         }
         if (fetched.ossKey.length === 0) {
@@ -4561,9 +4953,7 @@ struct TaskPage {
 
   /** 解析被控端历史媒体 URL 的最小图片 scheme 集合。 */
   private isDesktopLocalImageUrl(url: string): boolean {
-    return url.startsWith('xdt-image://')
-      || url.startsWith('cindy-media://')
-      || url.startsWith('xdt-file://');
+    return /^(?:xdt-image|cindy-media|xdt-file):\/\//i.test(url);
   }
 
   /** OSS key → 临时可加载地址，并在页面生命周期内复用。 */
@@ -4595,6 +4985,13 @@ struct TaskPage {
     }).catch(() => {
       promptAction.showToast({ message: '无法打开链接' });
     });
+  }
+
+  private openInlineImagePreview(url: string): void {
+    const src = this.imageSources.get(url) ?? '';
+    if (src.length > 0) {
+      this.previewImageUrl = src;
+    }
   }
 
   private openImagePreview(ref: RemoteImageRef): void {
@@ -4811,8 +5208,8 @@ struct TaskPage {
     AppServices.instance.messages.fork(this.deviceId, this.sessionId, clientId).then((newSessionId: string) => {
       if (newSessionId.length > 0) {
         promptAction.showToast({ message: '已创建新任务' });
-        // 返回任务列表（列表会刷新显示新任务）。
-        router.back();
+        // 返回任务列表（列表会刷新显示新任务）。嵌入式详情留在右侧，等待列表选择状态更新。
+        if (!this.isEmbedded()) router.back();
       } else {
         promptAction.showToast({ message: '分叉失败' });
       }
@@ -4825,13 +5222,26 @@ struct TaskPage {
     AppServices.instance.messages.rewindCommit(this.deviceId, this.sessionId, clientId).then((newSessionId: string) => {
       if (newSessionId.length > 0) {
         promptAction.showToast({ message: '已回退' });
-        router.back();
+        if (!this.isEmbedded()) router.back();
       } else {
         promptAction.showToast({ message: '回退失败' });
       }
     }).catch(() => {
       promptAction.showToast({ message: '回退失败' });
     });
+  }
+}
+
+/** 独立详情路由入口；宽屏双栏直接使用上面的可嵌入内容组件。 */
+@Entry
+@Component
+struct TaskPage {
+  build() {
+    Column() {
+      TaskPageContent()
+    }
+    .width('100%')
+    .height('100%')
   }
 }
 

@@ -8,6 +8,8 @@
 /** 发送时随消息携带的图片引用（chatMessage.images）。 */
 export class RemoteImageRef {
   url: string = '';
+  /** 兼容历史 content.images 的 inline base64 形态。 */
+  base64: string = '';
   originalName: string = '';
   name: string = '';
   mimeType: string = '';

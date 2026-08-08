@@ -8,7 +8,7 @@
  * - thinking 独立折叠块；user/assistant/system/error 为消息块。
  *
  * work_group 按 shared 的 turn 规则聚合；agent_task 子代理卡、tool_media
- * 独立媒体项仍未接入。原始 RemoteMessage 引用保留在渲染项里，
+ * 独立媒体项按托管引用抽取。原始 RemoteMessage 引用保留在渲染项里，
  * 供消息动作（复制/Fork/Rewind）与媒体识别使用。
  */
 
@@ -90,6 +90,8 @@ export class RenderToolItem {
   hasError: boolean = false;
   /** 精确 tool_result 的落库时间；邻接兜底不伪造结束时间。 */
   settledAt: string = '';
+  /** 配对 tool_result 中可直接展示的托管图片。 */
+  media: RemoteImageRef[] = [];
   /** 调用发起时间 ISO（work_group 时长计算用）。 */
   createdAt: string = '';
 }
@@ -97,6 +99,12 @@ export class RenderToolItem {
 /** 连续工具调用聚合块。 */
 export class RenderToolGroupItem extends RenderItem {
   tools: RenderToolItem[] = [];
+}
+
+/** 工具产出的独立图片媒体项；与 tool_group 分离，避免生成结果被折叠。 */
+export class RenderToolMediaItem extends RenderItem {
+  tools: RenderToolItem[] = [];
+  images: RemoteImageRef[] = [];
 }
 
 export class RenderTodoItem {
@@ -223,6 +231,62 @@ export function toolResultHasError(message: RemoteMessage): boolean {
   // 历史 tool_result 通常只有纯文本正文；正文可能本身就在讨论 error，
   // 没有结构化信号时宁可不标失败，避免假阳性。
   return false;
+}
+
+/** 从 tool_result JSON 提取生成图片；只接受 Desktop 媒体托管 scheme。 */
+function extractToolResultImages(content: string): RemoteImageRef[] {
+  if (content.length === 0
+    || (!content.includes('xdt_image_url') && !content.includes('xdt_media_produced'))) {
+    return [];
+  }
+  let parsed: Object;
+  try {
+    parsed = JSON.parse(content) as Object;
+  } catch (e) {
+    return [];
+  }
+  if (parsed === undefined || parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return [];
+  }
+  const record = parsed as Record<string, Object>;
+  if (record['_xdt_render_image'] === false) return [];
+  const out: RemoteImageRef[] = [];
+  const seen = new Set<string>();
+  const push = (url: string, title: string = ''): void => {
+    if ((!url.startsWith('xdt-image://') && !url.startsWith('cindy-media://'))
+      || seen.has(url)) return;
+    seen.add(url);
+    const ref = new RemoteImageRef();
+    ref.url = url;
+    ref.originalName = title;
+    out.push(ref);
+  };
+  const single = record['xdt_image_url'];
+  if (typeof single === 'string') push(single);
+  const many = record['xdt_image_urls'];
+  if (Array.isArray(many)) {
+    const list: Object[] = many as Object[];
+    for (let i = 0; i < list.length; i++) {
+      if (typeof list[i] === 'string') push(list[i] as string);
+    }
+  }
+  const produced = record['xdt_media_produced'];
+  if (Array.isArray(produced)) {
+    const list: Object[] = produced as Object[];
+    for (let i = 0; i < list.length; i++) {
+      const raw = list[i];
+      if (typeof raw === 'string') {
+        push(raw as string);
+      } else if (raw !== undefined && typeof raw === 'object' && !Array.isArray(raw)) {
+        const media = raw as Record<string, Object>;
+        const url = readStr(media, 'url').length > 0
+          ? readStr(media, 'url')
+          : readStr(media, 'xdt_image_url');
+        push(url, readStr(media, 'title'));
+      }
+    }
+  }
+  return out;
 }
 
 /** 判断工具调用是否是 todo 载体（TodoWrite / update_plan / Task*）。 */
@@ -396,12 +460,21 @@ function parseUserContent(content: Object | undefined): ParsedUserContent {
         const rr = raw as Record<string, Object>;
         const ref = new RemoteImageRef();
         ref.url = readStr(rr, 'url');
+        ref.base64 = readStr(rr, 'base64');
         ref.originalName = readStr(rr, 'originalName');
         ref.name = readStr(rr, 'name');
+        if (ref.originalName.length === 0) ref.originalName = ref.name;
         ref.mimeType = readStr(rr, 'mimeType');
+        if (ref.mimeType.length === 0) ref.mimeType = readStr(rr, 'type');
         const size = rr['size'];
         ref.size = typeof size === 'number' ? size : 0;
         ref.sha256 = readStr(rr, 'sha256');
+        if (ref.url.length === 0 && ref.base64.length > 0) {
+          const mimeType = ref.mimeType.length > 0 ? ref.mimeType : 'image/png';
+          if (mimeType.toLowerCase().startsWith('image/')) {
+            ref.url = `data:${mimeType};base64,${ref.base64}`;
+          }
+        }
         if (ref.url.length > 0) {
           out.images.push(ref);
         }
@@ -532,8 +605,10 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
   const resultByUseId = new Map<string, string>();
   const resultAtByUseId = new Map<string, string>();
   const resultErrorByUseId = new Map<string, boolean>();
+  const mediaByUseId = new Map<string, RemoteImageRef[]>();
   const settledUseIds = new Set<string>();
   const adjacentResultByMessageId = new Map<string, string>();
+  const adjacentMediaByMessageId = new Map<string, RemoteImageRef[]>();
   const adjacentErrorMessageIds = new Set<string>();
   const adjacentSettledMessageIds = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
@@ -554,6 +629,8 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     resultAtByUseId.set(useId, m.createdAt);
     if (toolResultHasError(m)) resultErrorByUseId.set(useId, true);
     const preview = summarizeText(contentPreview(m.content));
+    const media = extractToolResultImages(contentPreview(m.content));
+    if (media.length > 0) mediaByUseId.set(useId, media);
     if (!shouldHideToolResult(toolNameByUseId.get(useId) ?? '', preview)) {
       resultByUseId.set(useId, preview);
     }
@@ -570,6 +647,8 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     adjacentSettledMessageIds.add(use.id);
     if (toolResultHasError(result)) adjacentErrorMessageIds.add(use.id);
     const preview = summarizeText(contentPreview(result.content));
+    const media = extractToolResultImages(contentPreview(result.content));
+    if (media.length > 0) adjacentMediaByMessageId.set(use.id, media);
     if (!shouldHideToolResult(useInfo.toolName, preview)) {
       adjacentResultByMessageId.set(use.id, preview);
     }
@@ -586,6 +665,26 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     group.key = pendingFirstKey.length > 0 ? pendingFirstKey : pendingTools[0].toolUseId;
     group.tools = pendingTools;
     items.push(group);
+    const mediaTools: RenderToolItem[] = [];
+    for (let i = 0; i < pendingTools.length; i++) {
+      if (pendingTools[i].media.length > 0) mediaTools.push(pendingTools[i]);
+    }
+    if (mediaTools.length > 0) {
+      const media = new RenderToolMediaItem();
+      media.type = 'tool_media';
+      media.key = `media-${group.key}`;
+      media.tools = mediaTools;
+      const seenMedia = new Set<string>();
+      for (let i = 0; i < mediaTools.length; i++) {
+        for (let j = 0; j < mediaTools[i].media.length; j++) {
+          const ref = mediaTools[i].media[j];
+          if (seenMedia.has(ref.url)) continue;
+          seenMedia.add(ref.url);
+          media.images.push(ref);
+        }
+      }
+      items.push(media);
+    }
     pendingTools = [];
     pendingFirstKey = '';
   };
@@ -633,10 +732,12 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
         item.hasResult = true;
         item.hasError = resultErrorByUseId.get(item.toolUseId) ?? false;
         item.settledAt = resultAtByUseId.get(item.toolUseId) ?? '';
+        item.media = mediaByUseId.get(item.toolUseId) ?? [];
       } else if (adjacentSettledMessageIds.has(m.id)) {
         item.resultText = adjacentResultByMessageId.get(m.id) ?? '';
         item.hasResult = true;
         item.hasError = adjacentErrorMessageIds.has(m.id);
+        item.media = adjacentMediaByMessageId.get(m.id) ?? [];
       }
       item.createdAt = m.createdAt;
       if (pendingTools.length === 0) pendingFirstKey = m.id;

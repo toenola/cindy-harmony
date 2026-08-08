@@ -232,6 +232,11 @@ export class AppServices {
       }
       hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
       this.tasks.mergeServerDevices(views);
+      for (let i = 0; i < views.length; i++) {
+        if (views[i].online && views[i].remoteControlEnabled) {
+          void this.messages.hydrateActiveSessions(views[i].deviceId);
+        }
+      }
       return;
       }
     } catch (e) {
@@ -246,6 +251,9 @@ export class AppServices {
       case DlChannels.SESSION_ACTIVITY:
       case DlChannels.SESSION_ERROR_PERSISTED:
         this.tasks.handleSessionsPush(deviceId, channel, payload);
+        if (channel === DlChannels.SESSION_ACTIVITY) {
+          this.messages.handleSessionActivity(payload);
+        }
         break;
       case 'local-db:messages:created':
       case 'local-db:messages:deleted':
@@ -262,6 +270,9 @@ export class AppServices {
         }
         break;
       }
+      case 'maker:status-changed':
+        this.messages.handleMakerStatusChanged(payload);
+        break;
       case 'maker:interaction-request':
         this.interactions.handleInteractionRequest(payload);
         break;

@@ -57,7 +57,7 @@ struct LoginPage {
     AppServices.instance.auth.loginWithCode(this.phone, this.code).then(() => {
       // 登录成功：连接 relay 并进入首页。
       AppServices.instance.client.start();
-      router.replaceUrl({ url: 'pages/HomePage' });
+      router.replaceUrl({ url: 'pages/TaskListPage' });
     }).catch((e: Error) => {
       this.submitting = false;
       this.error = `登录失败：${e.message}`;
