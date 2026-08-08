@@ -5,9 +5,13 @@
 
 ## 仓库边界
 
-- 本仓库只负责 desktop、mobile 及其共享 packages。
+- 本仓库负责 Desktop、Mobile、Harmony 及其共享 packages；本工作区当前只开发 Harmony。
 - 服务端位于独立仓库；除非用户明确要求，不要跨仓修改服务端。
 - 开始工作前先检查工作区状态和相关源码，不覆盖、不回退用户已有改动。
+- 本工作区当前开发范围限定为 `apps/harmony`。除非用户明确要求，不修改
+  `apps/desktop`、`apps/mobile`、`packages`、`cindy-protocol` 或其他目录。
+- 本任务的单元测试、构建、静态检查、设备/模拟器验证只在 `apps/harmony` 目录内执行；
+  不要为了本任务运行仓库根目录或其他目录的测试与验证。
 
 ## 规则组织
 
