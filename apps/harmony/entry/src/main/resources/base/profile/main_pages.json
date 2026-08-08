@@ -4,6 +4,7 @@
     "pages/LoginPage",
     "pages/HomePage",
     "pages/TaskListPage",
+    "pages/NewSessionPage",
     "pages/TaskPage",
     "pages/SettingsPage"
   ]

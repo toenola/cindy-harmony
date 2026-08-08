@@ -23,6 +23,25 @@ export function taskDisplayTitle(session: RemoteSession): string {
   return '未命名任务';
 }
 
+/**
+ * 自动标题的统一归一化，与 `@cindy/maker-shared/session-title` 的 `normalizeAutoTitle`
+ * **逐字一致**：折叠空白 → trim → 截断 40 字 → trimEnd。
+ *
+ * 首条用户消息以此作为占位标题，与被控端自动起名写进 DB 的是同一个串，回流时不跳变。
+ * 落库出口、占位覆写方与鸿蒙端的乐观预览都用它算出同一个串。
+ */
+export function normalizeAutoTitle(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 40).trimEnd();
+}
+
+/**
+ * 标题是否仍是建会话时的裸默认哨兵（尚未起名、也未改名）。精确比较，不做大小写归一：
+ * 用户手动把标题改成 `new maker` 是合法自定义标题，不该被当成系统占位覆盖掉。
+ */
+export function isDefaultDraftSessionTitle(title: string): boolean {
+  return title === DEFAULT_DRAFT_TITLE;
+}
+
 export function taskPreviewText(preview: string): string {
   return preview.replace(/\s+/g, ' ').trim();
 }

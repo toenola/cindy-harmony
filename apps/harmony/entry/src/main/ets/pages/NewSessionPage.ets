@@ -1,0 +1,1969 @@
+/**
+ * 新建任务页：选择 Agent、对话类型和项目目录，然后用同款 Composer 发送首条消息。
+ *
+ * 创建与目录浏览都复用 Device Link 已有远程 channel；Harmony 只负责原生呈现，
+ * 任务和消息真相仍由被控端桌面维护。
+ */
+
+import { router, promptAction } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import {
+  photoAccessHelper, PhotoPickerComponent, PickerController, PickerOptions,
+  SelectMode, PickerOrientation, SingleLineConfig, DataType,
+} from '@kit.MediaLibraryKit';
+import { AppServices } from '../core/AppServices';
+import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
+import { uploadImage, deleteUpload } from '../core/attachments/AttachmentUpload';
+import { RemoteImageRef } from '../core/attachments/AttachmentModels';
+import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
+import { DlInvokeOptions } from '../core/device-link/DlClient';
+import { DlChannels, Envelope, PresenceSnapshot } from '../core/device-link/DlProtocol';
+import { unwrapInvokeResult } from '../core/tasks/TaskStore';
+import { RemoteSession, readBool, readObj, readStr } from '../core/tasks/TaskModels';
+import { normalizeAutoTitle, isDefaultDraftSessionTitle } from './TaskListPresentation';
+import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+
+type NewAgentKind = 'claude-code' | 'codex' | 'pi';
+type WorkspaceKind = 'dialogue' | 'project';
+
+class RecentProject {
+  path: string = '';
+  title: string = '';
+  lastActivityAt: string = '';
+}
+
+class RemoteDirectory {
+  name: string = '';
+  kind: string = 'dir';
+  path: string = '';
+}
+
+class RuntimeChoiceOption {
+  id: string = '';
+  label: string = '';
+  description: string = '';
+}
+
+class RuntimeModelOption {
+  id: string = '';
+  label: string = '';
+  description: string = '';
+  efforts: string[] = [];
+  defaultEffort: string = '';
+  supportsFastMode: boolean = false;
+  effortDisplayNames: Record<string, string> = {};
+  providerId: string = '';
+  providerName: string = '';
+  providerLogoKind: string = '';
+  modelIcon: string = '';
+  subscription: boolean = false;
+}
+
+class ProviderListOptions {
+  capabilities: string[] = [];
+}
+
+const NEW_AGENT_OPTIONS: NewAgentKind[] = ['claude-code', 'codex', 'pi'];
+const MAX_COMPOSER_IMAGES = 20;
+const NEW_SESSION_FONT_SCALE = 0.84;
+const NEW_SESSION_MIN_FONT_SIZE = 8;
+
+function newSessionFontSize(base: number): number {
+  return Math.max(NEW_SESSION_MIN_FONT_SIZE, Math.round(base * NEW_SESSION_FONT_SCALE));
+}
+
+function createRecentPickerOptions(): PickerOptions {
+  const options = new PickerOptions();
+  options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+  options.maxSelectNumber = MAX_COMPOSER_IMAGES;
+  options.maxPhotoSelectNumber = MAX_COMPOSER_IMAGES;
+  options.selectMode = SelectMode.MULTI_SELECT;
+  options.orientation = PickerOrientation.HORIZONTAL;
+  options.isPhotoTakingSupported = false;
+  const singleLine = new SingleLineConfig();
+  singleLine.itemBorderRadius = 6;
+  singleLine.itemGap = 6;
+  options.singleLineConfig = singleLine;
+  return options;
+}
+
+function agentLabel(kind: NewAgentKind): string {
+  if (kind === 'codex') return 'Codex';
+  if (kind === 'pi') return 'Pi';
+  return 'Claude';
+}
+
+function agentMark(kind: NewAgentKind): string {
+  if (kind === 'codex') return 'CX';
+  if (kind === 'pi') return 'π';
+  return 'CC';
+}
+
+function fallbackModel(kind: NewAgentKind): string {
+  if (kind === 'codex' || kind === 'pi') return 'gpt-5.4';
+  return 'claude-sonnet-4-6';
+}
+
+function directoryTitle(path: string): string {
+  const normalized = path.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normalized.length === 0) return '项目目录';
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || normalized;
+}
+
+function newAgentKindFromSession(session: RemoteSession): NewAgentKind {
+  if (session.agentKind === 'codex') return 'codex';
+  if (session.agentKind === 'pi') return 'pi';
+  return 'claude-code';
+}
+
+@Entry
+@Component
+struct NewSessionPage {
+  @State devices: PresenceSnapshot[] = [];
+  @State selectedDeviceId: string = '';
+  @State selectedAgentKind: NewAgentKind = 'claude-code';
+  @State workspaceKind: WorkspaceKind = 'dialogue';
+  @State workingDir: string = '';
+  @State input: string = '';
+  @State composerFocused: boolean = false;
+  @State composerImages: ComposerImage[] = [];
+  @State pickingImages: boolean = false;
+  @State contextSheetOpen: boolean = false;
+  @State contextSheetPage: string = 'main';
+  @State contextSelectedUris: string[] = [];
+  @State selectorOpen: string = '';
+  @State browseOpen: boolean = false;
+  @State browsePath: string = '';
+  @State browseParent: string = '';
+  @State browseEntries: RemoteDirectory[] = [];
+  @State browseLoading: boolean = false;
+  @State browseError: string = '';
+  @State showHiddenDirectories: boolean = false;
+  @State model: string = '';
+  @State providerId: string = '';
+  @State effort: string = '';
+  @State permissionMode: string = '';
+  @State permissionModeBeforePlan: string = 'auto';
+  @State planModeSupported: boolean = false;
+  @State planModeNative: boolean = false;
+  @State planModeEnabled: boolean = false;
+  @State fastMode: boolean = false;
+  @State modelOptions: RuntimeModelOption[] = [];
+  @State providerModelOptions: RuntimeModelOption[] = [];
+  @State providerModelAgent: string = '';
+  @State modelVisibilityOverrides: Map<string, boolean> = new Map();
+  @State effortOptions: RuntimeChoiceOption[] = [];
+  @State permissionOptions: RuntimeChoiceOption[] = [];
+  @State fastModeCapability: boolean = false;
+  @State creating: boolean = false;
+  @State error: string = '';
+  @State createdSession: RemoteSession | null = null;
+  @State taskRevision: number = 0;
+  private recentPickerOptions: PickerOptions = createRecentPickerOptions();
+  @State recentPickerController: PickerController = new PickerController();
+
+  private unsubs: Array<() => void> = [];
+  private routeDeviceId: string = '';
+  private runtimeLoadGeneration: number = 0;
+  private agentTouched: boolean = false;
+
+  aboutToAppear(): void {
+    const params = (router.getParams() ?? {}) as Record<string, Object>;
+    this.routeDeviceId = readStr(params, 'deviceId');
+    this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
+      this.refreshDevices();
+    }));
+    this.refreshDevices();
+  }
+
+  aboutToDisappear(): void {
+    this.runtimeLoadGeneration += 1;
+    for (const unsubscribe of this.unsubs) {
+      unsubscribe();
+    }
+    this.unsubs = [];
+  }
+
+  private refreshDevices(): void {
+    this.devices = AppServices.instance.tasks.deviceList;
+    this.taskRevision += 1;
+    let nextDeviceId = this.selectedDeviceId;
+    if (nextDeviceId.length === 0 && this.routeDeviceId.length > 0) {
+      nextDeviceId = this.routeDeviceId;
+    }
+    if (!this.canCreateOnDevice(nextDeviceId)) {
+      nextDeviceId = '';
+      for (let i = 0; i < this.devices.length; i++) {
+        if (this.canCreateOnDevice(this.devices[i].deviceId)) {
+          nextDeviceId = this.devices[i].deviceId;
+          break;
+        }
+      }
+    }
+    if (nextDeviceId !== this.selectedDeviceId) {
+      this.selectedDeviceId = nextDeviceId;
+      if (!this.agentTouched) {
+        const sessions = AppServices.instance.tasks.getSessions(nextDeviceId);
+        if (sessions.length > 0) {
+          this.selectedAgentKind = newAgentKindFromSession(sessions[0]);
+        }
+      }
+      void this.loadRuntimeDefaults(nextDeviceId, this.selectedAgentKind);
+    }
+  }
+
+  private canCreateOnDevice(deviceId: string): boolean {
+    if (deviceId.length === 0) return false;
+    for (let i = 0; i < this.devices.length; i++) {
+      const device = this.devices[i];
+      if (device.deviceId === deviceId) return device.online && device.remoteControlEnabled;
+    }
+    return false;
+  }
+
+  private recentProjects(): RecentProject[] {
+    // 与 Mobile 新建页一致：项目目录来自当前被控电脑最近使用过的任务。
+    const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId);
+    const out: RecentProject[] = [];
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i];
+      const path = session.workingDir.trim();
+      if (session.status === 'deleted' || session.workspaceKind === 'dialogue' || path.length === 0) continue;
+      let found = false;
+      for (let j = 0; j < out.length; j++) {
+        if (out[j].path === path) {
+          found = true;
+          if (session.updatedAt > out[j].lastActivityAt) out[j].lastActivityAt = session.updatedAt;
+          break;
+        }
+      }
+      if (!found) {
+        const project = new RecentProject();
+        project.path = path;
+        project.title = directoryTitle(path);
+        project.lastActivityAt = session.updatedAt;
+        out.push(project);
+      }
+    }
+    out.sort((a: RecentProject, b: RecentProject) => {
+      if (a.lastActivityAt === b.lastActivityAt) return a.path < b.path ? -1 : 1;
+      return a.lastActivityAt > b.lastActivityAt ? -1 : 1;
+    });
+    return out.slice(0, 8);
+  }
+
+  private selectAgent(kind: NewAgentKind): void {
+    if (this.creating) return;
+    this.agentTouched = true;
+    this.selectedAgentKind = kind;
+    this.selectorOpen = '';
+    this.error = '';
+    void this.loadRuntimeDefaults(this.selectedDeviceId, kind);
+  }
+
+  private selectModel(option: RuntimeModelOption): void {
+    if (this.creating) return;
+    this.model = option.id;
+    this.providerId = option.providerId;
+    if (option.defaultEffort.length > 0) {
+      this.effort = option.defaultEffort;
+    } else if (!this.modelSupportsEffort(option, this.effort) && option.efforts.length > 0) {
+      this.effort = option.efforts[0];
+    }
+    if (!this.fastModeCapability || !option.supportsFastMode) this.fastMode = false;
+    this.selectorOpen = '';
+    this.error = '';
+  }
+
+  private togglePlanMode(): void {
+    if (this.creating || !this.planModeSupported) return;
+    if (!this.planModeEnabled) {
+      this.permissionModeBeforePlan = this.permissionMode;
+    }
+    this.planModeEnabled = !this.planModeEnabled;
+  }
+
+  private toggleFastMode(): void {
+    const model = this.findModelOption(this.model, this.providerId);
+    if (!this.fastModeCapability || model === undefined || !model.supportsFastMode || this.creating) return;
+    this.fastMode = !this.fastMode;
+  }
+
+  private selectDialogue(): void {
+    this.workspaceKind = 'dialogue';
+    this.workingDir = '';
+    this.selectorOpen = '';
+    this.browseOpen = false;
+    this.showHiddenDirectories = false;
+  }
+
+  private selectProject(path: string): void {
+    const value = path.trim();
+    if (value.length === 0) return;
+    this.workspaceKind = 'project';
+    this.workingDir = value;
+    this.selectorOpen = '';
+    this.browseOpen = false;
+    this.browseError = '';
+    this.showHiddenDirectories = false;
+  }
+
+  private toggleSelector(name: string): void {
+    if (this.creating) return;
+    this.browseOpen = false;
+    this.browseError = '';
+    this.selectorOpen = this.selectorOpen === name ? '' : name;
+  }
+
+  /** Composer 的上下文 Sheet 与详情页同层级：图片、计划和运行时设置都从这里进入。 */
+  private openContextSheet(page: string = 'main'): void {
+    if (this.creating || this.pickingImages) return;
+    this.selectorOpen = '';
+    this.contextSheetPage = page;
+    this.contextSelectedUris = [];
+    try {
+      this.recentPickerController.setData(DataType.SET_SELECTED_URIS, []);
+    } catch (e) {
+      // Picker 尚未挂载时无需清理；下一次打开仍从空选择开始。
+    }
+    this.getUIContext().getFocusController().clearFocus();
+    this.contextSheetOpen = true;
+  }
+
+  private remainingImageSlots(): number {
+    return Math.max(0, MAX_COMPOSER_IMAGES - this.composerImages.length);
+  }
+
+  private selectRecentImage(uri: string): void {
+    if (uri.length === 0 || this.contextSelectedUris.includes(uri)) return;
+    if (this.contextSelectedUris.length >= this.remainingImageSlots()) {
+      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      return;
+    }
+    this.contextSelectedUris = this.contextSelectedUris.concat([uri]);
+  }
+
+  private deselectRecentImage(uri: string): void {
+    this.contextSelectedUris = this.contextSelectedUris.filter((value: string) => value !== uri);
+  }
+
+  private addRecentSelection(): void {
+    const uris = this.contextSelectedUris.slice();
+    this.contextSheetOpen = false;
+    this.contextSelectedUris = [];
+    this.enqueueImageUris(uris);
+  }
+
+  private pickImages(): void {
+    if (this.pickingImages || this.creating) return;
+    const remaining = this.remainingImageSlots();
+    if (remaining <= 0) {
+      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      return;
+    }
+    this.contextSheetOpen = false;
+    this.pickingImages = true;
+    setTimeout(() => {
+      pickImageUris(remaining).then((uris: string[]) => {
+        this.pickingImages = false;
+        this.enqueueImageUris(uris);
+      }).catch(() => {
+        this.pickingImages = false;
+      });
+    }, 160);
+  }
+
+  private pickScreenshots(): void {
+    if (this.pickingImages || this.creating) return;
+    const remaining = this.remainingImageSlots();
+    if (remaining <= 0) {
+      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      return;
+    }
+    this.contextSheetOpen = false;
+    this.pickingImages = true;
+    const context = getContext(this) as common.UIAbilityContext;
+    setTimeout(() => {
+      pickScreenshotUris(context, remaining).then((uris: string[]) => {
+        this.pickingImages = false;
+        this.enqueueImageUris(uris);
+      }).catch(() => {
+        this.pickingImages = false;
+        promptAction.showToast({ message: '无法打开截图选择器' });
+      });
+    }, 160);
+  }
+
+  private takePhoto(): void {
+    if (this.pickingImages || this.creating || this.remainingImageSlots() <= 0) {
+      if (this.remainingImageSlots() <= 0) {
+        promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      }
+      return;
+    }
+    this.contextSheetOpen = false;
+    this.pickingImages = true;
+    const context = getContext(this) as common.UIAbilityContext;
+    setTimeout(() => {
+      takePhotoUri(context).then((uri: string) => {
+        this.pickingImages = false;
+        if (uri.length > 0) this.enqueueImageUris([uri]);
+      }).catch(() => {
+        this.pickingImages = false;
+        promptAction.showToast({ message: '无法打开相机' });
+      });
+    }, 160);
+  }
+
+  private enqueueImageUris(uris: string[]): void {
+    let remaining = this.remainingImageSlots();
+    let accepted = 0;
+    for (let i = 0; i < uris.length && remaining > 0; i++) {
+      const uri = uris[i];
+      let duplicate = false;
+      for (let j = 0; j < this.composerImages.length; j++) {
+        if (this.composerImages[j].uri === uri) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) continue;
+      this.uploadComposerImage(uri, this.composerImages.length + accepted);
+      accepted += 1;
+      remaining -= 1;
+    }
+    if (uris.length > accepted && remaining <= 0) {
+      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+    }
+  }
+
+  private uploadComposerImage(uri: string, index: number): void {
+    const image = new ComposerImage();
+    image.uri = uri;
+    image.name = `image-${index + 1}`;
+    this.composerImages = this.composerImages.concat([image]);
+    buildImageCandidate(uri, index).then((candidate) => {
+      image.name = candidate.name;
+      return AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+        if (token === null || token.length === 0) throw new Error('未登录');
+        return uploadImage(candidate, token);
+      });
+    }).then((ref: RemoteImageRef) => {
+      image.ref = ref;
+      if (image.removed) {
+        this.recycleComposerImage(image);
+        return;
+      }
+      image.status = 'ready';
+      this.syncComposerImages();
+    }).catch(() => {
+      if (!image.removed) {
+        image.status = 'failed';
+        this.syncComposerImages();
+      }
+    });
+  }
+
+  private syncComposerImages(): void {
+    this.composerImages = this.composerImages.slice();
+  }
+
+  private removeComposerImage(image: ComposerImage): void {
+    if (this.creating) return;
+    image.removed = true;
+    const remaining: ComposerImage[] = [];
+    for (let i = 0; i < this.composerImages.length; i++) {
+      if (this.composerImages[i] !== image) remaining.push(this.composerImages[i]);
+    }
+    this.composerImages = remaining;
+    this.recycleComposerImage(image);
+  }
+
+  private recycleComposerImage(image: ComposerImage): void {
+    if (image.ref === null) return;
+    const parsed = parseAttachmentOssRef(image.ref.url);
+    if (parsed === null || parsed.ossKey.length === 0) return;
+    void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+      if (token !== null && token.length > 0) return deleteUpload(parsed.ossKey, token);
+      return Promise.resolve();
+    }).catch(() => {
+      // 删除中转对象是 best-effort，不阻断 Composer 操作。
+    });
+  }
+
+  private retryComposerImage(image: ComposerImage): void {
+    if (this.creating) return;
+    image.removed = true;
+    const remaining: ComposerImage[] = [];
+    for (let i = 0; i < this.composerImages.length; i++) {
+      if (this.composerImages[i] !== image) remaining.push(this.composerImages[i]);
+    }
+    this.composerImages = remaining;
+    this.uploadComposerImage(image.uri, this.composerImages.length);
+  }
+
+  private hasComposerContent(): boolean {
+    return this.input.trim().length > 0 || this.composerImages.length > 0;
+  }
+
+  private readyComposerImages(): RemoteImageRef[] {
+    const ready: RemoteImageRef[] = [];
+    for (let i = 0; i < this.composerImages.length; i++) {
+      const image = this.composerImages[i];
+      if (image.status === 'ready' && image.ref !== null) ready.push(image.ref);
+    }
+    return ready;
+  }
+
+  private canSend(): boolean {
+    if (this.creating) return false;
+    let readyCount = 0;
+    for (let i = 0; i < this.composerImages.length; i++) {
+      const image = this.composerImages[i];
+      if (image.status !== 'ready' || image.ref === null) return false;
+      readyCount += 1;
+    }
+    return this.input.trim().length > 0 || readyCount > 0;
+  }
+
+  private resetRuntimeDefaults(agent: NewAgentKind): void {
+    this.model = fallbackModel(agent);
+    this.providerId = '';
+    this.effort = 'medium';
+    this.permissionMode = 'auto';
+    this.permissionModeBeforePlan = 'auto';
+    this.planModeSupported = false;
+    this.planModeNative = false;
+    this.planModeEnabled = false;
+    this.fastMode = false;
+    this.modelOptions = [];
+    this.providerModelOptions = [];
+    this.providerModelAgent = '';
+    this.modelVisibilityOverrides = new Map();
+    this.effortOptions = [];
+    this.permissionOptions = [];
+    this.fastModeCapability = false;
+  }
+
+  private permissionLabel(id: string, fallback: string): string {
+    if (id === 'default') return '默认';
+    if (id === 'ask') return '每次询问';
+    if (id === 'acceptEdits') return '自动接受编辑';
+    if (id === 'bypassPermissions') return '完全访问';
+    if (id === 'auto') return '自动';
+    return fallback.length > 0 ? fallback : id;
+  }
+
+  private permissionDescription(id: string, fallback: string): string {
+    if (id === 'default') return '使用当前 Agent 的默认权限策略。';
+    if (id === 'ask') return '只读工具直接运行；写文件、执行命令和 MCP 工具每次询问。';
+    if (id === 'acceptEdits') return '自动允许文件编辑；其它敏感操作仍会询问。';
+    if (id === 'auto') return '工作区内写入和安全命令自动运行；高风险操作仍会询问。';
+    if (id === 'bypassPermissions') return '所有工具无需询问即可运行。风险最高，仅用于可信任务。';
+    return fallback;
+  }
+
+  private effortLabel(id: string, fallback: string): string {
+    if (id === 'minimal') return '最小';
+    if (id === 'low') return '低';
+    if (id === 'medium') return '中';
+    if (id === 'high') return '高';
+    if (id === 'xhigh') return '超高';
+    if (id === 'max') return '最高';
+    if (id === 'ultra') return '极致';
+    return fallback.length > 0 ? fallback : id;
+  }
+
+  private parseRuntimeChoices(value: Object | undefined, permission: boolean): RuntimeChoiceOption[] {
+    const out: RuntimeChoiceOption[] = [];
+    if (!Array.isArray(value)) return out;
+    const rows = value as Object[];
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      let id = '';
+      let label = '';
+      let description = '';
+      if (typeof raw === 'string') {
+        id = raw as string;
+      } else if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+        const record = raw as Record<string, Object>;
+        id = readStr(record, 'id');
+        label = readStr(record, 'displayName') || readStr(record, 'name');
+        description = readStr(record, 'description');
+      }
+      if (id.length === 0 || (permission && id === 'plan')) continue;
+      const option = new RuntimeChoiceOption();
+      option.id = id;
+      option.label = permission ? this.permissionLabel(id, label) : this.effortLabel(id, label);
+      option.description = permission ? this.permissionDescription(id, description) : description;
+      out.push(option);
+    }
+    return out;
+  }
+
+  private parseRuntimeModels(value: Object | undefined): RuntimeModelOption[] {
+    const out: RuntimeModelOption[] = [];
+    if (!Array.isArray(value)) return out;
+    const rows = value as Object[];
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      const option = new RuntimeModelOption();
+      if (typeof raw === 'string') {
+        option.id = raw as string;
+        option.label = option.id;
+      } else if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+        const record = raw as Record<string, Object>;
+        option.id = readStr(record, 'id');
+        option.label = readStr(record, 'displayName') || readStr(record, 'name') || option.id;
+        option.description = readStr(record, 'description');
+        option.defaultEffort = readStr(record, 'defaultEffort');
+        option.supportsFastMode = readBool(record, 'supportsFastMode', false);
+        const displayNames = readObj(record, 'effortDisplayNames');
+        const displayNameKeys = Object.keys(displayNames);
+        for (let j = 0; j < displayNameKeys.length; j++) {
+          const key = displayNameKeys[j];
+          const label = readStr(displayNames, key);
+          if (label.length > 0) option.effortDisplayNames[key] = label;
+        }
+        const rawEfforts = record['efforts'];
+        if (Array.isArray(rawEfforts)) {
+          const efforts = rawEfforts as Object[];
+          for (let j = 0; j < efforts.length; j++) {
+            if (typeof efforts[j] === 'string') option.efforts.push(efforts[j] as string);
+          }
+        }
+      }
+      if (option.id.length > 0) out.push(option);
+    }
+    return out;
+  }
+
+  /**
+   * 新会话也使用正常会话的 provider:list 模型目录；availableModels 仅作为旧桌面回退。
+   * 同名模型必须保留 providerId，否则新任务可能被路由到错误的凭证来源。
+   */
+  private parseProviderModelOptions(value: Object | undefined, agent: NewAgentKind): RuntimeModelOption[] {
+    if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return [];
+    const root = value as Record<string, Object>;
+    const rawProvidersValue = root['providers'];
+    if (!Array.isArray(rawProvidersValue)) return [];
+    const out: RuntimeModelOption[] = [];
+    const selected = this.latestSessionForAgent(agent);
+    const rawProviders = rawProvidersValue as Object[];
+    for (let i = 0; i < rawProviders.length; i++) {
+      const rawProvider = rawProviders[i];
+      if (rawProvider === null || typeof rawProvider !== 'object' || Array.isArray(rawProvider)) continue;
+      const provider = rawProvider as Record<string, Object>;
+      if (!readBool(provider, 'connected', false) || readBool(provider, 'suspended', false)) continue;
+      const providerId = readStr(provider, 'id');
+      if (providerId.length === 0 || !this.stringArrayHas(provider['agents'], agent)) continue;
+      const modelsByAgent = readObj(provider, 'models');
+      const rawModelsValue = modelsByAgent[agent];
+      if (!Array.isArray(rawModelsValue)) continue;
+      const access = readObj(provider, 'access');
+      const subscription = readStr(access, 'kind') === 'subscription';
+      const providerName = readStr(provider, 'name') || providerId;
+      const providerLogoKind = readStr(provider, 'logoKind');
+      const rawModels = rawModelsValue as Object[];
+      for (let j = 0; j < rawModels.length; j++) {
+        const rawModel = rawModels[j];
+        if (rawModel === null || typeof rawModel !== 'object' || Array.isArray(rawModel)) continue;
+        const model = rawModel as Record<string, Object>;
+        const id = readStr(model, 'id');
+        if (id.length === 0 || readBool(model, 'disabled', false)) continue;
+        const visibilityKey = `${agent}:${providerId}:${id}`;
+        const visibility = this.modelVisibilityOverrides.get(visibilityKey);
+        const selectedCurrent = selected !== undefined
+          && selected.model === id && selected.providerId === providerId;
+        if (visibility === false && !selectedCurrent) continue;
+        if (visibility === undefined && !readBool(model, 'defaultEnabled', true) && !selectedCurrent) continue;
+        const option = new RuntimeModelOption();
+        option.id = id;
+        option.label = readStr(model, 'name') || readStr(model, 'displayName') || id;
+        option.description = readStr(model, 'description');
+        option.defaultEffort = readStr(model, 'defaultEffort');
+        option.supportsFastMode = readBool(model, 'supportsFastMode', false);
+        option.providerId = providerId;
+        option.providerName = providerName;
+        option.providerLogoKind = providerLogoKind;
+        option.modelIcon = readStr(model, 'icon');
+        option.subscription = subscription;
+        const displayNames = readObj(model, 'effortDisplayNames');
+        const displayNameKeys = Object.keys(displayNames);
+        for (let k = 0; k < displayNameKeys.length; k++) {
+          const key = displayNameKeys[k];
+          const label = readStr(displayNames, key);
+          if (label.length > 0) option.effortDisplayNames[key] = label;
+        }
+        const rawEfforts = model['efforts'];
+        if (Array.isArray(rawEfforts)) {
+          const efforts = rawEfforts as Object[];
+          for (let k = 0; k < efforts.length; k++) {
+            if (typeof efforts[k] === 'string') option.efforts.push(efforts[k] as string);
+          }
+        }
+        out.push(option);
+      }
+    }
+    return out;
+  }
+
+  private latestSessionForAgent(agent: NewAgentKind): RemoteSession | undefined {
+    const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId);
+    let latest: RemoteSession | undefined = undefined;
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i];
+      if (session.status === 'deleted' || newAgentKindFromSession(session) !== agent) continue;
+      if (latest === undefined || session.updatedAt > latest.updatedAt) latest = session;
+    }
+    return latest;
+  }
+
+  private async loadProviderModelOptions(agent: NewAgentKind, deviceId: string): Promise<void> {
+    try {
+      await AppServices.instance.openLink(deviceId);
+      const options = new DlInvokeOptions();
+      options.channel = 'maker:provider:list';
+      const request = new ProviderListOptions();
+      request.capabilities = ['provider-logo-kinds-v2'];
+      options.args = [request];
+      const envelope = await AppServices.instance.client.invoke(deviceId, options);
+      const result = unwrapInvokeResult(envelope);
+      const providerOptions = this.parseProviderModelOptions(result, agent);
+      this.providerModelOptions = providerOptions;
+      this.providerModelAgent = providerOptions.length > 0 ? agent : '';
+      if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
+        const rawOverrides = (result as Record<string, Object>)['modelVisibilityOverrides'];
+        const nextOverrides = new Map<string, boolean>();
+        if (rawOverrides !== null && rawOverrides !== undefined
+          && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
+          const overrides = rawOverrides as Record<string, Object>;
+          const keys = Object.keys(overrides);
+          for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (typeof overrides[key] === 'boolean') nextOverrides.set(key, overrides[key] as boolean);
+          }
+        }
+        this.modelVisibilityOverrides = nextOverrides;
+        // Visibility overrides are part of the provider response. Reparse once so a
+        // hidden model cannot remain in the list produced before the map was loaded.
+        this.providerModelOptions = this.parseProviderModelOptions(result, agent);
+        this.providerModelAgent = this.providerModelOptions.length > 0 ? agent : '';
+      }
+    } catch (e) {
+      this.providerModelOptions = [];
+      this.providerModelAgent = '';
+      this.modelVisibilityOverrides = new Map();
+    }
+  }
+
+  private capabilityHasNativePlan(capabilities: Record<string, Object>): boolean {
+    return readBool(readObj(capabilities, 'planMode'), 'supported', false);
+  }
+
+  private capabilityHasLegacyPlan(capabilities: Record<string, Object>): boolean {
+    const modes = capabilities['permissionModes'];
+    if (!Array.isArray(modes)) return false;
+    const rows = modes as Object[];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i] === 'plan') return true;
+      if (rows[i] !== null && typeof rows[i] === 'object' && !Array.isArray(rows[i])
+        && readStr(rows[i] as Record<string, Object>, 'id') === 'plan') return true;
+    }
+    return false;
+  }
+
+  private findModelOption(modelId: string, preferredProviderId: string = ''): RuntimeModelOption | undefined {
+    const source = this.visibleModelOptions();
+    if (preferredProviderId.length > 0) {
+      for (let i = 0; i < source.length; i++) {
+        if (source[i].id === modelId && source[i].providerId === preferredProviderId) return source[i];
+      }
+    }
+    for (let i = 0; i < source.length; i++) {
+      if (source[i].id === modelId) return source[i];
+    }
+    return undefined;
+  }
+
+  private visibleModelOptions(): RuntimeModelOption[] {
+    if (this.providerModelOptions.length > 0 && this.providerModelAgent === this.selectedAgentKind) {
+      return this.providerModelOptions;
+    }
+    return this.modelOptions;
+  }
+
+  private modelOptionKey(option: RuntimeModelOption): string {
+    return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
+  }
+
+  private stringArrayHas(value: Object | undefined, expected: string): boolean {
+    if (!Array.isArray(value)) return false;
+    const values = value as Object[];
+    for (let i = 0; i < values.length; i++) {
+      if (values[i] === expected) return true;
+    }
+    return false;
+  }
+
+  private choiceExists(options: RuntimeChoiceOption[], id: string): boolean {
+    for (let i = 0; i < options.length; i++) {
+      if (options[i].id === id) return true;
+    }
+    return false;
+  }
+
+  private modelSupportsEffort(option: RuntimeModelOption, effort: string): boolean {
+    if (option.efforts.length === 0) return true;
+    for (let i = 0; i < option.efforts.length; i++) {
+      if (option.efforts[i] === effort) return true;
+    }
+    return false;
+  }
+
+  private modelEffortLabel(option: RuntimeModelOption, effort: string): string {
+    const custom = option.effortDisplayNames[effort];
+    return custom !== undefined && custom.length > 0 ? custom : this.effortLabel(effort, effort);
+  }
+
+  private currentEffortOptions(): RuntimeChoiceOption[] {
+    const model = this.findModelOption(this.model, this.providerId);
+    if (model === undefined || model.efforts.length === 0) return this.effortOptions;
+    const out: RuntimeChoiceOption[] = [];
+    for (let i = 0; i < model.efforts.length; i++) {
+      const id = model.efforts[i];
+      let matched: RuntimeChoiceOption | undefined;
+      for (let j = 0; j < this.effortOptions.length; j++) {
+        if (this.effortOptions[j].id === id) {
+          matched = this.effortOptions[j];
+          break;
+        }
+      }
+      const option = new RuntimeChoiceOption();
+      option.id = id;
+      option.label = matched === undefined ? this.modelEffortLabel(model, id) : this.modelEffortLabel(model, matched.id);
+      option.description = matched?.description ?? '';
+      out.push(option);
+    }
+    return out;
+  }
+
+  private currentModelLabel(): string {
+    const model = this.findModelOption(this.model, this.providerId);
+    return model === undefined ? (this.model || '选择模型') : model.label;
+  }
+
+  private currentEffortLabel(): string {
+    const model = this.findModelOption(this.model, this.providerId);
+    if (model !== undefined) return this.modelEffortLabel(model, this.effort);
+    return this.effort.length > 0 ? this.effortLabel(this.effort, this.effort) : '选择推理强度';
+  }
+
+  private currentModelSupportsFastMode(): boolean {
+    const model = this.findModelOption(this.model, this.providerId);
+    return this.fastModeCapability && model !== undefined && model.supportsFastMode;
+  }
+
+  private async loadRuntimeDefaults(deviceId: string, agent: NewAgentKind): Promise<void> {
+    if (deviceId.length === 0) return;
+    const generation = ++this.runtimeLoadGeneration;
+    this.resetRuntimeDefaults(agent);
+    try {
+      await AppServices.instance.openLink(deviceId);
+      const options = new DlInvokeOptions();
+      options.channel = 'maker:get-capabilities';
+      options.args = [agent];
+      const envelope = await AppServices.instance.client.invoke(deviceId, options);
+      const result = unwrapInvokeResult(envelope);
+      if (generation !== this.runtimeLoadGeneration
+        || result === undefined || typeof result !== 'object' || Array.isArray(result)) return;
+      const capabilities = result as Record<string, Object>;
+      this.modelOptions = this.parseRuntimeModels(capabilities['availableModels']);
+      this.effortOptions = this.parseRuntimeChoices(capabilities['effortLevels'], false);
+      this.permissionOptions = this.parseRuntimeChoices(capabilities['permissionModes'], true);
+      this.fastModeCapability = readBool(capabilities, 'hasFastMode', false);
+
+      this.planModeNative = this.capabilityHasNativePlan(capabilities);
+      this.planModeSupported = this.planModeNative || this.capabilityHasLegacyPlan(capabilities);
+      await this.loadProviderModelOptions(agent, deviceId);
+      if (generation !== this.runtimeLoadGeneration) return;
+
+      const recent = this.latestSessionForAgent(agent);
+      this.planModeEnabled = recent?.planModeEnabled === true || recent?.permissionMode === 'plan';
+      if (recent !== undefined && recent.permissionMode.length > 0 && recent.permissionMode !== 'plan') {
+        this.permissionMode = recent.permissionMode;
+        this.permissionModeBeforePlan = recent.permissionMode;
+      }
+      const source = this.visibleModelOptions();
+      let selectedModel: RuntimeModelOption | undefined = undefined;
+      if (recent !== undefined && recent.model.length > 0) {
+        selectedModel = this.findModelOption(recent.model, recent.providerId);
+      }
+      if (selectedModel === undefined) {
+        const fallback = fallbackModel(agent);
+        selectedModel = this.findModelOption(fallback);
+      }
+      if (selectedModel === undefined && source.length > 0) selectedModel = source[0];
+      if (selectedModel !== undefined) {
+        this.model = selectedModel.id;
+        this.providerId = selectedModel.providerId;
+        if (selectedModel.defaultEffort.length > 0) this.effort = selectedModel.defaultEffort;
+      }
+      const currentModel = this.findModelOption(this.model, this.providerId);
+      const effortValid = currentModel === undefined
+        ? this.choiceExists(this.effortOptions, this.effort)
+        : this.modelSupportsEffort(currentModel, this.effort)
+          && (this.effortOptions.length === 0 || this.choiceExists(this.effortOptions, this.effort));
+      if (this.effortOptions.length > 0 && !effortValid) {
+        this.effort = this.effortOptions[0].id;
+      }
+      if (this.permissionOptions.length > 0 && !this.choiceExists(this.permissionOptions, this.permissionMode)) {
+        this.permissionMode = this.choiceExists(this.permissionOptions, 'auto')
+          ? 'auto' : this.permissionOptions[0].id;
+        this.permissionModeBeforePlan = this.permissionMode;
+      }
+      this.fastMode = false;
+    } catch (e) {
+      // 旧版本被控端可能没有 capabilities；内置默认仍可被 create-session 校验。
+    }
+  }
+
+  private async loadBrowsePath(targetPath: string): Promise<void> {
+    if (this.selectedDeviceId.length === 0 || this.creating) return;
+    this.browseLoading = true;
+    this.browseError = '';
+    try {
+      await AppServices.instance.openLink(this.selectedDeviceId);
+      const options = new DlInvokeOptions();
+      options.channel = DlChannels.FS_LIST_DIR;
+      const request: Record<string, Object> = {};
+      request['path'] = targetPath.trim().length > 0 ? targetPath.trim() : '~';
+      options.args = [request];
+      const envelope = await AppServices.instance.client.invoke(this.selectedDeviceId, options);
+      const result = unwrapInvokeResult(envelope);
+      if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
+        throw new Error('目录返回格式无效');
+      }
+      const record = result as Record<string, Object>;
+      this.browsePath = readStr(record, 'resolvedPath');
+      this.browseParent = readStr(record, 'parent');
+      this.browseEntries = this.parseDirectories(record['entries']);
+    } catch (e) {
+      this.browseEntries = [];
+      this.browseError = e instanceof Error ? e.message : '无法读取远端目录';
+    } finally {
+      this.browseLoading = false;
+    }
+  }
+
+  private parseDirectories(value: Object | undefined): RemoteDirectory[] {
+    const out: RemoteDirectory[] = [];
+    if (!Array.isArray(value)) return out;
+    const rows = value as Object[];
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const record = raw as Record<string, Object>;
+      const path = readStr(record, 'path');
+      const name = readStr(record, 'name');
+      if (path.length === 0 || name.length === 0) continue;
+      const entry = new RemoteDirectory();
+      entry.path = path;
+      entry.name = name;
+      entry.kind = readStr(record, 'kind') || 'dir';
+      out.push(entry);
+    }
+    return out;
+  }
+
+  private visibleBrowseEntries(): RemoteDirectory[] {
+    if (this.showHiddenDirectories) return this.browseEntries;
+    return this.browseEntries.filter((entry: RemoteDirectory) => !entry.name.startsWith('.'));
+  }
+
+  private openProjectBrowse(): void {
+    if (this.selectedDeviceId.length === 0) {
+      promptAction.showToast({ message: '请先选择一台在线电脑' });
+      return;
+    }
+    this.workspaceKind = 'project';
+    this.selectorOpen = '';
+    this.browseOpen = true;
+    this.showHiddenDirectories = false;
+    void this.loadBrowsePath(this.workingDir.trim() || '~');
+  }
+
+  private selectCurrentBrowsePath(): void {
+    if (this.browsePath.length > 0) this.selectProject(this.browsePath);
+  }
+
+  private createOptions(): Record<string, Object> {
+    const options: Record<string, Object> = {};
+    options['agentKind'] = this.selectedAgentKind;
+    options['workspaceKind'] = this.workspaceKind;
+    options['model'] = this.model.trim() || fallbackModel(this.selectedAgentKind);
+    options['permissionMode'] = !this.planModeNative && this.planModeEnabled
+      ? 'plan' : this.permissionMode;
+    options['planMode'] = this.planModeNative && this.planModeEnabled;
+    options['fastMode'] = this.fastMode;
+    if (this.providerId.trim().length > 0) options['providerId'] = this.providerId.trim();
+    if (this.effort.trim().length > 0) options['effort'] = this.effort.trim();
+    if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir.trim();
+    return options;
+  }
+
+  private buildCreatedSession(sessionId: string, result: Record<string, Object>): RemoteSession {
+    const session = new RemoteSession();
+    session.id = sessionId;
+    session.workspaceKind = this.workspaceKind;
+    session.workingDir = readStr(result, 'workDir')
+      || (this.workspaceKind === 'project' ? this.workingDir.trim() : '');
+    session.model = this.model.trim() || fallbackModel(this.selectedAgentKind);
+    session.providerId = this.providerId;
+    session.effort = this.effort;
+    session.permissionMode = !this.planModeNative && this.planModeEnabled ? 'plan' : this.permissionMode;
+    session.planModeEnabled = this.planModeEnabled;
+    session.fastMode = this.fastMode;
+    session.agentKind = this.selectedAgentKind === 'claude-code' ? 'cc' : this.selectedAgentKind;
+    session.status = 'active';
+    return session;
+  }
+
+  private async sendToCreatedSession(
+    session: RemoteSession,
+    text: string,
+    images: RemoteImageRef[],
+  ): Promise<void> {
+    // 乐观标题预览：与桌面 / 手机端一致，首条用户消息先以截断文本占位，
+    // 不等被控端自动起名（被控端随后写入的占位也是 normalizeAutoTitle(text)）回流，
+    // 避免侧栏 / 会话头在发送后短暂显示「未命名任务」。被控端推送的权威标题会覆盖本预览。
+    if (text.length > 0 && (session.title.length === 0 || isDefaultDraftSessionTitle(session.title))) {
+      session.title = normalizeAutoTitle(text);
+    }
+    await AppServices.instance.messages.sendText(this.selectedDeviceId, session, text, images);
+    await AppServices.instance.tasks.loadSessions(this.selectedDeviceId);
+    const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId);
+    let present = false;
+    for (let i = 0; i < sessions.length; i++) {
+      if (sessions[i].id === session.id) {
+        present = true;
+        break;
+      }
+    }
+    if (!present) {
+      // 权威列表可能早于 sessions:created push 返回，保留占位直到下一次同步覆盖。
+      AppServices.instance.tasks.upsertSession(this.selectedDeviceId, session);
+    }
+    router.pushUrl({
+      url: 'pages/TaskPage',
+      params: { deviceId: this.selectedDeviceId, sessionId: session.id },
+    });
+  }
+
+  private async send(): Promise<void> {
+    const text = this.input.trim();
+    if (this.creating) return;
+    let uploading = false;
+    let failed = false;
+    for (let i = 0; i < this.composerImages.length; i++) {
+      if (this.composerImages[i].status === 'uploading') uploading = true;
+      if (this.composerImages[i].status === 'failed') failed = true;
+    }
+    if (uploading) {
+      promptAction.showToast({ message: '图片上传中，请稍候' });
+      return;
+    }
+    if (failed) {
+      promptAction.showToast({ message: '请重试或移除上传失败的图片' });
+      return;
+    }
+    const readyImages = this.readyComposerImages();
+    if (text.length === 0 && readyImages.length === 0) return;
+    if (!this.canCreateOnDevice(this.selectedDeviceId)) {
+      this.error = '请选择一台在线且允许远程控制的电脑';
+      return;
+    }
+    if (this.workspaceKind === 'project' && this.workingDir.trim().length === 0) {
+      this.error = '请选择项目目录';
+      this.selectorOpen = 'workspace';
+      return;
+    }
+    this.creating = true;
+    this.error = '';
+    try {
+      if (this.createdSession !== null) {
+        await this.sendToCreatedSession(this.createdSession, text, readyImages);
+        return;
+      }
+      await AppServices.instance.openLink(this.selectedDeviceId);
+      const options = new DlInvokeOptions();
+      options.channel = DlChannels.MAKER_CREATE_SESSION;
+      options.args = [this.createOptions()];
+      const envelope: Envelope = await AppServices.instance.client.invoke(this.selectedDeviceId, options);
+      const result = unwrapInvokeResult(envelope);
+      if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
+        throw new Error('新任务创建失败');
+      }
+      const record = result as Record<string, Object>;
+      const sessionId = readStr(record, 'sessionId');
+      if (sessionId.length === 0) throw new Error('电脑没有返回任务编号');
+      const session = this.buildCreatedSession(sessionId, record);
+      // 乐观标题预览：见 sendToCreatedSession 内说明。首条消息以截断文本占位，
+      // 让刚建好的任务在侧栏 / 会话头立即显示，而非「未命名任务」。
+      if (text.length > 0) {
+        session.title = normalizeAutoTitle(text);
+      }
+      this.createdSession = session;
+      AppServices.instance.tasks.upsertSession(this.selectedDeviceId, session);
+      await this.sendToCreatedSession(session, text, readyImages);
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : '创建任务失败，请重试';
+    } finally {
+      this.creating = false;
+    }
+  }
+
+  build() {
+    Column() {
+      this.topBar()
+      Column() {
+        Column() {
+          if (this.selectorOpen === 'agent') this.agentPanel()
+          this.agentSelector()
+          if (this.selectorOpen === 'workspace') this.workspacePanel()
+          this.workspaceSelector()
+          if (this.browseOpen) this.browsePanel()
+        }
+        .width('100%')
+        .padding({ left: 20, right: 20, bottom: 8 })
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.End)
+
+        this.composer()
+      }
+      .width('100%')
+      .layoutWeight(1)
+    }
+      .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.bg_page'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+    .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      dragBar: true,
+      showClose: false,
+      preferType: SheetType.BOTTOM,
+      backgroundColor: $r('app.color.bg_card'),
+      maskColor: $r('app.color.overlay'),
+    })
+  }
+
+  @Builder
+  topBar() {
+    Row() {
+      Button() {
+        SymbolGlyph($r('sys.symbol.chevron_left'))
+          .fontSize(20)
+          .fontColor([$r('app.color.text_primary')])
+      }
+      .type(ButtonType.Normal)
+      .width(44)
+      .height(44)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .onClick(() => router.back())
+      if (this.creating) {
+        LoadingProgress()
+          .width(16)
+          .height(16)
+          .color($r('app.color.text_secondary'))
+          .margin({ left: 8 })
+      }
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 16, right: 16 })
+  }
+
+  @Builder
+  selectorIcon(mark: string) {
+    Stack({ alignContent: Alignment.Center }) {
+      Text(mark)
+        .fontSize(mark === 'π' ? 18 : 9)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .width(24)
+    .height(24)
+  }
+
+  @Builder
+  agentSelector() {
+    Button() {
+      Row({ space: 10 }) {
+        this.selectorIcon(agentMark(this.selectedAgentKind))
+        Text(agentLabel(this.selectedAgentKind))
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(15)
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .width('100%')
+    }
+    .type(ButtonType.Normal)
+    .width('100%')
+    .height(42)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .enabled(!this.creating)
+    .onClick(() => this.toggleSelector('agent'))
+  }
+
+
+
+
+
+
+  @Builder
+  workspaceSelector() {
+    Button() {
+      Row({ space: 10 }) {
+        Text(this.workspaceKind === 'dialogue' ? '◯' : '□')
+          .fontSize(18)
+          .fontColor($r('app.color.text_secondary'))
+          .width(24)
+        Text(this.workspaceKind === 'dialogue' ? '对话' : directoryTitle(this.workingDir))
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(15)
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .width('100%')
+    }
+    .type(ButtonType.Normal)
+    .width('100%')
+    .height(42)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .enabled(!this.creating)
+    .onClick(() => this.toggleSelector('workspace'))
+  }
+
+
+  @Builder
+  agentPanel() {
+    Column() {
+      ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
+        Row({ space: 10 }) {
+          this.selectorIcon(agentMark(kind))
+          Text(agentLabel(kind))
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          if (kind === this.selectedAgentKind) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(18)
+              .fontColor([$r('app.color.text_primary')])
+          }
+        }
+        .width('100%')
+        .height(44)
+        .padding({ left: 10, right: 10 })
+        .onClick(() => this.selectAgent(kind))
+      }, (kind: NewAgentKind) => `new-agent:${kind}`)
+    }
+    .width('100%')
+    .padding(6)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(14)
+  }
+
+  @Builder
+  workspacePanel() {
+    Column() {
+      Row({ space: 10 }) {
+        Text('◯')
+          .fontSize(18)
+          .fontColor($r('app.color.text_secondary'))
+          .width(24)
+        Text('对话')
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+        if (this.workspaceKind === 'dialogue') {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(18)
+            .fontColor([$r('app.color.text_primary')])
+        }
+      }
+      .width('100%')
+      .height(44)
+      .padding({ left: 10, right: 10 })
+      .onClick(() => this.selectDialogue())
+      Divider()
+        .color($r('app.color.border'))
+        .strokeWidth(1)
+        .margin({ left: 10, right: 10 })
+      Scroll() {
+        Column() {
+          ForEach(this.recentProjects(), (project: RecentProject) => {
+            this.recentProjectOption(project)
+          }, (project: RecentProject) => `recent-project:${project.path}`)
+          if (this.recentProjects().length === 0) {
+            Text('还没有最近项目')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+              .padding({ left: 10, right: 10, top: 10, bottom: 10 })
+          }
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 260 })
+      .scrollBar(BarState.Off)
+      Divider()
+        .color($r('app.color.border'))
+        .strokeWidth(1)
+        .margin({ left: 10, right: 10 })
+      Row({ space: 10 }) {
+        SymbolGlyph($r('sys.symbol.folder'))
+          .fontSize(19)
+          .fontColor([$r('app.color.text_secondary')])
+          .width(24)
+        Text('选择其他项目文件夹')
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .height(48)
+      .padding({ left: 10, right: 10 })
+      .onClick(() => this.openProjectBrowse())
+    }
+    .width('100%')
+    .padding(6)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(14)
+  }
+
+  @Builder
+  recentProjectOption(project: RecentProject) {
+    Row({ space: 10 }) {
+      SymbolGlyph($r('sys.symbol.folder'))
+        .fontSize(19)
+        .fontColor([$r('app.color.text_secondary')])
+        .width(24)
+      Column({ space: 2 }) {
+        Text(project.title)
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+        Text(project.path)
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .layoutWeight(1)
+      if (this.workspaceKind === 'project' && this.workingDir === project.path) {
+        SymbolGlyph($r('sys.symbol.checkmark'))
+          .fontSize(18)
+          .fontColor([$r('app.color.text_primary')])
+      }
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 10, right: 10 })
+    .onClick(() => this.selectProject(project.path))
+  }
+
+  @Builder
+  browsePanel() {
+    Column() {
+      Row({ space: 8 }) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(15)
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .type(ButtonType.Normal)
+        .width(32)
+        .height(32)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.browseParent.length > 0 && !this.browseLoading)
+        .onClick(() => void this.loadBrowsePath(this.browseParent))
+        Text(this.browseLoading ? '读取目录…' : (this.browsePath || '远端项目目录'))
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        if (this.browseLoading) {
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color($r('app.color.text_secondary'))
+        }
+      }
+      .width('100%')
+      .height(36)
+      Scroll() {
+        Column() {
+          ForEach(this.visibleBrowseEntries(), (entry: RemoteDirectory) => {
+            this.browseEntry(entry)
+          }, (entry: RemoteDirectory) => `browse:${entry.path}`)
+          if (!this.browseLoading && this.browseError.length === 0 && this.visibleBrowseEntries().length === 0) {
+            Text('这个目录下没有可显示的文件夹')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+              .padding({ left: 10, right: 10, top: 12, bottom: 12 })
+          }
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 220 })
+      .scrollBar(BarState.Off)
+      if (this.browseError.length > 0) {
+        Text(this.browseError)
+          .fontSize(12)
+          .fontColor($r('app.color.danger'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+      }
+      Row({ space: 8 }) {
+        Row({ space: 8 }) {
+          Stack({ alignContent: Alignment.Center }) {
+            if (this.showHiddenDirectories) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(12)
+                .fontColor([$r('app.color.text_primary')])
+            }
+          }
+          .width(18)
+          .height(18)
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(5)
+          Text('显示隐藏文件夹')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .layoutWeight(1)
+        .onClick(() => {
+          this.showHiddenDirectories = !this.showHiddenDirectories;
+        })
+        Button('使用当前目录')
+          .type(ButtonType.Normal)
+          .height(30)
+          .padding({ left: 10, right: 10 })
+          .fontSize(12)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(17)
+          .enabled(this.browsePath.length > 0 && !this.browseLoading)
+          .onClick(() => this.selectCurrentBrowsePath())
+      }
+      .width('100%')
+      .height(38)
+    }
+    .width('100%')
+    .padding(6)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(14)
+  }
+
+  @Builder
+  browseEntry(entry: RemoteDirectory) {
+    Row({ space: 10 }) {
+      SymbolGlyph($r('sys.symbol.folder'))
+        .fontSize(18)
+        .fontColor([$r('app.color.text_secondary')])
+        .width(24)
+      Column({ space: 2 }) {
+        Text(entry.name)
+          .fontSize(14)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+        Text(entry.path)
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .layoutWeight(1)
+      Button() {
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(15)
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .type(ButtonType.Normal)
+      .width(30)
+      .height(30)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .onClick(() => void this.loadBrowsePath(entry.path))
+    }
+    .width('100%')
+    .height(46)
+    .padding({ left: 10, right: 4 })
+    .onClick(() => this.selectProject(entry.path))
+  }
+
+  @Builder
+  contextRowIcon(symbol: Resource) {
+    Stack({ alignContent: Alignment.Center }) {
+      SymbolGlyph(symbol)
+        .fontSize(newSessionFontSize(22))
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .width(36)
+    .height(36)
+    .borderRadius(8)
+    .backgroundColor($r('app.color.bg_chip'))
+  }
+
+  @Builder
+  contextActionRow(symbol: Resource, title: string, action: () => void) {
+    Row({ space: 12 }) {
+      this.contextRowIcon(symbol)
+      Text(title)
+        .fontSize(newSessionFontSize(16))
+        .fontColor($r('app.color.text_primary'))
+        .layoutWeight(1)
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(newSessionFontSize(14))
+        .fontColor([$r('app.color.text_tertiary')])
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 56 })
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .onClick(action)
+  }
+
+  private selectContextPermission(option: RuntimeChoiceOption): void {
+    if (this.creating) return;
+    if (option.id === 'bypassPermissions') {
+      this.getUIContext().showAlertDialog({
+        title: '确认完全访问',
+        message: 'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。',
+        primaryButton: {
+          value: '取消',
+          action: () => {
+          },
+        },
+        secondaryButton: {
+          value: '继续',
+          action: () => {
+            this.permissionMode = option.id;
+            this.permissionModeBeforePlan = option.id;
+            this.contextSheetOpen = false;
+          },
+        },
+      });
+      return;
+    }
+    this.permissionMode = option.id;
+    this.permissionModeBeforePlan = option.id;
+    this.contextSheetOpen = false;
+    this.error = '';
+  }
+
+  private selectContextModel(option: RuntimeModelOption): void {
+    this.selectModel(option);
+    this.contextSheetOpen = false;
+  }
+
+  private selectContextEffort(option: RuntimeChoiceOption): void {
+    if (this.creating) return;
+    this.effort = option.id;
+    this.error = '';
+  }
+
+  private openContextModelOptions(option: RuntimeModelOption): void {
+    if (this.creating) return;
+    if (option.id === this.model && option.providerId === this.providerId) {
+      this.contextSheetPage = 'model-options';
+      return;
+    }
+    this.selectContextModel(option);
+  }
+
+  @Builder
+  contextMainView() {
+    Scroll() {
+      Column() {
+        Column({ space: 6 }) {
+          PhotoPickerComponent({
+            pickerOptions: this.recentPickerOptions,
+            pickerController: this.recentPickerController,
+            onSelect: (uri: string): void => this.selectRecentImage(uri),
+            onDeselect: (uri: string): void => this.deselectRecentImage(uri),
+          })
+            .width('100%')
+            .height(104)
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+
+        if (this.contextSelectedUris.length > 0) {
+          Button(`加入对话 (${this.contextSelectedUris.length})`)
+            .width('calc(100% - 32vp)')
+            .height(42)
+            .fontSize(newSessionFontSize(15))
+            .fontColor($r('app.color.chat_cta_text'))
+            .backgroundColor($r('app.color.chat_cta'))
+            .borderRadius(8)
+            .margin({ left: 16, right: 16, bottom: 10 })
+            .onClick(() => this.addRecentSelection())
+        }
+
+        Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+
+        if (this.planModeSupported) {
+          Row({ space: 12 }) {
+            this.contextRowIcon($r('sys.symbol.list_bullet'))
+            Column({ space: 2 }) {
+              Text('计划模式')
+                .fontSize(newSessionFontSize(16))
+                .fontColor($r('app.color.text_primary'))
+              Text('先生成计划，确认后再执行')
+                .fontSize(newSessionFontSize(12))
+                .fontColor($r('app.color.text_tertiary'))
+            }
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.planModeEnabled })
+              .enabled(!this.creating)
+              .onChange(() => this.togglePlanMode())
+          }
+          .width('100%')
+          .constraintSize({ minHeight: 64 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+
+          Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        }
+
+        this.contextActionRow($r('sys.symbol.picture'), '照片', () => this.pickImages())
+        Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        this.contextActionRow($r('sys.symbol.snapshot'), '截图', () => this.pickScreenshots())
+        Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        this.contextActionRow($r('sys.symbol.camera'), '拍照', () => this.takePhoto())
+      }
+      .width('100%')
+      .padding({ bottom: 24 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  permissionContextView() {
+    Scroll() {
+      Column() {
+        ForEach(this.permissionOptions, (option: RuntimeChoiceOption) => {
+          Row({ space: 12 }) {
+            this.contextRowIcon($r('sys.symbol.lock'))
+            Column({ space: 2 }) {
+              Text(option.label)
+                .fontSize(newSessionFontSize(16))
+                .fontColor($r('app.color.text_primary'))
+              if (option.description.length > 0) {
+                Text(option.description)
+                  .fontSize(newSessionFontSize(12))
+                  .fontColor($r('app.color.text_tertiary'))
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+            }
+            .layoutWeight(1)
+            if (option.id === this.permissionMode) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(newSessionFontSize(18))
+                .fontColor([$r('app.color.chat_cta')])
+            }
+          }
+          .width('100%')
+          .constraintSize({ minHeight: 58 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .opacity(this.creating ? 0.55 : 1)
+          .onClick(() => this.selectContextPermission(option))
+          Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        }, (option: RuntimeChoiceOption) => option.id)
+      }
+      .width('100%')
+      .padding({ top: 8, bottom: 24 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  contextModelRow(option: RuntimeModelOption) {
+    Row({ space: 10 }) {
+      this.selectorIcon(agentMark(this.selectedAgentKind))
+      Column({ space: 1 }) {
+        Text(option.label)
+          .fontSize(newSessionFontSize(16))
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (option.providerName.length > 0 || option.description.length > 0) {
+          Text(option.providerName.length > 0 ? option.providerName : option.description)
+            .fontSize(newSessionFontSize(12))
+            .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .layoutWeight(1)
+      if (option.id === this.model && option.providerId === this.providerId) {
+        SymbolGlyph($r('sys.symbol.checkmark'))
+          .fontSize(newSessionFontSize(18))
+          .fontColor([$r('app.color.chat_cta')])
+      }
+      if (option.efforts.length > 0 || option.supportsFastMode) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
+            .fontSize(newSessionFontSize(18))
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .width(34)
+        .height(34)
+        .padding(0)
+        .borderRadius(17)
+        .backgroundColor(Color.Transparent)
+        .onClick(() => this.openContextModelOptions(option))
+      }
+    }
+    .width('100%')
+    .constraintSize({ minHeight: option.providerName.length > 0 ? 58 : 46 })
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .backgroundColor(option.id === this.model && option.providerId === this.providerId
+      ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(28)
+    .onClick(() => this.selectContextModel(option))
+  }
+
+  @Builder
+  modelContextView() {
+    Scroll() {
+      Column({ space: 8 }) {
+        if (this.visibleModelOptions().length === 0) {
+          Text('当前电脑未提供模型列表')
+            .fontSize(newSessionFontSize(14))
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+            .textAlign(TextAlign.Center)
+            .padding({ top: 28, bottom: 28 })
+        } else {
+          ForEach(this.visibleModelOptions(), (option: RuntimeModelOption) => {
+            this.contextModelRow(option)
+          }, (option: RuntimeModelOption) => this.modelOptionKey(option))
+        }
+      }
+      .width('100%')
+      .padding({ top: 8, bottom: 24 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  modelOptionsContextView() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Text(this.currentModelLabel())
+          .fontSize(newSessionFontSize(19))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+          .padding({ left: 20, right: 20, top: 18, bottom: 4 })
+
+        if (this.currentEffortOptions().length > 0) {
+          Column({ space: 8 }) {
+            Text('推理强度')
+              .fontSize(newSessionFontSize(14))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+              .width('100%')
+            Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+              ForEach(this.currentEffortOptions(), (option: RuntimeChoiceOption) => {
+                Button(option.label)
+                  .height(38)
+                  .fontSize(newSessionFontSize(14))
+                  .fontColor(option.id === this.effort
+                    ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
+                  .backgroundColor(option.id === this.effort
+                    ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+                  .borderRadius(19)
+                  .margin({ right: 8, bottom: 8 })
+                  .enabled(!this.creating)
+                  .onClick(() => this.selectContextEffort(option))
+              }, (option: RuntimeChoiceOption) => option.id)
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding({ left: 20, right: 20, top: 12 })
+        }
+
+        if (this.currentModelSupportsFastMode()) {
+          Row({ space: 12 }) {
+            this.contextRowIcon($r('sys.symbol.bolt'))
+            Column({ space: 2 }) {
+              Text('Fast 模式')
+                .fontSize(newSessionFontSize(16))
+                .fontColor($r('app.color.text_primary'))
+              Text('使用当前模型的快速服务通道')
+                .fontSize(newSessionFontSize(12))
+                .fontColor($r('app.color.text_tertiary'))
+            }
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.fastMode })
+              .enabled(!this.creating)
+              .onChange(() => this.toggleFastMode())
+          }
+          .width('100%')
+          .padding({ left: 20, right: 20, top: 8, bottom: 8 })
+        }
+      }
+      .width('100%')
+      .padding({ bottom: 24 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  contextSheet() {
+    Column() {
+      Row() {
+        if (this.contextSheetPage !== 'main') {
+          Button() {
+            SymbolGlyph($r('sys.symbol.chevron_left'))
+              .fontSize(newSessionFontSize(20))
+              .fontColor([$r('app.color.text_primary')])
+          }
+          .width(36)
+          .height(36)
+          .padding(0)
+          .borderRadius(18)
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.contextSheetPage = this.contextSheetPage === 'model-options' ? 'model' : 'main';
+          })
+        } else {
+          Row().width(36).height(36)
+        }
+        Text(this.contextSheetPage === 'permission'
+          ? '权限模式'
+          : this.contextSheetPage === 'model-options'
+            ? '推理设置'
+            : this.contextSheetPage === 'model'
+              ? '模型'
+              : '上下文')
+          .fontSize(newSessionFontSize(17))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .textAlign(TextAlign.Center)
+          .layoutWeight(1)
+        Row().width(36).height(36)
+      }
+      .width('100%')
+      .height(44)
+      .padding({ left: 12, right: 12 })
+
+      Divider()
+        .strokeWidth(0.5)
+        .color($r('app.color.border'))
+
+      if (this.contextSheetPage === 'permission') {
+        this.permissionContextView()
+      } else if (this.contextSheetPage === 'model') {
+        this.modelContextView()
+      } else if (this.contextSheetPage === 'model-options') {
+        this.modelOptionsContextView()
+      } else {
+        this.contextMainView()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.bg_card'))
+  }
+
+  @Builder
+  composer() {
+    Column({ space: 6 }) {
+      if (this.error.length > 0) {
+        Text(this.error)
+          .fontSize(12)
+          .fontColor($r('app.color.danger'))
+          .width('100%')
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .padding({ left: 12, right: 12 })
+      }
+      ConversationComposer({
+        input: this.input,
+        focused: this.composerFocused,
+        images: this.composerImages,
+        pickingImages: this.pickingImages,
+        sending: this.creating,
+        streaming: false,
+        hasContent: this.hasComposerContent(),
+        canSend: this.canSend(),
+        composerEnabled: true,
+        contextBusy: this.creating,
+        hasPermissionOptions: this.permissionOptions.length > 0,
+        hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
+        permissionMode: this.permissionMode,
+        planModeEnabled: this.planModeEnabled,
+        modelLabel: this.currentModelLabel(),
+        effortLabel: this.currentEffortLabel(),
+        showAddButton: true,
+        showStreamingStatus: false,
+        inputId: 'new-session-composer-input',
+        onInputChange: (value: string): void => {
+          this.input = value;
+          this.error = '';
+        },
+        onFocusChange: (focused: boolean): void => {
+          this.composerFocused = focused;
+        },
+        onAdd: (): void => this.openContextSheet(),
+        onPermission: (): void => this.openContextSheet('permission'),
+        onModel: (): void => this.openContextSheet('model'),
+        onPlanToggle: (): void => this.togglePlanMode(),
+        onSend: (): void => {
+          void this.send();
+        },
+        onRemoveImage: (image: ComposerImage): void => this.removeComposerImage(image),
+        onRetryImage: (image: ComposerImage): void => this.retryComposerImage(image),
+      })
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 2 })
+  }
+}

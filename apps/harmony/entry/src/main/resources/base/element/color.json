@@ -2,127 +2,111 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#EDEDED"
+      "value": "#F8F8F6"
     },
     {
       "name": "text_primary",
-      "value": "#3C3F43"
+      "value": "#262626"
     },
     {
       "name": "text_secondary",
-      "value": "#8C8E94"
+      "value": "#737373"
     },
     {
       "name": "text_tertiary",
-      "value": "#686B72"
+      "value": "#A3A3A3"
+    },
+    {
+      "name": "text_placeholder",
+      "value": "#C4C4C4"
     },
     {
       "name": "bg_page",
-      "value": "#EDEDED"
+      "value": "#F8F8F6"
     },
     {
       "name": "bg_card",
-      "value": "#F8F8F8"
+      "value": "#FFFFFF"
     },
     {
       "name": "bg_chip",
-      "value": "#F1F1F1"
+      "value": "#E5E5E5"
     },
     {
       "name": "bg_code",
-      "value": "#F5F5F5"
+      "value": "#F0F0EE"
     },
     {
       "name": "code_text",
-      "value": "#3C3F43"
-    },
-    {
-      "name": "code_accent",
-      "value": "#C7254E"
+      "value": "#262626"
     },
     {
       "name": "accent",
-      "value": "#1D4ED8"
+      "value": "#417CDD"
     },
     {
       "name": "danger",
-      "value": "#D33"
+      "value": "#D91F37"
     },
     {
       "name": "success",
-      "value": "#3A3"
+      "value": "#2AAE5B"
     },
     {
       "name": "warn",
-      "value": "#B8860B"
+      "value": "#F3A115"
     },
     {
       "name": "border",
-      "value": "#DCDFE3"
+      "value": "#D7D7D4"
     },
     {
       "name": "overlay",
-      "value": "#66000000"
-    },
-    {
-      "name": "task_list_row_surface",
-      "value": "#F6F6F6"
+      "value": "#66262626"
     },
     {
       "name": "task_list_group_surface",
-      "value": "#EAEAEA"
+      "value": "#FFFFFF"
     },
     {
       "name": "task_list_menu_surface",
-      "value": "#F8F8F8"
+      "value": "#FFFFFF"
     },
     {
       "name": "task_list_overlay",
       "value": "#59262626"
     },
     {
-      "name": "task_list_fab_surface",
-      "value": "#3C3F43"
-    },
-    {
-      "name": "task_list_fab_border",
-      "value": "#003C3F43"
-    },
-    {
-      "name": "task_list_fab_icon",
-      "value": "#FCFCFC"
-    },
-    {
       "name": "chat_header_surface",
-      "value": "#E6F6F6F6"
+      "value": "#E6F8F8F6"
     },
     {
       "name": "chat_header_divider",
-      "value": "#DCDFE3"
+      "value": "#D7D7D4"
     },
     {
       "name": "chat_text_secondary",
-      "value": "#8C8E94"
+      "value": "#737373"
     },
     {
       "name": "chat_bubble_border",
-      "value": "#686B72"
+      "value": "#D7D7D4"
     },
     {
       "name": "composer_surface",
-      "value": "#F8F8F8"
+      "value": "#FFFFFF"
     },
     {
       "name": "composer_border",
-      "value": "#DCDFE3"
+      "value": "#D7D7D4"
     },
     {
       "name": "chat_cta",
-      "value": "#3C3F43"
+      "value": "#000000"
     },
     {
       "name": "chat_cta_text",
-      "value": "#FCFCFC"
+      "value": "#FFFFFF"
     },
     {
       "name": "chat_status_accent",
@@ -134,11 +118,11 @@
     },
     {
       "name": "chat_fab_surface",
-      "value": "#C7EDEDED"
+      "value": "#CCFFFFFF"
     },
     {
       "name": "chat_fab_border",
-      "value": "#9EC6C9CE"
+      "value": "#59D7D7D4"
     },
     {
       "name": "chat_overlay_surface",

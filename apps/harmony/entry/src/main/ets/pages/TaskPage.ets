@@ -6,24 +6,54 @@
  * - thinking 默认折叠，点击展开；
  * - tool_group 默认展开，点击折叠；
  * - 消息动作（复制/Fork/Rewind）在切片 2.3 接入。
+ *
+ * 视觉与运行时选项解析复用 components/UiKit 与 core/ComposerCatalog，
+ * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
 import { router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
-import {
-  photoAccessHelper, PhotoPickerComponent, PickerController, PickerOptions,
-  SelectMode, PickerOrientation, SingleLineConfig, ItemInfo, DataType,
-} from '@kit.MediaLibraryKit';
+import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
-import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
-import { uploadImage, presignGet, deleteUpload } from '../core/attachments/AttachmentUpload';
+import { presignGet } from '../core/attachments/AttachmentUpload';
 import { RemoteImageRef, RemoteMediaFetchResult } from '../core/attachments/AttachmentModels';
 import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
+import { ComposerImageQueue, MAX_COMPOSER_IMAGES, createRecentPickerOptions } from '../core/attachments/ComposerImageQueue';
 import { PendingInteraction } from '../core/interactions/InteractionStore';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
+import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import {
+  UI_CLICK_EFFECT,
+  UI_ICON_CLICK_EFFECT,
+  UI_CURVE_MOVE,
+  UI_MOTION_BASE,
+  UI_MOTION_FAST,
+  UI_RADIUS_CONTAINER,
+  UI_RADIUS_CONTROL,
+  UI_RADIUS_PILL,
+  uiFontSize,
+  uiLineHeight,
+  uiOverlayEnterTransition,
+  uiRevealTransition,
+} from '../components/UiKit';
+import {
+  ComposerChoiceOption,
+  ComposerModelOption,
+  ModelSelectionHint,
+  ProviderListOptions,
+  composerModelKey,
+  effortLevelLabel,
+  modelProviderKind,
+  parseChoiceOptions,
+  parseModelOptions,
+  parseModelVisibilityOverrides,
+  parseProviderModelOptions,
+  permissionModeDescription,
+  permissionModeLabel,
+} from '../core/ComposerCatalog';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readNum, readObj, readStr } from '../core/tasks/TaskModels';
 import {
@@ -45,49 +75,7 @@ class WorkPreviewRow {
   error: boolean = false;
 }
 
-class ComposerChoiceOption {
-  id: string = '';
-  label: string = '';
-  description: string = '';
-}
-
-class ProviderListOptions {
-  capabilities: string[] = [];
-}
-
-class ComposerModelOption {
-  id: string = '';
-  label: string = '';
-  description: string = '';
-  efforts: string[] = [];
-  defaultEffort: string = '';
-  supportsFastMode: boolean = false;
-  effortDisplayNames: Record<string, string> = {};
-  /** provider-aware 目录行；空值表示旧 capabilities 扁平回退。 */
-  providerId: string = '';
-  providerName: string = '';
-  providerLogoKind: string = '';
-  modelIcon: string = '';
-  subscription: boolean = false;
-}
-
-const MAX_COMPOSER_IMAGES = 20;
-const TASK_DETAIL_FONT_SCALE = 0.84;
-const TASK_DETAIL_MIN_FONT_SIZE = 8;
-const TASK_DETAIL_MIN_LINE_HEIGHT = 10;
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
-
-function taskDetailFontSize(base: number): number {
-  return Math.max(TASK_DETAIL_MIN_FONT_SIZE, Math.round(base * TASK_DETAIL_FONT_SCALE));
-}
-
-function taskDetailLineHeight(base: number): number {
-  return Math.max(TASK_DETAIL_MIN_LINE_HEIGHT, Math.round(base * TASK_DETAIL_FONT_SCALE));
-}
-
-function taskDetailDimension(base: number): number {
-  return Math.max(1, Math.round(base * TASK_DETAIL_FONT_SCALE));
-}
 
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
@@ -97,21 +85,6 @@ function modelAgentLabel(kind: string): string {
 
 function modelAgentId(kind: string): string {
   return kind === 'cc' ? 'claude-code' : kind;
-}
-
-function createRecentPickerOptions(): PickerOptions {
-  const options = new PickerOptions();
-  options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
-  options.maxSelectNumber = MAX_COMPOSER_IMAGES;
-  options.maxPhotoSelectNumber = MAX_COMPOSER_IMAGES;
-  options.selectMode = SelectMode.MULTI_SELECT;
-  options.orientation = PickerOrientation.HORIZONTAL;
-  options.isPhotoTakingSupported = false;
-  const singleLine = new SingleLineConfig();
-  singleLine.itemBorderRadius = 6;
-  singleLine.itemGap = 6;
-  options.singleLineConfig = singleLine;
-  return options;
 }
 function queryValue(query: string, key: string): string {
   const pairs = query.split('&');
@@ -200,9 +173,10 @@ export struct TaskPageContent {
   /** 当前手势是否明确向消息尾部移动。 */
   private listTouchPushedUp: boolean = false;
   private listTouchLoadTriggered: boolean = false;
-  /** 待发送图片（上传状态）。 */
+  /** 待发送图片（上传状态，由共享队列同步镜像）。 */
   @State composerImages: ComposerImage[] = [];
-  private pickingImages: boolean = false;
+  @State pickingImages: boolean = false;
+  private imageQueue: ComposerImageQueue = new ComposerImageQueue();
   /** 发送开始后的输入变更不会被旧请求的成功回调清空。 */
   private composerInputRevision: number = 0;
   /** Composer 加号的原生上下文 Sheet。 */
@@ -257,6 +231,13 @@ export struct TaskPageContent {
 
   aboutToAppear(): void {
     this.stopWorkClock();
+    this.imageQueue.onChanged = (images: ComposerImage[]): void => {
+      this.composerImages = images;
+    };
+    this.imageQueue.onPickingChanged = (picking: boolean): void => {
+      this.pickingImages = picking;
+    };
+    this.imageQueue.isBusy = (): boolean => this.sending;
     const params = router.getParams() as Record<string, Object>;
     this.deviceId = this.paneDeviceId.length > 0
       ? this.paneDeviceId
@@ -399,189 +380,12 @@ export struct TaskPageContent {
     return session.agentKind === 'cc' ? 'claude-code' : session.agentKind;
   }
 
-  private permissionLabel(id: string, fallback: string): string {
-    if (id === 'default') return '默认';
-    if (id === 'ask') return '每次询问';
-    if (id === 'acceptEdits') return '自动接受编辑';
-    if (id === 'bypassPermissions') return '完全访问';
-    if (id === 'auto') return '自动';
-    return fallback.length > 0 ? fallback : id;
-  }
-
-  private permissionDescription(id: string, fallback: string): string {
-    if (id === 'default') return '使用当前 Agent 的默认权限策略。';
-    if (id === 'ask') return '只读工具直接运行；写文件、执行命令和 MCP 工具每次询问。';
-    if (id === 'acceptEdits') return '自动允许文件编辑；其它敏感操作仍会询问。';
-    if (id === 'auto') return '工作区内写入和安全命令自动运行；高风险操作仍会询问。';
-    if (id === 'bypassPermissions') return '所有工具无需询问即可运行。风险最高，仅用于可信任务。';
-    return fallback;
-  }
-
-  private effortLabel(id: string, fallback: string): string {
-    if (id === 'minimal') return '最小';
-    if (id === 'low') return '低';
-    if (id === 'medium') return '中';
-    if (id === 'high') return '高';
-    if (id === 'xhigh') return '超高';
-    if (id === 'max') return '最高';
-    if (id === 'ultra') return '极致';
-    return fallback.length > 0 ? fallback : id;
-  }
-
-  private parseChoiceOptions(value: Object | undefined, permission: boolean): ComposerChoiceOption[] {
-    const out: ComposerChoiceOption[] = [];
-    if (!Array.isArray(value)) {
-      return out;
-    }
-    const rows = value as Object[];
-    for (let i = 0; i < rows.length; i++) {
-      const raw = rows[i];
-      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-        continue;
-      }
-      const record = raw as Record<string, Object>;
-      const id = readStr(record, 'id');
-      if (id.length === 0 || (permission && id === 'plan')) {
-        continue;
-      }
-      const option = new ComposerChoiceOption();
-      option.id = id;
-      const displayName = readStr(record, 'displayName');
-      option.label = permission
-        ? this.permissionLabel(id, displayName)
-        : this.effortLabel(id, displayName);
-      option.description = permission
-        ? this.permissionDescription(id, readStr(record, 'description'))
-        : readStr(record, 'description');
-      out.push(option);
-    }
-    return out;
-  }
-
-  private parseModelOptions(value: Object | undefined): ComposerModelOption[] {
-    const out: ComposerModelOption[] = [];
-    if (!Array.isArray(value)) {
-      return out;
-    }
-    const rows = value as Object[];
-    for (let i = 0; i < rows.length; i++) {
-      const raw = rows[i];
-      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-        continue;
-      }
-      const record = raw as Record<string, Object>;
-      const id = readStr(record, 'id');
-      if (id.length === 0) {
-        continue;
-      }
-      const option = new ComposerModelOption();
-      option.id = id;
-      option.label = readStr(record, 'displayName') || id;
-      option.description = readStr(record, 'description');
-      const rawEfforts = record['efforts'];
-      if (Array.isArray(rawEfforts)) {
-        const effortValues = rawEfforts as Object[];
-        for (let j = 0; j < effortValues.length; j++) {
-          if (typeof effortValues[j] === 'string') {
-            option.efforts.push(effortValues[j] as string);
-          }
-        }
-      }
-      option.defaultEffort = readStr(record, 'defaultEffort');
-      option.supportsFastMode = readBool(record, 'supportsFastMode', false);
-      const displayNames = readObj(record, 'effortDisplayNames');
-      const displayNameKeys = Object.keys(displayNames);
-      for (let j = 0; j < displayNameKeys.length; j++) {
-        const key = displayNameKeys[j];
-        const label = readStr(displayNames, key);
-        if (label.length > 0) option.effortDisplayNames[key] = label;
-      }
-      out.push(option);
-    }
-    return out;
-  }
-
-  private stringArrayHas(value: Object | undefined, expected: string): boolean {
-    if (!Array.isArray(value)) return false;
-    const values = value as Object[];
-    for (let i = 0; i < values.length; i++) {
-      if (values[i] === expected) return true;
-    }
-    return false;
-  }
-
-  /**
-   * 解析被控端 maker:provider:list 的 per-provider 模型目录。
-   * capabilities.availableModels 是跨 provider 去重后的旧平面列表，只能作为旧主机回退；
-   * 只要 provider:list 有 connected 来源，就必须以这里的用户配置为准，保留同名模型的
-   * 不同 provider 行、订阅标记、模型图标和 per-provider Fast/effort 能力。
-   */
-  private parseProviderModelOptions(value: Object | undefined, agent: string): ComposerModelOption[] {
-    if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
-      return [];
-    }
-    const root = value as Record<string, Object>;
-    const rawProvidersValue = root['providers'];
-    if (!Array.isArray(rawProvidersValue)) return [];
-    const rawProviders = rawProvidersValue as Object[];
-    const out: ComposerModelOption[] = [];
-    const selected = this.session();
-    for (let i = 0; i < rawProviders.length; i++) {
-      const rawProvider: Object = rawProviders[i];
-      if (rawProvider === null || typeof rawProvider !== 'object' || Array.isArray(rawProvider)) continue;
-      const provider = rawProvider as Record<string, Object>;
-      if (!readBool(provider, 'connected', false) || readBool(provider, 'suspended', false)) continue;
-      const providerId = readStr(provider, 'id');
-      if (providerId.length === 0 || !this.stringArrayHas(provider['agents'], agent)) continue;
-      const modelsByAgent = readObj(provider, 'models');
-      const rawModelsValue = modelsByAgent[agent];
-      if (!Array.isArray(rawModelsValue)) continue;
-      const rawModels = rawModelsValue as Object[];
-      const access = readObj(provider, 'access');
-      const subscription = readStr(access, 'kind') === 'subscription';
-      const providerName = readStr(provider, 'name') || providerId;
-      const providerLogoKind = readStr(provider, 'logoKind');
-      for (let j = 0; j < rawModels.length; j++) {
-        const rawModel = rawModels[j];
-        if (rawModel === null || typeof rawModel !== 'object' || Array.isArray(rawModel)) continue;
-        const model = rawModel as Record<string, Object>;
-        const id = readStr(model, 'id');
-        if (id.length === 0 || readBool(model, 'disabled', false)) continue;
-        const visibilityKey = `${agent}:${providerId}:${id}`;
-        const visibility = this.modelVisibilityOverrides.get(visibilityKey);
-        if (visibility === false && !(selected !== undefined
-          && selected.model === id && selected.providerId === providerId)) continue;
-        if (visibility === undefined && !readBool(model, 'defaultEnabled', true)
-          && !(selected !== undefined && selected.model === id && selected.providerId === providerId)) continue;
-        const option = new ComposerModelOption();
-        option.id = id;
-        option.label = readStr(model, 'name') || readStr(model, 'displayName') || id;
-        option.description = readStr(model, 'description');
-        option.defaultEffort = readStr(model, 'defaultEffort');
-        option.supportsFastMode = readBool(model, 'supportsFastMode', false);
-        const displayNames = readObj(model, 'effortDisplayNames');
-        const displayNameKeys = Object.keys(displayNames);
-        for (let k = 0; k < displayNameKeys.length; k++) {
-          const key = displayNameKeys[k];
-          const label = readStr(displayNames, key);
-          if (label.length > 0) option.effortDisplayNames[key] = label;
-        }
-        option.providerId = providerId;
-        option.providerName = providerName;
-        option.providerLogoKind = providerLogoKind;
-        option.modelIcon = readStr(model, 'icon');
-        option.subscription = subscription;
-        const rawEfforts = model['efforts'];
-        if (Array.isArray(rawEfforts)) {
-          const efforts = rawEfforts as Object[];
-          for (let k = 0; k < efforts.length; k++) {
-            if (typeof efforts[k] === 'string') option.efforts.push(efforts[k] as string);
-          }
-        }
-        out.push(option);
-      }
-    }
-    return out;
+  /** 当前会话的模型选中线索：被隐藏的当前模型也必须保留在目录中。 */
+  private currentModelSelectionHint(): ModelSelectionHint | undefined {
+    const session = this.session();
+    if (session === undefined || session.model.length === 0) return undefined;
+    const hint: ModelSelectionHint = { model: session.model, providerId: session.providerId };
+    return hint;
   }
 
   private async loadProviderModelOptions(agent: string): Promise<void> {
@@ -589,23 +393,9 @@ export struct TaskPageContent {
       const request = new ProviderListOptions();
       request.capabilities = ['provider-logo-kinds-v2'];
       const result = await this.invokeContextRpc('maker:provider:list', [request]);
-      if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
-        const root = result as Record<string, Object>;
-        const rawOverrides = root['modelVisibilityOverrides'];
-        const nextOverrides = new Map<string, boolean>();
-        if (rawOverrides !== null && rawOverrides !== undefined
-          && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
-          const overrides = rawOverrides as Record<string, Object>;
-          const keys = Object.keys(overrides);
-          for (let i = 0; i < keys.length; i++) {
-            const key = keys[i];
-            if (typeof overrides[key] === 'boolean') nextOverrides.set(key, overrides[key] as boolean);
-          }
-        }
-        this.modelVisibilityOverrides = nextOverrides;
-      }
-      const options = this.parseProviderModelOptions(result, agent);
-      this.providerModelOptions = options;
+      this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
+      this.providerModelOptions = parseProviderModelOptions(
+        result, agent, this.modelVisibilityOverrides, this.currentModelSelectionHint());
       this.providerModelAgent = agent;
     } catch (e) {
       // 旧被控端没有 provider:list 时保持 capabilities 扁平回退，不影响模型页其它能力。
@@ -628,9 +418,9 @@ export struct TaskPageContent {
         return;
       }
       const capabilities = result as Record<string, Object>;
-      this.permissionOptions = this.parseChoiceOptions(capabilities['permissionModes'], true);
-      this.effortOptions = this.parseChoiceOptions(capabilities['effortLevels'], false);
-      this.modelOptions = this.parseModelOptions(capabilities['availableModels']);
+      this.permissionOptions = parseChoiceOptions(capabilities['permissionModes'], true);
+      this.effortOptions = parseChoiceOptions(capabilities['effortLevels'], false);
+      this.modelOptions = parseModelOptions(capabilities['availableModels']);
       this.fastModeCapability = readBool(capabilities, 'hasFastMode', false);
       await this.loadProviderModelOptions(this.currentAgentTab());
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
@@ -756,7 +546,7 @@ export struct TaskPageContent {
         return this.permissionOptions[i].label;
       }
     }
-    return this.permissionLabel(mode, mode);
+    return permissionModeLabel(mode, mode);
   }
 
   private currentAgentTab(): string {
@@ -798,9 +588,6 @@ export struct TaskPageContent {
     return out;
   }
 
-  private modelOptionKey(option: ComposerModelOption): string {
-    return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
-  }
 
   private modelOptionIsCurrent(option: ComposerModelOption): boolean {
     const session = this.session();
@@ -819,7 +606,7 @@ export struct TaskPageContent {
     for (let i = 0; i < options.length; i++) {
       if (options[i].id === id && options[i].label.length > 0) return options[i].label;
     }
-    return this.effortLabel(id, fallback);
+    return effortLevelLabel(id, fallback);
   }
 
   private modelEffortText(option: ComposerModelOption): string {
@@ -834,7 +621,7 @@ export struct TaskPageContent {
   private currentModelKey(): string {
     const source = this.visibleModelOptions();
     for (let i = 0; i < source.length; i++) {
-      if (this.modelOptionIsCurrent(source[i])) return this.modelOptionKey(source[i]);
+      if (this.modelOptionIsCurrent(source[i])) return composerModelKey(source[i]);
     }
     return this.session()?.model ?? '';
   }
@@ -842,7 +629,7 @@ export struct TaskPageContent {
   private modelOptionsForTarget(target: string): ComposerModelOption[] {
     const source = this.visibleModelOptions();
     for (let i = 0; i < source.length; i++) {
-      if (this.modelOptionKey(source[i]) === target) return [source[i]];
+      if (composerModelKey(source[i]) === target) return [source[i]];
     }
     for (let i = 0; i < source.length; i++) {
       if (source[i].id === target && this.modelOptionIsCurrent(source[i])) return [source[i]];
@@ -917,7 +704,7 @@ export struct TaskPageContent {
       } else {
         const fallback = new ComposerChoiceOption();
         fallback.id = id;
-        fallback.label = model.effortDisplayNames[id] ?? this.effortLabel(id, id);
+        fallback.label = model.effortDisplayNames[id] ?? effortLevelLabel(id, id);
         out.push(fallback);
       }
     }
@@ -928,20 +715,6 @@ export struct TaskPageContent {
     return this.modelAgentTab === kind;
   }
 
-  private modelProviderKind(option: ComposerModelOption): string {
-    const icon = option.modelIcon.toLowerCase();
-    const logo = option.providerLogoKind.toLowerCase();
-    const provider = option.providerId.toLowerCase();
-    const id = option.id.toLowerCase();
-    if (icon.includes('claude') || logo.includes('anthropic') || provider === 'anthropic') return 'claude';
-    if (icon.includes('openai') || logo.includes('openai') || provider === 'openai') return 'openai';
-    if (icon.includes('deepseek') || logo.includes('deepseek') || provider === 'deepseek'
-      || id.includes('deepseek')) return 'deepseek';
-    if (option.providerId.length === 0 && (id.includes('gpt') || id.includes('openai') || id.includes('codex'))) {
-      return 'openai';
-    }
-    return 'other';
-  }
 
   private modelOptionHasOptions(option: ComposerModelOption): boolean {
     return option.efforts.length > 0 || (this.visibleFastModeCapability() && option.supportsFastMode);
@@ -999,8 +772,8 @@ export struct TaskPageContent {
         throw new Error('capabilities unavailable');
       }
       const capabilities = result as Record<string, Object>;
-      this.alternateModelOptions = this.parseModelOptions(capabilities['availableModels']);
-      this.alternateEffortOptions = this.parseChoiceOptions(capabilities['effortLevels'], false);
+      this.alternateModelOptions = parseModelOptions(capabilities['availableModels']);
+      this.alternateEffortOptions = parseChoiceOptions(capabilities['effortLevels'], false);
       this.alternateFastModeCapability = readBool(capabilities, 'hasFastMode', false);
       await this.loadProviderModelOptions(kind);
     } catch (e) {
@@ -1018,7 +791,7 @@ export struct TaskPageContent {
     if (this.contextRpcBusy) return;
     const session = this.session();
     if (session === undefined) return;
-    this.modelOptionsTargetId = this.modelOptionKey(option);
+    this.modelOptionsTargetId = composerModelKey(option);
     if (!this.modelOptionIsCurrent(option) || !this.browsingCurrentAgent()) {
       // 非当前模型先完成真实模型/Agent 切换；在远端状态回流前不伪造其推理设置。
       void this.selectComposerModel(option, false);
@@ -1251,32 +1024,20 @@ export struct TaskPageContent {
 
   private send(): void {
     const text = this.input.trim();
-    const readyImages: RemoteImageRef[] = [];
-    let uploading = false;
-    let failed = false;
-    for (let i = 0; i < this.composerImages.length; i++) {
-      const c = this.composerImages[i];
-      if (c.status === 'uploading') {
-        uploading = true;
-      } else if (c.status === 'failed') {
-        failed = true;
-      } else if (c.status === 'ready' && c.ref !== null) {
-        readyImages.push(c.ref);
-      }
-    }
     if (this.sending) return;
     if (this.deviceDisabled) {
       promptAction.showToast({ message: '设备已关闭远程控制，仅可查看' });
       return;
     }
-    if (uploading) {
+    if (this.imageQueue.hasUploading()) {
       promptAction.showToast({ message: '图片上传中，请稍候' });
       return;
     }
-    if (failed) {
+    if (this.imageQueue.hasFailed()) {
       promptAction.showToast({ message: '请重试或移除上传失败的图片' });
       return;
     }
+    const readyImages = this.imageQueue.readyImages();
     if (text.length === 0 && readyImages.length === 0) return;
     const s = this.session();
     if (s === undefined) {
@@ -1284,7 +1045,7 @@ export struct TaskPageContent {
       return;
     }
     const sentInputRevision = this.composerInputRevision;
-    const sentImages = this.composerImages.slice();
+    const sentImages = this.imageQueue.images.slice();
     this.sending = true;
     this.error = '';
     AppServices.instance.messages.sendText(this.deviceId, s, text, readyImages).then(() => {
@@ -1292,13 +1053,7 @@ export struct TaskPageContent {
         this.input = '';
         this.composerInputRevision += 1;
       }
-      const remainingImages: ComposerImage[] = [];
-      for (let i = 0; i < this.composerImages.length; i++) {
-        if (sentImages.indexOf(this.composerImages[i]) < 0) {
-          remainingImages.push(this.composerImages[i]);
-        }
-      }
-      this.composerImages = remainingImages;
+      this.imageQueue.removeSent(sentImages);
       this.sending = false;
     }).catch((e: Error) => {
       this.sending = false;
@@ -1323,15 +1078,11 @@ export struct TaskPageContent {
     this.contextSheetOpen = true;
   }
 
-  private remainingImageSlots(): number {
-    return Math.max(0, MAX_COMPOSER_IMAGES - this.composerImages.length);
-  }
-
   private selectRecentImage(uri: string): void {
     if (uri.length === 0 || this.contextSelectedUris.includes(uri)) {
       return;
     }
-    if (this.contextSelectedUris.length >= this.remainingImageSlots()) {
+    if (this.contextSelectedUris.length >= this.imageQueue.remainingSlots()) {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
@@ -1346,180 +1097,44 @@ export struct TaskPageContent {
     const uris = this.contextSelectedUris.slice();
     this.contextSheetOpen = false;
     this.contextSelectedUris = [];
-    this.enqueueImageUris(uris);
+    this.imageQueue.enqueue(uris);
   }
 
+  /** Sheet 行点击入口：先校验容量并收起 Sheet，再交给共享队列选图。 */
   private pickImages(): void {
     if (this.pickingImages || this.sending) {
       return;
     }
-    const remaining = this.remainingImageSlots();
-    if (remaining <= 0) {
+    if (this.imageQueue.remainingSlots() <= 0) {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
     this.contextSheetOpen = false;
-    this.pickingImages = true;
-    setTimeout(() => {
-      pickImageUris(remaining).then((uris: string[]) => {
-        this.pickingImages = false;
-        this.enqueueImageUris(uris);
-      }).catch(() => {
-        this.pickingImages = false;
-      });
-    }, 160);
+    this.imageQueue.pickImages();
   }
 
   private pickScreenshots(): void {
     if (this.pickingImages || this.sending) {
       return;
     }
-    const remaining = this.remainingImageSlots();
-    if (remaining <= 0) {
+    if (this.imageQueue.remainingSlots() <= 0) {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
     this.contextSheetOpen = false;
-    this.pickingImages = true;
-    const context = getContext(this) as common.UIAbilityContext;
-    setTimeout(() => {
-      pickScreenshotUris(context, remaining).then((uris: string[]) => {
-        this.pickingImages = false;
-        this.enqueueImageUris(uris);
-      }).catch(() => {
-        this.pickingImages = false;
-        promptAction.showToast({ message: '无法打开截图选择器' });
-      });
-    }, 160);
+    this.imageQueue.pickScreenshots(getContext(this) as common.UIAbilityContext);
   }
 
   private takePhoto(): void {
-    if (this.pickingImages || this.sending || this.remainingImageSlots() <= 0) {
-      if (this.remainingImageSlots() <= 0) {
-        promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
-      }
+    if (this.pickingImages || this.sending) {
+      return;
+    }
+    if (this.imageQueue.remainingSlots() <= 0) {
+      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
     this.contextSheetOpen = false;
-    this.pickingImages = true;
-    const context = getContext(this) as common.UIAbilityContext;
-    setTimeout(() => {
-      takePhotoUri(context).then((uri: string) => {
-        this.pickingImages = false;
-        if (uri.length > 0) {
-          this.enqueueImageUris([uri]);
-        }
-      }).catch(() => {
-        this.pickingImages = false;
-        promptAction.showToast({ message: '无法打开相机' });
-      });
-    }, 160);
-  }
-
-  private enqueueImageUris(uris: string[]): void {
-    let remaining = this.remainingImageSlots();
-    let accepted = 0;
-    for (let i = 0; i < uris.length && remaining > 0; i++) {
-      const uri = uris[i];
-      let duplicate = false;
-      for (let j = 0; j < this.composerImages.length; j++) {
-        if (this.composerImages[j].uri === uri) {
-          duplicate = true;
-          break;
-        }
-      }
-      if (duplicate) {
-        continue;
-      }
-      this.uploadComposerImage(uri, this.composerImages.length + accepted);
-      accepted += 1;
-      remaining -= 1;
-    }
-    if (uris.length > accepted && remaining <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
-    }
-  }
-
-  private uploadComposerImage(uri: string, index: number): void {
-    const img = new ComposerImage();
-    img.uri = uri;
-    img.name = `image-${index + 1}`;
-    this.composerImages = this.composerImages.concat([img]);
-    buildImageCandidate(uri, index).then((candidate) => {
-      img.name = candidate.name;
-      return AppServices.instance.auth.getAccessToken().then((token: string | null) => {
-        if (token === null || token.length === 0) {
-          throw new Error('未登录');
-        }
-        return uploadImage(candidate, token);
-      });
-    }).then((ref: RemoteImageRef) => {
-      img.ref = ref;
-      if (img.removed) {
-        this.recycleComposerImage(img);
-        return;
-      }
-      img.status = 'ready';
-      this.syncComposerImages();
-    }).catch(() => {
-      if (!img.removed) {
-        img.status = 'failed';
-        this.syncComposerImages();
-      }
-    });
-  }
-
-  private syncComposerImages(): void {
-    this.composerImages = this.composerImages.slice();
-  }
-
-  private removeComposerImage(img: ComposerImage): void {
-    if (this.sending) {
-      return;
-    }
-    img.removed = true;
-    const out: ComposerImage[] = [];
-    for (let i = 0; i < this.composerImages.length; i++) {
-      if (this.composerImages[i] !== img) {
-        out.push(this.composerImages[i]);
-      }
-    }
-    this.composerImages = out;
-    this.recycleComposerImage(img);
-  }
-
-  private recycleComposerImage(img: ComposerImage): void {
-    if (img.ref === null) {
-      return;
-    }
-    const parsed = parseAttachmentOssRef(img.ref.url);
-    if (parsed === null || parsed.ossKey.length === 0) {
-      return;
-    }
-    void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
-      if (token !== null && token.length > 0) {
-        return deleteUpload(parsed.ossKey, token);
-      }
-      return Promise.resolve();
-    }).catch(() => {
-      // 删除中转对象是 best-effort，不阻断 Composer 操作。
-    });
-  }
-
-  private retryComposerImage(img: ComposerImage): void {
-    if (this.sending) {
-      return;
-    }
-    img.removed = true;
-    // 移除原失败项，再以同一 uri 重新上传（避免新旧两个对象并存）。
-    const out: ComposerImage[] = [];
-    for (let i = 0; i < this.composerImages.length; i++) {
-      if (this.composerImages[i] !== img) {
-        out.push(this.composerImages[i]);
-      }
-    }
-    this.composerImages = out;
-    this.uploadComposerImage(img.uri, this.composerImages.length);
+    this.imageQueue.takePhoto(getContext(this) as common.UIAbilityContext);
   }
 
   private abort(): void {
@@ -2037,13 +1652,8 @@ export struct TaskPageContent {
 
   private canSend(): boolean {
     if (this.sending || this.deviceDisabled) return false;
-    let hasReadyImage = false;
-    for (let i = 0; i < this.composerImages.length; i++) {
-      const image = this.composerImages[i];
-      if (image.status !== 'ready' || image.ref === null) return false;
-      hasReadyImage = true;
-    }
-    return this.input.trim().length > 0 || hasReadyImage;
+    if (!this.imageQueue.allSettled()) return false;
+    return this.input.trim().length > 0 || this.imageQueue.readyImages().length > 0;
   }
 
   build() {
@@ -2072,7 +1682,7 @@ export struct TaskPageContent {
 
       if (this.error.length > 0) {
         Text(this.error)
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
           .constraintSize({ maxWidth: 760 })
@@ -2082,7 +1692,7 @@ export struct TaskPageContent {
 
       if (this.deviceDisabled) {
         Text('设备已关闭远程控制，仅可查看')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.chat_text_secondary'))
           .textAlign(TextAlign.Center)
           .width('100%')
@@ -2101,7 +1711,7 @@ export struct TaskPageContent {
             .height('100%')
             .objectFit(ImageFit.Contain)
           Text('×')
-            .fontSize(taskDetailFontSize(22))
+            .fontSize(uiFontSize(22))
             .fontColor($r('app.color.chat_overlay_text'))
             .backgroundColor($r('app.color.overlay'))
             .width(36)
@@ -2144,7 +1754,7 @@ export struct TaskPageContent {
       if (!this.isEmbedded()) {
         Button() {
           SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(taskDetailFontSize(20))
+            .fontSize(uiFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
         .width(44)
@@ -2158,8 +1768,8 @@ export struct TaskPageContent {
 
       Column({ space: 1 }) {
         Text(this.sessionTitle())
-          .fontSize(taskDetailFontSize(16))
-          .lineHeight(taskDetailLineHeight(22))
+          .fontSize(uiFontSize(16))
+          .lineHeight(uiLineHeight(22))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -2167,8 +1777,8 @@ export struct TaskPageContent {
           .width('100%')
         if (this.headerNotice().length > 0) {
           Text(this.headerNotice())
-            .fontSize(taskDetailFontSize(11))
-            .lineHeight(taskDetailLineHeight(16))
+            .fontSize(uiFontSize(11))
+            .lineHeight(uiLineHeight(16))
             .fontColor(this.sessionStreaming
               ? $r('app.color.chat_status_accent')
               : $r('app.color.chat_text_secondary'))
@@ -2184,7 +1794,7 @@ export struct TaskPageContent {
       if ((this.session()?.workingDir ?? '').length > 0) {
         Button() {
           SymbolGlyph($r('sys.symbol.folder'))
-            .fontSize(taskDetailFontSize(20))
+            .fontSize(uiFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
         .width(38)
@@ -2198,7 +1808,7 @@ export struct TaskPageContent {
       if (this.items.length > 0) {
         Button() {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(taskDetailFontSize(20))
+            .fontSize(uiFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
         .width(38)
@@ -2214,7 +1824,7 @@ export struct TaskPageContent {
 
       Button() {
         SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-          .fontSize(taskDetailFontSize(20))
+          .fontSize(uiFontSize(20))
           .fontColor([$r('app.color.text_primary')])
       }
       .width(38)
@@ -2239,7 +1849,7 @@ export struct TaskPageContent {
     Row({ space: 4 }) {
       Search({ value: this.searchQuery, placeholder: '搜索消息' })
         .height(36)
-        .textFont({ size: taskDetailFontSize(15) })
+        .textFont({ size: uiFontSize(15) })
         .layoutWeight(1)
         .backgroundColor($r('app.color.bg_card'))
         .borderRadius(18)
@@ -2251,14 +1861,14 @@ export struct TaskPageContent {
         Text(this.searchHitIndices().length === 0
           ? '0/0'
           : `${this.searchActiveIndex + 1}/${this.searchHitIndices().length}`)
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.chat_text_secondary'))
           .constraintSize({ minWidth: 32 })
           .textAlign(TextAlign.Center)
       }
       Button() {
         SymbolGlyph($r('sys.symbol.chevron_up'))
-          .fontSize(taskDetailFontSize(16))
+          .fontSize(uiFontSize(16))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2270,7 +1880,7 @@ export struct TaskPageContent {
       .onClick(() => this.moveSearch(-1))
       Button() {
         SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(taskDetailFontSize(16))
+          .fontSize(uiFontSize(16))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2282,7 +1892,7 @@ export struct TaskPageContent {
       .onClick(() => this.moveSearch(1))
       Button() {
         SymbolGlyph($r('sys.symbol.xmark'))
-          .fontSize(taskDetailFontSize(15))
+          .fontSize(uiFontSize(15))
           .fontColor([$r('app.color.chat_text_secondary')])
       }
       .width(34)
@@ -2307,11 +1917,11 @@ export struct TaskPageContent {
         Column({ space: 8 }) {
           if (this.loadFailed) {
             Text('加载失败，请检查连接后重试')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.danger'))
             Button('重试')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontColor($r('app.color.text_primary'))
               .height(32)
               .padding({ left: 12, right: 12 })
@@ -2324,12 +1934,12 @@ export struct TaskPageContent {
               .height(14)
               .color($r('app.color.text_tertiary'))
             Text('正在同步')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_tertiary'))
           } else if (this.initialLoadResolved) {
             Text('暂无消息')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_tertiary'))
           }
@@ -2344,7 +1954,7 @@ export struct TaskPageContent {
           if (AppServices.instance.messages.hasMore(this.sessionId)) {
             ListItem() {
               Button(this.loadingOlder ? '加载中' : '加载更早消息')
-                .fontSize(taskDetailFontSize(12))
+                .fontSize(uiFontSize(12))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_tertiary'))
                 .height(32)
@@ -2396,7 +2006,7 @@ export struct TaskPageContent {
         Button() {
           Stack({ alignContent: Alignment.Center }) {
             SymbolGlyph($r('sys.symbol.chevron_down'))
-              .fontSize(taskDetailFontSize(20))
+              .fontSize(uiFontSize(20))
               .fontColor([$r('app.color.chat_text_secondary')])
             if (this.hasNewMessages) {
               Circle()
@@ -2428,229 +2038,43 @@ export struct TaskPageContent {
   /** Mobile 同款 Composer：活动状态独立于 50vp 输入胶囊，焦点态再展开为卡片。 */
   @Builder
   composerBar() {
-    Column({ space: taskDetailDimension(4) }) {
-      if (this.sessionStreaming) {
-        Row({ space: 6 }) {
-          LoadingProgress()
-            .width(12)
-            .height(12)
-            .color($r('app.color.chat_status_accent'))
-          Text('正在工作…')
-            .fontSize(taskDetailFontSize(12))
-            .lineHeight(taskDetailLineHeight(18))
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.chat_status_accent'))
-        }
-        .height(20)
-        .padding({ left: 12, right: 12 })
-      }
-
-      Column({ space: taskDetailDimension(6) }) {
-        if (this.composerImages.length > 0) {
-          List() {
-            ForEach(this.composerImages, (img: ComposerImage) => {
-              ListItem() {
-                this.composerImageItem(img)
-              }
-            }, (img: ComposerImage) => img.uri)
-          }
-          .listDirection(Axis.Horizontal)
-          .width('100%')
-          .height(taskDetailDimension(70))
-        }
-
-        if (this.composerFocused) {
-          Row() {
-            Divider()
-              .width(taskDetailDimension(40))
-              .strokeWidth(taskDetailDimension(4))
-              .color($r('app.color.composer_border'))
-              .borderRadius(taskDetailDimension(2))
-          }
-          .height(taskDetailDimension(10))
-          .width('100%')
-          .justifyContent(FlexAlign.Center)
-        }
-
-        Row({ space: taskDetailDimension(6) }) {
-          if (this.composerFocused || this.composerImages.length > 0) {
-            Button() {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(taskDetailFontSize(20))
-                .fontColor([$r('app.color.text_primary')])
-            }
-            .width(34)
-            .height(34)
-            .padding(0)
-            .borderRadius(17)
-            .backgroundColor(Color.Transparent)
-            .enabled(!this.sending && !this.pickingImages)
-            .onClick(() => this.openContextSheet())
-
-            if (this.permissionOptions.length > 0) {
-              Button() {
-                SymbolGlyph($r('sys.symbol.lock'))
-                  .fontSize(taskDetailFontSize(18))
-                  .fontColor([this.effectivePermissionMode() === 'bypassPermissions'
-                    || this.effectivePermissionMode() === 'auto'
-                    ? $r('app.color.danger')
-                    : $r('app.color.text_secondary')])
-              }
-              .width(34)
-              .height(34)
-              .padding(0)
-              .borderRadius(17)
-              .backgroundColor(Color.Transparent)
-              .enabled(!this.sending && !this.contextRpcBusy)
-              .onClick(() => this.openComposerControlSheet('permission'))
-            }
-
-            if (this.planModeEnabled) {
-              Button('计划')
-                .height(30)
-                .fontSize(taskDetailFontSize(12))
-                .fontColor($r('app.color.chat_cta'))
-                .backgroundColor($r('app.color.bg_chip'))
-                .borderRadius(8)
-                .padding({ left: 8, right: 8 })
-                .enabled(!this.contextRpcBusy)
-                .onClick(() => {
-                  void this.togglePlanMode();
-                })
-            }
-          }
-
-          TextArea({ placeholder: '输入远程消息', text: this.input })
-            .id('task-composer-input')
-            .fontSize(taskDetailFontSize(15))
-            .placeholderFont({ size: taskDetailFontSize(15) })
-            .lineHeight(taskDetailLineHeight(22))
-            .fontColor($r('app.color.text_primary'))
-            .placeholderColor($r('app.color.text_tertiary'))
-            .caretColor($r('app.color.chat_input_caret'))
-            .backgroundColor(Color.Transparent)
-            .align(Alignment.Center)
-            .textAlign(TextAlign.Start)
-            .padding({
-              left: taskDetailDimension(4),
-              right: taskDetailDimension(4),
-            })
-            .height(this.composerFocused || this.input.includes('\n')
-              ? taskDetailDimension(56)
-              : taskDetailDimension(40))
-            .layoutWeight(1)
-            .onFocus(() => {
-              this.composerFocused = true;
-            })
-            .onBlur(() => {
-              this.composerFocused = false;
-            })
-            .onChange((v: string) => {
-              this.input = v;
-              this.composerInputRevision += 1;
-            })
-
-          if ((this.composerFocused || this.composerImages.length > 0)
-            && this.modelOptions.length > 0 && this.currentModelLabel().length > 0) {
-            Button() {
-              Row({ space: taskDetailDimension(4) }) {
-                Text(this.currentModelLabel())
-                  .fontSize(taskDetailFontSize(12))
-                  .fontColor($r('app.color.text_secondary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                if (this.currentModelEffortLabel().length > 0) {
-                  Text('·')
-                    .fontSize(taskDetailFontSize(12))
-                    .fontColor($r('app.color.text_tertiary'))
-                  Text(this.currentModelEffortLabel())
-                    .fontSize(taskDetailFontSize(12))
-                    .fontColor($r('app.color.text_secondary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                }
-                SymbolGlyph($r('sys.symbol.chevron_down'))
-                  .fontSize(taskDetailFontSize(13))
-                  .fontColor([$r('app.color.text_secondary')])
-              }
-              .alignItems(VerticalAlign.Center)
-            }
-            .height(30)
-            .constraintSize({ minWidth: 100, maxWidth: 180 })
-            .padding({ left: 8, right: 8 })
-            .borderRadius(8)
-            .backgroundColor($r('app.color.bg_chip'))
-            .enabled(!this.sending && !this.contextRpcBusy)
-            .onClick(() => this.openComposerControlSheet('model'))
-          }
-
-          Button() {
-            if (this.sending) {
-              LoadingProgress()
-                .width(15)
-                .height(15)
-                .color($r('app.color.chat_cta_text'))
-            } else if (this.sessionStreaming && !this.hasComposerContent()) {
-              SymbolGlyph($r('sys.symbol.square'))
-                .fontSize(taskDetailFontSize(12))
-                .fontColor([$r('app.color.chat_cta_text')])
-            } else if (this.canSend()) {
-              SymbolGlyph($r('sys.symbol.arrow_up'))
-                .fontSize(taskDetailFontSize(18))
-                .fontColor([$r('app.color.chat_cta_text')])
-            } else {
-              SymbolGlyph($r('sys.symbol.mic'))
-                .fontSize(taskDetailFontSize(20))
-                .fontColor([$r('app.color.chat_text_secondary')])
-            }
-          }
-          .width(34)
-          .height(34)
-          .padding(0)
-          .borderRadius(17)
-          .backgroundColor(this.sessionStreaming && !this.hasComposerContent() || this.canSend()
-            ? $r('app.color.chat_cta')
-            : Color.Transparent)
-          .enabled(!this.sending)
-          .onClick(() => {
-            if (this.sessionStreaming && !this.hasComposerContent()) {
-              this.abort();
-            } else if (this.canSend()) {
-              this.send();
-            } else {
-              this.composerFocused = true;
-              setTimeout(() => {
-                focusControl.requestFocus('task-composer-input');
-                promptAction.showToast({ message: '请点击系统键盘中的麦克风' });
-              }, 0);
-            }
-          })
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-      }
-      .width('100%')
-      .constraintSize({ minHeight: taskDetailDimension(34) })
-      .padding({
-        left: taskDetailDimension(12),
-        right: taskDetailDimension(12),
-        top: this.composerFocused ? taskDetailDimension(4) : taskDetailDimension(3),
-        bottom: this.composerFocused ? taskDetailDimension(4) : taskDetailDimension(3),
-      })
-      .backgroundColor($r('app.color.composer_surface'))
-      .border({ width: 1, color: $r('app.color.composer_border') })
-      .borderRadius(this.composerFocused || this.composerImages.length > 0
-        ? taskDetailDimension(8)
-        : taskDetailDimension(28))
-    }
-    .width('100%')
-    .constraintSize({ maxWidth: 760 })
-    .alignSelf(ItemAlign.Center)
-    .padding({
-      left: taskDetailDimension(12),
-      right: taskDetailDimension(12),
-      top: taskDetailDimension(4),
-      bottom: taskDetailDimension(2),
+    ConversationComposer({
+      input: this.input,
+      focused: this.composerFocused,
+      images: this.composerImages,
+      sending: this.sending,
+      streaming: this.sessionStreaming,
+      hasContent: this.hasComposerContent(),
+      canSend: this.canSend(),
+      composerEnabled: !this.deviceDisabled,
+      pickingImages: this.pickingImages,
+      contextBusy: this.contextRpcBusy,
+      hasPermissionOptions: this.permissionOptions.length > 0,
+      hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
+      permissionMode: this.effectivePermissionMode(),
+      planModeEnabled: this.planModeEnabled,
+      modelLabel: this.currentModelLabel(),
+      effortLabel: this.currentModelEffortLabel(),
+      showAddButton: true,
+      showStreamingStatus: true,
+      inputId: 'task-composer-input',
+      onInputChange: (value: string): void => {
+        this.input = value;
+        this.composerInputRevision += 1;
+      },
+      onFocusChange: (focused: boolean): void => {
+        this.composerFocused = focused;
+      },
+      onAdd: (): void => this.openContextSheet(),
+      onPermission: (): void => this.openComposerControlSheet('permission'),
+      onModel: (): void => this.openComposerControlSheet('model'),
+      onPlanToggle: (): void => {
+        void this.togglePlanMode();
+      },
+      onSend: (): void => this.send(),
+      onAbort: (): void => this.abort(),
+      onRemoveImage: (image: ComposerImage): void => this.imageQueue.remove(image),
+      onRetryImage: (image: ComposerImage): void => this.imageQueue.retry(image),
     })
   }
 
@@ -2662,7 +2086,7 @@ export struct TaskPageContent {
         if (this.contextSheetPage !== 'main') {
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(taskDetailFontSize(20))
+              .fontSize(uiFontSize(20))
               .fontColor([$r('app.color.text_primary')])
           }
           .width(36)
@@ -2685,8 +2109,8 @@ export struct TaskPageContent {
               : this.contextSheetPage === 'model'
                 ? '模型'
                 : '上下文')
-          .fontSize(taskDetailFontSize(17))
-          .lineHeight(taskDetailLineHeight(24))
+          .fontSize(uiFontSize(17))
+          .lineHeight(uiLineHeight(24))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .textAlign(TextAlign.Center)
@@ -2739,7 +2163,7 @@ export struct TaskPageContent {
           Button(`加入对话 (${this.contextSelectedUris.length})`)
             .width('calc(100% - 32vp)')
             .height(42)
-            .fontSize(taskDetailFontSize(15))
+            .fontSize(uiFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(8)
@@ -2754,12 +2178,12 @@ export struct TaskPageContent {
             this.contextRowIcon($r('sys.symbol.list_bullet'))
             Column({ space: 2 }) {
               Text('计划模式')
-                .fontSize(taskDetailFontSize(16))
-                .lineHeight(taskDetailLineHeight(22))
+                .fontSize(uiFontSize(16))
+                .lineHeight(uiLineHeight(22))
                 .fontColor($r('app.color.text_primary'))
               Text('先生成计划，确认后再执行')
-                .fontSize(taskDetailFontSize(12))
-                .lineHeight(taskDetailLineHeight(18))
+                .fontSize(uiFontSize(12))
+                .lineHeight(uiLineHeight(18))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -2812,13 +2236,13 @@ export struct TaskPageContent {
             this.contextRowIcon($r('sys.symbol.lock'))
             Column({ space: 2 }) {
               Text(option.label)
-                .fontSize(taskDetailFontSize(16))
-                .lineHeight(taskDetailLineHeight(22))
+                .fontSize(uiFontSize(16))
+                .lineHeight(uiLineHeight(22))
                 .fontColor($r('app.color.text_primary'))
               if (option.description.length > 0) {
                 Text(option.description)
-                  .fontSize(taskDetailFontSize(12))
-                  .lineHeight(taskDetailLineHeight(18))
+                  .fontSize(uiFontSize(12))
+                  .lineHeight(uiLineHeight(18))
                   .fontColor($r('app.color.text_tertiary'))
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2828,7 +2252,7 @@ export struct TaskPageContent {
             .alignItems(HorizontalAlign.Start)
             if (option.id === this.effectivePermissionMode()) {
               SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(taskDetailFontSize(18))
+                .fontSize(uiFontSize(18))
                 .fontColor([$r('app.color.chat_cta')])
             }
           }
@@ -2850,7 +2274,7 @@ export struct TaskPageContent {
   @Builder
   modelAgentMark(kind: string, active: boolean) {
     Text(kind === 'claude-code' ? '♟' : kind === 'codex' ? '✣' : 'π')
-      .fontSize(taskDetailFontSize(kind === 'pi' ? 20 : 18))
+      .fontSize(uiFontSize(kind === 'pi' ? 20 : 18))
       .fontWeight(FontWeight.Medium)
       .fontColor(active ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
       .width(24)
@@ -2860,23 +2284,23 @@ export struct TaskPageContent {
 
   @Builder
   modelProviderMark(option: ComposerModelOption) {
-    if (this.modelProviderKind(option) === 'claude') {
+    if (modelProviderKind(option) === 'claude') {
       Text('♟')
-        .fontSize(taskDetailFontSize(22))
+        .fontSize(uiFontSize(22))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
         .textAlign(TextAlign.Center)
-    } else if (this.modelProviderKind(option) === 'deepseek') {
+    } else if (modelProviderKind(option) === 'deepseek') {
       Text('◉')
-        .fontSize(taskDetailFontSize(22))
+        .fontSize(uiFontSize(22))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
         .textAlign(TextAlign.Center)
-    } else if (this.modelProviderKind(option) === 'openai') {
+    } else if (modelProviderKind(option) === 'openai') {
       Text('✣')
-        .fontSize(taskDetailFontSize(21))
+        .fontSize(uiFontSize(21))
         .fontColor($r('app.color.text_secondary'))
         .width(30)
         .height(30)
@@ -2886,7 +2310,7 @@ export struct TaskPageContent {
           Text(option.providerName.length > 0
           ? option.providerName.charAt(0).toUpperCase()
           : 'S')
-          .fontSize(taskDetailFontSize(16))
+          .fontSize(uiFontSize(16))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_secondary'))
       }
@@ -2905,7 +2329,7 @@ export struct TaskPageContent {
           Row({ space: 7 }) {
             this.modelAgentMark(kind, this.modelAgentIsActive(kind))
             Text(modelAgentLabel(kind))
-              .fontSize(taskDetailFontSize(16))
+              .fontSize(uiFontSize(16))
               .fontWeight(this.modelAgentIsActive(kind) ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(this.modelAgentIsActive(kind)
                 ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
@@ -2943,15 +2367,15 @@ export struct TaskPageContent {
       Column({ space: 1 }) {
         Row({ space: 8 }) {
           Text(option.label)
-            .fontSize(taskDetailFontSize(17))
-            .lineHeight(taskDetailLineHeight(23))
+            .fontSize(uiFontSize(17))
+            .lineHeight(uiLineHeight(23))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           if (option.subscription) {
             Text('订阅')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.bg_chip'))
               .borderRadius(8)
@@ -2959,8 +2383,8 @@ export struct TaskPageContent {
           }
           if (this.modelEffortText(option).length > 0) {
             Text(this.modelEffortText(option))
-              .fontSize(taskDetailFontSize(15))
-              .lineHeight(taskDetailLineHeight(22))
+              .fontSize(uiFontSize(15))
+              .lineHeight(uiLineHeight(22))
               .fontColor($r('app.color.text_secondary'))
           }
         }
@@ -2971,13 +2395,13 @@ export struct TaskPageContent {
       .alignItems(HorizontalAlign.Start)
       if (this.modelOptionIsCurrent(option)) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(taskDetailFontSize(20))
+          .fontSize(uiFontSize(20))
           .fontColor([$r('app.color.text_primary')])
           .margin({ right: 2 })
       }
       Button() {
         SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(taskDetailFontSize(20))
+          .fontSize(uiFontSize(20))
           .fontColor([$r('app.color.text_secondary')])
       }
       .width(38)
@@ -3010,10 +2434,10 @@ export struct TaskPageContent {
 
         Row({ space: 8 }) {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(taskDetailFontSize(20))
+            .fontSize(uiFontSize(20))
             .fontColor([$r('app.color.text_secondary')])
           TextInput({ placeholder: '搜索模型...', text: this.modelSearchQuery })
-            .fontSize(taskDetailFontSize(15))
+            .fontSize(uiFontSize(15))
             .fontColor($r('app.color.text_primary'))
             .placeholderColor($r('app.color.text_secondary'))
             .backgroundColor(Color.Transparent)
@@ -3034,7 +2458,7 @@ export struct TaskPageContent {
         Column() {
           if (this.filteredModelOptions().length === 0) {
             Text(this.contextRpcBusy ? '正在加载模型...' : '没有匹配的模型')
-              .fontSize(taskDetailFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
               .textAlign(TextAlign.Center)
@@ -3042,7 +2466,7 @@ export struct TaskPageContent {
           } else {
             ForEach(this.filteredModelOptions(), (option: ComposerModelOption) => {
               this.modelOptionRow(option)
-            }, (option: ComposerModelOption) => this.modelOptionKey(option))
+            }, (option: ComposerModelOption) => composerModelKey(option))
           }
         }
         .width('100%')
@@ -3063,11 +2487,11 @@ export struct TaskPageContent {
             this.modelProviderMark(this.modelOptionsTarget()[0])
             Column({ space: 2 }) {
               Text(this.modelOptionsTarget()[0].label)
-                .fontSize(taskDetailFontSize(19))
+                .fontSize(uiFontSize(19))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
               Text('选择推理强度')
-                .fontSize(taskDetailFontSize(13))
+                .fontSize(uiFontSize(13))
                 .fontColor($r('app.color.text_secondary'))
             }
             .layoutWeight(1)
@@ -3080,7 +2504,7 @@ export struct TaskPageContent {
         if (this.currentModelEffortOptions().length > 0) {
           Column({ space: 8 }) {
             Text('推理强度')
-              .fontSize(taskDetailFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
               .width('100%')
@@ -3088,7 +2512,7 @@ export struct TaskPageContent {
               ForEach(this.currentModelEffortOptions(), (option: ComposerChoiceOption) => {
                 Button(option.label)
                   .height(38)
-                  .fontSize(taskDetailFontSize(14))
+                  .fontSize(uiFontSize(14))
                   .fontColor(this.modelOptionEffortSelected(option)
                     ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
                   .backgroundColor(this.modelOptionEffortSelected(option)
@@ -3113,10 +2537,10 @@ export struct TaskPageContent {
             this.contextRowIcon($r('sys.symbol.bolt'))
             Column({ space: 2 }) {
               Text('Fast 模式')
-                .fontSize(taskDetailFontSize(16))
+                .fontSize(uiFontSize(16))
                 .fontColor($r('app.color.text_primary'))
               Text('使用当前模型的快速服务通道')
-                .fontSize(taskDetailFontSize(12))
+                .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -3142,7 +2566,7 @@ export struct TaskPageContent {
   contextRowIcon(symbol: Resource) {
     Stack({ alignContent: Alignment.Center }) {
       SymbolGlyph(symbol)
-        .fontSize(taskDetailFontSize(22))
+        .fontSize(uiFontSize(22))
         .fontColor([$r('app.color.text_primary')])
     }
     .width(36)
@@ -3157,13 +2581,13 @@ export struct TaskPageContent {
       this.contextRowIcon(symbol)
       Column({ space: 2 }) {
         Text(title)
-          .fontSize(taskDetailFontSize(16))
-          .lineHeight(taskDetailLineHeight(22))
+          .fontSize(uiFontSize(16))
+          .lineHeight(uiLineHeight(22))
           .fontColor($r('app.color.text_primary'))
         if (subtitle.length > 0) {
           Text(subtitle)
-            .fontSize(taskDetailFontSize(12))
-            .lineHeight(taskDetailLineHeight(18))
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(18))
             .fontColor($r('app.color.text_tertiary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3172,7 +2596,7 @@ export struct TaskPageContent {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
       SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(taskDetailFontSize(14))
+        .fontSize(uiFontSize(14))
         .fontColor([$r('app.color.text_tertiary')])
     }
     .width('100%')
@@ -3188,13 +2612,13 @@ export struct TaskPageContent {
         Column({ space: 14 }) {
           Column({ space: 6 }) {
             Text('目标')
-              .fontSize(taskDetailFontSize(13))
+              .fontSize(uiFontSize(13))
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
             TextArea({ placeholder: '描述要持续推进的结果', text: this.goalObjective })
-              .fontSize(taskDetailFontSize(15))
-              .placeholderFont({ size: taskDetailFontSize(15) })
-              .lineHeight(taskDetailLineHeight(22))
+              .fontSize(uiFontSize(15))
+              .placeholderFont({ size: uiFontSize(15) })
+              .lineHeight(uiLineHeight(22))
               .fontColor($r('app.color.text_primary'))
               .placeholderColor($r('app.color.text_tertiary'))
               .caretColor($r('app.color.chat_input_caret'))
@@ -3212,17 +2636,17 @@ export struct TaskPageContent {
           .alignItems(HorizontalAlign.Start)
 
           Text('可选限制')
-            .fontSize(taskDetailFontSize(13))
+            .fontSize(uiFontSize(13))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           Row({ space: 8 }) {
             Column({ space: 5 }) {
-              Text('最大轮数').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('最大轮数').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalMaxTurns })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(taskDetailFontSize(14))
+                .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3234,11 +2658,11 @@ export struct TaskPageContent {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('token 预算').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('token 预算').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalBudgetTokens })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(taskDetailFontSize(14))
+                .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3250,11 +2674,11 @@ export struct TaskPageContent {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('无进展轮数').fontSize(taskDetailFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('无进展轮数').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '3', text: this.goalNoProgressLimit })
                 .type(InputType.Number)
                 .height(40)
-                .fontSize(taskDetailFontSize(14))
+                .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(8)
@@ -3270,7 +2694,7 @@ export struct TaskPageContent {
           Button(this.goalActionBusy ? '正在启动…' : '开始目标')
             .width('100%')
             .height(44)
-            .fontSize(taskDetailFontSize(15))
+            .fontSize(uiFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(8)
@@ -3291,29 +2715,29 @@ export struct TaskPageContent {
                 ? $r('app.color.chat_status_accent')
                 : $r('app.color.text_tertiary'))
             Text(this.goalStatusText(this.goalState.status))
-              .fontSize(taskDetailFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
           }
           .width('100%')
 
           Text(this.goalState.objective)
-            .fontSize(taskDetailFontSize(17))
-            .lineHeight(taskDetailLineHeight(25))
+            .fontSize(uiFontSize(17))
+            .lineHeight(uiLineHeight(25))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .width('100%')
 
           Text(`${this.goalState.currentTurns} 轮 · ${this.goalState.cumulativeTokens} tokens`)
-            .fontSize(taskDetailFontSize(13))
-            .lineHeight(taskDetailLineHeight(20))
+            .fontSize(uiFontSize(13))
+            .lineHeight(uiLineHeight(20))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           if (this.goalState.lastReason.length > 0) {
             Text(this.goalState.lastReason)
-              .fontSize(taskDetailFontSize(13))
-              .lineHeight(taskDetailLineHeight(20))
+              .fontSize(uiFontSize(13))
+              .lineHeight(uiLineHeight(20))
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
           }
@@ -3384,7 +2808,7 @@ export struct TaskPageContent {
   toolMediaBlock(item: RenderToolMediaItem) {
     Column({ space: 6 }) {
       Text('媒体结果')
-        .fontSize(taskDetailFontSize(12))
+        .fontSize(uiFontSize(12))
         .fontColor($r('app.color.text_tertiary'))
       List({ space: 8 }) {
         ForEach(item.images, (ref: RemoteImageRef) => {
@@ -3417,7 +2841,7 @@ export struct TaskPageContent {
           .width(16)
           .height(16)
         Text(ref.originalName.length > 0 ? ref.originalName : '图片')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3445,24 +2869,24 @@ export struct TaskPageContent {
             .color($r('app.color.text_tertiary'))
         } else {
           SymbolGlyph($r('sys.symbol.layer'))
-            .fontSize(taskDetailFontSize(14))
+            .fontSize(uiFontSize(14))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         }
         Text(this.workGroupTitle(item))
-          .fontSize(taskDetailFontSize(14))
-          .lineHeight(taskDetailLineHeight(20))
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
           .layoutWeight(1)
         if (item.isStreaming) {
           Text(this.formatDuration(this.workElapsedMs(item)))
-            .fontSize(taskDetailFontSize(12))
+            .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_tertiary'))
         }
         SymbolGlyph(this.isIn(this.expandedWorkGroups, item.key)
           ? $r('sys.symbol.chevron_down')
           : $r('sys.symbol.chevron_right'))
-          .fontSize(taskDetailFontSize(13))
+          .fontSize(uiFontSize(13))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       }
@@ -3510,17 +2934,17 @@ export struct TaskPageContent {
     Row({ space: 6 }) {
       if (row.kind === 'thinking') {
         SymbolGlyph($r('sys.symbol.wand_and_stars'))
-          .fontSize(taskDetailFontSize(14))
+          .fontSize(uiFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       } else if (row.error) {
         SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-          .fontSize(taskDetailFontSize(15))
+          .fontSize(uiFontSize(15))
           .fontColor([$r('app.color.danger')])
           .width(16)
       } else if (row.done) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(taskDetailFontSize(14))
+          .fontSize(uiFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
       } else {
@@ -3531,8 +2955,8 @@ export struct TaskPageContent {
           .margin({ left: 1, right: 1 })
       }
       Text(row.text)
-        .fontSize(taskDetailFontSize(14))
-        .lineHeight(taskDetailLineHeight(20))
+        .fontSize(uiFontSize(14))
+        .lineHeight(uiLineHeight(20))
         .fontStyle(row.kind === 'thinking' ? FontStyle.Italic : FontStyle.Normal)
         .fontColor($r('app.color.chat_text_secondary'))
         .maxLines(1)
@@ -3564,10 +2988,10 @@ export struct TaskPageContent {
         .layoutWeight(1)
       Row({ space: 4 }) {
         SymbolGlyph($r('sys.symbol.layer'))
-          .fontSize(taskDetailFontSize(11))
+          .fontSize(uiFontSize(11))
           .fontColor([$r('app.color.text_tertiary')])
         Text(this.compactBoundaryLabel(item))
-          .fontSize(taskDetailFontSize(11))
+          .fontSize(uiFontSize(11))
           .fontColor($r('app.color.text_tertiary'))
       }
       .padding({ left: 9, right: 9, top: 5, bottom: 5 })
@@ -3604,67 +3028,151 @@ export struct TaskPageContent {
       this.planReviewCard(item)
     } else {
       Text(`交互请求（${item.kind}）`)
-        .fontSize(taskDetailFontSize(13))
+        .fontSize(uiFontSize(13))
         .fontColor($r('app.color.text_secondary'))
         .width('100%')
-        .padding(12)
+        .padding(14)
         .backgroundColor($r('app.color.bg_card'))
-        .borderRadius(10)
+        .border({ width: 1, color: $r('app.color.border') })
+        .borderRadius(UI_RADIUS_CONTAINER)
     }
+  }
+
+  /** 交互卡统一头部：图标 + 标题。 */
+  @Builder
+  interactionCardHeader(symbol: Resource, title: string) {
+    Row({ space: 8 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph(symbol)
+          .fontSize(uiFontSize(16))
+          .fontColor([$r('app.color.text_primary')])
+      }
+      .width(28)
+      .height(28)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_CONTROL)
+      Text(title)
+        .fontSize(uiFontSize(14))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .layoutWeight(1)
+    }
+    .width('100%')
+  }
+
+  /** 交互卡次要按钮（拒绝 / 跳过）：描边胶囊。 */
+  @Builder
+  interactionSecondaryButton(label: string, danger: boolean, action: () => void) {
+    Button(label)
+      .type(ButtonType.Normal)
+      .height(34)
+      .fontSize(uiFontSize(13))
+      .fontWeight(FontWeight.Medium)
+      .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+      .backgroundColor($r('app.color.bg_card'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_PILL)
+      .padding({ left: 16, right: 16 })
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(action)
+  }
+
+  /** 交互卡主按钮（允许 / 提交 / 批准）：实心反色胶囊。 */
+  @Builder
+  interactionPrimaryButton(label: string, action: () => void) {
+    Button(label)
+      .type(ButtonType.Normal)
+      .height(34)
+      .fontSize(uiFontSize(13))
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('app.color.chat_cta_text'))
+      .backgroundColor($r('app.color.chat_cta'))
+      .borderRadius(UI_RADIUS_PILL)
+      .padding({ left: 16, right: 16 })
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(action)
   }
 
   /** Permission 卡：允许一次 / 始终允许 / 拒绝。 */
   @Builder
   permissionCard(item: PendingInteraction) {
-    Column({ space: 6 }) {
-      Text('权限请求')
-        .fontSize(taskDetailFontSize(13))
-        .fontWeight(FontWeight.Bold)
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.lock'), '权限请求')
       Text(this.permissionToolName(item))
-        .fontSize(taskDetailFontSize(14))
-      Text(this.permissionInputSummary(item))
-        .fontSize(taskDetailFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
+        .fontSize(uiFontSize(14))
+        .fontColor($r('app.color.text_primary'))
+        .width('100%')
+      if (this.permissionInputSummary(item).length > 0) {
+        Text(this.permissionInputSummary(item))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(17))
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(3)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
       Row({ space: 8 }) {
-        Button('拒绝')
-          .fontSize(taskDetailFontSize(12))
-          .backgroundColor($r('app.color.text_secondary'))
-          .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'deny')))
-        Button('允许一次')
-          .fontSize(taskDetailFontSize(12))
-          .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')))
+        this.interactionSecondaryButton('拒绝', true,
+          () => this.resolveInteraction(item, this.permissionDecision(item, 'deny')))
+        Row().layoutWeight(1)
+        this.interactionPrimaryButton('允许一次',
+          () => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')))
         if (this.permissionCanAlwaysAllow(item)) {
-          Button('始终允许')
-            .fontSize(taskDetailFontSize(12))
-            .onClick(() => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')))
+          this.interactionPrimaryButton('始终允许',
+            () => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')))
         }
       }
       .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(12)
+    .padding(14)
     .backgroundColor($r('app.color.bg_card'))
-    .borderRadius(10)
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiOverlayEnterTransition())
   }
 
   /** Ask User 卡：问题 + 选项（单选/多选）+ 自定义输入 + 提交。 */
   @Builder
   askUserCard(item: PendingInteraction) {
-    Column({ space: 6 }) {
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.ellipsis_message'), '请确认')
       Text(this.askQuestion(item))
-        .fontSize(taskDetailFontSize(14))
+        .fontSize(uiFontSize(14))
+        .lineHeight(uiLineHeight(20))
         .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .width('100%')
       if (this.askOptions(item).length > 0) {
         ForEach(this.askOptions(item), (opt: string) => {
-          Row({ space: 6 }) {
-            Text(this.isAskSelected(item, opt) ? '☑' : '☐')
-              .fontSize(taskDetailFontSize(13))
-              .fontColor(this.isAskSelected(item, opt) ? $r('app.color.accent') : $r('app.color.text_secondary'))
+          Row({ space: 8 }) {
+            Stack({ alignContent: Alignment.Center }) {
+              if (this.isAskSelected(item, opt)) {
+                SymbolGlyph($r('sys.symbol.checkmark'))
+                  .fontSize(uiFontSize(12))
+                  .fontColor([$r('app.color.text_primary')])
+              }
+            }
+            .width(18)
+            .height(18)
+            .backgroundColor(this.isAskSelected(item, opt)
+              ? $r('app.color.bg_chip') : Color.Transparent)
+            .border({ width: 1, color: $r('app.color.border') })
+            .borderRadius(UI_RADIUS_CONTROL)
             Text(opt)
-              .fontSize(taskDetailFontSize(13))
+              .fontSize(uiFontSize(13))
+              .fontColor($r('app.color.text_primary'))
+              .layoutWeight(1)
           }
           .width('100%')
+          .constraintSize({ minHeight: 36 })
+          .padding({ left: 10, right: 10 })
+          .backgroundColor(this.isAskSelected(item, opt)
+            ? $r('app.color.bg_chip') : Color.Transparent)
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .clickEffect(UI_CLICK_EFFECT)
           .onClick(() => this.toggleAskSelection(item, opt))
         }, (opt: string) => `${item.requestId}-${opt}`)
       }
@@ -3675,92 +3183,66 @@ export struct TaskPageContent {
             next.set(item.requestId, v);
             this.askCustomInputs = next;
           })
-          .fontSize(taskDetailFontSize(13))
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_placeholder'))
+          .caretColor($r('app.color.chat_input_caret'))
+          .height(36)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor($r('app.color.bg_page'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_PILL)
       }
       Row({ space: 8 }) {
-        Button('跳过')
-          .fontSize(taskDetailFontSize(12))
-          .backgroundColor($r('app.color.text_secondary'))
-          .onClick(() => this.resolveInteraction(item, this.askSkip(item)))
-        Button('提交')
-          .fontSize(taskDetailFontSize(12))
-          .onClick(() => this.resolveInteraction(item, this.askDecision(item)))
+        this.interactionSecondaryButton('跳过', false,
+          () => this.resolveInteraction(item, this.askSkip(item)))
+        Row().layoutWeight(1)
+        this.interactionPrimaryButton('提交回答',
+          () => this.resolveInteraction(item, this.askDecision(item)))
       }
       .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(12)
+    .padding(14)
     .backgroundColor($r('app.color.bg_card'))
-    .borderRadius(10)
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiOverlayEnterTransition())
   }
 
   /** Plan Review 卡：计划查看 + 批准 / 反馈拒绝。 */
   @Builder
   planReviewCard(item: PendingInteraction) {
-    Column({ space: 6 }) {
-      Text('计划审批')
-        .fontSize(taskDetailFontSize(13))
-        .fontWeight(FontWeight.Bold)
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.doc_text'), '计划审批')
       Text(this.planText(item))
-        .fontSize(taskDetailFontSize(12))
+        .fontSize(uiFontSize(12))
+        .lineHeight(uiLineHeight(18))
         .fontColor($r('app.color.code_text'))
         .maxLines(8)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+        .padding(10)
+        .backgroundColor($r('app.color.bg_code'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .borderRadius(UI_RADIUS_CONTROL)
       Row({ space: 8 }) {
-        Button('拒绝')
-          .fontSize(taskDetailFontSize(12))
-          .backgroundColor($r('app.color.text_secondary'))
-          .onClick(() => this.resolveInteraction(item, this.planDecision(item, false, '')))
-        Button('批准')
-          .fontSize(taskDetailFontSize(12))
-          .onClick(() => this.resolveInteraction(item, this.planDecision(item, true, this.planText(item))))
+        this.interactionSecondaryButton('拒绝', true,
+          () => this.resolveInteraction(item, this.planDecision(item, false, '')))
+        Row().layoutWeight(1)
+        this.interactionPrimaryButton('批准计划',
+          () => this.resolveInteraction(item, this.planDecision(item, true, this.planText(item))))
       }
       .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(12)
+    .padding(14)
     .backgroundColor($r('app.color.bg_card'))
-    .borderRadius(10)
-  }
-
-  /** 待发送图片项（缩略图 + 上传状态 + 移除）。 */
-  @Builder
-  composerImageItem(img: ComposerImage) {
-    Column({ space: 2 }) {
-      Stack({ alignContent: Alignment.TopEnd }) {
-        Image(img.uri)
-          .width(56)
-          .height(56)
-          .borderRadius(6)
-          .objectFit(ImageFit.Cover)
-        Text('✕')
-          .fontSize(taskDetailFontSize(10))
-          .fontColor($r('app.color.chat_overlay_text'))
-          .backgroundColor($r('app.color.overlay'))
-          .width(16)
-          .height(16)
-          .textAlign(TextAlign.Center)
-          .borderRadius(8)
-          .onClick(() => this.removeComposerImage(img))
-      }
-      if (img.status === 'uploading') {
-        Text('上传中…')
-          .fontSize(taskDetailFontSize(10))
-          .fontColor($r('app.color.text_secondary'))
-      } else if (img.status === 'failed') {
-        Text('重试')
-          .fontSize(taskDetailFontSize(10))
-          .fontColor($r('app.color.danger'))
-          .onClick(() => this.retryComposerImage(img))
-      } else {
-        Text('✓')
-          .fontSize(taskDetailFontSize(10))
-          .fontColor($r('app.color.success'))
-      }
-    }
-    .padding({ right: 8 })
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiOverlayEnterTransition())
   }
 
   private hasVisibleMessageBody(item: RenderMessageItem): boolean {
@@ -3820,14 +3302,14 @@ export struct TaskPageContent {
   @Builder
   collapsedPlainUserMessage(item: RenderMessageItem) {
     Text(item.body)
-      .fontSize(taskDetailFontSize(17))
-      .lineHeight(taskDetailLineHeight(26))
+      .fontSize(uiFontSize(17))
+      .lineHeight(uiLineHeight(26))
       .maxLines(this.collapsedMessageLines(item))
       .textOverflow({ overflow: TextOverflow.Ellipsis })
       .width('100%')
     Text('展开全文')
-      .fontSize(taskDetailFontSize(12))
-      .lineHeight(taskDetailLineHeight(18))
+      .fontSize(uiFontSize(12))
+      .lineHeight(uiLineHeight(18))
       .fontColor($r('app.color.accent'))
       .onClick(() => {
         this.expandedTextBlocks = this.toggleExpanded(
@@ -3845,11 +3327,11 @@ export struct TaskPageContent {
         && item.message.automationOrigin) {
         Row({ space: 4 }) {
           SymbolGlyph($r('sys.symbol.timer'))
-            .fontSize(taskDetailFontSize(12))
+            .fontSize(uiFontSize(12))
             .fontColor([$r('app.color.text_tertiary')])
           Text('由自动化发送')
-            .fontSize(taskDetailFontSize(12))
-            .lineHeight(taskDetailLineHeight(16))
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(16))
             .fontColor($r('app.color.text_tertiary'))
         }
         .width('86%')
@@ -3878,10 +3360,10 @@ export struct TaskPageContent {
           if (item.kind !== 'user' && item.kind !== 'assistant') {
             Row({ space: 8 }) {
               Text(item.label)
-                .fontSize(taskDetailFontSize(11))
+                .fontSize(uiFontSize(11))
                 .fontColor(this.labelColor(item.kind))
               Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-                .fontSize(taskDetailFontSize(11))
+                .fontSize(uiFontSize(11))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .width('100%')
@@ -3907,8 +3389,8 @@ export struct TaskPageContent {
           if (this.shouldCollapsePlainUserMessage(item)
             && this.isIn(this.expandedTextBlocks, this.plainMessageExpandKey(item))) {
             Text('收起')
-              .fontSize(taskDetailFontSize(12))
-              .lineHeight(taskDetailLineHeight(18))
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(18))
               .fontColor($r('app.color.accent'))
               .onClick(() => {
                 this.expandedTextBlocks = this.toggleExpanded(
@@ -3922,7 +3404,7 @@ export struct TaskPageContent {
             && item.message !== undefined
             && item.message.isStreaming) {
             Text('生成中')
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.chat_text_secondary'))
               .opacity(0.72)
@@ -3950,14 +3432,14 @@ export struct TaskPageContent {
         Row({ space: 2 }) {
           if (item.kind === 'user') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(taskDetailFontSize(12))
-              .lineHeight(taskDetailLineHeight(24))
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(24))
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ right: 2 })
           }
           Button() {
             SymbolGlyph($r('sys.symbol.rectangle_on_rectangle'))
-              .fontSize(taskDetailFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontColor([$r('app.color.chat_text_secondary')])
           }
           .width(24)
@@ -3969,7 +3451,7 @@ export struct TaskPageContent {
           if (this.canFork(item)) {
             Button() {
               SymbolGlyph($r('sys.symbol.split'))
-                .fontSize(taskDetailFontSize(14))
+                .fontSize(uiFontSize(14))
                 .fontColor([$r('app.color.chat_text_secondary')])
             }
             .width(24)
@@ -3981,7 +3463,7 @@ export struct TaskPageContent {
           }
           Button() {
             SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-              .fontSize(taskDetailFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontColor([$r('app.color.chat_text_secondary')])
           }
           .width(24)
@@ -3992,14 +3474,14 @@ export struct TaskPageContent {
           .onClick(() => this.showMessageActions(item))
           if (item.kind === 'assistant') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(taskDetailFontSize(12))
-              .lineHeight(taskDetailLineHeight(24))
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(24))
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ left: 2 })
             if (this.turnTokensLabel(item).length > 0) {
               Text(this.turnTokensLabel(item))
-                .fontSize(taskDetailFontSize(12))
-                .lineHeight(taskDetailLineHeight(24))
+                .fontSize(uiFontSize(12))
+                .lineHeight(uiLineHeight(24))
                 .fontColor($r('app.color.chat_text_secondary'))
             }
           }
@@ -4018,16 +3500,16 @@ export struct TaskPageContent {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text('▤')
-          .fontSize(taskDetailFontSize(14))
+          .fontSize(uiFontSize(14))
           .fontColor($r('app.color.text_tertiary'))
         Text(seg.display.length > 0 ? seg.display : `已粘贴文本（${seg.text.length} 字）`)
-          .fontSize(taskDetailFontSize(13))
+          .fontSize(uiFontSize(13))
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         Text(this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`) ? '▾' : '▸')
-          .fontSize(taskDetailFontSize(11))
+          .fontSize(uiFontSize(11))
           .fontColor($r('app.color.text_tertiary'))
       }
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
@@ -4041,7 +3523,7 @@ export struct TaskPageContent {
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
         this.mdBlocks(seg.mdBlocks)
         Text('收起')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -4059,7 +3541,7 @@ export struct TaskPageContent {
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
         this.mdBlocks(seg.mdBlocks)
         Text('收起')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -4067,8 +3549,8 @@ export struct TaskPageContent {
       } else {
         // 自动化消息使用更紧的 4/3 行策略；手打消息保持 14/10。
         Text(seg.text)
-          .fontSize(taskDetailFontSize(17))
-          .lineHeight(taskDetailLineHeight(26))
+          .fontSize(uiFontSize(17))
+          .lineHeight(uiLineHeight(26))
           .maxLines(this.collapsedMessageLines(item))
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
@@ -4076,7 +3558,7 @@ export struct TaskPageContent {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
           })
         Text('展开全文')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
           .onClick(() => {
             this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
@@ -4094,12 +3576,12 @@ export struct TaskPageContent {
         SymbolGlyph(this.isIn(this.expandedThinking, item.key)
           ? $r('sys.symbol.chevron_down')
           : $r('sys.symbol.chevron_right'))
-          .fontSize(taskDetailFontSize(13))
+          .fontSize(uiFontSize(13))
           .fontColor([$r('app.color.chat_text_secondary')])
           .width(16)
         Text(this.thinkingTitle(item))
-          .fontSize(taskDetailFontSize(14))
-          .lineHeight(taskDetailLineHeight(20))
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
       }
       .onClick(() => {
@@ -4109,14 +3591,14 @@ export struct TaskPageContent {
       if (this.isIn(this.expandedThinking, item.key)) {
         if (item.redacted) {
           Text('思考内容已隐藏')
-            .fontSize(taskDetailFontSize(12))
+            .fontSize(uiFontSize(12))
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.text_secondary'))
         } else if (item.body.trim().length > 0) {
           // Thinking 正文使用 12/18 斜体小字和 2vp rail，不继承普通消息 17/26 档。
           Text(item.body)
-            .fontSize(taskDetailFontSize(12))
-            .lineHeight(taskDetailLineHeight(18))
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(18))
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.chat_text_secondary'))
             .width('100%')
@@ -4158,12 +3640,12 @@ export struct TaskPageContent {
       Row({ space: 6 }) {
         if (t.hasError) {
           SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-            .fontSize(taskDetailFontSize(15))
+            .fontSize(uiFontSize(15))
             .fontColor([$r('app.color.danger')])
             .width(16)
         } else if (t.hasResult) {
           SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(taskDetailFontSize(14))
+            .fontSize(uiFontSize(14))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         } else {
@@ -4174,8 +3656,8 @@ export struct TaskPageContent {
             .margin({ left: 1, right: 1 })
         }
         Text(this.toolRowLabel(t))
-          .fontSize(taskDetailFontSize(14))
-          .lineHeight(taskDetailLineHeight(20))
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -4184,7 +3666,7 @@ export struct TaskPageContent {
           SymbolGlyph(this.isIn(this.expandedTools, this.toolKey(t))
             ? $r('sys.symbol.chevron_down')
             : $r('sys.symbol.chevron_right'))
-            .fontSize(taskDetailFontSize(13))
+            .fontSize(uiFontSize(13))
             .fontColor([$r('app.color.text_tertiary')])
             .width(16)
         }
@@ -4202,18 +3684,18 @@ export struct TaskPageContent {
         Column({ space: 4 }) {
           if (t.inputText.length > 0) {
             Text(t.inputText)
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontFamily('monospace')
               .fontColor($r('app.color.chat_text_secondary'))
-              .lineHeight(taskDetailLineHeight(18))
+              .lineHeight(uiLineHeight(18))
               .width('100%')
           }
           if (t.hasResult && t.resultText.length > 0) {
             Text(t.resultText)
-              .fontSize(taskDetailFontSize(12))
+              .fontSize(uiFontSize(12))
               .fontFamily('monospace')
               .fontColor($r('app.color.chat_text_secondary'))
-              .lineHeight(taskDetailLineHeight(18))
+              .lineHeight(uiLineHeight(18))
               .width('100%')
           }
         }
@@ -4234,7 +3716,7 @@ export struct TaskPageContent {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text(this.todoTitle(item))
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -4246,14 +3728,14 @@ export struct TaskPageContent {
       ForEach(item.todos, (t: RenderTodoItem) => {
         Row({ space: 6 }) {
           Text(this.todoMark(t.status))
-            .fontSize(taskDetailFontSize(13))
+            .fontSize(uiFontSize(13))
             .fontColor(this.todoColor(t.status))
           Text(t.content)
-            .fontSize(taskDetailFontSize(13))
+            .fontSize(uiFontSize(13))
             .fontColor(t.status === 'completed' ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
           if (t.status === 'in_progress') {
             Text('…')
-              .fontSize(taskDetailFontSize(13))
+              .fontSize(uiFontSize(13))
               .fontColor($r('app.color.warn'))
           }
         }
@@ -4321,7 +3803,7 @@ export struct TaskPageContent {
           .width(14)
           .height(14)
         Text(token.value.length > 0 ? token.value : '图片')
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -4348,10 +3830,10 @@ export struct TaskPageContent {
         this.mdInlineContent(b.inlineTokens)
       } else {
         Text(b.text)
-          .fontSize(taskDetailFontSize(b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17)))
+          .fontSize(uiFontSize(b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17)))
           .fontWeight(FontWeight.Medium)
           .width('100%')
-          .lineHeight(taskDetailLineHeight(b.level <= 2 ? 28 : 26))
+          .lineHeight(uiLineHeight(b.level <= 2 ? 28 : 26))
           .padding({ top: 4, bottom: 4 })
       }
     } else if (b.type === 'paragraph') {
@@ -4365,7 +3847,7 @@ export struct TaskPageContent {
         ForEach(b.items, (it: string, idx?: number) => {
           Row({ space: 6 }) {
             Text(b.ordered ? `${(idx ?? 0) + 1}.` : '•')
-              .fontSize(taskDetailFontSize(17))
+              .fontSize(uiFontSize(17))
               .fontColor($r('app.color.text_secondary'))
             if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
               this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [])
@@ -4388,9 +3870,9 @@ export struct TaskPageContent {
         .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
       } else {
         Text(b.text)
-          .fontSize(taskDetailFontSize(14))
+          .fontSize(uiFontSize(14))
           .fontColor($r('app.color.text_secondary'))
-          .lineHeight(taskDetailLineHeight(22))
+          .lineHeight(uiLineHeight(22))
           .padding({ left: 10 })
           .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
           .width('100%')
@@ -4398,10 +3880,10 @@ export struct TaskPageContent {
     } else if (b.type === 'code') {
       Column({ space: 4 }) {
         Text(b.code)
-          .fontSize(taskDetailFontSize(12))
+          .fontSize(uiFontSize(12))
           .fontFamily('monospace')
           .fontColor($r('app.color.code_text'))
-          .lineHeight(taskDetailLineHeight(18))
+          .lineHeight(uiLineHeight(18))
           .padding(10)
           .backgroundColor($r('app.color.bg_code'))
           .border({ width: 1, color: $r('app.color.border') })
@@ -4509,8 +3991,8 @@ export struct TaskPageContent {
         }
       }, (t: InlineToken) => `${t.seq}`)
     }
-    .fontSize(taskDetailFontSize(17))
-    .lineHeight(taskDetailLineHeight(26))
+    .fontSize(uiFontSize(17))
+    .lineHeight(uiLineHeight(26))
     .textAlign(TextAlign.Start)
   }
 
@@ -5240,14 +4722,4 @@ struct TaskPage {
     .width('100%')
     .height('100%')
   }
-}
-
-/** 待发送图片（上传状态机：uploading → ready / failed）。 */
-class ComposerImage {
-  uri: string = '';
-  name: string = '';
-  status: string = 'uploading';
-  ref: RemoteImageRef | null = null;
-  /** 用户已移除；异步上传若稍后成功，立即回收中转对象。 */
-  removed: boolean = false;
 }

@@ -77,8 +77,10 @@ class CreateOptsArgs {
   agentKind: string = '';
   workingDir: string = '';
   model: string = '';
+  providerId: string | null = null;
   effort: string = '';
   permissionMode: string = '';
+  planMode: boolean = false;
   fastMode: boolean = false;
 }
 
@@ -960,8 +962,10 @@ export class MessageStore {
     createOpts.agentKind = mapAgentKind(session.agentKind);
     createOpts.workingDir = session.workingDir;
     createOpts.model = session.model;
+    createOpts.providerId = session.providerId.length > 0 ? session.providerId : null;
     createOpts.effort = session.effort;
     createOpts.permissionMode = session.permissionMode;
+    createOpts.planMode = session.planModeEnabled;
     createOpts.fastMode = session.fastMode;
 
     const sendOpts: Record<string, Object> = {};

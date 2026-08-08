@@ -134,6 +134,24 @@ export class TaskStore {
     return this.sessionsByDevice.get(deviceId) ?? [];
   }
 
+  /** 新建任务拿到 sessionId 后先占位，避免 sessions:created push 晚到导致详情页空壳。 */
+  upsertSession(deviceId: string, session: RemoteSession): void {
+    const list = this.sessionsByDevice.get(deviceId) ?? [];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === session.id) {
+        list[i] = session;
+        list.sort(sortSessionsByUpdatedAt);
+        this.sessionsByDevice.set(deviceId, list);
+        this.notify();
+        return;
+      }
+    }
+    list.push(session);
+    list.sort(sortSessionsByUpdatedAt);
+    this.sessionsByDevice.set(deviceId, list);
+    this.notify();
+  }
+
   /** 拉取某设备的 active 任务列表；false 表示失败或结果已过期。 */
   async loadSessions(deviceId: string): Promise<boolean> {
     const client = this.client;

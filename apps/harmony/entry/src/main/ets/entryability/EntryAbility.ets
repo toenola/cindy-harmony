@@ -32,7 +32,7 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'CindyHarmony', 'Succeeded in loading the content.');
-      void this.applyNavigationBarAppearance(windowStage);
+      void this.applySystemBarAppearance(windowStage);
     });
   }
 
@@ -46,10 +46,17 @@ export default class EntryAbility extends UIAbility {
     // Ability has brought to foreground
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onForeground');
     if (this.mainWindowStage !== null) {
-      void this.applyNavigationBarAppearance(this.mainWindowStage);
+      void this.applySystemBarAppearance(this.mainWindowStage);
     }
     // 回前台：立即重连（后台期间 WS 可能已断），并触发重连后的订阅恢复。
     AppServices.instance.onAppForeground();
+  }
+
+  onConfigurationUpdate(): void {
+    // 运行时切换深浅色：同步刷新系统状态栏/导航栏配色，避免图标与背景同色不可见。
+    if (this.mainWindowStage !== null) {
+      void this.applySystemBarAppearance(this.mainWindowStage);
+    }
   }
 
   onBackground(): void {
@@ -57,22 +64,28 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onBackground');
   }
 
-  private async applyNavigationBarAppearance(windowStage: window.WindowStage): Promise<void> {
+  private async applySystemBarAppearance(windowStage: window.WindowStage): Promise<void> {
     try {
       const resourceManager = this.context.resourceManager;
-      const navigationBarColor = this.colorToHex(resourceManager.getColorByNameSync('bg_page'));
-      const navigationBarContentColor = this.colorToHex(
+      // 状态栏与导航栏共用页面背景 bg_page，使系统栏与页面视觉无缝融合（沉浸式）。
+      const barColor = this.colorToHex(resourceManager.getColorByNameSync('bg_page'));
+      const barContentColor = this.colorToHex(
         resourceManager.getColorByNameSync('text_primary'));
       const isDarkMode = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      // 系统栏背景越深，图标越需要亮色；浅色背景则用暗色图标。
+      const lightIcon = isDarkMode;
       const mainWindow = await windowStage.getMainWindow();
       await mainWindow.setWindowSystemBarProperties({
-        navigationBarColor,
-        navigationBarContentColor,
-        isNavigationBarLightIcon: isDarkMode,
+        statusBarColor: barColor,
+        statusBarContentColor: barContentColor,
+        isStatusBarLightIcon: lightIcon,
+        navigationBarColor: barColor,
+        navigationBarContentColor: barContentColor,
+        isNavigationBarLightIcon: lightIcon,
       });
     } catch (err) {
       hilog.error(DOMAIN, 'CindyHarmony',
-        'Failed to apply navigation bar appearance. Cause: %{public}s', JSON.stringify(err));
+        'Failed to apply system bar appearance. Cause: %{public}s', JSON.stringify(err));
     }
   }
 
