@@ -30,6 +30,20 @@ import {
   PendingInteraction,
   PlanReviewDraft,
 } from '../core/interactions/InteractionStore';
+import {
+  AskOptionPresentation,
+  PlanOutlinePresentation,
+  PlanReviewEvidencePresentation,
+  askOptionPresentations,
+  buildPlanReviewEvidence,
+  buildPermissionDecision,
+  interactionKindLabel,
+  pendingInteractionsBlockRemoteComposer,
+  permissionCanAlwaysAllow,
+  permissionRequestFingerprint,
+  permissionRiskSummary,
+  sortPendingInteractions,
+} from '../core/interactions/InteractionPresentation';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
@@ -65,7 +79,11 @@ import {
   permissionModeDescription,
 } from '../core/ComposerCatalog';
 import { SessionMetaPatch, unwrapInvokeResult } from '../core/tasks/TaskStore';
-import { RemoteSession, readBool, readNum, readObj, readStr } from '../core/tasks/TaskModels';
+import { RemoteSession, readBool, readNum, readObj, readStr, recordOrEmpty } from '../core/tasks/TaskModels';
+import {
+  NewSessionCreationTask,
+  shouldBlockNewSessionRemoteOperation,
+} from '../core/tasks/NewSessionCreationStore';
 import {
   PiSessionTreeNode,
   PiSessionTreeSnapshot,
@@ -82,6 +100,7 @@ import {
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
+  todoCardContentSignature, todoCardIndexAtRankFromTail, todoCardRankFromTail,
 } from '../core/messages/MessageRender';
 import {
   RenderDiffPayload,
@@ -89,26 +108,61 @@ import {
   RenderMediaPayload,
 } from '../core/messages/MessagePayload';
 import {
-  MdBlock, tokenizeInline, InlineToken, parseMarkdown,
+  MdBlock, tokenizeInline, InlineToken, InlineTokenGroup, groupInlineTokens,
 } from '../core/messages/MarkdownParser';
+import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
+import {
+  MessageSearchHit,
+  MessageSearchPagingPresentation,
+  findMessageSearchHits,
+  messageSearchPagingPresentation,
+  nextMessageSearchIndex,
+  reconcileMessageSearchIndex,
+} from '../core/messages/MessageSearch';
 import {
   PendingQueueBubble,
   QueuedInputItem,
 } from '../core/messages/InputQueueStore';
 import { RewindPreview } from '../core/messages/MessageStore';
 import {
+  AutoResumePresentation,
+  appendAutoResumePendingMessage,
+  deriveAutoResumePresentation,
+} from '../core/messages/AutoResumePresentation';
+import {
+  SystemCardPresentation,
+  SystemCardRow,
+  deriveSystemCardPresentation,
+} from '../core/messages/SystemCardPresentation';
+import {
+  LearnCommandMatch,
+  buildLearnStartRequest,
+  parseLearnCommand,
+} from '../core/messages/LearnCommand';
+import {
+  CONTINUE_AFTER_APP_EXIT_PROMPT,
+  CONTINUE_AFTER_ERROR_PROMPT,
+  SessionTailPresentation,
+  deriveSessionTailPresentation,
+  isContinuationText,
+} from '../core/messages/SessionTailPresentation';
+import {
   ComposerDocument,
+  ComposerAtomPresentation,
   ComposerNode,
   SerializedComposerDocument,
   appendComposerNode,
   composerDocumentHasContent,
+  composerDocumentFromPersistedContent,
   composerDocumentProjectedText,
+  composerAtomPresentations,
   emptyComposerDocument,
   isLongComposerPaste,
   pastedTextNode,
   mentionNode,
   quoteNode,
   reconcileComposerProjectedText,
+  removeComposerNode,
   replaceComposerTextRange,
   serializeComposerDocument,
   slashCommandNode,
@@ -126,6 +180,10 @@ import {
   remoteMediaResolveReady,
 } from '../core/messages/RemoteMediaState';
 import { AgentTaskUpdate, WorkflowProgressEntry } from '../core/messages/AgentTaskStore';
+import {
+  ToolActionPresentation,
+  projectToolUseActions,
+} from '../core/messages/ToolUsePresentation';
 
 /** 活动 work_group 收起态的实时步骤预览行（对齐 Mobile collapsedBody）。 */
 class WorkPreviewRow {
@@ -134,6 +192,15 @@ class WorkPreviewRow {
   text: string = '';
   done: boolean = false;
   error: boolean = false;
+  explorationKind: string = 'other';
+  readKey: string = '';
+}
+
+class WorkExplorationCount {
+  reads: number = 0;
+  searches: number = 0;
+  lists: number = 0;
+  unsupported: boolean = false;
 }
 
 class ComposerPaletteItem {
@@ -194,6 +261,7 @@ export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
+  @Prop paneMessageClientId: string = '';
   @State items: RenderItem[] = [];
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
@@ -204,10 +272,22 @@ export struct TaskPageContent {
   @State queueBubbles: PendingQueueBubble[] = [];
   @State queuePaused: boolean = false;
   @State queueProjectionError: string = '';
+  @State queueErrorRetryText: string = '';
+  @State queueCredentialWaiting: boolean = false;
+  @State queueCredentialBlockedCount: number = 0;
+  @State queueAbortPending: boolean = false;
+  @State queueInteractionLocked: boolean = false;
   @State queueBusy: boolean = false;
+  private interactionSessionActivated: boolean = false;
+  /** 新任务后台创建态；running/create-failed 期间详情页不得发普通 session RPC。 */
+  @State newSessionCreationStatus: string = '';
+  @State newSessionCreationError: string = '';
+  @State newSessionCreationClientId: string = '';
   @State selectedQueueClientId: string = '';
   @State editingQueueClientId: string = '';
   private stashedComposerInput: string = '';
+  private stashedComposerDocument: ComposerDocument = new ComposerDocument();
+  private editingQueueOriginalText: string = '';
   @State error: string = '';
   @State loadFailed: boolean = false;
   /** 首次历史请求已经结束；空任务据此从“正在同步”切到真实空态。 */
@@ -216,6 +296,9 @@ export struct TaskPageContent {
   @State showInitialSync: boolean = false;
   /** 会话仍在流式生成；驱动 Header、Composer 和消息尾部状态。 */
   @State sessionStreaming: boolean = false;
+  /** 真实消息区宽度；折叠双栏下不能拿整块屏幕宽度估算 Markdown 表格。 */
+  @State messageAreaWidth: number = 0;
+  private tableColumnWidthCache: Map<MdBlock, number[]> = new Map();
   /** 用户是否仍明确跟随消息尾部。 */
   @State followingLatest: boolean = true;
   /** 离底期间收到尾部更新时，在回到底部浮标上显示提示点。 */
@@ -226,11 +309,19 @@ export struct TaskPageContent {
   @State searchOpen: boolean = false;
   @State searchQuery: string = '';
   @State searchActiveIndex: number = 0;
+  @State searchActiveSourceKey: string = '';
+  @State focusedSearchItemKey: string = '';
+  @State focusedMessageClientId: string = '';
+  @State tailHiddenErrorClientIds: string[] = [];
+  @State tailInterruptAcked: boolean = false;
+  @State tailBannerBusy: boolean = false;
   /** thinking 展开的 key（默认折叠）。 */
   @State expandedThinking: string[] = [];
   /** tool_group 折叠的 key（默认展开）。 */
   /** work_group 展开的 key（默认折叠）。 */
   @State expandedWorkGroups: string[] = [];
+  /** todo 默认展开；这里只记录用户主动收起的 key。 */
+  @State collapsedTodoCards: string[] = [];
   /** 单条工具结果展开 key（默认折叠）。 */
   @State expandedTools: string[] = [];
   /** user 长文本块展开的 key（默认折叠）。 */
@@ -245,6 +336,13 @@ export struct TaskPageContent {
   private initialScrollGeneration: number = 0;
   private initialLoadGeneration: number = 0;
   private sessionOpenResolved: boolean = false;
+  private sessionSyncStarted: boolean = false;
+  private routeMessageClientId: string = '';
+  private messageFocusGeneration: number = 0;
+  private messageFocusLoadStarted: boolean = false;
+  private inputQueueActivated: boolean = false;
+  private creationDraftHandoffDone: boolean = false;
+  private leavingForCreationEdit: boolean = false;
   /** 加载更早消息进行中（防重复触发，并驱动列表头入口）。 */
   @State loadingOlder: boolean = false;
   /** List 当前可见的首尾渲染项，用于贴底意图和历史分页。 */
@@ -257,6 +355,8 @@ export struct TaskPageContent {
   /** 当前手势是否明确向消息尾部移动。 */
   private listTouchPushedUp: boolean = false;
   private listTouchLoadTriggered: boolean = false;
+  private historyReviewIntent: boolean = false;
+  private historyLastAttemptFirstKey: string = '';
   /** 待发送图片（上传状态，由共享队列同步镜像）。 */
   @State composerImages: ComposerImage[] = [];
   @State pickingImages: boolean = false;
@@ -288,6 +388,8 @@ export struct TaskPageContent {
   private composerPaletteFrom: number = 0;
   private composerPaletteQuery: string = '';
   private composerPaletteGeneration: number = 0;
+  /** 同名 Agent Skill 被明确选择时，下一次 `/learn` 让行给 Agent。 */
+  private selectedLearnRoute: string = '';
   @State planModeSupported: boolean = false;
   @State planModeEnabled: boolean = false;
   @State permissionOptions: ComposerChoiceOption[] = [];
@@ -330,6 +432,12 @@ export struct TaskPageContent {
   @State previewImageUrl: string = '';
   /** 挂起的交互请求（Permission / Ask User / Plan Review）。 */
   @State pendingInteractions: PendingInteraction[] = [];
+  /** 多卡时只展示一个 active request；新快照优先保留用户正在处理的卡。 */
+  @State activeInteractionRequestId: string = '';
+  /** 高风险 Permission 首击只进入确认态；同一 request 的第二击才真正提交。 */
+  @State armedPermissionRequestId: string = '';
+  @State armedPermissionAction: string = '';
+  @State armedPermissionFingerprint: string = '';
   /** 当前设备是否关闭远程控制（只读提示）。 */
   @State deviceDisabled: boolean = false;
   /** 活动工作组的实时计时基准；与 Mobile 每 500ms 刷新一次。 */
@@ -354,13 +462,28 @@ export struct TaskPageContent {
     };
     this.fileQueue.isBusy = (): boolean => this.sending;
     this.fileQueue.occupiedByOtherAttachments = (): number => this.imageQueue.images.length;
-    const params = router.getParams() as Record<string, Object>;
+    const params = recordOrEmpty(router.getParams());
     this.deviceId = this.paneDeviceId.length > 0
       ? this.paneDeviceId
       : readStr(params, 'deviceId');
     this.sessionId = this.paneSessionId.length > 0
       ? this.paneSessionId
       : readStr(params, 'sessionId');
+    this.routeMessageClientId = this.paneMessageClientId.length > 0
+      ? this.paneMessageClientId : readStr(params, 'message');
+    this.focusedMessageClientId = '';
+    this.tailHiddenErrorClientIds = [];
+    this.tailInterruptAcked = false;
+    this.tailBannerBusy = false;
+    this.messageFocusGeneration += 1;
+    this.messageFocusLoadStarted = false;
+    this.sessionSyncStarted = false;
+    this.inputQueueActivated = false;
+    this.creationDraftHandoffDone = false;
+    this.leavingForCreationEdit = false;
+    this.newSessionCreationStatus = '';
+    this.newSessionCreationError = '';
+    this.newSessionCreationClientId = '';
     this.initialScrolled = false;
     this.initialScrollSettling = true;
     this.initialScrollGeneration += 1;
@@ -376,6 +499,8 @@ export struct TaskPageContent {
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
+    this.historyReviewIntent = false;
+    this.historyLastAttemptFirstKey = '';
     this.agentSwitchConfirmed = false;
     this.pendingAgentSwitchIntent = null;
     this.composerDocument = emptyComposerDocument();
@@ -392,16 +517,20 @@ export struct TaskPageContent {
     // 输入队列由应用级 Store 持有；页面仅镜像展示并触发操作。
     this.unsubs.push(AppServices.instance.inputQueue.onChanged(() => {
       this.refreshQueueState();
+      this.refreshItems();
     }));
     this.refreshQueueState();
-    void AppServices.instance.inputQueue.refresh(this.deviceId, this.sessionId);
 
-    // 交互确认：订阅挂起交互 + 拉快照。
+    // 交互确认：先镜像已有本地状态；远端快照由 session sync guard 统一放行。
     this.unsubs.push(AppServices.instance.interactions.onChanged(() => {
-      this.pendingInteractions = AppServices.instance.interactions.getPending(this.sessionId);
+      this.syncPendingInteractions();
+      if (this.armedPermissionRequestId.length > 0
+        && !this.pendingInteractions.some((item: PendingInteraction) =>
+          item.requestId === this.armedPermissionRequestId)) {
+        this.clearArmedPermission();
+      }
     }));
-    this.pendingInteractions = AppServices.instance.interactions.getPending(this.sessionId);
-    void AppServices.instance.interactions.refreshPending(this.deviceId, this.sessionId);
+    this.syncPendingInteractions();
 
     // 撤权检查：设备关闭远程控制时只读。
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
@@ -413,24 +542,23 @@ export struct TaskPageContent {
     this.syncMessageCount();
     this.syncComposerContextState();
 
-    // 目标模式走 session topic 推送；打开任务时补拉一次快照。
+    // 目标模式走 session topic 推送；普通任务放行后再补拉一次快照。
     this.unsubs.push(AppServices.instance.goals.onChanged(() => {
       this.goalState = AppServices.instance.goals.getState(this.sessionId);
     }));
     this.goalState = AppServices.instance.goals.getState(this.sessionId);
-    void AppServices.instance.goals.refresh(this.deviceId, this.sessionId);
-    void this.loadComposerCapabilities();
-    void this.invokeContextRpc('notification:clear-session-attention', [this.sessionId, 'explicit']).catch(() => {
-      // 已读清除是幂等增强；旧被控端不支持时不阻塞详情页。
-    });
-
-    this.beginInitialLoad();
     this.restoreComposerDraft();
+
+    this.unsubs.push(AppServices.instance.newSessionCreations.onChanged(() => {
+      this.refreshNewSessionCreation();
+    }));
+    this.refreshNewSessionCreation();
   }
 
   aboutToDisappear(): void {
     this.initialScrollGeneration += 1;
     this.initialLoadGeneration += 1;
+    this.messageFocusGeneration += 1;
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.initialScrollSettling = false;
@@ -447,6 +575,14 @@ export struct TaskPageContent {
         this.deviceId, this.sessionId, this.editingQueueClientId, false).catch(() => {
       });
     }
+    if (this.inputQueueActivated) {
+      AppServices.instance.inputQueue.deactivateSession(this.deviceId, this.sessionId);
+      this.inputQueueActivated = false;
+    }
+    if (this.interactionSessionActivated) {
+      AppServices.instance.interactions.deactivateSession(this.deviceId, this.sessionId);
+      this.interactionSessionActivated = false;
+    }
     this.stopWorkClock();
     for (const u of this.unsubs) {
       u();
@@ -455,11 +591,107 @@ export struct TaskPageContent {
     void AppServices.instance.messages.closeSession(this.sessionId);
   }
 
+  private refreshNewSessionCreation(): void {
+    const task = AppServices.instance.newSessionCreations.getTask(this.sessionId);
+    this.newSessionCreationStatus = task?.status ?? '';
+    this.newSessionCreationError = task?.error ?? '';
+    this.newSessionCreationClientId = task?.firstMessageClientId ?? '';
+    if (task?.status === 'enqueue-failed' && !this.creationDraftHandoffDone) {
+      this.handoffFailedFirstMessage(task);
+    }
+    if (!this.leavingForCreationEdit
+      && !AppServices.instance.newSessionCreations.shouldBlockSessionSync(this.sessionId)) {
+      this.startSessionSyncOnce();
+    }
+  }
+
+  private syncPendingInteractions(): void {
+    const sorted = sortPendingInteractions(
+      AppServices.instance.interactions.getPending(this.sessionId));
+    this.pendingInteractions = sorted;
+    let activeExists = false;
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i].requestId === this.activeInteractionRequestId) {
+        activeExists = true;
+        break;
+      }
+    }
+    if (!activeExists) {
+      this.activeInteractionRequestId = sorted.length > 0 ? sorted[0].requestId : '';
+    }
+  }
+
+  private activeInteractionIndex(): number {
+    for (let i = 0; i < this.pendingInteractions.length; i++) {
+      if (this.pendingInteractions[i].requestId === this.activeInteractionRequestId) return i;
+    }
+    return this.pendingInteractions.length > 0 ? 0 : -1;
+  }
+
+  private selectPendingInteraction(requestId: string): void {
+    if (requestId === this.activeInteractionRequestId) return;
+    this.activeInteractionRequestId = requestId;
+    this.clearArmedPermission();
+  }
+
+  private isCreationBlockingRemoteOps(): boolean {
+    return shouldBlockNewSessionRemoteOperation(
+      this.session()?.pendingLocalCreation === true,
+      this.newSessionCreationStatus,
+    );
+  }
+
+  private handoffFailedFirstMessage(task: NewSessionCreationTask): void {
+    this.creationDraftHandoffDone = true;
+    const current = composerDocumentProjectedText(this.composerDocument);
+    let restored = task.firstMessageText;
+    if (current.trim().length > 0) {
+      restored = restored.length > 0 ? `${restored}\n\n${current}` : current;
+    }
+    this.setComposerDocument(reconcileComposerProjectedText(this.composerDocument, restored));
+    const recoveredImages = this.imageQueue.restoreReady(task.firstMessageImages);
+    const recoveredFiles = this.fileQueue.restoreReady(task.firstMessageFiles);
+    const missingAttachments = task.firstMessageImages.length - recoveredImages
+      + task.firstMessageFiles.length - recoveredFiles;
+    this.error = missingAttachments > 0
+      ? `${task.error}；有 ${missingAttachments} 个附件因数量上限未恢复`
+      : task.error;
+    AppServices.instance.newSessionCreations.finishDraftHandoff(this.sessionId);
+  }
+
+  /** 创建完成后只启动一次详情页的完整远端同步。 */
+  private startSessionSyncOnce(): void {
+    if (this.sessionSyncStarted || this.deviceId.length === 0 || this.sessionId.length === 0) return;
+    this.sessionSyncStarted = true;
+    AppServices.instance.inputQueue.activateSession(this.deviceId, this.sessionId);
+    this.inputQueueActivated = true;
+    AppServices.instance.interactions.activateSession(this.deviceId, this.sessionId);
+    this.interactionSessionActivated = true;
+    void AppServices.instance.inputQueue.refresh(this.deviceId, this.sessionId);
+    void AppServices.instance.interactions.refreshPending(this.deviceId, this.sessionId);
+    void AppServices.instance.goals.refresh(this.deviceId, this.sessionId);
+    void this.loadComposerCapabilities();
+    void this.invokeContextRpc('notification:clear-session-attention', [this.sessionId, 'explicit']).catch(() => {
+      // 已读清除是幂等增强；旧被控端不支持时不阻塞详情页。
+    });
+    this.beginInitialLoad();
+  }
+
   private refreshQueueState(): void {
     const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
     this.queueBubbles = AppServices.instance.inputQueue.getBubbles(this.sessionId);
     this.queuePaused = projection.queuePaused;
     this.queueProjectionError = projection.error;
+    this.queueErrorRetryText = projection.errorRetryText;
+    this.queueCredentialWaiting = projection.credentialSwitchWaiting;
+    this.queueCredentialBlockedCount = projection.credentialSwitchBlockedBy.length;
+    this.queueAbortPending = projection.queueAbortPending;
+    this.queueInteractionLocked = projection.queueInteractionLocks.length > 0;
+  }
+
+  private queueActionBlocked(): boolean {
+    return this.queueBusy || this.isCreationBlockingRemoteOps() || this.deviceDisabled
+      || this.queueAbortPending || this.queueInteractionLocked;
   }
 
   /**
@@ -482,7 +714,10 @@ export struct TaskPageContent {
       this.showInitialSync = false;
       this.loadFailed = !loaded || AppServices.instance.messages.loadFailed(this.sessionId);
       this.refreshItems();
-      if (loaded) this.scrollToBottomOnce();
+      if (loaded) {
+        if (this.routeMessageClientId.length > 0) this.focusMessageTarget();
+        else this.scrollToBottomOnce();
+      }
     });
   }
 
@@ -499,6 +734,15 @@ export struct TaskPageContent {
 
   private isEmbedded(): boolean {
     return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
+  }
+
+  private handleMessageAreaChange(_oldArea: Area, newArea: Area): void {
+    const value = newArea.width;
+    const width = typeof value === 'number' ? value : 0;
+    if (Number.isFinite(width) && width > 0 && width !== this.messageAreaWidth) {
+      this.messageAreaWidth = width;
+      this.tableColumnWidthCache.clear();
+    }
   }
 
   private session(): RemoteSession | undefined {
@@ -666,6 +910,9 @@ export struct TaskPageContent {
   }
 
   private async invokeContextRpc(channel: string, args: Object[]): Promise<Object | undefined> {
+    if (this.isCreationBlockingRemoteOps()) {
+      throw new Error('任务创建完成后才能修改任务设置');
+    }
     await AppServices.instance.openLink(this.deviceId);
     const options = new DlInvokeOptions();
     options.channel = channel;
@@ -675,7 +922,7 @@ export struct TaskPageContent {
   }
 
   private async togglePlanMode(): Promise<void> {
-    if (this.contextRpcBusy || !this.planModeSupported) {
+    if (this.contextRpcBusy || !this.planModeSupported || this.isCreationBlockingRemoteOps()) {
       return;
     }
     const session = this.session();
@@ -912,7 +1159,8 @@ export struct TaskPageContent {
   }
 
   private openComposerControlSheet(page: string): void {
-    if (this.sending || this.contextRpcBusy || this.deviceDisabled) {
+    if (this.sending || this.contextRpcBusy || this.deviceDisabled
+      || this.isCreationBlockingRemoteOps()) {
       return;
     }
     if (page === 'model') {
@@ -1127,7 +1375,7 @@ export struct TaskPageContent {
 
   private async startGoal(): Promise<void> {
     const objective = this.goalObjective.trim();
-    if (objective.length === 0 || this.goalActionBusy) {
+    if (objective.length === 0 || this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       if (objective.length === 0) {
         promptAction.showToast({ message: '请先填写目标' });
       }
@@ -1165,7 +1413,7 @@ export struct TaskPageContent {
   }
 
   private async pauseOrResumeGoal(): Promise<void> {
-    if (this.goalState === null || this.goalActionBusy) {
+    if (this.goalState === null || this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       return;
     }
     this.goalActionBusy = true;
@@ -1184,7 +1432,7 @@ export struct TaskPageContent {
   }
 
   private confirmClearGoal(): void {
-    if (this.goalActionBusy) {
+    if (this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       return;
     }
     this.getUIContext().showActionSheet({
@@ -1200,6 +1448,7 @@ export struct TaskPageContent {
   }
 
   private async clearGoal(): Promise<void> {
+    if (this.isCreationBlockingRemoteOps()) return;
     this.goalActionBusy = true;
     try {
       await AppServices.instance.goals.clear(this.deviceId, this.sessionId);
@@ -1225,10 +1474,20 @@ export struct TaskPageContent {
     const serialized: SerializedComposerDocument = serializeComposerDocument(this.composerDocument);
     const text = serialized.text;
     if (this.sending) return;
+    if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
+      promptAction.showToast({ message: '请先处理待确认请求' });
+      return;
+    }
     if (this.editingQueueClientId.length > 0) {
       this.saveQueueEdit(text);
       return;
     }
+    const learn = parseLearnCommand(text, this.selectedLearnRoute === 'agent-skill');
+    if (learn.matched) {
+      this.sendLearnCommand(learn);
+      return;
+    }
+    this.selectedLearnRoute = '';
     if (this.deviceDisabled) {
       promptAction.showToast({ message: '设备已关闭远程控制，仅可查看' });
       return;
@@ -1259,6 +1518,8 @@ export struct TaskPageContent {
     }
     const sentImages = this.imageQueue.images.slice();
     const sentFiles = this.fileQueue.files.slice();
+    const deferForCreation = this.isCreationBlockingRemoteOps()
+      || AppServices.instance.inputQueue.shouldDeferNewInput(this.sessionId);
     // 点发送后当帧清空 composer；同一个 clientId 的 pending 气泡立即进入消息流。
     this.composerDocument = emptyComposerDocument();
     this.input = '';
@@ -1266,6 +1527,13 @@ export struct TaskPageContent {
     AppServices.instance.composerDrafts.clear(this.sessionId);
     this.imageQueue.removeSent(sentImages);
     this.fileQueue.removeSent(sentFiles);
+    this.error = '';
+    if (deferForCreation) {
+      AppServices.instance.inputQueue.deferDocument(
+        this.deviceId, s, serialized, readyImages, readyFiles);
+      this.followLatestSoon();
+      return;
+    }
     this.sending = true;
     this.error = '';
     AppServices.instance.inputQueue.enqueueDocument(
@@ -1278,6 +1546,39 @@ export struct TaskPageContent {
     });
   }
 
+  private sendLearnCommand(command: LearnCommandMatch): void {
+    if (this.sending || this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
+    if (this.composerImages.length > 0 || this.composerFiles.length > 0) {
+      promptAction.showToast({ message: '技能学习命令不能同时发送附件' });
+      return;
+    }
+    this.sending = true;
+    const request = buildLearnStartRequest(command, this.sessionId);
+    this.invokeContextRpc('learn:start', [request]).then((result: Object | undefined) => {
+      const data: Record<string, Object> = {};
+      if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
+        const record = result as Record<string, Object>;
+        data['runId'] = readStr(record, 'runId');
+        data['detail'] = readStr(record, 'detail');
+      }
+      data['input'] = command.input;
+      this.setComposerDocument(emptyComposerDocument(), false);
+      AppServices.instance.composerDrafts.clear(this.sessionId);
+      this.selectedLearnRoute = '';
+      AppServices.instance.messages.appendLocalSystemCard(this.sessionId, 'learn', data);
+      this.followLatestSoon();
+    }).catch((e: Error) => {
+      const data: Record<string, Object> = {};
+      data['error'] = e.message.indexOf('learn-busy') >= 0 ? 'learn-busy' : 'learn-failed';
+      data['detail'] = e.message;
+      data['input'] = command.input;
+      AppServices.instance.messages.appendLocalSystemCard(this.sessionId, 'learn', data);
+      promptAction.showToast({ message: '技能学习未启动，草稿已保留' });
+    }).finally(() => {
+      this.sending = false;
+    });
+  }
+
   private queueItem(clientId: string): QueuedInputItem | null {
     const queue = AppServices.instance.inputQueue.getProjection(this.sessionId).pendingQueue;
     for (let i = 0; i < queue.length; i++) {
@@ -1287,14 +1588,19 @@ export struct TaskPageContent {
   }
 
   private beginQueueEdit(clientId: string): void {
-    if (this.queueBusy || this.editingQueueClientId === clientId) return;
+    if (this.queueActionBlocked() || this.editingQueueClientId === clientId) return;
     const item = this.queueItem(clientId);
     if (item === null) return;
     const previous = this.editingQueueClientId;
     const start = (): void => {
       this.stashedComposerInput = previous.length > 0 ? this.stashedComposerInput : this.input;
+      if (previous.length === 0) this.stashedComposerDocument = this.composerDocument;
       this.editingQueueClientId = clientId;
-      this.setComposerDocument(textComposerDocument(item.text), false);
+      this.editingQueueOriginalText = item.text;
+      this.setComposerDocument(
+        composerDocumentFromPersistedContent(item.persistedContent) ?? textComposerDocument(item.text),
+        false,
+      );
       this.selectedQueueClientId = '';
       void AppServices.instance.inputQueue.setEditLock(
         this.deviceId, this.sessionId, clientId, true).catch(() => {
@@ -1310,20 +1616,24 @@ export struct TaskPageContent {
     }
   }
 
-  private saveQueueEdit(text: string): void {
+  private saveQueueEdit(_text: string): void {
     const clientId = this.editingQueueClientId;
-    if (clientId.length === 0 || text.length === 0 || this.queueBusy) return;
+    const serialized = serializeComposerDocument(this.composerDocument);
+    if (clientId.length === 0 || serialized.text.length === 0 || this.queueActionBlocked()) return;
     this.queueBusy = true;
     this.sending = true;
-    AppServices.instance.inputQueue.updateText(
-      this.deviceId, this.sessionId, clientId, text,
-    ).then(() => AppServices.instance.inputQueue.setEditLock(
+    const save = serialized.text === this.editingQueueOriginalText
+      ? Promise.resolve()
+      : AppServices.instance.inputQueue.updateDocument(
+        this.deviceId, this.sessionId, clientId, serialized);
+    save.then(() => AppServices.instance.inputQueue.setEditLock(
       this.deviceId, this.sessionId, clientId, false,
     )).then(() => {
       this.editingQueueClientId = '';
-      this.composerDocument = textComposerDocument(this.stashedComposerInput);
-      this.input = this.stashedComposerInput;
+      this.setComposerDocument(this.stashedComposerDocument, false);
       this.stashedComposerInput = '';
+      this.stashedComposerDocument = emptyComposerDocument();
+      this.editingQueueOriginalText = '';
       this.composerInputRevision += 1;
     }).catch(() => {
       promptAction.showToast({ message: '队列消息未保存，请重试' });
@@ -1337,9 +1647,10 @@ export struct TaskPageContent {
     const clientId = this.editingQueueClientId;
     if (clientId.length === 0) return;
     this.editingQueueClientId = '';
-    this.composerDocument = textComposerDocument(this.stashedComposerInput);
-    this.input = this.stashedComposerInput;
+    this.setComposerDocument(this.stashedComposerDocument, false);
     this.stashedComposerInput = '';
+    this.stashedComposerDocument = emptyComposerDocument();
+    this.editingQueueOriginalText = '';
     this.composerInputRevision += 1;
     void AppServices.instance.inputQueue.setEditLock(
       this.deviceId, this.sessionId, clientId, false).catch(() => {
@@ -1347,7 +1658,7 @@ export struct TaskPageContent {
   }
 
   private removeQueueItem(clientId: string): void {
-    if (this.queueBusy) return;
+    if (this.queueActionBlocked()) return;
     this.queueBusy = true;
     this.selectedQueueClientId = '';
     if (this.editingQueueClientId === clientId) this.cancelQueueEdit();
@@ -1359,7 +1670,7 @@ export struct TaskPageContent {
   }
 
   private moveQueueItem(clientId: string, direction: number): void {
-    if (this.queueBusy) return;
+    if (this.queueActionBlocked()) return;
     const queue = AppServices.instance.inputQueue.getProjection(this.sessionId).pendingQueue;
     const index = queue.findIndex((item: QueuedInputItem) => item.clientId === clientId);
     if (index < 0) return;
@@ -1376,7 +1687,7 @@ export struct TaskPageContent {
   }
 
   private steerQueueItem(clientId: string): void {
-    if (this.queueBusy || !this.sessionStreaming) return;
+    if (this.queueActionBlocked() || !this.sessionStreaming) return;
     this.queueBusy = true;
     this.selectedQueueClientId = '';
     AppServices.instance.inputQueue.steer(this.deviceId, this.sessionId, clientId).catch(() => {
@@ -1387,7 +1698,7 @@ export struct TaskPageContent {
   }
 
   private retryQueueItem(clientId: string): void {
-    if (this.queueBusy) return;
+    if (this.queueActionBlocked()) return;
     this.queueBusy = true;
     AppServices.instance.inputQueue.retry(this.deviceId, this.sessionId, clientId).catch(() => {
       promptAction.showToast({ message: '消息仍未发送，请检查连接' });
@@ -1397,10 +1708,30 @@ export struct TaskPageContent {
   }
 
   private resumeQueue(): void {
-    if (this.queueBusy) return;
+    if (this.queueActionBlocked()) return;
     this.queueBusy = true;
     AppServices.instance.inputQueue.resume(this.deviceId, this.sessionId).catch(() => {
       promptAction.showToast({ message: '队列未恢复，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private retryQueueError(): void {
+    if (this.queueActionBlocked() || this.queueErrorRetryText.length === 0) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.retryLastError(this.deviceId, this.sessionId).catch(() => {
+      promptAction.showToast({ message: '重试失败，请检查电脑端状态' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private clearQueueError(): void {
+    if (this.queueActionBlocked()) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.clearError(this.deviceId, this.sessionId).catch(() => {
+      promptAction.showToast({ message: '暂时无法忽略该错误' });
     }).finally(() => {
       this.queueBusy = false;
     });
@@ -1493,7 +1824,7 @@ export struct TaskPageContent {
   }
 
   private abort(): void {
-    if (this.queueBusy) return;
+    if (this.queueActionBlocked()) return;
     this.queueBusy = true;
     AppServices.instance.inputQueue.stop(this.deviceId, this.sessionId).catch(() => {
       // 兼容尚未实现 input queue 的旧 Desktop。
@@ -1528,7 +1859,11 @@ export struct TaskPageContent {
   private refreshItems(): void {
     this.syncMessageCount();
     const previousTailToken = this.renderTailToken(this.items);
-    const messages = AppServices.instance.messages.getMessagesWithStreaming(this.sessionId);
+    const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
+    const messages = appendAutoResumePendingMessage(
+      AppServices.instance.messages.getMessagesWithStreaming(this.sessionId),
+      projection.autoResumePending,
+    );
     const deliveredClientIds = new Set<string>();
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].clientId.length > 0) deliveredClientIds.add(messages[i].clientId);
@@ -1540,16 +1875,24 @@ export struct TaskPageContent {
       streaming,
       AppServices.instance.messages.getTaskUpdates(this.sessionId),
       AppServices.instance.messages.isMakerTurnRunning(this.sessionId),
+      projection.continuationTurnClientId,
+      projection.continuationInFlightProjectionCapability,
+      AppServices.instance.messages.isMakerTurnRunning(this.sessionId),
     );
     const nextTailToken = this.renderTailToken(nextItems);
     const tailChanged = previousTailToken.length > 0 && previousTailToken !== nextTailToken;
     this.sessionStreaming = streaming;
+    if (streaming) this.tailInterruptAcked = true;
     this.syncWorkClock(streaming);
+    this.tableColumnWidthCache.clear();
+    this.reconcileCollapsedTodoCards(this.items, nextItems);
     this.items = nextItems;
+    this.reconcileSearchSelection();
     this.loadFailed = AppServices.instance.messages.loadFailed(this.sessionId);
     this.ensureImageUrls();
     if (this.sessionOpenResolved && this.items.length > 0 && !this.initialScrolled) {
-      this.scrollToBottomOnce();
+      if (this.routeMessageClientId.length > 0) this.focusMessageTarget();
+      else this.scrollToBottomOnce();
       return;
     }
     if (!tailChanged || this.loadingOlder || !this.sessionOpenResolved) return;
@@ -1605,6 +1948,74 @@ export struct TaskPageContent {
     return renderIndex + (AppServices.instance.messages.hasMore(this.sessionId) ? 1 : 0);
   }
 
+  private renderItemContainsClientId(item: RenderItem, clientId: string): boolean {
+    if (clientId.length === 0) return false;
+    if (item.type === 'message') {
+      const message = (item as RenderMessageItem).message;
+      return message !== undefined && (message.clientId === clientId || message.id === clientId);
+    }
+    if (item.type === 'work_group') {
+      const children = (item as RenderWorkGroupItem).children;
+      return children.some((child: RenderItem) => this.renderItemContainsClientId(child, clientId));
+    }
+    if (item.type === 'subagent_group') {
+      const children = (item as RenderSubagentGroupItem).children;
+      return children.some((child: RenderItem) => this.renderItemContainsClientId(child, clientId));
+    }
+    return false;
+  }
+
+  private messageRenderIndex(clientId: string): number {
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.renderItemContainsClientId(this.items[i], clientId)) return i;
+    }
+    return -1;
+  }
+
+  private focusMessageTarget(): void {
+    const target = this.routeMessageClientId;
+    if (target.length === 0) return;
+    const index = this.messageRenderIndex(target);
+    if (index >= 0) {
+      this.initialScrolled = true;
+      this.initialScrollSettling = false;
+      this.followingLatest = false;
+      this.focusedMessageClientId = target;
+      const generation = this.messageFocusGeneration;
+      setTimeout(() => {
+        if (generation !== this.messageFocusGeneration) return;
+        this.listScroller.scrollToIndex(this.renderListIndex(index), true, ScrollAlign.CENTER);
+      }, 80);
+      setTimeout(() => {
+        if (generation === this.messageFocusGeneration
+          && this.focusedMessageClientId === target) this.focusedMessageClientId = '';
+      }, 1800);
+      return;
+    }
+    if (!this.sessionOpenResolved || this.messageFocusLoadStarted) return;
+    this.messageFocusLoadStarted = true;
+    const generation = ++this.messageFocusGeneration;
+    AppServices.instance.messages.loadAroundClientId(
+      this.deviceId, this.sessionId, target, 60,
+    ).then((found: boolean) => {
+      if (generation !== this.messageFocusGeneration) return;
+      this.refreshItems();
+      this.messageFocusLoadStarted = false;
+      if (found) {
+        this.focusMessageTarget();
+      } else {
+        this.initialScrolled = false;
+        this.routeMessageClientId = '';
+        this.scrollToBottomOnce();
+        promptAction.showToast({ message: '找不到这条消息，可能已被删除' });
+      }
+    }).catch(() => {
+      if (generation !== this.messageFocusGeneration) return;
+      this.messageFocusLoadStarted = false;
+      promptAction.showToast({ message: '消息定位失败，请检查连接后重试' });
+    });
+  }
+
   private lastMessageListIndex(): number {
     return this.items.length === 0 ? -1 : this.renderListIndex(this.items.length - 1);
   }
@@ -1627,6 +2038,74 @@ export struct TaskPageContent {
     if (this.items.length > 0) {
       this.listScroller.scrollToIndex(this.lastMessageListIndex(), true, ScrollAlign.END);
     }
+  }
+
+  private tailContinuationInFlight(): boolean {
+    const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
+    if (projection.pendingQueue.some((item: QueuedInputItem) => isContinuationText(item.text))) return true;
+    return this.queueBubbles.some((item: PendingQueueBubble) => isContinuationText(item.text));
+  }
+
+  private tailPresentation(): SessionTailPresentation | null {
+    const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
+    return deriveSessionTailPresentation(
+      AppServices.instance.messages.getMessages(this.sessionId),
+      this.session(),
+      projection.error,
+      projection.credentialSwitchWaiting,
+      this.sessionStreaming,
+      this.tailContinuationInFlight(),
+      this.tailInterruptAcked,
+      this.tailHiddenErrorClientIds,
+    );
+  }
+
+  private continueSessionTail(): void {
+    const presentation = this.tailPresentation();
+    const session = this.session();
+    if (presentation === null || session === undefined || this.tailBannerBusy
+      || (!presentation.retryable && !presentation.interrupted)) return;
+    const prompt = presentation.interrupted
+      ? CONTINUE_AFTER_APP_EXIT_PROMPT : CONTINUE_AFTER_ERROR_PROMPT;
+    const serialized = new SerializedComposerDocument();
+    serialized.text = prompt;
+    this.tailBannerBusy = true;
+    if (presentation.kind === 'error-tail') {
+      this.tailHiddenErrorClientIds = this.tailHiddenErrorClientIds.concat([presentation.clientId]);
+    } else {
+      this.tailInterruptAcked = true;
+    }
+    AppServices.instance.inputQueue.enqueueDocument(
+      this.deviceId, session, serialized, [], [], '', false,
+    ).catch(() => {
+      if (presentation.kind === 'error-tail') {
+        this.tailHiddenErrorClientIds = this.tailHiddenErrorClientIds.filter(
+          (clientId: string) => clientId !== presentation.clientId);
+      } else {
+        this.tailInterruptAcked = false;
+      }
+      promptAction.showToast({ message: '任务未能继续，请检查连接后重试' });
+    }).finally(() => {
+      this.tailBannerBusy = false;
+    });
+  }
+
+  private dismissSessionTail(): void {
+    const presentation = this.tailPresentation();
+    if (presentation === null || this.tailBannerBusy) return;
+    if (presentation.kind === 'error-tail') {
+      this.tailHiddenErrorClientIds = this.tailHiddenErrorClientIds.concat([presentation.clientId]);
+      void AppServices.instance.messages.dismissErrorMessage(
+        this.deviceId, this.sessionId, presentation.clientId).catch(() => {
+        // 老被控端可在本视图内降级为隐藏；下次重进仍会再次提示。
+      });
+    } else {
+      this.tailInterruptAcked = true;
+      void AppServices.instance.messages.ackInterruptedTurn(
+        this.deviceId, this.sessionId).catch(() => {
+      });
+    }
+    this.refreshItems();
   }
 
   /** 活动工作组使用实时 elapsed，而不是每次事件生成的 duration 快照。 */
@@ -1702,9 +2181,14 @@ export struct TaskPageContent {
       // content change 不再把用户拽回末尾；短列表不解除，避免 bounce 误判。
       if (deltaY > 8) {
         this.listTouchPulledDown = true;
+        if (!this.historyReviewIntent) {
+          this.historyReviewIntent = true;
+          this.historyLastAttemptFirstKey = '';
+        }
         if (this.visibleStartIndex > 0) {
           this.followingLatest = false;
         }
+        this.attemptAutoLoadEarlier();
       }
       // 手指向上是回到最新消息的方向；尾项重新可见后恢复贴底跟随。
       if (deltaY < -8) {
@@ -1713,14 +2197,6 @@ export struct TaskPageContent {
           this.followingLatest = true;
           this.hasNewMessages = false;
         }
-      }
-      if (this.listTouchLoadTriggered || !this.sessionOpenResolved) {
-        return;
-      }
-      // 未展示的历史在列表上方，因此用户应以“手指向下拖”的方式回看更早消息。
-      if (deltaY > 48 && this.visibleStartIndex <= 0) {
-        this.listTouchLoadTriggered = true;
-        this.loadOlder();
       }
       return;
     }
@@ -1737,7 +2213,7 @@ export struct TaskPageContent {
   }
 
   /** 滚动到顶部：加载更早历史，并锚定到旧内容起始位置（阅读位置保持）。 */
-  private loadOlder(): void {
+  private loadOlder(continueSearch: boolean = false): void {
     if (this.loadingOlder) {
       return;
     }
@@ -1750,7 +2226,11 @@ export struct TaskPageContent {
     }
     // 不能用“新增原始消息数”作为 List index：多个 thinking/tool 行会被渲染模型
     // 合成一个 work_group，原始消息下标与可见 ListItem 下标并不相等。
-    const previousFirstRenderKey = this.items.length > 0 ? this.items[0].key : '';
+    const previousFirstRenderAnchor = this.items.length > 0
+      ? this.renderAnchorKey(this.items[0], this.items) : '';
+    this.historyReviewIntent = true;
+    this.historyLastAttemptFirstKey = previousFirstRenderAnchor;
+    const previousRenderCount = this.items.length;
     this.loadingOlder = true;
     AppServices.instance.messages.loadOlder(this.deviceId, this.sessionId).then(() => {
       this.loadingOlder = false;
@@ -1760,19 +2240,42 @@ export struct TaskPageContent {
         // 新加载的更早消息插在头部：回到 prepend 前的第一条渲染项，保持当前阅读点。
         // 这是桌面/Mobile 的 mVCP 语义在 ArkUI List 上的稳定 key 版本。
         setTimeout(() => {
-          const anchorIndex = this.renderItemIndex(previousFirstRenderKey);
+          if (continueSearch && this.searchOpen && this.searchQuery.trim().length > 0) {
+            this.reconcileSearchSelection();
+            const hits = this.searchHits();
+            if (hits.length > 0) this.focusSearchHit(hits[this.searchActiveIndex]);
+            return;
+          }
+          const anchorIndex = this.renderItemIndexContainingAnchor(previousFirstRenderAnchor);
           if (anchorIndex >= 0) {
             this.listScroller.scrollToIndex(this.renderListIndex(anchorIndex), false);
           } else {
-            // 极旧历史没有稳定 work_group key 时保留一个保守兜底，避免阅读位置跳回顶部。
-            const fallbackIndex = Math.min(added, Math.max(0, this.items.length - 1));
+            // fallback 也只能使用可见 render item 数，不能混用原始 DB 行数。
+            const visibleAdded = Math.max(0, this.items.length - previousRenderCount);
+            const fallbackIndex = Math.min(visibleAdded, Math.max(0, this.items.length - 1));
             this.listScroller.scrollToIndex(this.renderListIndex(fallbackIndex), false);
           }
         }, 50);
       }
+      setTimeout(() => this.attemptAutoLoadEarlier(), 120);
     }).catch(() => {
       this.loadingOlder = false;
     });
+  }
+
+  private nearHistoryStart(): boolean {
+    const visibleCount = Math.max(1, this.visibleEndIndex - this.visibleStartIndex + 1);
+    return this.visibleStartIndex <= Math.max(1, visibleCount * 2);
+  }
+
+  private attemptAutoLoadEarlier(): void {
+    if (!this.historyReviewIntent || !this.sessionOpenResolved || this.initialScrollSettling
+      || this.loadingOlder || !this.nearHistoryStart()
+      || !AppServices.instance.messages.hasMore(this.sessionId) || this.items.length === 0) return;
+    const firstKey = this.renderAnchorKey(this.items[0], this.items);
+    if (firstKey.length > 0 && firstKey === this.historyLastAttemptFirstKey) return;
+    this.listTouchLoadTriggered = true;
+    this.loadOlder();
   }
 
   /** todo 卡标题（对齐 iOS：{completed}/{total} · 进行中内容）。 */
@@ -1788,6 +2291,9 @@ export struct TaskPageContent {
       }
     }
     const base = `${doneCount}/${item.todos.length}`;
+    if (activeContent.length === 0 && item.todos.length > 0) {
+      activeContent = item.todos[item.todos.length - 1].content;
+    }
     return activeContent.length > 0 ? `${base} · ${activeContent}` : base;
   }
 
@@ -1807,20 +2313,58 @@ export struct TaskPageContent {
     if (item.isStreaming) {
       return '正在工作…';
     }
+    let base = '工作过程';
     if (item.durationMs >= 0) {
-      return `已工作 ${this.formatDuration(item.durationMs)}`;
+      base = `已工作 ${this.formatDuration(item.durationMs)}`;
     }
-    return '工作过程';
+    const summary = this.workExplorationSummary(item);
+    return summary.length > 0 ? `${base} · ${summary}` : base;
+  }
+
+  private workExplorationSummary(item: RenderWorkGroupItem): string {
+    const count = new WorkExplorationCount();
+    const rawRows: WorkPreviewRow[] = [];
+    this.appendWorkPreviewRows(item.children, rawRows);
+    const rows = this.dedupeWorkRowsFromTail(rawRows, 0);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.kind !== 'tool') continue;
+      if (row.explorationKind === 'read') count.reads += 1;
+      else if (row.explorationKind === 'search') count.searches += 1;
+      else if (row.explorationKind === 'list') count.lists += 1;
+      else count.unsupported = true;
+    }
+    if (count.unsupported || count.reads + count.searches + count.lists === 0) return '';
+    const parts: string[] = [];
+    if (count.reads > 0) parts.push(`读取 ${count.reads} 个文件`);
+    if (count.searches > 0) parts.push(`搜索 ${count.searches} 次`);
+    if (count.lists > 0) parts.push(`列出 ${count.lists} 次`);
+    return parts.join(' · ');
   }
 
   /** 活动态收起面板显示最近 5 条步骤，与 Mobile MAX_LIVE_WORK_ACTIVITIES 对齐。 */
   private workPreviewRows(item: RenderWorkGroupItem): WorkPreviewRow[] {
-    const rows: WorkPreviewRow[] = [];
-    this.appendWorkPreviewRows(item.children, rows);
-    if (rows.length <= 5) {
-      return rows;
+    const rawRows: WorkPreviewRow[] = [];
+    this.appendWorkPreviewRows(item.children, rawRows);
+    return this.dedupeWorkRowsFromTail(rawRows, 5);
+  }
+
+  /** limit <= 0 表示全部保留；同一探索段的重复读取只保留最后一次。 */
+  private dedupeWorkRowsFromTail(rawRows: WorkPreviewRow[], limit: number): WorkPreviewRow[] {
+    const keptReversed: WorkPreviewRow[] = [];
+    const seenReads = new Set<string>();
+    // 与 shared recent projection 一致：从尾部保留同一探索段里最后一次读取。
+    for (let i = rawRows.length - 1; i >= 0; i--) {
+      const row = rawRows[i];
+      if (row.kind === 'tool' && row.explorationKind === 'other') seenReads.clear();
+      if (row.kind === 'tool' && row.explorationKind === 'read' && row.readKey.length > 0) {
+        if (seenReads.has(row.readKey)) continue;
+        seenReads.add(row.readKey);
+      }
+      keptReversed.push(row);
+      if (limit > 0 && keptReversed.length === limit) break;
     }
-    return rows.slice(rows.length - 5);
+    return keptReversed.reverse();
   }
 
   private appendWorkPreviewRows(children: RenderItem[], rows: WorkPreviewRow[]): void {
@@ -1841,69 +2385,22 @@ export struct TaskPageContent {
         const tools = (child as RenderToolGroupItem).tools;
         for (let j = 0; j < tools.length; j++) {
           const tool = tools[j];
-          const row = new WorkPreviewRow();
-          row.key = `${child.key}-${tool.seq}`;
-          row.kind = 'tool';
-          row.done = tool.hasResult;
-          row.error = tool.hasError;
-          row.text = this.toolStepLabel(tool);
-          rows.push(row);
-        }
-      }
-    }
-  }
-
-  /** 工作步骤文案：优先显示文件/命令等关键输入，避免只显示“正在工作”。 */
-  private toolStepLabel(tool: RenderToolItem): string {
-    const name = tool.toolName.length > 0 ? tool.toolName : 'tool';
-    const lower = name.toLowerCase();
-    let action = `调用 ${name}`;
-    if (lower.includes('read') || lower === 'cat') {
-      action = '读取';
-    } else if (lower.includes('grep') || lower.includes('search') || lower.includes('find')) {
-      action = '搜索';
-    } else if (lower.includes('glob') || lower === 'ls' || lower.includes('list')) {
-      action = '查找';
-    } else if (lower.includes('write') || lower.includes('edit') || lower.includes('patch')) {
-      action = '修改';
-    } else if (lower.includes('bash') || lower.includes('shell') || lower.includes('exec') || lower.includes('run')) {
-      action = '执行';
-    }
-    const detail = this.toolStepDetail(tool);
-    if (action === `调用 ${name}`) {
-      return detail.length > 0 ? `${action} · ${detail}` : action;
-    }
-    return detail.length > 0 ? `${action} ${detail}` : `${action} ${name}`;
-  }
-
-  private toolStepDetail(tool: RenderToolItem): string {
-    if (tool.inputRaw.length > 0) {
-      try {
-        const parsed = JSON.parse(tool.inputRaw) as Object;
-        if (parsed !== undefined && parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          const record = parsed as Record<string, Object>;
-          const keys: string[] = ['file_path', 'filePath', 'path', 'command', 'pattern', 'query', 'url'];
-          for (let i = 0; i < keys.length; i++) {
-            const value = readStr(record, keys[i]);
-            if (value.length > 0) return summarizeText(value, 100);
+          const actions = projectToolUseActions(tool.toolName, tool.inputRaw, tool.inputText);
+          for (let k = 0; k < actions.length; k++) {
+            const action = actions[k];
+            const row = new WorkPreviewRow();
+            row.key = `${child.key}-${tool.seq}-action-${action.actionIndex}`;
+            row.kind = 'tool';
+            row.done = tool.hasResult;
+            row.error = tool.hasError;
+            row.text = action.label;
+            row.explorationKind = action.explorationKind;
+            row.readKey = action.readKey;
+            rows.push(row);
           }
         }
-      } catch (e) {
-        // inputRaw 可能是旧版非 JSON 摘要，回退到 inputText。
       }
     }
-    return tool.inputText.length > 0 ? summarizeText(tool.inputText, 100) : '';
-  }
-
-  private toolRowLabel(tool: RenderToolItem): string {
-    const name = tool.toolName.length > 0 ? tool.toolName : 'tool';
-    const lower = name.toLowerCase();
-    if (lower.includes('read') || lower === 'cat') return `读取 ${name}`;
-    if (lower.includes('grep') || lower.includes('search') || lower.includes('find')) return `搜索 ${name}`;
-    if (lower.includes('glob') || lower === 'ls' || lower.includes('list')) return `查找 ${name}`;
-    if (lower.includes('write') || lower.includes('edit') || lower.includes('patch')) return `修改 ${name}`;
-    if (lower.includes('bash') || lower.includes('shell') || lower.includes('exec') || lower.includes('run')) return `执行 ${name}`;
-    return `调用 ${name}`;
   }
 
   private compactBoundaryLabel(item: RenderMessageItem): string {
@@ -1960,6 +2457,64 @@ export struct TaskPageContent {
     });
   }
 
+  private toggleTodoCard(key: string): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.collapsedTodoCards = this.toggleExpanded(this.collapsedTodoCards, key);
+    });
+  }
+
+  private todoCardExpanded(key: string): boolean {
+    return !this.isIn(this.collapsedTodoCards, key);
+  }
+
+  /** 计划补齐更早历史后 key 可能从 orphan tool id 切到 turn id；按内容迁移折叠态。 */
+  private reconcileCollapsedTodoCards(previous: RenderItem[], next: RenderItem[]): void {
+    if (this.collapsedTodoCards.length === 0) return;
+    const previousCards: RenderTodoCardItem[] = [];
+    const nextCards: RenderTodoCardItem[] = [];
+    this.collectTodoCards(previous, previousCards);
+    this.collectTodoCards(next, nextCards);
+    const migrated: string[] = [];
+    const used = new Set<string>();
+    for (let i = 0; i < this.collapsedTodoCards.length; i++) {
+      const oldKey = this.collapsedTodoCards[i];
+      const exact = nextCards.find((card: RenderTodoCardItem) => card.key === oldKey);
+      if (exact !== undefined) {
+        migrated.push(exact.key);
+        used.add(exact.key);
+        continue;
+      }
+      const oldCard = previousCards.find((card: RenderTodoCardItem) => card.key === oldKey);
+      if (oldCard === undefined) continue;
+      const signature = todoCardContentSignature(oldCard);
+      const rank = todoCardRankFromTail(previousCards, oldCard.key);
+      const replacementIndex = todoCardIndexAtRankFromTail(nextCards, signature, rank);
+      const replacement = replacementIndex >= 0 ? nextCards[replacementIndex] : undefined;
+      if (replacement !== undefined && !used.has(replacement.key)) {
+        migrated.push(replacement.key);
+        used.add(replacement.key);
+      }
+    }
+    let changed = migrated.length !== this.collapsedTodoCards.length;
+    for (let i = 0; !changed && i < migrated.length; i++) {
+      if (migrated[i] !== this.collapsedTodoCards[i]) changed = true;
+    }
+    if (changed) this.collapsedTodoCards = migrated;
+  }
+
+  private collectTodoCards(items: RenderItem[], out: RenderTodoCardItem[]): void {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type === 'todo') {
+        out.push(item as RenderTodoCardItem);
+      } else if (item.type === 'work_group') {
+        this.collectTodoCards((item as RenderWorkGroupItem).children, out);
+      } else if (item.type === 'subagent_group') {
+        this.collectTodoCards((item as RenderSubagentGroupItem).children, out);
+      }
+    }
+  }
+
   private toggleToolDetails(key: string): void {
     uiAnimateState(this.getUIContext(), () => {
       this.expandedTools = this.toggleExpanded(this.expandedTools, key);
@@ -1970,14 +2525,86 @@ export struct TaskPageContent {
     return list.indexOf(key) >= 0;
   }
 
-  /** 返回渲染列表中稳定 key 的位置；渲染项可能把多条原始消息折成一个 work_group。 */
-  private renderItemIndex(key: string): number {
-    if (key.length === 0) {
-      return -1;
+  /** 保存稳定叶子，而不是可能因 prepend 改名的外层 work_group key。 */
+  private renderAnchorKey(item: RenderItem, allItems: RenderItem[]): string {
+    if (item.type === 'todo') {
+      const todo = item as RenderTodoCardItem;
+      const cards: RenderTodoCardItem[] = [];
+      this.collectTodoCards(allItems, cards);
+      const rank = todoCardRankFromTail(cards, todo.key);
+      return `todo:${todo.key}\u001e${rank}\u001e${todoCardContentSignature(todo)}`;
+    } else if (item.type === 'work_group') {
+      const children = (item as RenderWorkGroupItem).children;
+      for (let i = 0; i < children.length; i++) {
+        const nested = this.renderAnchorKey(children[i], allItems);
+        if (nested.length > 0) return nested;
+      }
+    } else if (item.type === 'subagent_group') {
+      const children = (item as RenderSubagentGroupItem).children;
+      for (let i = 0; i < children.length; i++) {
+        const nested = this.renderAnchorKey(children[i], allItems);
+        if (nested.length > 0) return nested;
+      }
+    } else if (item.type === 'tool_group') {
+      const tools = (item as RenderToolGroupItem).tools;
+      if (tools.length > 0 && tools[0].toolUseId.length > 0) {
+        return `tool:${tools[0].toolUseId}`;
+      }
     }
+    return item.key.length > 0 ? `item:${item.key}` : '';
+  }
+
+  private renderItemContainsAnchor(item: RenderItem, anchor: string): boolean {
+    if (anchor.length === 0) return false;
+    if (anchor.startsWith('item:') && item.key === anchor.slice(5)) return true;
+    if (anchor.startsWith('todo:') && item.type === 'todo') {
+      const payload = anchor.slice(5);
+      const separator = payload.indexOf('\u001e');
+      const oldKey = separator >= 0 ? payload.slice(0, separator) : payload;
+      return item.key === oldKey;
+    }
+    if (item.type === 'tool_group' && anchor.startsWith('tool:')) {
+      const toolUseId = anchor.slice(5);
+      return (item as RenderToolGroupItem).tools.some(
+        (tool: RenderToolItem) => tool.toolUseId === toolUseId);
+    }
+    if (item.type === 'work_group') {
+      const children = (item as RenderWorkGroupItem).children;
+      return children.some((child: RenderItem) => this.renderItemContainsAnchor(child, anchor));
+    }
+    if (item.type === 'subagent_group') {
+      const children = (item as RenderSubagentGroupItem).children;
+      return children.some((child: RenderItem) => this.renderItemContainsAnchor(child, anchor));
+    }
+    return false;
+  }
+
+  private renderItemIndexContainingAnchor(anchor: string): number {
     for (let i = 0; i < this.items.length; i++) {
-      if (this.items[i].key === key) {
-        return i;
+      if (this.renderItemContainsAnchor(this.items[i], anchor)) return i;
+    }
+    if (anchor.startsWith('todo:')) {
+      const payload = anchor.slice(5);
+      const firstSeparator = payload.indexOf('\u001e');
+      const secondSeparator = firstSeparator >= 0
+        ? payload.indexOf('\u001e', firstSeparator + 1) : -1;
+      if (secondSeparator > firstSeparator) {
+        const rank = Number(payload.slice(firstSeparator + 1, secondSeparator));
+        const signature = payload.slice(secondSeparator + 1);
+        if (Number.isSafeInteger(rank) && rank >= 0 && signature.length > 0) {
+          const cards: RenderTodoCardItem[] = [];
+          const topLevelIndices: number[] = [];
+          for (let i = 0; i < this.items.length; i++) {
+            const nested: RenderTodoCardItem[] = [];
+            this.collectTodoCards([this.items[i]], nested);
+            for (let j = 0; j < nested.length; j++) {
+              cards.push(nested[j]);
+              topLevelIndices.push(i);
+            }
+          }
+          const cardIndex = todoCardIndexAtRankFromTail(cards, signature, rank);
+          if (cardIndex >= 0) return topLevelIndices[cardIndex];
+        }
       }
     }
     return -1;
@@ -1992,58 +2619,67 @@ export struct TaskPageContent {
     return '';
   }
 
-  private searchItemText(item: RenderItem): string {
-    if (item.type === 'message') return (item as RenderMessageItem).body;
-    if (item.type === 'thinking') return (item as RenderThinkingItem).body;
-    if (item.type === 'tool_group') {
-      const tools = (item as RenderToolGroupItem).tools;
-      let text = '';
-      for (let i = 0; i < tools.length; i++) {
-        text += ` ${tools[i].toolName} ${tools[i].inputText} ${tools[i].resultText}`;
-      }
-      return text;
-    }
-    if (item.type === 'tool_media') {
-      const media = item as RenderToolMediaItem;
-      let text = '';
-      for (let i = 0; i < media.images.length; i++) {
-        text += ` ${media.images[i].originalName} ${media.images[i].url}`;
-      }
-      return text;
-    }
-    if (item.type === 'todo') {
-      const todos = (item as RenderTodoCardItem).todos;
-      let text = '';
-      for (let i = 0; i < todos.length; i++) text += ` ${todos[i].content}`;
-      return text;
-    }
-    if (item.type === 'work_group') {
-      const children = (item as RenderWorkGroupItem).children;
-      let text = '';
-      for (let i = 0; i < children.length; i++) text += ` ${this.searchItemText(children[i])}`;
-      return text;
-    }
-    return '';
+  private searchHits(): MessageSearchHit[] {
+    return findMessageSearchHits(this.items, this.searchQuery);
   }
 
-  private searchHitIndices(): number[] {
-    const query = this.searchQuery.trim().toLowerCase();
-    if (query.length === 0) return [];
-    const hits: number[] = [];
-    for (let i = 0; i < this.items.length; i++) {
-      if (this.searchItemText(this.items[i]).toLowerCase().includes(query)) hits.push(i);
+  private reconcileSearchSelection(): void {
+    if (!this.searchOpen || this.searchQuery.trim().length === 0) return;
+    const hits = this.searchHits();
+    const next = reconcileMessageSearchIndex(
+      hits, this.searchActiveIndex, this.searchActiveSourceKey);
+    if (next < 0) {
+      this.searchActiveIndex = 0;
+      this.searchActiveSourceKey = '';
+      return;
     }
-    return hits;
+    this.searchActiveIndex = next;
+    this.searchActiveSourceKey = hits[next].sourceKey;
+  }
+
+  private updateSearchQuery(value: string): void {
+    this.searchQuery = value;
+    this.searchActiveIndex = 0;
+    const hits = this.searchHits();
+    this.searchActiveSourceKey = hits.length > 0 ? hits[0].sourceKey : '';
+    this.focusedSearchItemKey = '';
+  }
+
+  private focusSearchHit(hit: MessageSearchHit): void {
+    let index = -1;
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.items[i].key === hit.itemKey) {
+        index = i;
+        break;
+      }
+    }
+    if (index < 0) return;
+    this.followingLatest = false;
+    this.focusedSearchItemKey = hit.itemKey;
+    this.listScroller.scrollToIndex(this.renderListIndex(index), true, ScrollAlign.CENTER);
+    const sourceKey = hit.sourceKey;
+    setTimeout(() => {
+      if (this.searchActiveSourceKey === sourceKey) this.focusedSearchItemKey = '';
+    }, 1600);
   }
 
   private moveSearch(delta: number): void {
-    const hits = this.searchHitIndices();
+    const hits = this.searchHits();
     if (hits.length === 0) return;
-    let next = (this.searchActiveIndex + delta) % hits.length;
-    if (next < 0) next += hits.length;
+    const next = nextMessageSearchIndex(hits.length, this.searchActiveIndex, delta);
+    if (next < 0) return;
     this.searchActiveIndex = next;
-    this.followingLatest = false;
-    this.listScroller.scrollToIndex(this.renderListIndex(hits[next]), true, ScrollAlign.CENTER);
+    this.searchActiveSourceKey = hits[next].sourceKey;
+    this.focusSearchHit(hits[next]);
+  }
+
+  private searchPaging(): MessageSearchPagingPresentation {
+    return messageSearchPagingPresentation(
+      this.searchQuery,
+      AppServices.instance.messages.hasMore(this.sessionId),
+      this.loadingOlder,
+      this.searchHits().length,
+    );
   }
 
   private closeSearch(): void {
@@ -2051,6 +2687,8 @@ export struct TaskPageContent {
       this.searchOpen = false;
       this.searchQuery = '';
       this.searchActiveIndex = 0;
+      this.searchActiveSourceKey = '';
+      this.focusedSearchItemKey = '';
     });
   }
 
@@ -2073,6 +2711,7 @@ export struct TaskPageContent {
 
   private canSend(): boolean {
     if (this.sending || this.deviceDisabled) return false;
+    if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) return false;
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) return false;
     return composerDocumentHasContent(this.composerDocument)
       || this.imageQueue.readyImages().length > 0 || this.fileQueue.readyFiles().length > 0;
@@ -2082,7 +2721,8 @@ export struct TaskPageContent {
     const sessionId = this.sessionId;
     const generation = ++this.composerDraftGeneration;
     void AppServices.instance.composerDrafts.read(sessionId).then((document: ComposerDocument | null) => {
-      if (generation !== this.composerDraftGeneration || sessionId !== this.sessionId || document === null) return;
+      if (generation !== this.composerDraftGeneration || sessionId !== this.sessionId
+        || document === null || this.creationDraftHandoffDone) return;
       this.setComposerDocument(document, false);
     });
   }
@@ -2097,6 +2737,7 @@ export struct TaskPageContent {
   }
 
   private applyComposerTextChange(value: string): void {
+    this.selectedLearnRoute = '';
     const previous = composerDocumentProjectedText(this.composerDocument);
     let prefix = 0;
     while (prefix < previous.length && prefix < value.length
@@ -2187,10 +2828,11 @@ export struct TaskPageContent {
         const seen = new Set<string>();
         const merged = skills.concat(desktop).concat(builtins);
         for (let i = 0; i < merged.length; i++) {
-          const key = merged[i].name.toLowerCase();
+          const nameKey = merged[i].name.toLowerCase();
+          const key = nameKey === 'learn' ? `${merged[i].kind}:${nameKey}` : nameKey;
           if (seen.has(key)) continue;
           seen.add(key);
-          if (query.length === 0 || key.startsWith(query.toLowerCase())) items.push(merged[i]);
+          if (query.length === 0 || nameKey.startsWith(query.toLowerCase())) items.push(merged[i]);
           if (items.length >= 8) break;
         }
       } else {
@@ -2225,7 +2867,9 @@ export struct TaskPageContent {
     let replacement: ComposerNode[] = [];
     if (this.composerPaletteMode === 'slash') {
       replacement = [slashCommandNode(item.name), textNode(' ')];
+      this.selectedLearnRoute = item.name === 'learn' ? item.kind : '';
     } else {
+      this.selectedLearnRoute = '';
       const raw = this.paletteMentionRaw(item);
       replacement = [mentionNode(item.kind, item.name, raw), textNode(' ')];
     }
@@ -2246,17 +2890,21 @@ export struct TaskPageContent {
       this.messageArea()
 
       if (this.pendingInteractions.length > 0) {
-        // 多个交互请求在窄屏/键盘态内滚动，不能无限挤压消息区和 Composer。
-        Scroll() {
-          Column({ space: 8 }) {
-            ForEach(this.pendingInteractions, (item: PendingInteraction) => {
-              this.pendingInteractionCard(item)
-            }, (item: PendingInteraction) => item.requestId)
+        // 与 Mobile 一致只展开一张 active 卡；其它请求按桌面优先级排队切换。
+        Column({ space: 6 }) {
+          if (this.pendingInteractions.length > 1) {
+            this.pendingInteractionSwitcher()
+          }
+          Scroll() {
+            if (this.activeInteractionIndex() >= 0) {
+              this.pendingInteractionCard(this.pendingInteractions[this.activeInteractionIndex()])
+            }
           }
           .width('100%')
+          .constraintSize({ maxHeight: 240 })
         }
         .width('100%')
-        .constraintSize({ maxWidth: 760, maxHeight: 240 })
+        .constraintSize({ maxWidth: 760, maxHeight: 286 })
         .alignSelf(ItemAlign.Center)
         .padding({ left: 16, right: 16, top: 4, bottom: 4 })
       }
@@ -2279,8 +2927,8 @@ export struct TaskPageContent {
           .width('100%')
           .padding({ left: 16, right: 16, top: 12, bottom: 16 })
           .border({ width: { top: 1 }, color: { top: $r('app.color.chat_header_divider') } })
-      } else if (this.pendingInteractions.length === 0) {
-        // Mobile 中可由本机完成的 pending 会接管 Composer，避免等待确认时继续发送。
+      } else if (!pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
+        // 只有 Mobile 本端可终结的 pending 接管 Composer；桌面专属/未知卡仅作提示。
         if (this.composerPaletteMode.length > 0) {
           this.composerPalettePanel()
         }
@@ -2508,7 +3156,7 @@ export struct TaskPageContent {
     .padding({ left: 10, right: 10 })
     .backgroundColor(Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .enabled(!this.sessionActionBusy)
+    .enabled(!this.sessionActionBusy && !this.isCreationBlockingRemoteOps())
     .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(action)
   }
@@ -2600,7 +3248,8 @@ export struct TaskPageContent {
                 .width('100%').constraintSize({ minHeight: 52 })
                 .padding({ left: 8 + Math.min(row.depth, 8) * 14, right: 8, top: 6, bottom: 6 })
                 .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
-                .enabled(!this.sessionStreaming && this.sessionTreeSwitchingId.length === 0
+                .enabled(!this.sessionStreaming && !this.isCreationBlockingRemoteOps()
+                  && this.sessionTreeSwitchingId.length === 0
                   && this.sessionTree?.leafId !== row.node.id)
                 .clickEffect(UI_LIST_CLICK_EFFECT)
                 .onClick(() => void this.navigateSessionTree(row.node.id))
@@ -2694,7 +3343,8 @@ export struct TaskPageContent {
       .padding({ left: 4 })
 
       if ((this.session()?.workingDir ?? '').length > 0) {
-        this.taskIconButton($r('sys.symbol.folder'), 40, false, true, () => this.showProjectActions())
+        this.taskIconButton($r('sys.symbol.folder'), 40, false,
+          !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
       }
 
       if (this.items.length > 0) {
@@ -2704,7 +3354,8 @@ export struct TaskPageContent {
         })
       }
 
-      this.taskIconButton($r('sys.symbol.ellipsis_circle'), 40, false, true,
+      this.taskIconButton($r('sys.symbol.ellipsis_circle'), 40, false,
+        !this.isCreationBlockingRemoteOps(),
         () => this.showSessionActions())
     }
     .width('100%')
@@ -2719,34 +3370,47 @@ export struct TaskPageContent {
 
   @Builder
   sessionSearchBar() {
-    Row({ space: 4 }) {
-      Search({ value: this.searchQuery, placeholder: '搜索消息' })
-        .height(36)
-        .textFont({ size: uiFontSize(15) })
-        .layoutWeight(1)
-        .backgroundColor($r('app.color.bg_card'))
-        .borderRadius(UI_RADIUS_PILL)
-        .onChange((value: string) => {
-          this.searchQuery = value;
-          this.searchActiveIndex = 0;
-        })
-      if (this.searchQuery.trim().length > 0) {
-        Text(this.searchHitIndices().length === 0
-          ? '0/0'
-          : `${this.searchActiveIndex + 1}/${this.searchHitIndices().length}`)
-          .fontSize(uiFontSize(12))
-          .fontColor($r('app.color.chat_text_secondary'))
-          .constraintSize({ minWidth: 32 })
-          .textAlign(TextAlign.Center)
+    Column() {
+      Row({ space: 4 }) {
+        Search({ value: this.searchQuery, placeholder: '搜索消息' })
+          .height(36)
+          .textFont({ size: uiFontSize(15) })
+          .layoutWeight(1)
+          .backgroundColor($r('app.color.bg_card'))
+          .borderRadius(UI_RADIUS_PILL)
+          .onChange((value: string) => this.updateSearchQuery(value))
+        if (this.searchQuery.trim().length > 0) {
+          Text(this.searchHits().length === 0
+            ? '0/0'
+            : `${this.searchActiveIndex + 1}/${this.searchHits().length}`)
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.chat_text_secondary'))
+            .constraintSize({ minWidth: 32 })
+            .textAlign(TextAlign.Center)
+        }
+        this.taskIconButton($r('sys.symbol.chevron_up'), 36, false,
+          this.searchHits().length > 0, () => this.moveSearch(-1))
+        this.taskIconButton($r('sys.symbol.chevron_down'), 36, false,
+          this.searchHits().length > 0, () => this.moveSearch(1))
+        this.taskIconButton($r('sys.symbol.xmark'), 36, false, true, () => this.closeSearch())
       }
-      this.taskIconButton($r('sys.symbol.chevron_up'), 36, false,
-        this.searchHitIndices().length > 0, () => this.moveSearch(-1))
-      this.taskIconButton($r('sys.symbol.chevron_down'), 36, false,
-        this.searchHitIndices().length > 0, () => this.moveSearch(1))
-      this.taskIconButton($r('sys.symbol.xmark'), 36, false, true, () => this.closeSearch())
+      .width('100%')
+      .padding({ left: 12, right: 8, top: 6, bottom: 6 })
+      if (this.searchPaging().visible) {
+        Button(this.searchPaging().label)
+          .fontSize(uiFontSize(12))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_secondary'))
+          .height(30)
+          .padding({ left: 12, right: 12 })
+          .borderRadius(UI_RADIUS_PILL)
+          .backgroundColor(Color.Transparent)
+          .enabled(this.searchPaging().enabled)
+          .clickEffect(UI_CLICK_EFFECT)
+          .onClick(() => this.loadOlder(true))
+      }
     }
     .width('100%')
-    .padding({ left: 12, right: 8, top: 6, bottom: 6 })
     .backgroundColor(this.isEmbedded()
       ? $r('app.color.bg_page')
       : $r('app.color.chat_header_surface'))
@@ -2755,12 +3419,59 @@ export struct TaskPageContent {
   }
 
   private pendingQueueStatusText(item: PendingQueueBubble): string {
+    if (item.clientId === this.newSessionCreationClientId) {
+      if (this.newSessionCreationStatus === 'running') return '正在创建任务…';
+      if (this.newSessionCreationStatus === 'create-failed') return '任务创建失败';
+    }
     if (item.phase === 'sending') return '正在发送…';
+    if (item.phase === 'waiting') return '等待任务创建后发送…';
     if (item.phase === 'settling') return '已发送，正在同步…';
     if (item.phase === 'editing') return '正在编辑';
     if (item.phase === 'paused') return `队列 ${item.queueIndex} · 已暂停`;
     if (item.phase === 'failed') return '发送失败';
     return `队列 ${item.queueIndex}`;
+  }
+
+  private isCreateFailureBubble(item: PendingQueueBubble): boolean {
+    return this.newSessionCreationStatus === 'create-failed'
+      && this.newSessionCreationClientId.length > 0
+      && item.clientId === this.newSessionCreationClientId;
+  }
+
+  private retryNewSessionCreation(): void {
+    AppServices.instance.newSessionCreations.retry(this.sessionId);
+  }
+
+  private async returnNewSessionToEdit(): Promise<void> {
+    if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
+      promptAction.showToast({ message: '请等待附件上传完成，或移除上传失败的附件' });
+      return;
+    }
+    const store = AppServices.instance.newSessionCreations;
+    this.leavingForCreationEdit = true;
+    this.sending = true;
+    this.getUIContext().getFocusController().clearFocus();
+    const action = await store.returnToEdit(
+      this.sessionId,
+      composerDocumentProjectedText(this.composerDocument),
+      this.imageQueue.readyImages(),
+      this.fileQueue.readyFiles(),
+    );
+    if (action === 'edit') {
+      AppServices.instance.composerDrafts.clear(this.sessionId);
+      router.replaceUrl({
+        url: 'pages/NewSessionPage',
+        params: { deviceId: this.deviceId },
+      });
+      return;
+    }
+    this.leavingForCreationEdit = false;
+    this.sending = false;
+    if (action === 'resume') {
+      promptAction.showToast({ message: '已找到电脑上的任务，正在继续发送首条消息' });
+    } else if (action === 'unknown') {
+      promptAction.showToast({ message: '暂时无法确认任务状态，请稍后重试' });
+    }
   }
 
   @Builder
@@ -2784,7 +3495,7 @@ export struct TaskPageContent {
   pendingQueueBubble(item: PendingQueueBubble) {
     Column({ space: 8 }) {
       Row({ space: 8 }) {
-        if (item.phase === 'sending' || item.phase === 'settling') {
+        if (item.phase === 'sending' || item.phase === 'settling' || item.phase === 'waiting') {
           LoadingProgress()
             .width(13)
             .height(13)
@@ -2826,9 +3537,16 @@ export struct TaskPageContent {
           .width('100%')
       }
 
-      if (this.selectedQueueClientId === item.clientId || item.phase === 'failed') {
+      if (this.isCreateFailureBubble(item)
+        || (!this.isCreationBlockingRemoteOps()
+          && (this.selectedQueueClientId === item.clientId || item.phase === 'failed'))) {
         Row({ space: 6 }) {
-          if (item.phase === 'failed') {
+          if (this.isCreateFailureBubble(item)) {
+            this.queueInlineAction('重试创建', false, !this.queueBusy,
+              () => this.retryNewSessionCreation())
+            this.queueInlineAction('返回编辑', false, !this.queueBusy,
+              () => void this.returnNewSessionToEdit())
+          } else if (item.phase === 'failed') {
             this.queueInlineAction('重试发送', false, !this.queueBusy,
               () => this.retryQueueItem(item.clientId))
           } else if (item.phase === 'queued' || item.phase === 'paused') {
@@ -2844,8 +3562,10 @@ export struct TaskPageContent {
               () => this.steerQueueItem(item.clientId))
           }
           Row().layoutWeight(1)
-          this.queueInlineAction('删除消息', true, !this.queueBusy,
-            () => this.removeQueueItem(item.clientId))
+          if (!this.isCreateFailureBubble(item)) {
+            this.queueInlineAction('删除消息', true, !this.queueBusy,
+              () => this.removeQueueItem(item.clientId))
+          }
         }
         .width('100%')
         .transition(uiRevealTransition())
@@ -2861,7 +3581,8 @@ export struct TaskPageContent {
     .borderRadius(UI_RADIUS_CONTAINER)
     .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => {
-      if (item.phase === 'queued' || item.phase === 'paused') {
+      if (!this.isCreationBlockingRemoteOps()
+        && (item.phase === 'queued' || item.phase === 'paused')) {
         this.selectedQueueClientId = this.selectedQueueClientId === item.clientId ? '' : item.clientId;
       }
     })
@@ -2869,17 +3590,60 @@ export struct TaskPageContent {
 
   @Builder
   queueStateBanner() {
-    Row({ space: 8 }) {
-      SymbolGlyph($r('sys.symbol.clock'))
-        .fontSize(uiFontSize(14))
-        .fontColor([$r('app.color.text_secondary')])
-      Text(this.queueProjectionError.length > 0 ? '待发送队列需要处理' : '待发送队列已暂停')
-        .fontSize(uiFontSize(12))
-        .fontColor(this.queueProjectionError.length > 0
-          ? $r('app.color.danger') : $r('app.color.text_secondary'))
-        .layoutWeight(1)
-      if (this.queuePaused) {
-        this.queueInlineAction('继续发送', false, !this.queueBusy, () => this.resumeQueue())
+    Column({ space: 8 }) {
+      if (this.queueProjectionError.length > 0) {
+        Text(this.queueProjectionError)
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.danger'))
+          .width('100%')
+        Row({ space: 8 }) {
+          this.queueInlineAction('重试发送', false,
+            this.queueErrorRetryText.length > 0 && !this.queueActionBlocked(),
+            () => this.retryQueueError())
+          this.queueInlineAction('忽略错误', false, !this.queueActionBlocked(),
+            () => this.clearQueueError())
+        }
+        .width('100%')
+      } else if (this.queueCredentialWaiting) {
+        Row({ space: 8 }) {
+          LoadingProgress()
+            .width(13)
+            .height(13)
+            .color($r('app.color.text_tertiary'))
+          Text(this.queueCredentialBlockedCount > 0
+            ? `正在等待 ${this.queueCredentialBlockedCount} 个任务完成凭证切换`
+            : '正在等待电脑完成凭证切换')
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_secondary'))
+            .layoutWeight(1)
+        }
+        .width('100%')
+      } else if (this.queueAbortPending) {
+        Row({ space: 8 }) {
+          LoadingProgress()
+            .width(13)
+            .height(13)
+            .color($r('app.color.text_tertiary'))
+          Text('正在停止当前工作…')
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_secondary'))
+            .layoutWeight(1)
+        }
+        .width('100%')
+      } else if (this.queuePaused) {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.clock'))
+            .fontSize(uiFontSize(14))
+            .fontColor([$r('app.color.text_secondary')])
+          Text('待发送队列已暂停')
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_secondary'))
+            .layoutWeight(1)
+          this.queueInlineAction('继续发送', false, !this.queueActionBlocked(),
+            () => this.resumeQueue())
+        }
+        .width('100%')
       }
     }
     .width('100%')
@@ -2887,6 +3651,36 @@ export struct TaskPageContent {
     .backgroundColor($r('app.color.bg_card'))
     .border({ width: 1, color: $r('app.color.border') })
     .borderRadius(UI_RADIUS_CONTAINER)
+  }
+
+  @Builder
+  sessionTailBanner() {
+    if (this.tailPresentation() !== null) {
+      Column({ space: 9 }) {
+        Text(this.tailPresentation()?.text ?? '')
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor(this.tailPresentation()?.interrupted === true
+            ? $r('app.color.text_secondary') : $r('app.color.danger'))
+          .width('100%')
+        Row({ space: 8 }) {
+          if (this.tailPresentation()?.retryable === true
+            || this.tailPresentation()?.interrupted === true) {
+            this.queueInlineAction(this.tailPresentation()?.interrupted === true ? '继续任务' : '重试',
+              false, !this.tailBannerBusy && !this.deviceDisabled,
+              () => this.continueSessionTail())
+          }
+          this.queueInlineAction('忽略', false, !this.tailBannerBusy && !this.deviceDisabled,
+            () => this.dismissSessionTail())
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .padding(12)
+      .backgroundColor($r('app.color.bg_card'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
+    }
   }
 
   @Builder
@@ -2908,6 +3702,22 @@ export struct TaskPageContent {
               .backgroundColor($r('app.color.bg_chip'))
               .clickEffect(UI_CLICK_EFFECT)
               .onClick(() => this.retryLoad())
+          } else if (this.newSessionCreationStatus === 'running') {
+            LoadingProgress()
+              .width(14)
+              .height(14)
+              .color($r('app.color.text_tertiary'))
+            Text('正在创建任务')
+              .fontSize(uiFontSize(12))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_tertiary'))
+          } else if (this.newSessionCreationStatus === 'create-failed') {
+            Text(this.newSessionCreationError.length > 0
+              ? this.newSessionCreationError : '任务创建失败，请返回编辑后重试')
+              .fontSize(uiFontSize(12))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.danger'))
+              .textAlign(TextAlign.Center)
           } else if (!this.initialLoadResolved && this.showInitialSync) {
             LoadingProgress()
               .width(14)
@@ -2950,10 +3760,21 @@ export struct TaskPageContent {
             ListItem() {
               this.renderItem(item)
             }
+            .backgroundColor((item.key === this.focusedSearchItemKey
+              || this.renderItemContainsClientId(item, this.focusedMessageClientId))
+              ? $r('app.color.bg_chip') : Color.Transparent)
+            .borderRadius(UI_RADIUS_CONTAINER)
+            .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
           }, (item: RenderItem) => item.key)
-          if (this.queuePaused || this.queueProjectionError.length > 0) {
+          if (this.queuePaused || this.queueProjectionError.length > 0
+            || this.queueCredentialWaiting || this.queueAbortPending) {
             ListItem() {
               this.queueStateBanner()
+            }
+          }
+          if (this.tailPresentation() !== null) {
+            ListItem() {
+              this.sessionTailBanner()
             }
           }
           ForEach(this.queueBubbles, (item: PendingQueueBubble) => {
@@ -2972,24 +3793,13 @@ export struct TaskPageContent {
             this.followingLatest = true;
             this.hasNewMessages = false;
           }
-          // 不要因为短首屏/初始布局停在 index=0 就自动追翻整段历史。
-          if (!this.initialScrollSettling
-            && start <= 0
-            && this.listTouchPulledDown
-            && !this.listTouchLoadTriggered) {
-            this.listTouchLoadTriggered = true;
-            this.loadOlder();
-          }
+          this.attemptAutoLoadEarlier();
         })
         .onTouch((event: TouchEvent) => {
           this.handleListTouch(event);
         })
         .onReachStart(() => {
-          if (this.initialScrollSettling
-            || !this.listTouchPulledDown
-            || this.listTouchLoadTriggered) return;
-          this.listTouchLoadTriggered = true;
-          this.loadOlder();
+          this.attemptAutoLoadEarlier();
         })
       }
 
@@ -3026,6 +3836,9 @@ export struct TaskPageContent {
     .constraintSize({ maxWidth: 760 })
     .alignSelf(ItemAlign.Center)
     .layoutWeight(1)
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      this.handleMessageAreaChange(oldArea, newArea);
+    })
   }
 
   /** Mobile 同款 Composer：活动状态独立于 50vp 输入胶囊，焦点态再展开为卡片。 */
@@ -3102,11 +3915,13 @@ export struct TaskPageContent {
       focused: this.composerFocused,
       images: this.composerImages,
       files: this.composerFiles,
+      atoms: composerAtomPresentations(this.composerDocument),
       sending: this.sending,
       streaming: this.sessionStreaming,
       hasContent: this.hasComposerContent(),
       canSend: this.canSend(),
-      composerEnabled: !this.deviceDisabled,
+      composerEnabled: !this.deviceDisabled && !this.leavingForCreationEdit
+        && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions),
       pickingImages: this.pickingImages,
       contextBusy: this.contextRpcBusy,
       hasPermissionOptions: this.permissionOptions.length > 0,
@@ -3119,6 +3934,7 @@ export struct TaskPageContent {
       showStreamingStatus: true,
       inputId: 'task-composer-input',
       onInputChange: (value: string): void => {
+        if (this.leavingForCreationEdit) return;
         this.applyComposerTextChange(value);
       },
       onFocusChange: (focused: boolean): void => {
@@ -3136,6 +3952,9 @@ export struct TaskPageContent {
       onRetryImage: (image: ComposerImage): void => this.imageQueue.retry(image),
       onRemoveFile: (file: ComposerFile): void => this.fileQueue.remove(file),
       onRetryFile: (file: ComposerFile): void => this.fileQueue.retry(file),
+      onRemoveAtom: (atom: ComposerAtomPresentation): void => {
+        this.setComposerDocument(removeComposerNode(this.composerDocument, atom.index));
+      },
     })
   }
 
@@ -3788,7 +4607,8 @@ export struct TaskPageContent {
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(UI_RADIUS_CONTROL)
-            .enabled(!this.goalActionBusy && this.goalObjective.trim().length > 0)
+            .enabled(!this.goalActionBusy && !this.isCreationBlockingRemoteOps()
+              && this.goalObjective.trim().length > 0)
             .clickEffect(UI_CLICK_EFFECT)
             .onClick(() => {
               void this.startGoal();
@@ -3844,7 +4664,7 @@ export struct TaskPageContent {
                 .fontColor($r('app.color.text_primary'))
                 .backgroundColor($r('app.color.bg_chip'))
                 .borderRadius(UI_RADIUS_CONTROL)
-                .enabled(!this.goalActionBusy)
+                .enabled(!this.goalActionBusy && !this.isCreationBlockingRemoteOps())
                 .clickEffect(UI_CLICK_EFFECT)
                 .onClick(() => {
                   void this.pauseOrResumeGoal();
@@ -3856,7 +4676,7 @@ export struct TaskPageContent {
               .fontColor($r('app.color.danger'))
               .backgroundColor($r('app.color.bg_chip'))
               .borderRadius(UI_RADIUS_CONTROL)
-              .enabled(!this.goalActionBusy)
+              .enabled(!this.goalActionBusy && !this.isCreationBlockingRemoteOps())
               .clickEffect(UI_CLICK_EFFECT)
               .onClick(() => this.confirmClearGoal())
           }
@@ -3880,6 +4700,11 @@ export struct TaskPageContent {
         && (item as RenderMessageItem).message !== undefined
         && (item as RenderMessageItem).message?.systemCardType === 'compact') {
         this.compactBoundaryBlock(item as RenderMessageItem)
+      } else if ((item as RenderMessageItem).message !== undefined
+        && (item as RenderMessageItem).message?.systemCardType === 'auto-resume') {
+        this.autoResumeBlock(item as RenderMessageItem)
+      } else if ((item as RenderMessageItem).message?.systemCardType.length) {
+        this.systemCardBlock(item as RenderMessageItem)
       } else {
         this.messageBlock(item as RenderMessageItem)
       }
@@ -3951,6 +4776,26 @@ export struct TaskPageContent {
     return '运行中';
   }
 
+  private compactMetric(value: number): string {
+    if (value >= 1000000) return `${Math.round(value / 100000) / 10}m`;
+    if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
+    return `${Math.max(0, Math.round(value))}`;
+  }
+
+  private agentTaskSubtitle(item: RenderAgentTaskItem): string {
+    const parts: string[] = [
+      modelAgentLabel(this.agentTaskProvider(item)),
+      this.agentTaskStatusLabel(this.agentTaskStatus(item)),
+    ];
+    const usage = item.update?.usage;
+    if (usage !== null && usage !== undefined) {
+      if (usage.totalTokens > 0) parts.push(`${this.compactMetric(usage.totalTokens)} tokens`);
+      if (usage.toolUses > 0) parts.push(`${Math.round(usage.toolUses)} 次工具调用`);
+      if (usage.durationMs > 0) parts.push(this.formatDuration(usage.durationMs));
+    }
+    return parts.join(' · ');
+  }
+
   private agentTaskHasDetails(item: RenderAgentTaskItem): boolean {
     return this.agentTaskDescription(item).length > 0
       || this.agentTaskSummary(item).length > 0
@@ -3981,10 +4826,12 @@ export struct TaskPageContent {
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
-          Text(`${modelAgentLabel(this.agentTaskProvider(item))} · ${this.agentTaskStatusLabel(this.agentTaskStatus(item))}`)
+          Text(this.agentTaskSubtitle(item))
             .fontSize(uiFontSize(12))
             .fontColor(this.agentTaskStatus(item) === 'failed'
               ? $r('app.color.danger') : $r('app.color.text_tertiary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
@@ -4362,6 +5209,146 @@ export struct TaskPageContent {
     }
   }
 
+  private autoResumePresentation(item: RenderMessageItem): AutoResumePresentation {
+    const data: Record<string, Object> = {};
+    if (item.message !== undefined) return deriveAutoResumePresentation(
+      item.message.systemCardData, item.autoResumeInFlight);
+    return deriveAutoResumePresentation(data, item.autoResumeInFlight);
+  }
+
+  private autoResumeExpandKey(item: RenderMessageItem): string {
+    return `auto-resume:${item.key}`;
+  }
+
+  private autoResumeLabel(item: RenderMessageItem): string {
+    const state = this.autoResumePresentation(item).state;
+    if (state === 'live') {
+      const info = this.autoResumePresentation(item);
+      return info.attempt > 0 && info.maxAttempts > 0
+        ? `正在自动续跑（${info.attempt}/${info.maxAttempts}）…`
+        : '正在自动续跑…';
+    }
+    if (state === 'succeeded') return '自动续跑已恢复';
+    if (state === 'failed') return '自动续跑失败';
+    return '自动续跑';
+  }
+
+  @Builder
+  autoResumeBlock(item: RenderMessageItem) {
+    if (this.autoResumePresentation(item).state === 'separator') {
+      Row({ space: 8 }) {
+        Divider().color($r('app.color.border')).layoutWeight(1)
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+            .fontSize(uiFontSize(11))
+            .fontColor([$r('app.color.text_tertiary')])
+          Text('自动续跑')
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        .padding({ left: 9, right: 9, top: 5, bottom: 5 })
+        .backgroundColor($r('app.color.bg_chip'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .borderRadius(UI_RADIUS_PILL)
+        Divider().color($r('app.color.border')).layoutWeight(1)
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+    } else {
+      Column({ space: 7 }) {
+        Row({ space: 8 }) {
+          if (this.autoResumePresentation(item).state === 'live') {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color($r('app.color.warn'))
+          } else if (this.autoResumePresentation(item).state === 'succeeded') {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(uiFontSize(15))
+              .fontColor([$r('app.color.success')])
+          } else if (this.autoResumePresentation(item).state === 'failed') {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(uiFontSize(14))
+              .fontColor([$r('app.color.danger')])
+          } else {
+            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+              .fontSize(uiFontSize(15))
+              .fontColor([$r('app.color.text_tertiary')])
+          }
+          Text(this.autoResumeLabel(item))
+            .fontSize(uiFontSize(13))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.autoResumePresentation(item).state === 'failed'
+              ? $r('app.color.danger') : $r('app.color.text_primary'))
+            .maxLines(1)
+          if (this.autoResumePresentation(item).summary.length > 0) {
+            Text(this.autoResumePresentation(item).summary)
+              .fontSize(uiFontSize(12))
+              .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          } else {
+            Blank().layoutWeight(1)
+          }
+          if (this.autoResumePresentation(item).canExpand) {
+            this.disclosureChevron(
+              this.isIn(this.expandedTextBlocks, this.autoResumeExpandKey(item)),
+              $r('app.color.text_tertiary'))
+          }
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 30 })
+        .clickEffect(this.autoResumePresentation(item).canExpand ? UI_LIST_CLICK_EFFECT : undefined)
+        .onClick(() => {
+          if (this.autoResumePresentation(item).canExpand) {
+            this.toggleTextBlock(this.autoResumeExpandKey(item));
+          }
+        })
+
+        if (this.autoResumePresentation(item).canExpand
+          && this.isIn(this.expandedTextBlocks, this.autoResumeExpandKey(item))) {
+          Column({ space: 6 }) {
+            if (this.autoResumePresentation(item).error.length > 0) {
+              Text('中断原因')
+                .fontSize(uiFontSize(11))
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+              Text(this.autoResumePresentation(item).error)
+                .fontSize(uiFontSize(12))
+                .lineHeight(uiLineHeight(18))
+                .fontColor($r('app.color.text_secondary'))
+                .width('100%')
+            }
+            if (this.autoResumePresentation(item).attempt > 0
+              && this.autoResumePresentation(item).maxAttempts > 0) {
+              Text(`第 ${this.autoResumePresentation(item).attempt}/${this.autoResumePresentation(item).maxAttempts} 次尝试`)
+                .fontSize(uiFontSize(11))
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+            }
+            if (this.autoResumePresentation(item).sessionTotal > 0) {
+              Text(`本任务累计自动续跑 ${this.autoResumePresentation(item).sessionTotal} 次`)
+                .fontSize(uiFontSize(11))
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+            }
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding({ left: 24, right: 4, top: 2 })
+          .transition(uiRevealTransition())
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+      .backgroundColor($r('app.color.bg_chip'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTROL)
+    }
+  }
+
   /** 自动压缩边界：与 Desktop CompactBoundaryCard 同款“分隔线 + 居中 chip”。 */
   @Builder
   compactBoundaryBlock(item: RenderMessageItem) {
@@ -4387,6 +5374,68 @@ export struct TaskPageContent {
     }
     .width('100%')
     .padding({ top: 4, bottom: 4 })
+  }
+
+  private systemCardPresentation(item: RenderMessageItem): SystemCardPresentation {
+    if (item.message === undefined) return deriveSystemCardPresentation('', {});
+    return deriveSystemCardPresentation(
+      item.message.systemCardType,
+      item.message.systemCardData,
+    );
+  }
+
+  @Builder
+  systemCardBlock(item: RenderMessageItem) {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        SymbolGlyph(this.systemCardPresentation(item).danger
+          ? $r('sys.symbol.exclamationmark_circle') : $r('sys.symbol.flag'))
+          .fontSize(uiFontSize(15))
+          .fontColor([this.systemCardPresentation(item).danger
+            ? $r('app.color.danger') : $r('app.color.text_secondary')])
+        Text(this.systemCardPresentation(item).title)
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.systemCardPresentation(item).danger
+            ? $r('app.color.danger') : $r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      if (this.systemCardPresentation(item).subtitle.length > 0) {
+        Text(this.systemCardPresentation(item).subtitle)
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+          .width('100%')
+      }
+      if (this.systemCardPresentation(item).body.length > 0) {
+        Text(this.systemCardPresentation(item).body)
+          .fontSize(uiFontSize(13))
+          .lineHeight(uiLineHeight(20))
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+          .maxLines(12)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      ForEach(this.systemCardPresentation(item).rows, (row: SystemCardRow) => {
+        Row({ space: 12 }) {
+          Text(row.label)
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+            .width(72)
+          Text(row.value)
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_secondary'))
+            .layoutWeight(1)
+        }
+        .width('100%')
+      }, (row: SystemCardRow) => `${row.label}-${row.value}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(12)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
   }
 
   /** 历史消息图片缩略图（点击全屏预览）。 */
@@ -4433,6 +5482,41 @@ export struct TaskPageContent {
     .borderRadius(UI_RADIUS_CONTROL)
     .clickEffect(UI_CLICK_EFFECT)
     .onClick(retry)
+  }
+
+  /** 交互卡分派（按 kind）。 */
+  @Builder
+  pendingInteractionSwitcher() {
+    Row({ space: 8 }) {
+      Text(`待处理 ${this.pendingInteractions.length} 个`)
+        .fontSize(uiFontSize(12))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_secondary'))
+      Scroll() {
+        Row({ space: 6 }) {
+          ForEach(this.pendingInteractions, (item: PendingInteraction, index?: number) => {
+            Button(`${(index ?? 0) + 1} · ${interactionKindLabel(item.kind)}`)
+              .type(ButtonType.Normal)
+              .height(30)
+              .padding({ left: 12, right: 12 })
+              .fontSize(uiFontSize(12))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(item.requestId === this.activeInteractionRequestId
+                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+              .backgroundColor(item.requestId === this.activeInteractionRequestId
+                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+              .borderRadius(UI_RADIUS_PILL)
+              .clickEffect(UI_CLICK_EFFECT)
+              .onClick(() => this.selectPendingInteraction(item.requestId))
+          }, (item: PendingInteraction) => item.requestId)
+        }
+      }
+      .layoutWeight(1)
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 34 })
   }
 
   /** 交互卡分派（按 kind）。 */
@@ -4596,7 +5680,7 @@ export struct TaskPageContent {
   permissionCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.lock'), '权限请求')
-      Text(this.permissionToolName(item))
+      Text(this.permissionIsArmed(item) ? '确认高风险操作' : this.permissionToolName(item))
         .fontSize(uiFontSize(14))
         .fontColor($r('app.color.text_primary'))
         .width('100%')
@@ -4605,21 +5689,31 @@ export struct TaskPageContent {
           .fontSize(uiFontSize(12))
           .lineHeight(uiLineHeight(17))
           .fontColor($r('app.color.text_secondary'))
-          .maxLines(3)
+          .maxLines(12)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+      }
+      if (this.permissionRiskText(item).length > 0) {
+        Text(this.permissionIsArmed(item)
+          ? '再次点击“确认允许”才会执行；不确定时请选择拒绝。'
+          : this.permissionRiskText(item))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(17))
+          .fontColor($r('app.color.chat_status_accent'))
           .width('100%')
       }
       Row({ space: 8 }) {
         this.interactionSecondaryButton('拒绝', true,
-          () => this.resolveInteraction(item, this.permissionDecision(item, 'deny')),
+          () => this.handlePermissionDecision(item, 'deny'),
           !this.interactionBusy(item))
         Row().layoutWeight(1)
-        this.interactionPrimaryButton('允许一次',
-          () => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')),
+        this.interactionPrimaryButton(this.permissionIsArmed(item) ? '确认允许' : '允许一次',
+          () => this.handlePermissionDecision(item, 'allow-once'),
           !this.interactionBusy(item))
         if (this.permissionCanAlwaysAllow(item)) {
           this.interactionPrimaryButton('始终允许',
-            () => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')),
+            () => this.handlePermissionDecision(item, 'always-allow'),
             !this.interactionBusy(item))
         }
       }
@@ -4676,11 +5770,11 @@ export struct TaskPageContent {
           .fontColor($r('app.color.text_primary'))
           .width('100%')
 
-        if (this.askOptions(item).length > 0) {
-          ForEach(this.askOptions(item), (opt: string) => {
+        if (this.askOptionRows(item).length > 0) {
+          ForEach(this.askOptionRows(item), (opt: AskOptionPresentation) => {
             Row({ space: 8 }) {
               Stack({ alignContent: Alignment.Center }) {
-                if (this.isAskSelected(item, opt)) {
+                if (this.isAskSelected(item, opt.label)) {
                   SymbolGlyph($r('sys.symbol.checkmark'))
                     .fontSize(uiFontSize(12))
                     .fontColor([$r('app.color.chat_cta_text')])
@@ -4688,26 +5782,39 @@ export struct TaskPageContent {
               }
               .width(18)
               .height(18)
-              .backgroundColor(this.isAskSelected(item, opt)
+              .backgroundColor(this.isAskSelected(item, opt.label)
                 ? $r('app.color.chat_cta') : Color.Transparent)
               .border({ width: 1, color: $r('app.color.border') })
               .borderRadius(this.askMultiSelect(item) ? UI_RADIUS_CONTROL : UI_RADIUS_PILL)
-              Text(opt)
-                .fontSize(uiFontSize(13))
-                .fontColor($r('app.color.text_primary'))
-                .layoutWeight(1)
+              Column({ space: 2 }) {
+                Text(opt.label)
+                  .fontSize(uiFontSize(13))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                  .width('100%')
+                if (opt.description.length > 0) {
+                  Text(opt.description)
+                    .fontSize(uiFontSize(12))
+                    .lineHeight(uiLineHeight(17))
+                    .fontColor($r('app.color.text_secondary'))
+                    .width('100%')
+                }
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
             }
             .width('100%')
             .constraintSize({ minHeight: 40 })
             .padding({ left: 10, right: 10 })
-            .backgroundColor(this.isAskSelected(item, opt)
+            .backgroundColor(this.isAskSelected(item, opt.label)
               ? $r('app.color.bg_chip') : Color.Transparent)
             .border({ width: 1, color: $r('app.color.border') })
             .borderRadius(UI_RADIUS_CONTROL)
             .enabled(!this.interactionBusy(item))
             .clickEffect(UI_CLICK_EFFECT)
-            .onClick(() => this.toggleAskSelection(item, opt))
-          }, (opt: string) => `${item.requestId}-${this.askCurrentIndex(item)}-${opt}`)
+            .onClick(() => this.toggleAskSelection(item, opt.label))
+          }, (opt: AskOptionPresentation) =>
+            `${item.requestId}-${this.askCurrentIndex(item)}-${opt.label}`)
         }
 
         TextInput({ placeholder: '自定义回答…', text: this.askCustomInput(item) })
@@ -4759,6 +5866,63 @@ export struct TaskPageContent {
   planReviewCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.doc_text'), '计划审批')
+      if (this.planEvidence(item).filePath.length > 0) {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.doc'))
+            .fontSize(uiFontSize(15))
+            .fontColor([$r('app.color.text_secondary')])
+          Column({ space: 1 }) {
+            Text(this.planEvidence(item).fileName)
+              .fontSize(uiFontSize(12))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+            Text(this.planEvidence(item).compactPath)
+              .fontSize(uiFontSize(11))
+              .fontColor($r('app.color.text_tertiary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+        .backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL)
+        .clickEffect(UI_CLICK_EFFECT)
+        .onClick(() => this.copyPlainText(this.planEvidence(item).filePath, '已复制计划文件路径'))
+      }
+      if (this.planEvidence(item).outlineItems.length > 0) {
+        Scroll() {
+          Row({ space: 6 }) {
+            Text('目录')
+              .fontSize(uiFontSize(11))
+              .fontColor($r('app.color.text_tertiary'))
+            ForEach(this.planEvidence(item).outlineItems, (outline: PlanOutlinePresentation) => {
+              Text(outline.title)
+                .fontSize(uiFontSize(11))
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_secondary'))
+                .maxLines(1)
+                .padding({ left: 9, right: 9, top: 5, bottom: 5 })
+                .backgroundColor($r('app.color.bg_chip'))
+                .borderRadius(UI_RADIUS_PILL)
+            }, (outline: PlanOutlinePresentation) => outline.id)
+            if (this.planEvidence(item).outlineOverflowCount > 0) {
+              Text(`+${this.planEvidence(item).outlineOverflowCount}`)
+                .fontSize(uiFontSize(11))
+                .fontColor($r('app.color.text_tertiary'))
+            }
+          }
+        }
+        .width('100%')
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+      }
       Row({ space: 8 }) {
         Text(this.planDraftEdited(item) ? '已编辑' : '请检查完整计划后再批准')
           .fontSize(uiFontSize(12))
@@ -4935,9 +6099,7 @@ export struct TaskPageContent {
 
   private hasMessageActions(item: RenderMessageItem): boolean {
     return item.kind === 'user'
-      || (item.kind === 'assistant'
-        && item.message !== undefined
-        && item.message.turnCompleted);
+      || (item.kind === 'assistant' && item.isTurnFinalAssistant);
   }
 
   private collapsedMessageLines(item: RenderMessageItem): number {
@@ -5345,7 +6507,7 @@ export struct TaskPageContent {
       // work_group 展开后只显示每个真实调用行；tool_group 自己再加“调用 bash”
       // 标题会与行标题叠加，历史数据里尤其容易形成重复的 Bash 行。
       ForEach(item.tools, (t: RenderToolItem) => {
-        this.toolRow(t)
+        this.projectedToolRows(t)
       }, (t: RenderToolItem) => `${item.key}-${t.seq}`)
     }
     .width('100%')
@@ -5357,8 +6519,12 @@ export struct TaskPageContent {
     return t.toolUseId.length > 0 ? t.toolUseId : `${t.toolName}-${t.seq}`;
   }
 
-  private toolHasDetails(t: RenderToolItem): boolean {
-    return t.inputText.length > 0 || (t.hasResult && t.resultText.length > 0) || t.diff !== null;
+  private toolActionKey(t: RenderToolItem, action: ToolActionPresentation): string {
+    return `${this.toolKey(t)}:action:${action.actionIndex}`;
+  }
+
+  private toolHasDetails(t: RenderToolItem, action: ToolActionPresentation): boolean {
+    return action.detail.length > 0 || (t.hasResult && t.resultText.length > 0) || t.diff !== null;
   }
 
   private diffLines(value: string, prefix: string): string {
@@ -5371,7 +6537,16 @@ export struct TaskPageContent {
   }
 
   @Builder
-  toolRow(t: RenderToolItem) {
+  projectedToolRows(t: RenderToolItem) {
+    ForEach(projectToolUseActions(t.toolName, t.inputRaw, t.inputText),
+      (action: ToolActionPresentation) => {
+        this.toolRow(t, action)
+      },
+      (action: ToolActionPresentation) => this.toolActionKey(t, action))
+  }
+
+  @Builder
+  toolRow(t: RenderToolItem, action: ToolActionPresentation) {
     Column({ space: 2 }) {
       Row({ space: 6 }) {
         if (t.hasError) {
@@ -5391,16 +6566,16 @@ export struct TaskPageContent {
             .color($r('app.color.text_tertiary'))
             .margin({ left: 1, right: 1 })
         }
-        Text(this.toolRowLabel(t))
+        Text(action.label)
           .fontSize(uiFontSize(14))
           .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
-        if (this.toolHasDetails(t)) {
+        if (this.toolHasDetails(t, action)) {
           this.disclosureChevron(
-            this.isIn(this.expandedTools, this.toolKey(t)),
+            this.isIn(this.expandedTools, this.toolActionKey(t, action)),
             $r('app.color.text_tertiary'),
           )
         }
@@ -5408,17 +6583,18 @@ export struct TaskPageContent {
       .width('100%')
       .constraintSize({ minHeight: 28 })
       .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-      .clickEffect(this.toolHasDetails(t) ? UI_LIST_CLICK_EFFECT : undefined)
+      .clickEffect(this.toolHasDetails(t, action) ? UI_LIST_CLICK_EFFECT : undefined)
       .onClick(() => {
-        if (this.toolHasDetails(t)) {
-          this.toggleToolDetails(this.toolKey(t));
+        if (this.toolHasDetails(t, action)) {
+          this.toggleToolDetails(this.toolActionKey(t, action));
         }
       })
 
-      if (this.toolHasDetails(t) && this.isIn(this.expandedTools, this.toolKey(t))) {
+      if (this.toolHasDetails(t, action)
+        && this.isIn(this.expandedTools, this.toolActionKey(t, action))) {
         Column({ space: 4 }) {
-          if (t.inputText.length > 0) {
-            Text(t.inputText)
+          if (action.detail.length > 0) {
+            Text(action.detail)
               .fontSize(uiFontSize(12))
               .fontFamily('monospace')
               .fontColor($r('app.color.chat_text_secondary'))
@@ -5516,10 +6692,16 @@ export struct TaskPageContent {
 
   @Builder
   todoBlock(item: RenderTodoCardItem) {
-    Column({ space: 4 }) {
-      Row({ space: 6 }) {
+    Column() {
+      Row({ space: 8 }) {
+        this.disclosureChevron(
+          this.todoCardExpanded(item.key), $r('app.color.text_tertiary'))
+        SymbolGlyph($r('sys.symbol.list_bullet'))
+          .fontSize(uiFontSize(16))
+          .fontColor([$r('app.color.text_secondary')])
+          .width(18)
         Text(this.todoTitle(item))
-          .fontSize(uiFontSize(12))
+          .fontSize(uiFontSize(14))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -5527,32 +6709,89 @@ export struct TaskPageContent {
           .layoutWeight(1)
       }
       .width('100%')
+      .constraintSize({ minHeight: this.todoCardCompact(item) ? 42 : 46 })
+      .padding({ left: 10, right: 10 })
+      .clickEffect(UI_LIST_CLICK_EFFECT)
+      .onClick(() => this.toggleTodoCard(item.key))
 
-      ForEach(item.todos, (t: RenderTodoItem) => {
-        Row({ space: 6 }) {
-          Text(this.todoMark(t.status))
-            .fontSize(uiFontSize(13))
-            .fontColor(this.todoColor(t.status))
-          Text(t.content)
-            .fontSize(uiFontSize(13))
-            .fontColor(t.status === 'completed' ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
-          if (t.status === 'in_progress') {
-            Text('…')
-              .fontSize(uiFontSize(13))
-              .fontColor($r('app.color.warn'))
-          }
+      if (this.todoCardExpanded(item.key)) {
+        Column() {
+          ForEach(item.todos, (t: RenderTodoItem) => {
+            Row({ space: 10 }) {
+              this.todoStatusIcon(t.status, item.isStreaming)
+              Text(t.content)
+                .fontSize(uiFontSize(14))
+                .lineHeight(uiLineHeight(20))
+                .fontColor(t.status === 'pending'
+                  ? $r('app.color.text_tertiary') : $r('app.color.text_primary'))
+                .opacity(t.status === 'completed' ? 0.72 : 1)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .constraintSize({ minHeight: this.todoCardCompact(item) ? 38 : 42 })
+            .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+            .alignItems(VerticalAlign.Center)
+          }, (t: RenderTodoItem) => `${item.key}-${t.seq}`)
         }
         .width('100%')
-        .alignItems(VerticalAlign.Center)
-      }, (t: RenderTodoItem) => `${item.key}-${t.seq}`)
+        .padding({ bottom: 6 })
+        .border({ width: { top: 1 }, color: { top: $r('app.color.border') } })
+        .transition(uiRevealTransition())
+      }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(10)
     .backgroundColor($r('app.color.bg_card'))
     .borderRadius(UI_RADIUS_CONTAINER)
     .border({ width: 1, color: $r('app.color.border') })
     .margin({ top: 4, bottom: 4 })
+  }
+
+  private todoCardCompact(item: RenderTodoCardItem): boolean {
+    return (this.messageAreaWidth > 0 && this.messageAreaWidth <= 360)
+      || item.todos.length > 3;
+  }
+
+  @Builder
+  todoStatusIcon(status: string, streaming: boolean) {
+    Stack({ alignContent: Alignment.Center }) {
+      if (status === 'completed') {
+        Circle()
+          .width(18)
+          .height(18)
+          .fill($r('app.color.text_primary'))
+        SymbolGlyph($r('sys.symbol.checkmark'))
+          .fontSize(uiFontSize(11))
+          .fontColor([$r('app.color.bg_card')])
+      } else if (status === 'in_progress' && streaming) {
+        LoadingProgress()
+          .width(18)
+          .height(18)
+          .color($r('app.color.text_secondary'))
+      } else if (status === 'in_progress') {
+        Circle()
+          .width(16)
+          .height(16)
+          .fill(Color.Transparent)
+          .stroke($r('app.color.text_secondary'))
+          .strokeWidth(1.5)
+        Circle()
+          .width(5)
+          .height(5)
+          .fill($r('app.color.text_secondary'))
+      } else {
+        Circle()
+          .width(16)
+          .height(16)
+          .fill(Color.Transparent)
+          .stroke($r('app.color.text_tertiary'))
+          .strokeWidth(1.5)
+      }
+    }
+    .width(20)
+    .height(20)
   }
 
   // ─── Markdown 渲染 ──────────────────────────────────────────────────────────
@@ -5577,15 +6816,18 @@ export struct TaskPageContent {
   }
 
   @Builder
-  mdInlineContent(tokens: InlineToken[]) {
+  mdInlineContent(
+    tokens: InlineToken[], fontSize: number, lineHeight: number,
+    heading: boolean, secondary: boolean,
+  ) {
     Column({ space: 4 }) {
-      ForEach(tokens, (token: InlineToken) => {
-        if (token.kind === 'image') {
-          this.mdInlineImage(token)
+      ForEach(groupInlineTokens(tokens), (group: InlineTokenGroup) => {
+        if (group.image !== null) {
+          this.mdInlineImage(group.image)
         } else {
-          this.inlineText(token.value)
+          this.inlineTokensText(group.tokens, fontSize, lineHeight, heading, secondary)
         }
-      }, (token: InlineToken) => `${token.seq}`)
+      }, (group: InlineTokenGroup) => `${group.key}`)
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -5634,19 +6876,16 @@ export struct TaskPageContent {
   @Builder
   mdBlock(b: MdBlock) {
     if (b.type === 'heading') {
-      if (this.hasImageToken(b.inlineTokens)) {
-        this.mdInlineContent(b.inlineTokens)
-      } else {
-        Text(b.text)
-          .fontSize(uiFontSize(b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17)))
-          .fontWeight(FontWeight.Medium)
-          .width('100%')
-          .lineHeight(uiLineHeight(b.level <= 2 ? 28 : 26))
-          .padding({ top: 4, bottom: 4 })
-      }
+      this.mdInlineContent(
+        b.inlineTokens,
+        b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17),
+        b.level <= 2 ? 28 : 26,
+        true,
+        false,
+      )
     } else if (b.type === 'paragraph') {
       if (this.hasImageToken(b.inlineTokens)) {
-        this.mdInlineContent(b.inlineTokens)
+        this.mdInlineContent(b.inlineTokens, 17, 26, false, false)
       } else {
         this.inlineText(b.text)
       }
@@ -5654,11 +6893,9 @@ export struct TaskPageContent {
       Column({ space: 2 }) {
         ForEach(b.items, (it: string, idx?: number) => {
           Row({ space: 6 }) {
-            Text(b.ordered ? `${(idx ?? 0) + 1}.` : '•')
-              .fontSize(uiFontSize(17))
-              .fontColor($r('app.color.text_secondary'))
+            this.markdownListMarker(b, idx ?? 0)
             if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
-              this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [])
+              this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
             } else {
               this.inlineText(it)
             }
@@ -5671,16 +6908,15 @@ export struct TaskPageContent {
     } else if (b.type === 'quote') {
       if (this.hasImageToken(b.inlineTokens)) {
         Row() {
-          this.mdInlineContent(b.inlineTokens)
+          this.mdInlineContent(b.inlineTokens, 14, 22, false, true)
         }
         .width('100%')
         .padding({ left: 10 })
         .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
       } else {
-        Text(b.text)
-          .fontSize(uiFontSize(14))
-          .fontColor($r('app.color.text_secondary'))
-          .lineHeight(uiLineHeight(22))
+        Row() {
+          this.inlineTokensText(b.inlineTokens, 14, 22, false, true)
+        }
           .padding({ left: 10 })
           .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
           .width('100%')
@@ -5724,6 +6960,31 @@ export struct TaskPageContent {
   }
 
   @Builder
+  markdownListMarker(b: MdBlock, index: number) {
+    if ((b.itemChecked[index] ?? -1) >= 0) {
+      Row() {
+        if ((b.itemChecked[index] ?? 0) === 1) {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(uiFontSize(11))
+            .fontColor([$r('app.color.accent')])
+        }
+      }
+      .width(17)
+      .height(17)
+      .justifyContent(FlexAlign.Center)
+      .border({ width: 1, color: (b.itemChecked[index] ?? 0) === 1
+        ? $r('app.color.accent') : $r('app.color.border') })
+      .borderRadius(4)
+      .margin({ top: 4 })
+    } else {
+      Text(b.itemOrdered[index] === true
+        ? (b.itemMarkers[index] ?? `${index + 1}.`) : '•')
+        .fontSize(uiFontSize(17))
+        .fontColor($r('app.color.text_secondary'))
+    }
+  }
+
+  @Builder
   richSourceBlock(title: string, source: string, kind: string) {
     Column({ space: 6 }) {
       Row({ space: 6 }) {
@@ -5755,8 +7016,30 @@ export struct TaskPageContent {
     return row === undefined ? [] : (row[cellIndex] ?? []);
   }
 
+  private tableColumnWidths(b: MdBlock): number[] {
+    const cached = this.tableColumnWidthCache.get(b);
+    if (cached !== undefined) return cached;
+    const compact = this.messageAreaWidth > 0 && this.messageAreaWidth <= 360;
+    const available = this.messageAreaWidth > 0
+      ? Math.max(280, this.messageAreaWidth - (compact ? 48 : 64)) : 0;
+    const widths = buildMarkdownTableColumnWidths(
+      b.headerTokens, b.rowTokens, compact ? 96 : 112, 220, available);
+    this.tableColumnWidthCache.set(b, widths);
+    return widths;
+  }
+
+  private tableColumnIndexes(b: MdBlock): number[] {
+    const count = this.tableColumnWidths(b).length;
+    const out: number[] = [];
+    for (let i = 0; i < count; i++) out.push(i);
+    return out;
+  }
+
   private tableContentWidth(b: MdBlock): number {
-    return Math.max(320, b.headers.length * 140);
+    const widths = this.tableColumnWidths(b);
+    let total = 0;
+    for (let i = 0; i < widths.length; i++) total += widths[i];
+    return total;
   }
 
   @Builder
@@ -5764,35 +7047,37 @@ export struct TaskPageContent {
     Scroll() {
       Column() {
         Row() {
-          ForEach(b.headers, (h: string, hIndex?: number) => {
+          ForEach(this.tableColumnIndexes(b), (hIndex: number) => {
             Row() {
-              if (this.hasImageToken(this.tableHeaderTokens(b, hIndex ?? 0))) {
-                this.mdInlineContent(this.tableHeaderTokens(b, hIndex ?? 0))
+              if (this.hasImageToken(this.tableHeaderTokens(b, hIndex))) {
+                this.mdInlineContent(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
               } else {
-                this.inlineText(h)
+                this.inlineText(b.headers[hIndex] ?? '')
               }
             }
-            .width(140)
-            .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+            .width(this.tableColumnWidths(b)[hIndex])
+            .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+            .backgroundColor($r('app.color.bg_chip'))
             .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
-          }, (h: string, hIndex?: number) => `${b.seq}-h-${hIndex ?? 0}`)
+          }, (hIndex: number) => `${b.seq}-h-${hIndex}`)
         }
         .width(this.tableContentWidth(b))
 
         ForEach(b.rows, (row: string[], rowIndex?: number) => {
           Row() {
-            ForEach(row, (cell: string, cellIndex?: number) => {
+            ForEach(this.tableColumnIndexes(b), (cellIndex: number) => {
               Row() {
-                if (this.hasImageToken(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex ?? 0))) {
-                  this.mdInlineContent(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex ?? 0))
+                if (this.hasImageToken(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex))) {
+                  this.mdInlineContent(
+                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
                 } else {
-                  this.inlineText(cell)
+                  this.inlineText(row[cellIndex] ?? '')
                 }
               }
-              .width(140)
-              .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+              .width(this.tableColumnWidths(b)[cellIndex])
+              .padding({ left: 10, right: 10, top: 7, bottom: 7 })
               .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
-            }, (cell: string, cellIndex?: number) => `${b.seq}-${rowIndex ?? 0}-${cellIndex ?? 0}`)
+            }, (cellIndex: number) => `${b.seq}-${rowIndex ?? 0}-${cellIndex}`)
           }
           .width(this.tableContentWidth(b))
         }, (row: string[], rowIndex?: number) => `${b.seq}-r-${rowIndex ?? 0}`)
@@ -5806,8 +7091,16 @@ export struct TaskPageContent {
 
   @Builder
   inlineText(text: string) {
+    this.inlineTokensText(tokenizeInline(text), 17, 26, false, false)
+  }
+
+  @Builder
+  inlineTokensText(
+    tokens: InlineToken[], fontSize: number, lineHeight: number,
+    heading: boolean, secondary: boolean,
+  ) {
     Text() {
-      ForEach(tokenizeInline(text), (t: InlineToken) => {
+      ForEach(tokens, (t: InlineToken) => {
         if (t.kind === 'code') {
           Span(t.value)
             .fontFamily('monospace')
@@ -5815,7 +7108,18 @@ export struct TaskPageContent {
             .textBackgroundStyle({ color: $r('app.color.bg_chip') })
         } else if (t.kind === 'strong') {
           Span(t.value)
-            .fontWeight(FontWeight.Medium)
+            .fontWeight(FontWeight.Bold)
+        } else if (t.kind === 'emphasis') {
+          Span(t.value)
+            .fontStyle(FontStyle.Italic)
+        } else if (t.kind === 'strikethrough') {
+          Span(t.value)
+            .decoration({ type: TextDecorationType.LineThrough })
+        } else if (t.kind === 'math') {
+          Span(t.value)
+            .fontFamily('serif')
+            .fontStyle(FontStyle.Italic)
+            .fontColor($r('app.color.code_text'))
         } else if (t.kind === 'link' && this.isLocalReference(t.url)) {
           // Desktop 将文件路径、代码文件名等本地引用显示为中性的 code chip，
           // 只有真正的外部链接使用 accent；这样不会把 .ets / HAP 误染成蓝色。
@@ -5835,9 +7139,12 @@ export struct TaskPageContent {
         }
       }, (t: InlineToken) => `${t.seq}`)
     }
-    .fontSize(uiFontSize(17))
-    .lineHeight(uiLineHeight(26))
+    .fontSize(uiFontSize(fontSize))
+    .lineHeight(uiLineHeight(lineHeight))
+    .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+    .fontColor(secondary ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
     .textAlign(TextAlign.Start)
+    .width('100%')
   }
 
   // ─── 样式/工具 ──────────────────────────────────────────────────────────────
@@ -5861,18 +7168,6 @@ export struct TaskPageContent {
       default:
         return $r('app.color.text_secondary');
     }
-  }
-
-  private todoMark(status: string): string {
-    if (status === 'completed') return '☑';
-    if (status === 'in_progress') return '◐';
-    return '☐';
-  }
-
-  private todoColor(status: string): Resource {
-    if (status === 'completed') return $r('app.color.success');
-    if (status === 'in_progress') return $r('app.color.warn');
-    return $r('app.color.text_tertiary');
   }
 
   private pad2(value: number): string {
@@ -5960,6 +7255,7 @@ export struct TaskPageContent {
   }
 
   private showProjectActions(): void {
+    if (this.isCreationBlockingRemoteOps()) return;
     const workingDir = this.session()?.workingDir ?? '';
     if (workingDir.length === 0) return;
     this.getUIContext().showActionSheet({
@@ -5973,6 +7269,7 @@ export struct TaskPageContent {
   }
 
   private showSessionActions(): void {
+    if (this.isCreationBlockingRemoteOps()) return;
     this.sessionRenameDraft = this.sessionTitle();
     this.sessionRenameMode = false;
     uiAnimateState(this.getUIContext(), () => {
@@ -5989,6 +7286,7 @@ export struct TaskPageContent {
   }
 
   private openSessionTree(): void {
+    if (this.isCreationBlockingRemoteOps()) return;
     this.sessionActionOpen = false;
     this.sessionTreeOpen = true;
     this.sessionTreeError = '';
@@ -6002,6 +7300,7 @@ export struct TaskPageContent {
   }
 
   private async loadSessionTree(): Promise<void> {
+    if (this.isCreationBlockingRemoteOps()) return;
     const generation = ++this.sessionTreeGeneration;
     this.sessionTreeLoading = true;
     this.sessionTreeError = '';
@@ -6020,7 +7319,7 @@ export struct TaskPageContent {
 
   private async navigateSessionTree(entryId: string): Promise<void> {
     if (this.sessionStreaming || this.sessionTreeSwitchingId.length > 0
-      || this.sessionTree?.leafId === entryId) return;
+      || this.sessionTree?.leafId === entryId || this.isCreationBlockingRemoteOps()) return;
     const generation = ++this.sessionTreeGeneration;
     this.sessionTreeSwitchingId = entryId;
     this.sessionTreeError = '';
@@ -6051,7 +7350,7 @@ export struct TaskPageContent {
   }
 
   private async patchCurrentSession(patch: SessionMetaPatch, leaveDetail: boolean = false): Promise<boolean> {
-    if (this.sessionActionBusy) return false;
+    if (this.sessionActionBusy || this.isCreationBlockingRemoteOps()) return false;
     this.sessionActionBusy = true;
     const ok = await AppServices.instance.tasks.patchSession(this.deviceId, this.sessionId, patch);
     this.sessionActionBusy = false;
@@ -6073,7 +7372,7 @@ export struct TaskPageContent {
   }
 
   private async generateSessionRename(): Promise<void> {
-    if (this.sessionActionBusy) return;
+    if (this.sessionActionBusy || this.isCreationBlockingRemoteOps()) return;
     this.sessionActionBusy = true;
     const title = await AppServices.instance.tasks.regenerateTitle(this.deviceId, this.sessionId);
     this.sessionActionBusy = false;
@@ -6103,6 +7402,7 @@ export struct TaskPageContent {
   }
 
   private confirmDeleteSession(): void {
+    if (this.isCreationBlockingRemoteOps()) return;
     this.getUIContext().showAlertDialog({
       title: '删除任务？',
       message: '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。',
@@ -6597,6 +7897,7 @@ export struct TaskPageContent {
   // ─── 交互确认（Permission / Ask User / Plan Review）──────────────────────────
 
   private resolveInteraction(item: PendingInteraction, decision: Record<string, Object>): void {
+    this.clearArmedPermission();
     AppServices.instance.interactions.resolve(
       this.deviceId, item.sessionId, item.requestId, decision).catch(() => {
       promptAction.showToast({ message: '提交失败，请重试' });
@@ -6657,49 +7958,50 @@ export struct TaskPageContent {
     if (Object.keys(input).length === 0) {
       return '';
     }
-    const s = JSON.stringify(input);
-    return s.length > 120 ? `${s.slice(0, 120)}…` : s;
+    const command = typeof input['command'] === 'string' ? input['command'] as string : '';
+    if (command.length > 0) return command.slice(0, 12000);
+    return JSON.stringify(input).slice(0, 12000);
   }
 
   private permissionCanAlwaysAllow(item: PendingInteraction): boolean {
-    return this.requestBool(item, 'canAlwaysAllow');
+    return permissionCanAlwaysAllow(item.raw);
   }
 
   private permissionDecision(item: PendingInteraction, behavior: string): Record<string, Object> {
-    const d: Record<string, Object> = {};
-    d['kind'] = 'permission';
-    if (behavior === 'deny') {
-      d['behavior'] = 'deny';
-      d['reason'] = 'User denied';
-    } else {
-      d['behavior'] = 'allow';
-      // 始终允许：session 级 permissionUpdates（request 携带时透传）。
-      if (behavior === 'always-allow') {
-        const suggestions = this.sessionSuggestions(item);
-        if (suggestions.length > 0) {
-          d['permissionUpdates'] = suggestions;
-        }
-      }
-    }
-    return d;
+    return buildPermissionDecision(item.raw, behavior);
   }
 
-  private sessionSuggestions(item: PendingInteraction): Object[] {
-    const raw = item.raw['permissionSuggestions'];
-    const out: Object[] = [];
-    if (Array.isArray(raw)) {
-      const list: Object[] = raw as Object[];
-      for (let i = 0; i < list.length; i++) {
-        const s = list[i];
-        if (s !== undefined && typeof s === 'object' && !Array.isArray(s)) {
-          const r = s as Record<string, Object>;
-          if (r['destination'] === 'session') {
-            out.push(s);
-          }
-        }
-      }
+  private permissionRiskText(item: PendingInteraction): string {
+    return permissionRiskSummary(item.raw);
+  }
+
+  private permissionIsArmed(item: PendingInteraction): boolean {
+    return this.armedPermissionRequestId === item.requestId
+      && this.armedPermissionAction === 'allow-once'
+      && this.armedPermissionFingerprint === permissionRequestFingerprint(item.raw, 'allow-once');
+  }
+
+  private clearArmedPermission(): void {
+    this.armedPermissionRequestId = '';
+    this.armedPermissionAction = '';
+    this.armedPermissionFingerprint = '';
+  }
+
+  private handlePermissionDecision(item: PendingInteraction, action: string): void {
+    if (this.interactionBusy(item)) return;
+    if (action === 'deny') {
+      this.clearArmedPermission();
+      this.resolveInteraction(item, this.permissionDecision(item, action));
+      return;
     }
-    return out;
+    if (this.permissionRiskText(item).length > 0
+      && this.armedPermissionFingerprint !== permissionRequestFingerprint(item.raw, action)) {
+      this.armedPermissionRequestId = item.requestId;
+      this.armedPermissionAction = action;
+      this.armedPermissionFingerprint = permissionRequestFingerprint(item.raw, action);
+      return;
+    }
+    this.resolveInteraction(item, this.permissionDecision(item, action));
   }
 
   // ── Ask User ──
@@ -6750,22 +8052,14 @@ export struct TaskPageContent {
     return q['multiSelect'] === true;
   }
 
+  private askOptionRows(item: PendingInteraction): AskOptionPresentation[] {
+    return askOptionPresentations(this.currentAskQuestion(item));
+  }
+
   private askOptions(item: PendingInteraction): string[] {
-    const q = this.currentAskQuestion(item);
-    const raw = q['options'];
     const out: string[] = [];
-    if (Array.isArray(raw)) {
-      const list: Object[] = raw as Object[];
-      for (let i = 0; i < list.length; i++) {
-        const o = list[i];
-        if (o !== undefined && typeof o === 'object' && !Array.isArray(o)) {
-          const label = (o as Record<string, Object>)['label'];
-          if (typeof label === 'string' && label.length > 0) {
-            out.push(label);
-          }
-        }
-      }
-    }
+    const rows = this.askOptionRows(item);
+    for (let i = 0; i < rows.length; i++) out.push(rows[i].label);
     return out;
   }
 
@@ -6955,6 +8249,11 @@ export struct TaskPageContent {
 
   private planText(item: PendingInteraction): string {
     return this.planDraft(item).planText;
+  }
+
+  private planEvidence(item: PendingInteraction): PlanReviewEvidencePresentation {
+    return buildPlanReviewEvidence(
+      this.planText(item), this.requestStr(item, 'planFilePath'), 3);
   }
 
   private planDraftEdited(item: PendingInteraction): boolean {

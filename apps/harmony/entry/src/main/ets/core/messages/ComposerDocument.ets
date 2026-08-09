@@ -42,6 +42,20 @@ export class SerializedComposerDocument {
   slashCommandRanges: Object[] = [];
 }
 
+/** Composer 原子节点的轻量展示模型；正文仍由 TextArea 编辑。 */
+export class ComposerAtomPresentation {
+  index: number = -1;
+  type: string = '';
+  label: string = '';
+  detail: string = '';
+}
+
+class ComposerSemanticRange {
+  start: number = 0;
+  end: number = 0;
+  node: ComposerNode = new ComposerNode();
+}
+
 export function emptyComposerDocument(): ComposerDocument {
   return new ComposerDocument();
 }
@@ -208,6 +222,46 @@ export function appendComposerNode(document: ComposerDocument, node: ComposerNod
   return normalizeComposerDocument(out);
 }
 
+export function removeComposerNode(document: ComposerDocument, index: number): ComposerDocument {
+  if (index < 0 || index >= document.nodes.length) return document;
+  const out = new ComposerDocument();
+  out.nodes = document.nodes.filter((_node: ComposerNode, nodeIndex: number) => nodeIndex !== index);
+  return normalizeComposerDocument(out);
+}
+
+export function composerAtomPresentations(document: ComposerDocument): ComposerAtomPresentation[] {
+  const out: ComposerAtomPresentation[] = [];
+  for (let i = 0; i < document.nodes.length; i++) {
+    const node = document.nodes[i];
+    if (node.type === 'text' && node.slashCommand.length === 0) continue;
+    const item = new ComposerAtomPresentation();
+    item.index = i;
+    item.type = node.type === 'text' ? 'slash-command' : node.type;
+    if (node.type === 'quote') {
+      item.label = '引用';
+      item.detail = node.sourcePath.length > 0 ? node.sourcePath : compactAtomText(node.text);
+    } else if (node.type === 'pasted-text') {
+      item.label = node.display.length > 0 ? node.display : '已粘贴文本';
+      item.detail = compactAtomText(node.text);
+    } else if (node.type === 'mention') {
+      item.label = node.label.length > 0 ? node.label : node.raw;
+      item.detail = node.mentionKind === 'project' ? '项目' : '提及';
+    } else if (node.type === 'session-link') {
+      item.label = node.messageClientId.length > 0 ? '消息引用' : '任务引用';
+      item.detail = node.label.length > 0 ? node.label : node.href;
+    } else {
+      item.label = node.slashCommand.length > 0 ? node.slashCommand : node.text;
+      item.detail = '命令';
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+function compactAtomText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, 64);
+}
+
 function stripOuterNewlines(text: string): string {
   let start = 0;
   while (start < text.length && text.charCodeAt(start) === 10) start += 1;
@@ -300,6 +354,170 @@ export function serializeComposerDocument(document: ComposerDocument): Serialize
   result.pastedTextRanges = trimRanges(result.pastedTextRanges, leading, result.text.length);
   result.slashCommandRanges = trimRanges(result.slashCommandRanges, leading, result.text.length);
   return result;
+}
+
+/** 从队列 persistedContent 恢复结构化文档，编辑时不再把引用/粘贴/命令压成纯文本。 */
+export function composerDocumentFromPersistedContent(value: string): ComposerDocument | null {
+  try {
+    const raw = JSON.parse(value) as Record<string, Object>;
+    const rawText = raw['text'];
+    if (typeof rawText !== 'string') return null;
+    const text = rawText as string;
+    const ranges: ComposerSemanticRange[] = [];
+    collectMetadataRanges(raw['pastedTextRanges'], text, 'pasted-text', ranges);
+    collectMetadataRanges(raw['slashCommandRanges'], text, 'slash-command', ranges);
+    collectAgentReferenceRanges(raw['agentReferences'], text, ranges);
+    if (raw['quotesEncoded'] === true) collectQuoteRanges(text, ranges);
+    ranges.sort((a: ComposerSemanticRange, b: ComposerSemanticRange) => {
+      if (a.start !== b.start) return a.start - b.start;
+      return b.end - a.end;
+    });
+
+    const document = new ComposerDocument();
+    let cursor = 0;
+    for (let i = 0; i < ranges.length; i++) {
+      const range = ranges[i];
+      if (range.start < cursor || range.end <= range.start || range.end > text.length) continue;
+      if (range.start > cursor) document.nodes.push(textNode(text.slice(cursor, range.start)));
+      document.nodes.push(range.node);
+      cursor = range.end;
+    }
+    if (cursor < text.length) document.nodes.push(textNode(text.slice(cursor)));
+    return normalizeComposerDocument(document);
+  } catch (e) {
+    return null;
+  }
+}
+
+function collectMetadataRanges(value: Object | undefined, text: string, kind: string,
+  target: ComposerSemanticRange[]): void {
+  if (!Array.isArray(value)) return;
+  const rows = value as Object[];
+  for (let i = 0; i < rows.length; i++) {
+    const record = asRecord(rows[i]);
+    if (record === null) continue;
+    const start = rangeNumber(record, 'start');
+    const end = rangeNumber(record, 'end');
+    if (!validSemanticRange(start, end, text.length)) continue;
+    const range = new ComposerSemanticRange();
+    range.start = start;
+    range.end = end;
+    const slice = text.slice(start, end);
+    if (kind === 'pasted-text') {
+      range.node = pastedTextNode(slice);
+      if (typeof record['display'] === 'string') range.node.display = record['display'] as string;
+    } else {
+      range.node = textNode(slice, slice);
+    }
+    target.push(range);
+  }
+}
+
+function collectAgentReferenceRanges(value: Object | undefined, text: string,
+  target: ComposerSemanticRange[]): void {
+  if (!Array.isArray(value)) return;
+  const rows = value as Object[];
+  for (let i = 0; i < rows.length; i++) {
+    const record = asRecord(rows[i]);
+    if (record === null) continue;
+    const start = rangeNumber(record, 'start');
+    const end = rangeNumber(record, 'end');
+    if (!validSemanticRange(start, end, text.length)) continue;
+    const kind = typeof record['kind'] === 'string' ? record['kind'] as string : '';
+    const node = new ComposerNode();
+    if (kind === 'project') {
+      node.type = 'mention';
+      node.mentionKind = 'project';
+      node.raw = text.slice(start, end);
+      node.label = stringField(record, 'name');
+      node.href = stringField(record, 'href');
+      node.workingDir = stringField(record, 'workingDir');
+    } else if (kind === 'session' || kind === 'message') {
+      node.type = 'session-link';
+      node.href = stringField(record, 'href');
+      if (node.href.length === 0) node.href = text.slice(start, end);
+      node.messageClientId = stringField(record, 'messageClientId');
+      node.agentText = stringField(record, 'text');
+      node.agentTextTruncated = record['truncated'] === true;
+      node.label = stringField(record, 'title');
+      node.titled = node.label.length > 0;
+    } else {
+      continue;
+    }
+    const range = new ComposerSemanticRange();
+    range.start = start;
+    range.end = end;
+    range.node = node;
+    target.push(range);
+  }
+}
+
+function collectQuoteRanges(text: string, target: ComposerSemanticRange[]): void {
+  const marker = '> <!-- cindy-composer-quote -->';
+  let searchAt = 0;
+  for (;;) {
+    const markerAt = text.indexOf(marker, searchAt);
+    if (markerAt < 0) return;
+    let lineAt = text.indexOf('\n', markerAt + marker.length);
+    if (lineAt < 0) lineAt = text.length;
+    let cursor = lineAt < text.length ? lineAt + 1 : lineAt;
+    const lines: string[] = [];
+    let end = lineAt;
+    while (cursor < text.length) {
+      let lineEnd = text.indexOf('\n', cursor);
+      if (lineEnd < 0) lineEnd = text.length;
+      const line = text.slice(cursor, lineEnd);
+      if (!line.startsWith('>')) break;
+      lines.push(line.startsWith('> ') ? line.slice(2) : line.slice(1));
+      end = lineEnd;
+      cursor = lineEnd < text.length ? lineEnd + 1 : lineEnd;
+    }
+    let sourcePath = '';
+    let startLine = 0;
+    let endLine = 0;
+    if (lines.length > 0 && lines[lines.length - 1].startsWith('— source: ')) {
+      const source = lines.pop()?.slice('— source: '.length) ?? '';
+      const lineMarker = source.lastIndexOf('#L');
+      sourcePath = lineMarker >= 0 ? source.slice(0, lineMarker) : source;
+      if (lineMarker >= 0) {
+        const lineRange = source.slice(lineMarker + 2).split('-L');
+        startLine = Number.parseInt(lineRange[0], 10);
+        endLine = lineRange.length > 1 ? Number.parseInt(lineRange[1], 10) : startLine;
+        if (!Number.isFinite(startLine)) startLine = 0;
+        if (!Number.isFinite(endLine)) endLine = startLine;
+      }
+    }
+    if (lines.length > 0) {
+      let start = markerAt;
+      if (start >= 2 && text.slice(start - 2, start) === '\n\n') start -= 2;
+      if (end + 2 <= text.length && text.slice(end, end + 2) === '\n\n') end += 2;
+      const range = new ComposerSemanticRange();
+      range.start = start;
+      range.end = end;
+      range.node = quoteNode(lines.join('\n'), sourcePath, startLine, endLine);
+      target.push(range);
+    }
+    searchAt = Math.max(markerAt + marker.length, end);
+  }
+}
+
+function asRecord(value: Object): Record<string, Object> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, Object> : null;
+}
+
+function rangeNumber(record: Record<string, Object>, key: string): number {
+  const value = record[key];
+  return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : -1;
+}
+
+function validSemanticRange(start: number, end: number, length: number): boolean {
+  return start >= 0 && end > start && end <= length;
+}
+
+function stringField(record: Record<string, Object>, key: string): string {
+  const value = record[key];
+  return typeof value === 'string' ? value as string : '';
 }
 
 function trimRanges(source: Object[], leading: number, textLength: number): Object[] {

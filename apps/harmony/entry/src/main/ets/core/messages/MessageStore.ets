@@ -42,6 +42,14 @@ import {
   HISTORY_GAP_PROBE_MAX_STEPS,
   HistoryWindowGap,
 } from './HistoryGap';
+import {
+  MessageWindowCoverage,
+  reconcileLatestMessageWindow,
+  extendCoverageEarlier,
+  extendCoverageLiveTail,
+} from './HistoryWindowCoverage';
+import { revealNearestCompleteHistoryTurn } from './HistoryTurnPaging';
+import { historyRetryLimits, isPayloadTooLargeError } from './MessagePaging';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -49,6 +57,10 @@ const TAG = 'CindyMsg';
 // 与 Desktop local-db:messages:list 的默认页大小一致。Harmony 走 Device Link 时，
 // 工具结果可能还要经过压缩/裁页；100 条会让特殊会话在一次响应和 UI 重建中卡很久。
 const HISTORY_PAGE_LIMIT = 50;
+const RECONNECT_MESSAGE_WINDOW_LIMIT = 80;
+/** 单次手势内部连续取页的保险预算；到预算后保留 buffer，下次从同一位置续取。 */
+const HISTORY_TURN_MAX_REQUESTS = 24;
+const HISTORY_TURN_MAX_ROWS = 1200;
 
 function hasTurnContinuation(event: Record<string, Object>): boolean {
   const value = event['turnContinuationId'];
@@ -59,6 +71,8 @@ function hasTurnContinuation(event: Record<string, Object>): boolean {
 export class StreamingToolRow {
   toolUseId: string = '';
   toolName: string = '';
+  /** 原始结构化 input；工作步骤的人话摘要依赖 description / commandActions 等字段。 */
+  input: Object | undefined = undefined;
   /** 工具摘要（input 浓缩）。 */
   inputText: string = '';
   /** true = tool_result 事件已到（或收到 done）。 */
@@ -70,6 +84,8 @@ export class StreamingToolRow {
 /** 流式 assistant 消息（maker:event 增量累积，落库后清除）。 */
 export class StreamingMessage {
   sessionId: string = '';
+  /** maker:event 顶层持久消息身份；用于只清理真正对应的 live 投影。 */
+  persistId: string = '';
   /** 正文 delta 累积。 */
   text: string = '';
   /** 流式 tool 行（tool_use 事件增量，按 toolUseId 去重）。 */
@@ -83,6 +99,8 @@ export class StreamingMessage {
 class HistoryPage {
   items: RemoteMessage[] = [];
   hasMore: boolean = false;
+  effectiveLimit: number = 0;
+  reducedByPayloadTooLarge: boolean = false;
 }
 
 /** Rewind 的文件影响预览；文件回退失败不等于对话不能回退。 */
@@ -119,6 +137,10 @@ export class MessageStore {
   /** sessionId -> deviceId（当前订阅关系）。 */
   private subscribed: Map<string, string> = new Map();
   private hasMoreBySession: Map<string, boolean> = new Map();
+  /** 已取回但尚未按完整 turn 揭示的旧行。 */
+  private olderTurnBufferBySession: Map<string, RemoteMessage[]> = new Map();
+  /** buffer 之前是否仍可能存在未取回的权威历史。 */
+  private olderSourceHasMoreBySession: Map<string, boolean> = new Map();
   /** 会话列表透出的服务端消息总数，用于短页（payload 裁剪）时判断还有历史。 */
   private messageCountBySession: Map<string, number> = new Map();
   /** 流式 assistant 消息（maker:event 累积）。 */
@@ -141,6 +163,9 @@ export class MessageStore {
   private historyHealGenerations: Map<string, number> = new Map();
   /** 本次访问已经探测过的合法停顿/缺口，避免反复请求同一处。 */
   private consideredHistoryGaps: Map<string, Set<string>> = new Map();
+  /** 已验证连续窗口；只有 subscribe ACK 后到达的实时尾部可推进 until。 */
+  private historyCoverageBySession: Map<string, MessageWindowCoverage> = new Map();
+  private subscriptionAckedSessions: Set<string> = new Set();
 
   attach(client: DlClient): void {
     this.client = client;
@@ -170,6 +195,95 @@ export class MessageStore {
 
   getMessages(sessionId: string): RemoteMessage[] {
     return this.messagesBySession.get(sessionId) ?? [];
+  }
+
+  hasMessageClientId(sessionId: string, clientId: string): boolean {
+    if (clientId.length === 0) return false;
+    const messages = this.messagesBySession.get(sessionId) ?? [];
+    return messages.some((message: RemoteMessage) =>
+      message.clientId === clientId || message.id === clientId);
+  }
+
+  appendLocalSystemCard(
+    sessionId: string,
+    type: string,
+    data: Record<string, Object>,
+  ): void {
+    const message = new RemoteMessage();
+    const key = `harmony-local-${type}-${Date.now()}-${++this.sendSequence}`;
+    message.id = key;
+    message.clientId = key;
+    message.sessionId = sessionId;
+    message.role = 'system';
+    message.systemCardType = type;
+    message.systemCardData = data;
+    message.createdAt = new Date().toISOString();
+    message.localOnly = true;
+    const current = this.messagesBySession.get(sessionId) ?? [];
+    const next = current.concat([message]);
+    next.sort(sortMessagesAsc);
+    this.messagesBySession.set(sessionId, next);
+    this.notify();
+  }
+
+  /** 消息链接定位使用独立 around 窗口，不污染连续历史分页 coverage。 */
+  async loadAroundClientId(
+    deviceId: string,
+    sessionId: string,
+    clientId: string,
+    radius: number = 60,
+  ): Promise<boolean> {
+    const client = this.client;
+    if (!client || clientId.length === 0) return false;
+    if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    const options: Record<string, Object> = {};
+    options['radius'] = Math.max(1, Math.min(100, Math.floor(radius)));
+    const invoke = new DlInvokeOptions();
+    invoke.channel = 'local-db:messages:around-client-id';
+    invoke.args = [sessionId, clientId, options];
+    const env = await client.invoke(deviceId, invoke);
+    const result = unwrapInvokeResult(env);
+    const rows: RemoteMessage[] = [];
+    if (Array.isArray(result)) {
+      const source = result as Object[];
+      for (let i = 0; i < source.length; i++) {
+        const raw = source[i];
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        rows.push(parseMessage(raw as Record<string, Object>));
+      }
+    }
+    if (rows.length > 0) {
+      const current = this.messagesBySession.get(sessionId) ?? [];
+      const merged = this.mergeWithoutDuplicates(rows, current);
+      merged.sort(sortMessagesAsc);
+      this.messagesBySession.set(sessionId, merged);
+      this.notify();
+    }
+    return this.hasMessageClientId(sessionId, clientId);
+  }
+
+  /**
+   * 首条消息 ACK 丢失时的权威兜底：applied / missing / unknown。
+   * 最新窗口打满或被 relay 裁剪时，未命中不能证明消息从未落库。
+   */
+  async probeMessageClientId(
+    deviceId: string,
+    sessionId: string,
+    clientId: string,
+    limit: number = 200,
+  ): Promise<string> {
+    const local = this.messagesBySession.get(sessionId) ?? [];
+    if (local.some((message: RemoteMessage) =>
+      message.clientId === clientId || message.id === clientId)) return 'applied';
+    try {
+      const page = await this.requestMessagesList(deviceId, sessionId, limit, '');
+      if (page.items.some((message: RemoteMessage) =>
+        message.clientId === clientId || message.id === clientId)) return 'applied';
+      if (page.hasMore || page.items.length >= limit) return 'unknown';
+      return 'missing';
+    } catch (e) {
+      return 'unknown';
+    }
   }
 
   getTaskUpdates(sessionId: string): Map<string, AgentTaskUpdate> {
@@ -209,7 +323,11 @@ export class MessageStore {
     this.messageCountBySession.set(sessionId, count);
     const current = this.messagesBySession.get(sessionId) ?? [];
     if (current.length === 0) return;
-    this.hasMoreBySession.set(sessionId, count > countRealMessages(current));
+    const buffered = this.olderTurnBufferBySession.get(sessionId) ?? [];
+    const fetched = this.mergeWithoutDuplicates(buffered, current);
+    const sourceHasMore = count > countRealMessages(fetched);
+    this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
+    this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
   }
 
   /** 该会话历史是否加载失败（页面据此显示重试）。 */
@@ -220,6 +338,10 @@ export class MessageStore {
   // ─── 打开 / 关闭 ────────────────────────────────────────────────────────────
 
   /** 打开会话：确保控制链路 → 拉历史（优先）→ 订阅实时流（并行，失败不阻塞）。 */
+  isSessionOpen(sessionId: string): boolean {
+    return this.subscribed.has(sessionId);
+  }
+
   async openSession(deviceId: string, sessionId: string): Promise<boolean> {
     const client = this.client;
     if (!client) {
@@ -243,8 +365,13 @@ export class MessageStore {
       }
     }
     this.subscribed.set(sessionId, deviceId);
+    this.subscriptionAckedSessions.delete(sessionId);
+    const existingCoverage = this.historyCoverageBySession.get(sessionId);
+    if (existingCoverage !== undefined) existingCoverage.liveTailTrusted = false;
     // 订阅实时流（并行，失败不阻塞历史）。
-    client.subscribe(deviceId, [sessionTopic(sessionId)]).catch(() => {
+    client.subscribe(deviceId, [sessionTopic(sessionId)]).then(() => {
+      if (this.subscribed.get(sessionId) === deviceId) this.subscriptionAckedSessions.add(sessionId);
+    }).catch(() => {
     });
     const loaded = await this.loadInitial(deviceId, sessionId);
     if (loaded) this.scheduleHistoryHeal(deviceId, sessionId, true);
@@ -258,6 +385,8 @@ export class MessageStore {
     this.subscribed.delete(sessionId);
     this.messagesBySession.delete(sessionId);
     this.hasMoreBySession.delete(sessionId);
+    this.olderTurnBufferBySession.delete(sessionId);
+    this.olderSourceHasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
     this.loadFailedBySession.delete(sessionId);
     this.streamingBySession.delete(sessionId);
@@ -269,6 +398,8 @@ export class MessageStore {
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.consideredHistoryGaps.delete(sessionId);
+    this.historyCoverageBySession.delete(sessionId);
+    this.subscriptionAckedSessions.delete(sessionId);
     if (deviceId !== undefined) {
       const client = this.client;
       if (client) {
@@ -303,19 +434,22 @@ export class MessageStore {
       return;
     }
     // relay 新连接后旧订阅失效，需重新 subscribe。
+    this.subscriptionAckedSessions.delete(sessionId);
+    const previousCoverage = this.historyCoverageBySession.get(sessionId);
+    if (previousCoverage !== undefined) previousCoverage.liveTailTrusted = false;
     try {
       await client.subscribe(deviceId, [sessionTopic(sessionId)]);
+      if (this.subscribed.get(sessionId) === deviceId) this.subscriptionAckedSessions.add(sessionId);
     } catch (e) {
       // 订阅失败不阻断 healing
     }
     try {
-      const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
+      const page = await this.requestMessagesList(
+        deviceId, sessionId, RECONNECT_MESSAGE_WINDOW_LIMIT, '');
       page.items.sort(sortMessagesAsc);
-      const existing = this.messagesBySession.get(sessionId) ?? [];
-      const merged = this.mergeWithoutDuplicates(page.items, existing);
-      merged.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, merged);
-      this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, merged));
+      const merged = this.applyLatestWindow(sessionId, page);
+      this.setOlderAvailability(
+        sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.notify();
       this.scheduleHistoryHeal(deviceId, sessionId, true);
       void this.refreshSessionRunningState(deviceId, sessionId);
@@ -445,6 +579,14 @@ export class MessageStore {
     });
   }
 
+  /** socket 断线会同时撤销实时尾部背书与订阅 ACK。 */
+  invalidateLiveTailTrust(): void {
+    this.subscriptionAckedSessions.clear();
+    this.historyCoverageBySession.forEach((coverage: MessageWindowCoverage) => {
+      coverage.liveTailTrusted = false;
+    });
+  }
+
   /** 从被控端 active 快照恢复已存在的运行态；终态清理仍由显式 session 探针负责。 */
   async hydrateActiveSessions(deviceId: string): Promise<void> {
     const client = this.client;
@@ -477,7 +619,7 @@ export class MessageStore {
   }
 
   /** maker:event 处理：运行态按终态语义收口，流式正文保留到持久化行回流。 */
-  handleMakerEvent(sessionId: string, event: Object | undefined): void {
+  handleMakerEvent(sessionId: string, event: Object | undefined, persistId: string = ''): void {
     if (event === undefined || typeof event !== 'object') {
       return;
     }
@@ -512,7 +654,7 @@ export class MessageStore {
       if (delta.length === 0) {
         return;
       }
-      const s = this.ensureStreaming(sessionId);
+      const s = this.ensureStreaming(sessionId, persistId);
       s.text += delta;
       this.notify();
       return;
@@ -523,7 +665,7 @@ export class MessageStore {
       if (toolUseId.length === 0) {
         return;
       }
-      const s = this.ensureStreaming(sessionId);
+      const s = this.ensureStreaming(sessionId, persistId);
       // 同 toolUseId 原地更新（不重复建行）。
       let row = s.tools.find((t: StreamingToolRow) => t.toolUseId === toolUseId);
       if (row === undefined) {
@@ -535,6 +677,7 @@ export class MessageStore {
       row.settled = false;
       const rawInput = data['input'];
       if (rawInput !== undefined) {
+        row.input = rawInput;
         row.inputText = summarizeText(JSON.stringify(rawInput));
       }
       this.notify();
@@ -652,15 +795,85 @@ export class MessageStore {
 
 
   /** 取或建流式消息。 */
-  private ensureStreaming(sessionId: string): StreamingMessage {
+  private ensureStreaming(sessionId: string, persistId: string = ''): StreamingMessage {
     let s = this.streamingBySession.get(sessionId);
-    if (s === undefined || s.finished) {
+    if (s !== undefined && persistId.length > 0 && s.persistId.length === 0) {
+      // 老生产者先发无身份事件、后续帧才补 persistId：迁移身份，不重建正文。
+      s.persistId = persistId;
+    }
+    if (s !== undefined && (s.finished
+      || (persistId.length > 0 && s.persistId.length > 0 && s.persistId !== persistId))) {
+      // 新的持久块开始前，把旧投影固化进本地窗口。随后旧块 DB push 回流时按
+      // persistId 原位替换，不能清掉仍在增长的新块。
+      this.materializeStreamingProjection(sessionId, s);
+      s = undefined;
+    }
+    if (s === undefined) {
       s = new StreamingMessage();
       s.sessionId = sessionId;
+      s.persistId = persistId;
       s.createdAt = new Date().toISOString();
       this.streamingBySession.set(sessionId, s);
     }
     return s;
+  }
+
+  private materializeStreamingProjection(sessionId: string, streaming: StreamingMessage): void {
+    const list = this.messagesBySession.get(sessionId) ?? [];
+    for (let i = 0; i < streaming.tools.length; i++) {
+      const tool = streaming.tools[i];
+      if (!list.some((message: RemoteMessage) => message.role === 'tool_use'
+        && message.toolUseId === tool.toolUseId)) {
+        const use = new RemoteMessage();
+        use.id = `streaming-tool-${tool.toolUseId}`;
+        use.clientId = use.id;
+        use.sessionId = sessionId;
+        use.role = 'tool_use';
+        use.toolUseId = tool.toolUseId;
+        use.createdAt = streaming.createdAt;
+        const content: Record<string, Object> = {};
+        content['toolUseId'] = tool.toolUseId;
+        content['toolName'] = tool.toolName;
+        const emptyInput: Record<string, Object> = {};
+        content['input'] = tool.input ?? emptyInput;
+        use.content = content;
+        list.push(use);
+      }
+      if (tool.settled && !list.some((message: RemoteMessage) => message.role === 'tool_result'
+        && message.toolUseId === tool.toolUseId)) {
+        const result = new RemoteMessage();
+        result.id = `streaming-result-${tool.toolUseId}`;
+        result.clientId = result.id;
+        result.sessionId = sessionId;
+        result.role = 'tool_result';
+        result.toolUseId = tool.toolUseId;
+        result.createdAt = streaming.createdAt;
+        const resultContent: Record<string, Object> = {};
+        resultContent['toolUseId'] = tool.toolUseId;
+        resultContent['isError'] = tool.hasError;
+        resultContent['text'] = '';
+        result.content = resultContent;
+        list.push(result);
+      }
+    }
+    if (streaming.text.length > 0) {
+      const identity = streaming.persistId.length > 0
+        ? streaming.persistId : `streaming-text-${sessionId}:${streaming.createdAt}`;
+      const index = list.findIndex((message: RemoteMessage) =>
+        message.id === identity || message.clientId === identity);
+      const assistant = new RemoteMessage();
+      assistant.id = identity;
+      assistant.clientId = identity;
+      assistant.sessionId = sessionId;
+      assistant.role = 'assistant';
+      assistant.createdAt = streaming.createdAt;
+      assistant.content = streaming.text;
+      assistant.isStreaming = false;
+      if (index >= 0) list[index] = assistant;
+      else list.push(assistant);
+    }
+    list.sort(sortMessagesAsc);
+    this.messagesBySession.set(sessionId, list);
   }
 
   private bumpRunningStateRevision(sessionId: string): number {
@@ -826,26 +1039,43 @@ export class MessageStore {
     }
     const isStreaming = !s.finished;
     const tmp: RemoteMessage[] = [];
+    const persistedToolUseIds = new Set<string>();
+    const persistedToolResultIds = new Set<string>();
+    for (let i = 0; i < base.length; i++) {
+      let nestedUseId = '';
+      const rawContent = base[i].content;
+      if (rawContent !== undefined && rawContent !== null
+        && typeof rawContent === 'object' && !Array.isArray(rawContent)) {
+        nestedUseId = readStr(rawContent as Record<string, Object>, 'toolUseId');
+      }
+      if (base[i].role === 'tool_use') {
+        const useId = base[i].toolUseId.length > 0
+          ? base[i].toolUseId : nestedUseId;
+        if (useId.length > 0) persistedToolUseIds.add(useId);
+      } else if (base[i].role === 'tool_result') {
+        const useId = base[i].toolUseId.length > 0
+          ? base[i].toolUseId : nestedUseId;
+        if (useId.length > 0) persistedToolResultIds.add(useId);
+      }
+    }
     for (let i = 0; i < s.tools.length; i++) {
       const t = s.tools[i];
-      const tm = new RemoteMessage();
-      tm.id = `streaming-tool-${t.toolUseId}`;
-      tm.role = 'tool_use';
-      tm.toolUseId = t.toolUseId;
-      tm.createdAt = s.createdAt;
-      tm.isStreaming = isStreaming;
-      const content: Record<string, Object> = {};
-      content['toolUseId'] = t.toolUseId;
-      content['toolName'] = t.toolName;
-      const inputObj: Record<string, Object> = {};
-      if (t.inputText.length > 0) {
-        content['input'] = t.inputText;
-      } else {
-        content['input'] = inputObj;
+      if (!persistedToolUseIds.has(t.toolUseId)) {
+        const tm = new RemoteMessage();
+        tm.id = `streaming-tool-${t.toolUseId}`;
+        tm.role = 'tool_use';
+        tm.toolUseId = t.toolUseId;
+        tm.createdAt = s.createdAt;
+        tm.isStreaming = isStreaming;
+        const content: Record<string, Object> = {};
+        content['toolUseId'] = t.toolUseId;
+        content['toolName'] = t.toolName;
+        const inputObj: Record<string, Object> = {};
+        content['input'] = t.input ?? inputObj;
+        tm.content = content;
+        tmp.push(tm);
       }
-      tm.content = content;
-      tmp.push(tm);
-      if (t.settled) {
+      if (t.settled && !persistedToolResultIds.has(t.toolUseId)) {
         const result = new RemoteMessage();
         result.id = `streaming-result-${t.toolUseId}`;
         result.role = 'tool_result';
@@ -862,7 +1092,9 @@ export class MessageStore {
     }
     if (s.text.length > 0) {
       const tm = new RemoteMessage();
-      tm.id = `streaming-text-${sessionId}`;
+      tm.id = s.persistId.length > 0 ? s.persistId : `streaming-text-${sessionId}`;
+      tm.clientId = tm.id;
+      tm.sessionId = sessionId;
       tm.role = 'assistant';
       tm.createdAt = s.createdAt;
       tm.content = s.text;
@@ -872,11 +1104,16 @@ export class MessageStore {
     return base.concat(tmp);
   }
 
-  /** assistant 正文落库时清对应流式缓存；thinking/tool 落库不清（正文还在路上）。 */
+  /** assistant 正文落库时只清同 persistId 投影；旧块 push 不能清掉新块。 */
   private clearStreamingIfAssistant(sessionId: string, message: RemoteMessage): void {
     if (message.role !== 'assistant') {
       return;
     }
+    const streaming = this.streamingBySession.get(sessionId);
+    if (streaming === undefined) return;
+    if (streaming.persistId.length > 0
+      && message.id !== streaming.persistId
+      && message.clientId !== streaming.persistId) return;
     if (this.streamingBySession.delete(sessionId)) {
       this.notify();
     }
@@ -889,12 +1126,9 @@ export class MessageStore {
       // 对齐 iOS：历史走 local-db:messages:list（返回完整行含 clientId，最新在前）。
       const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
       page.items.sort(sortMessagesAsc);
-      // 与已存在的（可能来自更早 push 的暂存）合并去重，避免整窗覆盖丢消息。
-      const existing = this.messagesBySession.get(sessionId) ?? [];
-      const merged = this.mergeWithoutDuplicates(page.items, existing);
-      merged.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, merged);
-      this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, merged));
+      const merged = this.applyLatestWindow(sessionId, page);
+      this.setOlderAvailability(
+        sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.loadFailedBySession.delete(sessionId);
       // 临时诊断：确认 user 消息是否在数据层（对比渲染层丢失）。
       let userCount = 0;
@@ -926,6 +1160,9 @@ export class MessageStore {
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.consideredHistoryGaps.delete(sessionId);
+    this.historyCoverageBySession.delete(sessionId);
+    this.clearOlderTurnState(sessionId);
+    this.messagesBySession.delete(sessionId);
     return this.loadInitial(deviceId, sessionId);
   }
 
@@ -934,13 +1171,19 @@ export class MessageStore {
     const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
     this.historyHealGenerations.set(sessionId, generation);
     this.consideredHistoryGaps.delete(sessionId);
+    this.historyCoverageBySession.delete(sessionId);
+    this.clearOlderTurnState(sessionId);
     try {
       const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
         || this.subscribed.get(sessionId) !== deviceId) return false;
       page.items.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, page.items);
-      this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, page.items));
+      const reconciled = reconcileLatestMessageWindow(
+        [], page.items, page.hasMore, null, this.subscriptionAckedSessions.has(sessionId));
+      this.messagesBySession.set(sessionId, reconciled.items);
+      if (reconciled.coverage !== null) this.historyCoverageBySession.set(sessionId, reconciled.coverage);
+      this.setOlderAvailability(
+        sessionId, this.hasMoreAfterPage(sessionId, page, page.items));
       this.streamingBySession.delete(sessionId);
       this.runningBySession.delete(sessionId);
       this.makerTurnRunningBySession.delete(sessionId);
@@ -952,34 +1195,129 @@ export class MessageStore {
     }
   }
 
-  /** 向上翻页（加载更早消息，追加到列表头部）。 */
+  /**
+   * 向上翻页：一次用户触发只揭示上一轮完整的「user + 回复/工作过程」。
+   * relay 把大页裁成一行时会在内部继续向前请求，命中顶层 user 前不改可见列表，
+   * 从而避免一条 tool/thinking 被临时并进现有 work_group。
+   */
   async loadOlder(deviceId: string, sessionId: string): Promise<void> {
     const client = this.client;
     if (!client) return;
     if (!this.hasMore(sessionId)) return;
-    const current = this.messagesBySession.get(sessionId) ?? [];
-    // asc 序最早一条的 id 作为 before 游标（messages:list 是 desc，before = 更早）。
-    const firstId = oldestMessageCursor(current);
-    if (firstId.length === 0) return;
+    const generation = this.historyHealGenerations.get(sessionId) ?? 0;
+    let current = this.messagesBySession.get(sessionId) ?? [];
+    let buffered = (this.olderTurnBufferBySession.get(sessionId) ?? []).slice();
+    let sourceHasMore = this.olderSourceHasMoreBySession.get(sessionId)
+      ?? this.hasMore(sessionId);
+    let reveal = revealNearestCompleteHistoryTurn(buffered, sourceHasMore);
+    let requests = 0;
+    let fetchedRows = 0;
+    let lastCursor = '';
+    let requestLimit = HISTORY_PAGE_LIMIT;
     try {
-      const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, firstId);
-      page.items.sort(sortMessagesAsc);
-      const merged = this.mergeWithoutDuplicates(page.items, current);
+      while (reveal.needsOlderPage
+        && requests < HISTORY_TURN_MAX_REQUESTS
+        && fetchedRows < HISTORY_TURN_MAX_ROWS) {
+        const cursorRows = buffered.length > 0 ? buffered : current;
+        const before = oldestMessageCursor(cursorRows);
+        if (before.length === 0 || before === lastCursor) {
+          // 无可用游标或游标没有前移，不等同于权威历史耗尽。保留半轮和入口，
+          // 禁止把尚未命中 user 边界的行作为孤儿内容提前揭示。
+          break;
+        }
+        lastCursor = before;
+        const page = await this.requestMessagesList(
+          deviceId, sessionId, requestLimit, before);
+        if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
+          || this.subscribed.get(sessionId) !== deviceId) return;
+        requests += 1;
+        fetchedRows += page.items.length;
+        page.items.sort(sortMessagesAsc);
+
+        // before 理论上排除当前游标；仍按 identity 过滤，兼容旧 host 的包含式分页。
+        const previousSize = buffered.length;
+        const allFetched = this.mergeWithoutDuplicates(page.items, buffered.concat(current));
+        const currentIds = new Set<string>();
+        for (let i = 0; i < current.length; i++) currentIds.add(messageIdentity(current[i]));
+        buffered = [];
+        for (let i = 0; i < allFetched.length; i++) {
+          if (!currentIds.has(messageIdentity(allFetched[i]))) buffered.push(allFetched[i]);
+        }
+        buffered.sort(sortMessagesAsc);
+        const progressed = buffered.length > previousSize;
+        const fetchedWindow = this.mergeWithoutDuplicates(buffered, current);
+        sourceHasMore = this.hasMoreAfterPage(sessionId, page, fetchedWindow);
+        reveal = revealNearestCompleteHistoryTurn(buffered, sourceHasMore);
+        if (page.items.length === 0) break;
+        if (!progressed) {
+          // 旧 host 的包含式 before 加上 relay 裁页，可能只返当前游标本身。
+          // 缩小页大小可降低响应裁剪概率；仍不前进时保留 hasMore 给下次重试。
+          if (sourceHasMore && requestLimit > 1) {
+            requestLimit = Math.max(1, Math.floor(requestLimit / 2));
+            lastCursor = '';
+            continue;
+          }
+          break;
+        }
+        requestLimit = HISTORY_PAGE_LIMIT;
+      }
+
+      // 请求预算只负责防止异常 host 死循环；未命中 user 时继续保留 buffer，
+      // 不把半轮内容塞进现有工作组。下一次触发会从 buffer 最早游标续取。
+      this.olderTurnBufferBySession.set(sessionId, reveal.buffered);
+      this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
+      if (reveal.reveal.length === 0) {
+        this.hasMoreBySession.set(sessionId, reveal.buffered.length > 0 || sourceHasMore);
+        hilog.info(DOMAIN, TAG,
+          'history turn buffered session=%{public}s rows=%{public}d requests=%{public}d',
+          sessionId.slice(0, 8), reveal.buffered.length, requests);
+        this.notify();
+        return;
+      }
+
+      // 收集期间可能有实时尾部 push；最终 merge 使用最新窗口，且只 notify 一次。
+      if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
+        || this.subscribed.get(sessionId) !== deviceId) return;
+      current = this.messagesBySession.get(sessionId) ?? current;
+      const merged = this.mergeWithoutDuplicates(reveal.reveal, current);
       merged.sort(sortMessagesAsc);
       this.messagesBySession.set(sessionId, merged);
-      const progressed = merged.length > current.length;
+      const coverage = extendCoverageEarlier(
+        this.historyCoverageBySession.get(sessionId) ?? null,
+        reveal.reveal,
+        current.length > 0 ? current[0] : null);
+      if (coverage !== null) this.historyCoverageBySession.set(sessionId, coverage);
       this.hasMoreBySession.set(sessionId,
-        progressed && this.hasMoreAfterPage(sessionId, page, merged));
+        reveal.buffered.length > 0 || sourceHasMore);
       hilog.info(DOMAIN, TAG,
-        'history older loaded before=%{public}s page=%{public}d added=%{public}d hasMore=%{public}s',
-        firstId.slice(0, 8), page.items.length, Math.max(0, merged.length - current.length),
+        'history turn revealed requests=%{public}d fetched=%{public}d added=%{public}d hasMore=%{public}s',
+        requests, fetchedRows, Math.max(0, merged.length - current.length),
         this.hasMore(sessionId) ? 'true' : 'false');
       this.notify();
     } catch (e) {
+      // 一轮内部可能已经跨过多个 relay 裁页；后续页断线时保留已取回的半轮，
+      // 下次手势从 buffer 最早游标续取，既不逐条闪入 UI，也不重复请求这些行。
+      if ((this.historyHealGenerations.get(sessionId) ?? 0) === generation
+        && this.subscribed.get(sessionId) === deviceId) {
+        this.olderTurnBufferBySession.set(sessionId, buffered);
+        this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
+        this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
+      }
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
       hilog.warn(DOMAIN, TAG, 'history older failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), msg);
     }
+  }
+
+  private clearOlderTurnState(sessionId: string): void {
+    this.olderTurnBufferBySession.delete(sessionId);
+    this.olderSourceHasMoreBySession.delete(sessionId);
+  }
+
+  private setOlderAvailability(sessionId: string, sourceHasMore: boolean): void {
+    this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
+    const buffered = this.olderTurnBufferBySession.get(sessionId) ?? [];
+    this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
   }
 
   /**
@@ -999,7 +1337,30 @@ export class MessageStore {
    * local-db:messages:list（对齐 iOS 主历史通道）：最新在前（desc），
    * before 为更早分页游标（消息 id）。返回完整行含 clientId。
    */
-  private requestMessagesList(
+  private async requestMessagesList(
+    deviceId: string,
+    sessionId: string,
+    limit: number,
+    beforeId: string,
+  ): Promise<HistoryPage> {
+    const limits = historyRetryLimits(limit);
+    let lastError: Error = new Error('messages:list failed');
+    for (let i = 0; i < limits.length; i++) {
+      try {
+        const page = await this.requestMessagesListOnce(deviceId, sessionId, limits[i], beforeId);
+        page.effectiveLimit = limits[i];
+        page.reducedByPayloadTooLarge = limits[i] !== limit;
+        if (page.reducedByPayloadTooLarge) page.hasMore = true;
+        return page;
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error(JSON.stringify(e));
+        if (!isPayloadTooLargeError(lastError) || i === limits.length - 1) throw lastError;
+      }
+    }
+    throw lastError;
+  }
+
+  private requestMessagesListOnce(
     deviceId: string,
     sessionId: string,
     limit: number,
@@ -1039,6 +1400,7 @@ export class MessageStore {
       }
       const out = new HistoryPage();
       out.items = items;
+      out.effectiveLimit = limit;
       // messages:list 没有 hasMore 字段：满载即可能还有更早；但 device-link 为避免
       // 超过 relay 帧上限会裁掉页尾，并在保留行的 agentMeta 上打 remoteRowsTrimmed。
       // 这种页通常少于 limit，不能把它误判成已经到历史起点（Mobile 同源判定）。
@@ -1074,6 +1436,7 @@ export class MessageStore {
         const sessionId = readStr(p, 'sessionId');
         if (sessionId.length > 0 && this.subscribed.has(sessionId)) {
           // 会话尾部落 error 行：重载一次让错误消息可见。
+          this.historyCoverageBySession.delete(sessionId);
           void this.loadInitial(deviceId, sessionId);
         }
         break;
@@ -1105,12 +1468,31 @@ export class MessageStore {
       this.notify();
       return;
     }
-    if (list.some((m: RemoteMessage) => m.id === message.id)) {
+    // 新的权威工具行到达后清掉之前为跨 persistId 保活而固化的临时工具行。
+    if ((message.role === 'tool_use' || message.role === 'tool_result')
+      && message.toolUseId.length > 0) {
+      const syntheticPrefix = message.role === 'tool_use' ? 'streaming-tool-' : 'streaming-result-';
+      list = list.filter((existing: RemoteMessage) => !(existing.toolUseId === message.toolUseId
+        && existing.role === message.role && existing.id.startsWith(syntheticPrefix)));
+      this.messagesBySession.set(sessionId, list);
+    }
+    const existingIndex = list.findIndex((m: RemoteMessage) =>
+      m.id === message.id || (message.clientId.length > 0 && m.clientId === message.clientId));
+    if (existingIndex >= 0) {
+      if (preferIncomingCreatedMessage(list[existingIndex], message)) {
+        list[existingIndex] = message;
+        list.sort(sortMessagesAsc);
+        this.messagesBySession.set(sessionId, list);
+        this.notify();
+      }
       this.clearStreamingIfAssistant(sessionId, message);
-      return; // 去重
+      return;
     }
     list.push(message);
     list.sort(sortMessagesAsc);
+    if (this.subscriptionAckedSessions.has(sessionId)) {
+      extendCoverageLiveTail(this.historyCoverageBySession.get(sessionId) ?? null, message);
+    }
     // 正文行（assistant）落库 = 流式正文已持久化，清临时；thinking/tool 行落库保留
     // 流式正文（它们只是工作过程的持久化，正文还在路上）。
     this.clearStreamingIfAssistant(sessionId, message);
@@ -1133,6 +1515,7 @@ export class MessageStore {
       if (single.length > 0) clientIds.push(single);
     }
     if (sessionId.length === 0 || clientIds.length === 0) return;
+    this.historyCoverageBySession.delete(sessionId);
     const list = this.messagesBySession.get(sessionId);
     if (!list) return;
     const filtered = list.filter((m: RemoteMessage) => !clientIds.includes(m.clientId));
@@ -1258,6 +1641,42 @@ export class MessageStore {
     await client.invoke(deviceId, opts);
   }
 
+  async dismissErrorMessage(deviceId: string, sessionId: string, clientId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    const messages = this.messagesBySession.get(sessionId) ?? [];
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].clientId !== clientId && messages[i].id !== clientId) continue;
+      let content: Record<string, Object> = {};
+      if (messages[i].content !== undefined && messages[i].content !== null
+        && typeof messages[i].content === 'object' && !Array.isArray(messages[i].content)) {
+        content = messages[i].content as Record<string, Object>;
+      } else {
+        content['message'] = typeof messages[i].content === 'string' ? messages[i].content as string : '';
+      }
+      content['dismissed'] = true;
+      messages[i].content = content;
+      break;
+    }
+    this.messagesBySession.set(sessionId, messages);
+    this.notify();
+    if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    const opts = new DlInvokeOptions();
+    opts.channel = 'local-db:messages:dismiss-error';
+    opts.args = [sessionId, clientId];
+    await client.invoke(deviceId, opts);
+  }
+
+  async ackInterruptedTurn(deviceId: string, sessionId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    const opts = new DlInvokeOptions();
+    opts.channel = 'local-db:sessions:ack-interrupted';
+    opts.args = [sessionId];
+    await client.invoke(deviceId, opts);
+  }
+
   /**
    * Fork：以某条消息为起点创建新任务（对齐 maker:fork，返回新会话 id）。
    * messageClientId 定位消息（对齐 mobile fork(sourceSessionId, messageClientId)）。
@@ -1342,6 +1761,7 @@ export class MessageStore {
         if (deleted.indexOf(current[i].clientId) < 0) next.push(current[i]);
       }
       this.messagesBySession.set(sessionId, next);
+      this.historyCoverageBySession.delete(sessionId);
       this.notify();
     }
     return deleted;
@@ -1366,6 +1786,36 @@ export class MessageStore {
       out.push(m);
     });
     return out;
+  }
+
+  private applyLatestWindow(sessionId: string, page: HistoryPage): RemoteMessage[] {
+    // 最新窗重拉会重新裁定连续区间；旧 buffer 不能跨权威窗口复用。
+    this.clearOlderTurnState(sessionId);
+    if (page.items.length === 0) {
+      const streaming = this.streamingBySession.get(sessionId);
+      if (streaming !== undefined && !streaming.finished
+        && (streaming.text.length > 0 || streaming.tools.length > 0)) {
+        return this.messagesBySession.get(sessionId) ?? [];
+      }
+    }
+    const current = this.messagesBySession.get(sessionId) ?? [];
+    const localOnly = current.filter((message: RemoteMessage) => message.localOnly);
+    const reconciled = reconcileLatestMessageWindow(
+      current,
+      page.items,
+      page.hasMore,
+      this.historyCoverageBySession.get(sessionId) ?? null,
+      this.subscriptionAckedSessions.has(sessionId),
+    );
+    reconciled.items = this.mergeWithoutDuplicates(localOnly, reconciled.items);
+    reconciled.items.sort(sortMessagesAsc);
+    this.messagesBySession.set(sessionId, reconciled.items);
+    if (reconciled.coverage !== null) {
+      this.historyCoverageBySession.set(sessionId, reconciled.coverage);
+    } else {
+      this.historyCoverageBySession.delete(sessionId);
+    }
+    return reconciled.items;
   }
 }
 
@@ -1444,6 +1894,17 @@ function isSyntheticMessageId(id: string): boolean {
   return id.startsWith('mobile-system-')
     || id.startsWith('harmony-system-')
     || id.startsWith('streaming-');
+}
+
+/** created push 是权威行；唯一例外是不能让新截断占位覆盖已有完整行。 */
+export function preferIncomingCreatedMessage(
+  existing: RemoteMessage,
+  incoming: RemoteMessage,
+): boolean {
+  const existingTruncated = readBool(existing.agentMeta, 'remoteContentTruncated', false);
+  const incomingTruncated = readBool(incoming.agentMeta, 'remoteContentTruncated', false);
+  if (!existingTruncated && incomingTruncated) return false;
+  return true;
 }
 
 /** 服务端消息总数只统计真实 DB 行，不把本地系统卡/流式投影算进去。 */

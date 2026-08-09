@@ -3,9 +3,9 @@
  *
  * 覆盖一期消息流需要的子集：
  * - 块级：标题、段落、有序/无序列表、引用、代码块（``` 围栏）、表格、分隔线
- * - 行内：`code`、**strong**、[text](url)
+ * - 行内：`code`、strong、emphasis、strikethrough、inline math、链接和图片
  *
- * 不做：嵌套列表、转义完整语义、执行型 HTML。渲染端按 MdBlock 结构逐块渲染。
+ * 不执行 HTML；仅把受支持的 img 标签归一为安全图片 token。
  */
 
 // ─── 行内 token ──────────────────────────────────────────────────────────────
@@ -15,11 +15,41 @@ let inlineSeq = 0;
 
 export class InlineToken {
   seq: number = 0;
-  kind: string = ''; // 'text' | 'code' | 'strong' | 'link' | 'image'
+  kind: string = ''; // text | code | strong | emphasis | strikethrough | math | link | image
   value: string = '';
   url: string = '';
   width: number = 0;
   height: number = 0;
+}
+
+/** 图片独占一段，其余连续 token 保持在同一个 Text 流中，避免富文本降级。 */
+export class InlineTokenGroup {
+  key: number = 0;
+  image: InlineToken | null = null;
+  tokens: InlineToken[] = [];
+}
+
+export function groupInlineTokens(tokens: InlineToken[]): InlineTokenGroup[] {
+  const groups: InlineTokenGroup[] = [];
+  let textGroup: InlineTokenGroup | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.kind === 'image') {
+      textGroup = null;
+      const imageGroup = new InlineTokenGroup();
+      imageGroup.key = token.seq;
+      imageGroup.image = token;
+      groups.push(imageGroup);
+      continue;
+    }
+    if (textGroup === null) {
+      textGroup = new InlineTokenGroup();
+      textGroup.key = token.seq;
+      groups.push(textGroup);
+    }
+    textGroup.tokens.push(token);
+  }
+  return groups;
 }
 
 function isEscapedAt(value: string, index: number): boolean {
@@ -86,7 +116,22 @@ function findStrongClose(value: string, contentStart: number): number {
   return -1;
 }
 
-/** 解析行内 token：`code`、**strong**、![image](url)、安全的 <img>、[text](url)。 */
+function findDelimiterClose(value: string, contentStart: number, delimiter: string): number {
+  let cursor = contentStart;
+  while (cursor < value.length) {
+    const close = value.indexOf(delimiter, cursor);
+    if (close < 0) return -1;
+    if (!isEscapedAt(value, close)) return close;
+    cursor = close + delimiter.length;
+  }
+  return -1;
+}
+
+function isWordCharacter(value: string): boolean {
+  return /^[A-Za-z0-9_]$/.test(value);
+}
+
+/** 解析 Mobile 消息流常见的行内 token；未知或未闭合语法保持字面文本。 */
 export function tokenizeInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   let plainStart = 0;
@@ -191,6 +236,60 @@ export function tokenizeInline(text: string): InlineToken[] {
         continue;
       }
     }
+    if (ch === '_' && text[cursor + 1] === '_' && !isEscapedAt(text, cursor)) {
+      const close = findDelimiterClose(text, cursor + 2, '__');
+      if (close > cursor + 2) {
+        flushPlain(cursor);
+        pushToken('strong', text.slice(cursor + 2, close), '');
+        cursor = close + 2;
+        plainStart = cursor;
+        continue;
+      }
+    }
+    if (ch === '~' && text[cursor + 1] === '~' && !isEscapedAt(text, cursor)) {
+      const close = findDelimiterClose(text, cursor + 2, '~~');
+      if (close > cursor + 2) {
+        flushPlain(cursor);
+        pushToken('strikethrough', text.slice(cursor + 2, close), '');
+        cursor = close + 2;
+        plainStart = cursor;
+        continue;
+      }
+    }
+    if (ch === '$' && !isEscapedAt(text, cursor)) {
+      const delimiter = text[cursor + 1] === '$' ? '$$' : '$';
+      const contentStart = cursor + delimiter.length;
+      const close = findDelimiterClose(text, contentStart, delimiter);
+      const body = close < 0 ? '' : text.slice(contentStart, close);
+      const followsDigit = close >= 0 && close + delimiter.length < text.length
+        && /^\d$/.test(text[close + delimiter.length]);
+      if (close > contentStart && !body.includes('\n') && !body.includes('`')
+        && body.trim() === body && !followsDigit) {
+        flushPlain(cursor);
+        pushToken('math', body, '');
+        cursor = close + delimiter.length;
+        plainStart = cursor;
+        continue;
+      }
+    }
+    if ((ch === '*' || ch === '_') && text[cursor + 1] !== ch && !isEscapedAt(text, cursor)) {
+      const previous = cursor > 0 ? text[cursor - 1] : '';
+      const next = text[cursor + 1] ?? '';
+      const canOpen = next.length > 0 && !/\s/.test(next)
+        && (cursor === 0 || !isWordCharacter(previous));
+      if (canOpen) {
+        const close = findDelimiterClose(text, cursor + 1, ch);
+        const after = close >= 0 && close + 1 < text.length ? text[close + 1] : '';
+        if (close > cursor + 1 && !text.slice(cursor + 1, close).includes('\n')
+          && (after.length === 0 || !isWordCharacter(after))) {
+          flushPlain(cursor);
+          pushToken('emphasis', text.slice(cursor + 1, close), '');
+          cursor = close + 1;
+          plainStart = cursor;
+          continue;
+        }
+      }
+    }
     if (ch === '[' && !(cursor > 0 && text[cursor - 1] === '!' && !isEscapedAt(text, cursor - 1))) {
       const linkEnd = text.indexOf(']', cursor + 1);
       if (linkEnd > cursor + 1 && text[linkEnd + 1] === '(') {
@@ -230,6 +329,11 @@ export class MdBlock {
   inlineTokens: InlineToken[] = [];
   items: string[] = [];
   itemTokens: InlineToken[][] = [];
+  /** 每项自己的 marker；嵌套列表允许有序与无序混排。 */
+  itemMarkers: string[] = [];
+  itemOrdered: boolean[] = [];
+  /** -1 普通项，0 未完成任务，1 已完成任务。 */
+  itemChecked: number[] = [];
   ordered: boolean = false;
   lang: string = '';
   code: string = '';
@@ -343,7 +447,7 @@ export function parseMarkdown(text: string): MdBlock[] {
     }
 
     // 标题
-    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    const heading = /^(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/.exec(line);
     if (heading !== null) {
       const block = makeBlock();
       block.type = 'heading';
@@ -376,21 +480,30 @@ export function parseMarkdown(text: string): MdBlock[] {
     }
 
     // 列表
-    const ul = /^(\s*)[-*+]\s+(.*)$/.exec(line);
-    const ol = /^(\s*)\d+[.)]\s+(.*)$/.exec(line);
-    if (ul !== null || ol !== null) {
-      const ordered = ol !== null;
+    const listItem = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    if (listItem !== null) {
+      const ordered = /^\d/.test(listItem[2]);
       const block = makeBlock();
       block.type = 'list';
       block.ordered = ordered;
       while (i < lines.length) {
-        const t = lines[i];
-        const m = ordered ? /^(\s*)\d+[.)]\s+(.*)$/.exec(t) : /^(\s*)[-*+]\s+(.*)$/.exec(t);
+        const m = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i]);
         if (m !== null) {
-          block.items.push(m[2]);
-          block.itemTokens.push(tokenizeInline(m[2]));
+          const marker = m[2];
+          let content = m[3];
+          let checked = -1;
+          const task = /^\[([ xX])\]\s+(.*)$/.exec(content);
+          if (task !== null) {
+            checked = task[1].toLowerCase() === 'x' ? 1 : 0;
+            content = task[2];
+          }
+          block.items.push(content);
+          block.itemTokens.push(tokenizeInline(content));
+          block.itemMarkers.push(marker);
+          block.itemOrdered.push(/^\d/.test(marker));
+          block.itemChecked.push(checked);
           i += 1;
-        } else if (t.trim().length === 0) {
+        } else if (lines[i].trim().length === 0) {
           // 列表结束（空行分隔）；简单起见空行即止
           break;
         } else {
@@ -427,8 +540,7 @@ export function parseMarkdown(text: string): MdBlock[] {
         || /^(#{1,6})\s/.test(t)
         || /^```/.test(t)
         || t === '$$'
-        || /^(\s*)[-*+]\s/.test(t)
-        || /^(\s*)\d+[.)]\s/.test(t)
+        || /^(\s*)(?:[-*+]|\d+[.)])\s/.test(t)
         || t.startsWith('>')
         || t.includes('|')
         || /^\s*([-*_])\1{2,}\s*$/.test(t)) {

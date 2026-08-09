@@ -19,15 +19,18 @@ import { AuthStore } from './auth/AuthStore';
 import { DlClient, DlClientOptions, DlEvents, DlOpenLinkOptions } from './device-link/DlClient';
 import {
   HelloPayload, HelloAckPayload, PresenceSnapshot, DlChannels, SESSIONS_TOPIC,
+  CONTROLLER_CAPABILITIES, MAKER_EVENT_BATCH_CHANNEL, expandMakerEventBatchPayload,
 } from './device-link/DlProtocol';
 import { TaskStore } from './tasks/TaskStore';
 import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
-import { InputQueueStore } from './messages/InputQueueStore';
+import { InputQueueStore, isTerminalMakerInputEvent } from './messages/InputQueueStore';
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
+import { NewSessionCreationStore } from './tasks/NewSessionCreationStore';
+import { SessionDeepLinkIntent, parseSessionDeepLink } from './navigation/SessionDeepLink';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
@@ -50,9 +53,12 @@ export class AppServices {
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
+  readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
   private readonly http: HarmonyHttp = new HarmonyHttp();
   private statusListeners: Array<(status: string) => void> = [];
+  private deepLinkListeners: Array<() => void> = [];
+  private pendingDeepLink: SessionDeepLinkIntent | null = null;
   /** 已建立控制链路的设备（openLink 幂等去重）。 */
   private linkedDevices: Set<string> = new Set();
   /** 应用级 sessions topic 订阅；不能绑在任务列表页面，否则离开页面就漏实时更新。 */
@@ -82,7 +88,41 @@ export class AppServices {
     this.goals.attach(this.client);
     this.messages.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    this.interactions.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    this.newSessionCreations.attach(
+      this.client,
+      this.tasks,
+      this.inputQueue,
+      this.messages,
+      (deviceId: string) => this.openLink(deviceId),
+    );
+  }
+
+  acceptDeepLinkUri(uri: string): boolean {
+    const intent = parseSessionDeepLink(uri);
+    if (intent === null) return false;
+    this.pendingDeepLink = intent;
+    for (let i = 0; i < this.deepLinkListeners.length; i++) this.deepLinkListeners[i]();
+    return true;
+  }
+
+  peekPendingDeepLink(): SessionDeepLinkIntent | null {
+    return this.pendingDeepLink;
+  }
+
+  consumePendingDeepLink(): SessionDeepLinkIntent | null {
+    const intent = this.pendingDeepLink;
+    this.pendingDeepLink = null;
+    return intent;
+  }
+
+  onDeepLink(listener: () => void): () => void {
+    this.deepLinkListeners.push(listener);
+    return () => {
+      const index = this.deepLinkListeners.indexOf(listener);
+      if (index >= 0) this.deepLinkListeners.splice(index, 1);
+    };
   }
 
   /**
@@ -98,7 +138,7 @@ export class AppServices {
     const opts = new DlOpenLinkOptions();
     opts.controllerName = 'Cindy Harmony';
     opts.appVersion = AppConfig.appVersion;
-    opts.capabilities = [];
+    opts.capabilities = CONTROLLER_CAPABILITIES.slice();
     try {
       await Promise.race([
         this.client.openLink(deviceId, opts),
@@ -139,7 +179,7 @@ export class AppServices {
   /** App 回到前台：已登录才立即重连（未登录不启动网络重试循环）。 */
   onAppForeground(): void {
     if (this.auth.isLoggedIn) {
-      this.client.connectNow('foreground');
+      this.client.connectNow('foreground', true);
     }
   }
 
@@ -204,13 +244,24 @@ export class AppServices {
       hilog.info(DOMAIN, TAG, 'device-link status=%{public}s', status);
       if (status === 'online') {
         // 重连成功：重新订阅已打开会话并 gap healing，刷新设备快照。
+        this.newSessionCreations.onRelayOnline();
         this.messages.resubscribeAll();
+        void this.inputQueue.resyncActiveSessions();
+        void this.interactions.resyncActiveSessions();
         void this.loadDevices();
       } else {
         // relay 重连后旧 topic registry 已失效；让下一次 online 重新订阅。
         // link-open 也是连接级状态，不能沿用旧 socket 上的已建立标记。
         this.linkedDevices.clear();
         this.resetSessionSubscriptions();
+        this.messages.invalidateLiveTailTrust();
+        if (status === 'stopped') {
+          this.newSessionCreations.clearAll();
+          this.inputQueue.clearAll();
+          this.interactions.clearAll();
+        } else {
+          this.inputQueue.invalidateActiveAuthorities();
+        }
       }
       for (const l of this.statusListeners) {
         l(status);
@@ -219,6 +270,7 @@ export class AppServices {
     events.onLinkClosed = (deviceId: string, reason: string) => {
       if (reason === 'revoked') {
         hilog.warn(DOMAIN, TAG, 'access revoked by device %{public}s', deviceId.slice(0, 8));
+        this.inputQueue.invalidateDevice(deviceId);
       }
     };
     events.onHelloAck = (ack: HelloAckPayload) => {
@@ -232,6 +284,11 @@ export class AppServices {
     };
     events.onPresence = (snap: PresenceSnapshot) => {
       this.tasks.handlePresence(snap);
+      if (!snap.online || !snap.remoteControlEnabled) {
+        this.inputQueue.invalidateDevice(snap.deviceId);
+      } else {
+        void this.inputQueue.resyncDevice(snap.deviceId);
+      }
     };
     events.onPush = (deviceId: string, channel: string, payload: Object | undefined) => {
       this.dispatchPush(deviceId, channel, payload);
@@ -306,6 +363,16 @@ export class AppServices {
       }
       hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
       this.tasks.mergeServerDevices(views);
+      const seenDeviceIds = new Set<string>();
+      for (let i = 0; i < views.length; i++) seenDeviceIds.add(views[i].deviceId);
+      const availableDeviceIds = new Set<string>();
+      const mergedDevices = this.tasks.deviceList;
+      for (let i = 0; i < mergedDevices.length; i++) {
+        if (mergedDevices[i].online && mergedDevices[i].remoteControlEnabled) {
+          availableDeviceIds.add(mergedDevices[i].deviceId);
+        }
+      }
+      this.inputQueue.reconcileDeviceSnapshot(seenDeviceIds, availableDeviceIds);
       this.syncSessionSubscriptions();
       for (let i = 0; i < views.length; i++) {
         if (views[i].online && views[i].remoteControlEnabled) {
@@ -328,6 +395,8 @@ export class AppServices {
         this.tasks.handleSessionsPush(deviceId, channel, payload);
         if (channel === DlChannels.SESSION_ACTIVITY) {
           this.messages.handleSessionActivity(payload);
+        } else if (channel === DlChannels.SESSION_ERROR_PERSISTED) {
+          this.messages.handleSessionPush(deviceId, channel, payload);
         }
         break;
       case 'local-db:messages:created':
@@ -335,18 +404,22 @@ export class AppServices {
         this.messages.handleSessionPush(deviceId, channel, payload);
         break;
       case 'maker:event': {
-        // 流式事件（text delta）→ 消息 Store 累积流式回复。
-        if (payload !== undefined && typeof payload === 'object') {
-          const p = payload as Record<string, Object>;
-          const sid = readStr(p, 'sessionId');
-          if (sid.length > 0) {
-            this.messages.handleMakerEvent(sid, p['event']);
-          }
-        }
+        this.dispatchMakerEventPayload(payload);
+        break;
+      }
+      case MAKER_EVENT_BATCH_CHANNEL: {
+        const events = expandMakerEventBatchPayload(payload);
+        for (let i = 0; i < events.length; i++) this.dispatchMakerEventPayload(events[i]);
         break;
       }
       case 'maker:status-changed':
         this.messages.handleMakerStatusChanged(payload);
+        if (payload !== undefined && typeof payload === 'object' && !Array.isArray(payload)) {
+          const statusPayload = payload as Record<string, Object>;
+          if (readStr(statusPayload, 'status') === 'closed') {
+            this.inputQueue.noteTurnTerminal(readStr(statusPayload, 'sessionId'));
+          }
+        }
         break;
       case 'maker:interaction-request':
         this.interactions.handleInteractionRequest(payload);
@@ -364,6 +437,17 @@ export class AppServices {
         // 未识别的 push channel 忽略（切片 2+ 逐步接入）。
         break;
     }
+  }
+
+  /** 单条与微批展开后的事件共用唯一处理路径，保证状态/终态顺序完全一致。 */
+  private dispatchMakerEventPayload(payload: Object | undefined): void {
+    if (payload === undefined || payload === null || typeof payload !== 'object'
+      || Array.isArray(payload)) return;
+    const record = payload as Record<string, Object>;
+    const sessionId = readStr(record, 'sessionId');
+    if (sessionId.length === 0) return;
+    this.messages.handleMakerEvent(sessionId, record['event'], readStr(record, 'persistId'));
+    if (isTerminalMakerInputEvent(record['event'])) this.inputQueue.noteTurnTerminal(sessionId);
   }
 
   private async subscribeSessions(deviceId: string, generation: number): Promise<void> {

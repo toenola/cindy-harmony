@@ -12,7 +12,7 @@ import {
 } from '@kit.MediaLibraryKit';
 import { AppServices } from '../AppServices';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from './ImagePicker';
-import { uploadImage, deleteUpload } from './AttachmentUpload';
+import { uploadImage, deleteUpload, presignGet, isUploadRevisionCurrent } from './AttachmentUpload';
 import { RemoteImageRef } from './AttachmentModels';
 import { parseAttachmentOssRef } from './AttachmentOssRef';
 import { ComposerImage } from '../../components/ConversationComposer';
@@ -69,6 +69,65 @@ export class ComposerImageQueue {
     return ready;
   }
 
+  /** 新任务首条 enqueue 确认失败时，把已上传引用原样放回详情页托盘。 */
+  restoreReady(refs: RemoteImageRef[]): number {
+    if (refs.length === 0) return 0;
+    const next = this.images.slice();
+    let remaining = this.remainingSlots();
+    let restored = 0;
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i];
+      let duplicate = false;
+      for (let j = 0; j < next.length; j++) {
+        const existing = next[j].ref;
+        if (existing !== null && (
+          (ref.url.length > 0 && existing.url === ref.url)
+          || (ref.sha256.length > 0 && existing.sha256 === ref.sha256)
+          || (ref.url.length === 0 && ref.sha256.length === 0 && ref.base64.length > 0
+            && existing.base64 === ref.base64)
+        )) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) {
+        restored += 1;
+        continue;
+      }
+      if (remaining <= 0) continue;
+      const image = new ComposerImage();
+      image.uri = ref.base64.length > 0
+        ? `data:${ref.mimeType.length > 0 ? ref.mimeType : 'image/png'};base64,${ref.base64}`
+        : ref.url;
+      image.name = ref.originalName.length > 0 ? ref.originalName : `image-${next.length + 1}`;
+      image.status = 'ready';
+      image.ref = ref;
+      next.push(image);
+      remaining -= 1;
+      restored += 1;
+      this.resolveRestoredPreview(image);
+    }
+    this.images = next;
+    this.emit();
+    return restored;
+  }
+
+  private resolveRestoredPreview(image: ComposerImage): void {
+    if (image.ref === null || image.ref.base64.length > 0) return;
+    const parsed = parseAttachmentOssRef(image.ref.url);
+    if (parsed === null || parsed.ossKey.length === 0) return;
+    void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+      if (token === null || token.length === 0) return Promise.reject(new Error('未登录'));
+      return presignGet(parsed.ossKey, token);
+    }).then((url: string) => {
+      if (image.removed || this.images.indexOf(image) < 0) return;
+      image.uri = url;
+      this.emit();
+    }).catch(() => {
+      // 预览失败不影响已上传引用再次发送；托盘仍保留附件名和删除入口。
+    });
+  }
+
   /** 有任一图片不在 ready 态时不可发送（上传中或失败）。 */
   allSettled(): boolean {
     for (let i = 0; i < this.images.length; i++) {
@@ -95,7 +154,12 @@ export class ComposerImageQueue {
   removeSent(sent: ComposerImage[]): void {
     const remaining: ComposerImage[] = [];
     for (let i = 0; i < this.images.length; i++) {
-      if (sent.indexOf(this.images[i]) < 0) remaining.push(this.images[i]);
+      if (sent.indexOf(this.images[i]) < 0) {
+        remaining.push(this.images[i]);
+      } else {
+        this.images[i].removed = true;
+        this.images[i].uploadRevision += 1;
+      }
     }
     this.images = remaining;
     this.emit();
@@ -184,23 +248,42 @@ export class ComposerImageQueue {
     image.uri = uri;
     image.name = `image-${index + 1}`;
     this.images = this.images.concat([image]);
+    this.startUpload(image, index);
+  }
+
+  private isCurrentUpload(image: ComposerImage, revision: number): boolean {
+    return isUploadRevisionCurrent(
+      image.uploadRevision, revision, image.removed, this.images.indexOf(image) >= 0);
+  }
+
+  private startUpload(image: ComposerImage, index: number, preserveName: boolean = false): void {
+    const previousName = preserveName ? image.name : '';
+    image.removed = false;
+    image.status = 'uploading';
+    image.ref = null;
+    image.uploadRevision += 1;
+    const revision = image.uploadRevision;
     this.emit();
-    buildImageCandidate(uri, index).then((candidate) => {
+    buildImageCandidate(image.uri, index).then((candidate) => {
+      if (!this.isCurrentUpload(image, revision)) throw new Error('stale image upload');
+      if (previousName.length > 0) candidate.name = previousName;
       image.name = candidate.name;
       return AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+        if (!this.isCurrentUpload(image, revision)) throw new Error('stale image upload');
         if (token === null || token.length === 0) throw new Error('未登录');
         return uploadImage(candidate, token);
       });
     }).then((ref: RemoteImageRef) => {
-      image.ref = ref;
-      if (image.removed) {
-        this.recycle(image);
+      if (!this.isCurrentUpload(image, revision)) {
+        this.recycleRef(ref);
         return;
       }
+      image.ref = ref;
+      if (ref.originalName.length > 0) image.name = ref.originalName;
       image.status = 'ready';
       this.emit();
     }).catch(() => {
-      if (!image.removed) {
+      if (this.isCurrentUpload(image, revision)) {
         image.status = 'failed';
         this.emit();
       }
@@ -209,6 +292,7 @@ export class ComposerImageQueue {
 
   remove(image: ComposerImage): void {
     if (this.isBusy()) return;
+    image.uploadRevision += 1;
     image.removed = true;
     this.images = this.images.filter((item: ComposerImage) => item !== image);
     this.emit();
@@ -216,17 +300,20 @@ export class ComposerImageQueue {
   }
 
   retry(image: ComposerImage): void {
-    if (this.isBusy()) return;
-    image.removed = true;
-    // 移除原失败项，再以同一 uri 重新上传（避免新旧两个对象并存）。
-    this.images = this.images.filter((item: ComposerImage) => item !== image);
-    this.upload(image.uri, this.images.length);
+    if (this.isBusy() || image.removed || image.status !== 'failed') return;
+    const index = this.images.indexOf(image);
+    if (index < 0) return;
+    // 同一对象原位重试，保持托盘顺序、文件名和 UI identity。
+    this.startUpload(image, index, true);
   }
 
   /** 回收中转 OSS 对象（best-effort，不阻断 Composer 操作）。 */
   private recycle(image: ComposerImage): void {
-    if (image.ref === null) return;
-    const parsed = parseAttachmentOssRef(image.ref.url);
+    if (image.ref !== null) this.recycleRef(image.ref);
+  }
+
+  private recycleRef(ref: RemoteImageRef): void {
+    const parsed = parseAttachmentOssRef(ref.url);
     if (parsed === null || parsed.ossKey.length === 0) return;
     void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
       if (token !== null && token.length > 0) return deleteUpload(parsed.ossKey, token);

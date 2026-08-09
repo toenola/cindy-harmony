@@ -1,6 +1,7 @@
 import { promptAction } from '@kit.ArkUI';
 import { RemoteImageRef } from '../core/attachments/AttachmentModels';
 import { ComposerFile } from '../core/attachments/ComposerFileQueue';
+import { ComposerAtomPresentation } from '../core/messages/ComposerDocument';
 import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
@@ -22,6 +23,8 @@ export class ComposerImage {
   ref: RemoteImageRef | null = null;
   /** 用户已移除；异步上传若稍后成功，立即回收中转对象。 */
   removed: boolean = false;
+  /** 每次上传/重试/移除递增；旧异步回调不得覆盖新尝试。 */
+  uploadRevision: number = 0;
 }
 
 /**
@@ -36,6 +39,7 @@ export struct ConversationComposer {
   @Prop focused: boolean = false;
   @Prop images: ComposerImage[] = [];
   @Prop files: ComposerFile[] = [];
+  @Prop atoms: ComposerAtomPresentation[] = [];
   @Prop sending: boolean = false;
   @Prop streaming: boolean = false;
   @Prop hasContent: boolean = false;
@@ -66,6 +70,7 @@ export struct ConversationComposer {
   onRetryImage: (image: ComposerImage) => void = () => {};
   onRemoveFile: (file: ComposerFile) => void = () => {};
   onRetryFile: (file: ComposerFile) => void = () => {};
+  onRemoveAtom: (atom: ComposerAtomPresentation) => void = () => {};
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
@@ -95,7 +100,7 @@ export struct ConversationComposer {
   }
 
   private expanded(): boolean {
-    return this.focused || this.images.length > 0 || this.files.length > 0;
+    return this.focused || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
   }
 
   private tapPrimaryAction(): void {
@@ -201,6 +206,53 @@ export struct ConversationComposer {
     .borderRadius(UI_RADIUS_CONTROL)
   }
 
+  @Builder
+  composerAtomItem(atom: ComposerAtomPresentation) {
+    Row({ space: 7 }) {
+      SymbolGlyph(atom.type === 'quote' ? $r('sys.symbol.doc')
+        : atom.type === 'pasted-text' ? $r('sys.symbol.doc')
+          : atom.type === 'slash-command' ? $r('sys.symbol.bolt')
+            : $r('sys.symbol.link'))
+        .fontSize(uiFontSize(14))
+        .fontColor([$r('app.color.text_secondary')])
+      Column({ space: 1 }) {
+        Text(atom.label)
+          .fontSize(uiFontSize(11))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (atom.detail.length > 0) {
+          Text(atom.detail)
+            .fontSize(uiFontSize(10))
+            .fontColor($r('app.color.text_tertiary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .constraintSize({ maxWidth: 160 })
+      .alignItems(HorizontalAlign.Start)
+      Button() {
+        SymbolGlyph($r('sys.symbol.xmark'))
+          .fontSize(uiFontSize(9))
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .type(ButtonType.Circle)
+      .width(24)
+      .height(24)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .clickEffect(UI_ICON_CLICK_EFFECT)
+      .onClick(() => this.onRemoveAtom(atom))
+    }
+    .height(42)
+    .padding({ left: 10, right: 4 })
+    .margin({ right: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTROL)
+  }
+
   /** 胶囊内的圆形 icon 按钮（加号 / 权限）。 */
   @Builder
   composerIconButton(symbol: Resource, tint: Resource, enabled: boolean, action: () => void) {
@@ -280,6 +332,19 @@ export struct ConversationComposer {
           .transition(uiRevealTransition())
         }
 
+
+        if (this.atoms.length > 0) {
+          List({ space: 0 }) {
+            ForEach(this.atoms, (atom: ComposerAtomPresentation) => {
+              ListItem() { this.composerAtomItem(atom) }
+            }, (atom: ComposerAtomPresentation) => `${atom.index}-${atom.type}`)
+          }
+          .listDirection(Axis.Horizontal)
+          .width('100%')
+          .height(48)
+          .transition(uiRevealTransition())
+        }
+
         Row({ space: 6 }) {
           if (this.expanded()) {
             if (this.showAddButton) {
@@ -318,6 +383,7 @@ export struct ConversationComposer {
 
           TextArea({ placeholder: this.placeholder, text: this.input })
             .id(this.inputId)
+            .enabled(this.composerEnabled)
             .fontSize(uiFontSize(15))
             .placeholderFont({ size: uiFontSize(15) })
             .lineHeight(uiLineHeight(22))

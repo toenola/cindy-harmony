@@ -76,6 +76,7 @@ struct TaskListPage {
   @State selectedDeviceId: string = '';
   @State selectedSessionDeviceId: string = '';
   @State selectedSessionId: string = '';
+  @State selectedMessageClientId: string = '';
   @State scopeMenuOpen: boolean = false;
   @State filterMenuOpen: boolean = false;
   @State projectFilterKeys: string[] = [];
@@ -138,6 +139,9 @@ struct TaskListPage {
     }));
     this.unsubs.push(AppServices.instance.onStatus((status: string) => {
       this.connectionStatus = status;
+    }));
+    this.unsubs.push(AppServices.instance.onDeepLink(() => {
+      this.tryOpenPendingDeepLink();
     }));
 
     this.refreshProjection();
@@ -252,6 +256,7 @@ struct TaskListPage {
     this.entries = next;
     this.collapseProjectGroupsOnce();
     this.ensureWideSelection();
+    this.tryOpenPendingDeepLink();
   }
 
   /**
@@ -305,6 +310,10 @@ struct TaskListPage {
     return `${this.selectedSessionDeviceId}:${this.selectedSessionId}`;
   }
 
+  private selectedTaskInstanceKey(): string {
+    return `${this.selectedTaskKey()}:${this.selectedMessageClientId}`;
+  }
+
   private entrySelected(entry: TaskListEntry): boolean {
     return this.splitLayoutEnabled()
       && entry.deviceId === this.selectedSessionDeviceId
@@ -315,6 +324,36 @@ struct TaskListPage {
     uiAnimateState(this.getUIContext(), () => {
       this.selectedSessionDeviceId = entry.deviceId;
       this.selectedSessionId = entry.session.id;
+      this.selectedMessageClientId = '';
+    });
+  }
+
+  private tryOpenPendingDeepLink(): void {
+    const intent = AppServices.instance.peekPendingDeepLink();
+    if (intent === null) return;
+    const devices = AppServices.instance.tasks.deviceList;
+    let deviceId = '';
+    for (let i = 0; i < devices.length && deviceId.length === 0; i++) {
+      const sessions = AppServices.instance.tasks.getSessions(devices[i].deviceId);
+      if (sessions.some((session: RemoteSession) => session.id === intent.sessionId)) {
+        deviceId = devices[i].deviceId;
+      }
+    }
+    if (deviceId.length === 0) return;
+    AppServices.instance.consumePendingDeepLink();
+    if (this.splitLayoutEnabled()) {
+      this.selectedSessionDeviceId = deviceId;
+      this.selectedSessionId = intent.sessionId;
+      this.selectedMessageClientId = intent.messageClientId;
+      return;
+    }
+    router.pushUrl({
+      url: 'pages/TaskPage',
+      params: {
+        deviceId: deviceId,
+        sessionId: intent.sessionId,
+        message: intent.messageClientId,
+      },
     });
   }
 
@@ -1132,10 +1171,11 @@ struct TaskListPage {
     if (this.selectedTaskKey().length === 0) {
       this.emptyDetailPane()
     } else {
-      ForEach([this.selectedTaskKey()], (key: string) => {
+      ForEach([this.selectedTaskInstanceKey()], (key: string) => {
         TaskPageContent({
           paneDeviceId: this.selectedSessionDeviceId,
           paneSessionId: this.selectedSessionId,
+          paneMessageClientId: this.selectedMessageClientId,
         })
           .transition(uiRevealTransition())
       }, (key: string) => key)

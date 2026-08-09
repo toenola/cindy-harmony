@@ -190,6 +190,21 @@ export class TaskStore {
       if (device !== undefined && !device.remoteControlEnabled) return false;
       const result = unwrapInvokeResult(env);
       const sessions = this.parseSessionList(result);
+      const previous = this.sessionsByDevice.get(deviceId) ?? [];
+      const pendingById = new Map<string, RemoteSession>();
+      for (let i = 0; i < previous.length; i++) {
+        if (previous[i].pendingLocalCreation) pendingById.set(previous[i].id, previous[i]);
+      }
+      for (let i = 0; i < sessions.length; i++) {
+        if (pendingById.has(sessions[i].id)) {
+          sessions[i].pendingLocalCreation = true;
+          pendingById.delete(sessions[i].id);
+        }
+      }
+      // create-session 尚未在列表快照中可见时继续保留合成本地行；否则详情页会
+      // 在“立即跳转”后被一次应用级 sessions 刷新挖空。
+      pendingById.forEach((session: RemoteSession) => sessions.push(session));
+      sessions.sort(sortSessionsByUpdatedAt);
       this.applyPendingActivity(deviceId, sessions);
       this.sessionsByDevice.set(deviceId, sessions);
       this.pendingActivityByDevice.delete(deviceId);
@@ -320,6 +335,22 @@ export class TaskStore {
     this.sessionsByDevice.set(deviceId, filtered);
     this.liveActivityBySession.delete(sessionId);
     this.notify();
+  }
+
+  setPendingLocalCreation(deviceId: string, sessionId: string, pending: boolean): void {
+    const list = this.sessionsByDevice.get(deviceId);
+    if (list === undefined) return;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id !== sessionId) continue;
+      if (list[i].pendingLocalCreation === pending) return;
+      list[i].pendingLocalCreation = pending;
+      this.notify();
+      return;
+    }
+  }
+
+  removeLocalSession(deviceId: string, sessionId: string): void {
+    this.removeSession(deviceId, sessionId);
   }
 
   /** sessions topic 的 push 分发。 */
@@ -465,6 +496,7 @@ export class TaskStore {
     merged.updatedAt = base.updatedAt;
     merged.preview = base.preview;
     merged.messageCount = base.messageCount;
+    merged.pendingLocalCreation = base.pendingLocalCreation;
     return parseSession(mergeFields(this.sessionToRecord(merged), patch));
   }
 
@@ -500,6 +532,7 @@ export class TaskStore {
     out['createdAt'] = s.createdAt;
     out['updatedAt'] = s.updatedAt;
     out['preview'] = s.preview;
+    out['pendingLocalCreation'] = s.pendingLocalCreation;
     out['_count'] = count;
     return out;
   }

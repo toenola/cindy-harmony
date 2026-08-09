@@ -72,8 +72,32 @@ export async function readFileBytes(uri: string): Promise<ArrayBuffer> {
 
 export class PreprocessResult {
   bytes: ArrayBuffer = new ArrayBuffer(0);
+  /** 与重编码产物一致的文件名；PNG/JPEG 产物不能继续沿用 .webp 等旧扩展名。 */
+  name: string = '';
   mimeType: string = '';
   size: number = 0;
+}
+
+export function renameForImagePreprocess(name: string, format: string): string {
+  const extension = format === 'png' ? 'png' : 'jpg';
+  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  const dot = name.lastIndexOf('.');
+  const stem = dot > slash ? name.slice(0, dot) : name;
+  return `${stem.length > 0 ? stem : 'image'}.${extension}`;
+}
+
+async function originalImageResult(
+  uri: string,
+  name: string,
+  mimeType: string,
+): Promise<PreprocessResult> {
+  const bytes = await readFileBytes(uri);
+  const out = new PreprocessResult();
+  out.bytes = bytes;
+  out.name = name;
+  out.mimeType = mimeType;
+  out.size = bytes.byteLength;
+  return out;
 }
 
 /**
@@ -81,6 +105,7 @@ export class PreprocessResult {
  */
 export async function preprocessImage(
   uri: string,
+  name: string,
   mimeType: string,
   size: number,
   width: number,
@@ -88,12 +113,7 @@ export async function preprocessImage(
 ): Promise<PreprocessResult> {
   const plan = planImagePreprocess(mimeType, size, width, height);
   if (plan === null) {
-    const bytes = await readFileBytes(uri);
-    const out = new PreprocessResult();
-    out.bytes = bytes;
-    out.mimeType = mimeType;
-    out.size = bytes.byteLength;
-    return out;
+    return originalImageResult(uri, name, mimeType);
   }
   try {
     const source = image.createImageSource(uri);
@@ -119,25 +139,16 @@ export async function preprocessImage(
     source.release();
     // 产物没变小 → 白做，回退原图。
     if (buffer.byteLength >= size) {
-      const bytes = await readFileBytes(uri);
-      const out = new PreprocessResult();
-      out.bytes = bytes;
-      out.mimeType = mimeType;
-      out.size = bytes.byteLength;
-      return out;
+      return originalImageResult(uri, name, mimeType);
     }
     const out = new PreprocessResult();
     out.bytes = buffer;
+    out.name = renameForImagePreprocess(name, plan.format);
     out.mimeType = plan.format === 'png' ? 'image/png' : 'image/jpeg';
     out.size = buffer.byteLength;
     return out;
   } catch (e) {
     // 压缩失败不能挡发图，回退原图。
-    const bytes = await readFileBytes(uri);
-    const out = new PreprocessResult();
-    out.bytes = bytes;
-    out.mimeType = mimeType;
-    out.size = bytes.byteLength;
-    return out;
+    return originalImageResult(uri, name, mimeType);
   }
 }

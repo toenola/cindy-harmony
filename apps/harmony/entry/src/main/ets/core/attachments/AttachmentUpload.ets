@@ -23,6 +23,20 @@ export class AttachmentUploadError extends Error {
   }
 }
 
+export function isRetryablePresignStatus(statusCode: number): boolean {
+  return statusCode === 408 || statusCode === 429
+    || (statusCode >= 500 && statusCode <= 599);
+}
+
+export function isUploadRevisionCurrent(
+  currentRevision: number,
+  capturedRevision: number,
+  removed: boolean,
+  present: boolean,
+): boolean {
+  return !removed && present && currentRevision === capturedRevision;
+}
+
 /** SHA-256（小写 hex）。 */
 export async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
   const md = cryptoFramework.createMd('SHA256');
@@ -50,33 +64,46 @@ export async function presignUpload(
     contentType: contentType,
     ext: ext,
   });
-  const res = await http.requestJson(
-    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-put`,
-    'POST',
-    headers,
-    body,
-  );
-  if (res.statusCode >= 300) {
-    throw new AttachmentUploadError(`presign failed: ${res.statusCode}`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let receivedResponse = false;
+    try {
+      const res = await http.requestJson(
+        `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-put`,
+        'POST',
+        headers,
+        body,
+      );
+      receivedResponse = true;
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        if (attempt === 0 && isRetryablePresignStatus(res.statusCode)) continue;
+        throw new AttachmentUploadError(`presign failed: ${res.statusCode}`);
+      }
+      let obj: Record<string, Object>;
+      try {
+        obj = JSON.parse(res.body) as Record<string, Object>;
+      } catch (e) {
+        throw new AttachmentUploadError('presign: invalid response');
+      }
+      const putUrl = obj['putUrl'];
+      const key = obj['key'];
+      if (typeof putUrl !== 'string' || putUrl.length === 0 ||
+        typeof key !== 'string' || key.length === 0) {
+        throw new AttachmentUploadError('presign: missing putUrl/key');
+      }
+      const out = new AttachmentPresignResult();
+      out.putUrl = putUrl;
+      out.key = key;
+      const expiresAt = obj['expiresAt'];
+      out.expiresAt = typeof expiresAt === 'string' ? expiresAt : '';
+      return out;
+    } catch (e) {
+      // 只有 transport rejection 自动重试；已收到的无效 2xx 不可重放。
+      if (!receivedResponse && attempt === 0) continue;
+      if (e instanceof Error) throw e;
+      throw new AttachmentUploadError('presign failed');
+    }
   }
-  let obj: Record<string, Object>;
-  try {
-    obj = JSON.parse(res.body) as Record<string, Object>;
-  } catch (e) {
-    throw new AttachmentUploadError('presign: invalid response');
-  }
-  const putUrl = obj['putUrl'];
-  const key = obj['key'];
-  if (typeof putUrl !== 'string' || putUrl.length === 0 ||
-    typeof key !== 'string' || key.length === 0) {
-    throw new AttachmentUploadError('presign: missing putUrl/key');
-  }
-  const out = new AttachmentPresignResult();
-  out.putUrl = putUrl;
-  out.key = key;
-  const expiresAt = obj['expiresAt'];
-  out.expiresAt = typeof expiresAt === 'string' ? expiresAt : '';
-  return out;
+  throw new AttachmentUploadError('presign failed');
 }
 
 /** PUT 字节到 presign URL。 */
@@ -89,10 +116,23 @@ export async function putUpload(
   const headers: Record<string, string> = {};
   headers['Content-Type'] = mimeType.length > 0 ? mimeType : 'application/octet-stream';
   headers['x-oss-object-acl'] = 'private';
-  const res = await http.uploadBytes(putUrl, 'PUT', headers, bytes);
-  if (res < 200 || res >= 300) {
-    throw new AttachmentUploadError(`upload failed: ${res}`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let receivedStatus = false;
+    try {
+      const status = await http.uploadBytes(putUrl, 'PUT', headers, bytes);
+      receivedStatus = true;
+      if (status < 200 || status >= 300) {
+        throw new AttachmentUploadError(`upload failed: ${status}`);
+      }
+      return;
+    } catch (e) {
+      // OSS 已返回状态码时绝不自动重放；仅 transport exception 重试一次。
+      if (!receivedStatus && attempt === 0) continue;
+      if (e instanceof Error) throw e;
+      throw new AttachmentUploadError('upload failed');
+    }
   }
+  throw new AttachmentUploadError('upload failed');
 }
 
 /** 获取 OSS 下载 URL（历史图片加载用；cindy-oss-attach 引用 → presign-get → OSS GET URL）。 */
@@ -166,6 +206,7 @@ export async function uploadImage(
   }
   const processed = await preprocessImage(
     candidate.uri,
+    candidate.name,
     candidate.mimeType,
     candidate.size,
     candidate.width,
@@ -175,7 +216,7 @@ export async function uploadImage(
   const presigned = await presignUpload(
     processed.size,
     processed.mimeType,
-    uploadExtForName(candidate.name),
+    uploadExtForName(processed.name),
     token,
   );
   try {
@@ -195,14 +236,14 @@ export async function uploadImage(
   const ref = new AttachmentOssRef();
   ref.ossKey = presigned.key;
   ref.mimeType = processed.mimeType;
-  ref.originalName = candidate.name;
+  ref.originalName = processed.name;
   ref.size = processed.size;
   ref.sha256 = sha;
   const refStr = buildAttachmentOssRef(ref);
 
   const imageRef = new RemoteImageRef();
   imageRef.url = refStr;
-  imageRef.originalName = candidate.name;
+  imageRef.originalName = processed.name;
   imageRef.mimeType = processed.mimeType;
   imageRef.size = processed.size;
   imageRef.sha256 = sha;

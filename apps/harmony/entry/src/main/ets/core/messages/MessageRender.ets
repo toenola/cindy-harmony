@@ -29,6 +29,8 @@ import {
   findAgentTaskUpdate,
   isAgentTaskToolName,
 } from './AgentTaskStore';
+import { isAutoResumeRowInFlight } from './AutoResumePresentation';
+import { findErrorTailClientId } from './SessionTailPresentation';
 
 // ─── 渲染项类型 ──────────────────────────────────────────────────────────────
 
@@ -73,6 +75,12 @@ export class RenderMessageItem extends RenderItem {
   /** user 消息携带的普通文件；与 Mobile 一致放在正文气泡外。 */
   files: RemoteSerializedAttachment[] = [];
   message: RemoteMessage | undefined = undefined;
+  /** 自动续跑活动态由 projection owner 判定，不能仅靠 maker running 猜测。 */
+  autoResumeInFlight: boolean = false;
+  /** 合成输入仍作为 turn boundary，但不进入最终 UI。 */
+  hidden: boolean = false;
+  /** 旧历史缺 turn seal 时，由用户轮次边界推导出的最终 assistant。 */
+  isTurnFinalAssistant: boolean = false;
 }
 
 /** thinking 折叠块。 */
@@ -86,6 +94,129 @@ export class RenderThinkingItem extends RenderItem {
   redacted: boolean = false;
   /** 落库时间 ISO（work_group 时长计算用）。 */
   createdAt: string = '';
+}
+
+export class ThinkingPresentation {
+  body: string = '';
+  durationMs: number = -1;
+  redacted: boolean = false;
+  startedAt: string = '';
+}
+
+export function parseThinkingPresentation(message: RemoteMessage): ThinkingPresentation | null {
+  const out = new ThinkingPresentation();
+  out.startedAt = message.createdAt;
+  if (typeof message.content === 'string') {
+    out.body = message.content;
+    return out.body.trim().length > 0 ? out : null;
+  }
+  if (message.content === undefined || message.content === null
+    || typeof message.content !== 'object' || Array.isArray(message.content)) return null;
+  const record = message.content as Record<string, Object>;
+  const text = record['text'];
+  const thinking = record['thinking'];
+  out.body = typeof text === 'string' ? text as string
+    : typeof thinking === 'string' ? thinking as string : '';
+  const duration = record['durationMs'];
+  if (typeof duration === 'number' && Number.isFinite(duration)) out.durationMs = Math.max(0, duration);
+  out.redacted = record['isRedacted'] === true;
+  if (!out.redacted && out.body.trim().length === 0 && out.durationMs <= 0) return null;
+  let finishedAtMs = 0;
+  const finishedAt = record['finishedAt'];
+  if (typeof finishedAt === 'number' && Number.isFinite(finishedAt)) finishedAtMs = finishedAt;
+  else if (typeof finishedAt === 'string') finishedAtMs = Date.parse(finishedAt as string);
+  if (!Number.isFinite(finishedAtMs) || finishedAtMs <= 0) finishedAtMs = Date.parse(message.createdAt);
+  if (out.durationMs >= 0 && Number.isFinite(finishedAtMs) && finishedAtMs > 0) {
+    out.startedAt = new Date(Math.max(0, finishedAtMs - out.durationMs)).toISOString();
+  }
+  return out;
+}
+
+export function turnFinalAssistantIds(
+  messages: RemoteMessage[],
+  isSessionStreaming: boolean,
+): Set<string> {
+  const result = new Set<string>();
+  const suppressTailFinalAssistant = isSessionStreaming && hasActiveLoadedTail(messages);
+  let candidate = '';
+  let sealedAnswerFound = false;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (isTurnUserBoundary(message)) {
+      if (!sealedAnswerFound && candidate.length > 0) result.add(candidate);
+      candidate = '';
+      sealedAnswerFound = false;
+      continue;
+    }
+    if (message.role !== 'assistant' || message.systemCardType.length > 0
+      || readStr(message.agentMeta, 'parentUuid').length > 0
+      || contentPreview(message.content).trim().length === 0) continue;
+    candidate = message.id.length > 0 ? message.id : message.clientId;
+    if (message.turnCompleted && candidate.length > 0) {
+      result.add(candidate);
+      sealedAnswerFound = true;
+    }
+  }
+  if (!sealedAnswerFound && !suppressTailFinalAssistant && candidate.length > 0) result.add(candidate);
+  return result;
+}
+
+/**
+ * maker/session 的 running 可能先于新 user 行到达；必须看“已加载尾部”是否真的活动，
+ * 否则上一轮已完成回答的操作行会在发送瞬间闪退。
+ */
+function hasActiveLoadedTail(messages: RemoteMessage[]): boolean {
+  let lastUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (isTurnUserBoundary(messages[i])) {
+      lastUserIndex = i;
+      break;
+    }
+  }
+  const tailStart = lastUserIndex + 1;
+  if (tailStart >= messages.length) return lastUserIndex >= 0;
+  for (let i = tailStart; i < messages.length; i++) {
+    if (messages[i].isStreaming) return true;
+  }
+
+  const settledUseIds = new Set<string>();
+  for (let i = tailStart; i < messages.length; i++) {
+    if (messages[i].role !== 'tool_result') continue;
+    const useId = toolResultUseId(messages[i]);
+    if (useId.length > 0) settledUseIds.add(useId);
+  }
+  for (let i = tailStart; i < messages.length; i++) {
+    if (messages[i].role !== 'tool_use') continue;
+    const useId = rawToolUseId(messages[i]);
+    let settled = useId.length > 0 && settledUseIds.has(useId);
+    if (!settled && i + 1 < messages.length && messages[i + 1].role === 'tool_result') {
+      const adjacentUseId = toolResultUseId(messages[i + 1]);
+      settled = useId.length === 0 || adjacentUseId.length === 0 || adjacentUseId === useId;
+    }
+    if (settled) continue;
+    let answeredAfter = false;
+    for (let j = i + 1; j < messages.length; j++) {
+      if (messages[j].role === 'assistant' && !messages[j].isStreaming
+        && contentPreview(messages[j].content).trim().length > 0) {
+        answeredAfter = true;
+        break;
+      }
+    }
+    if (!answeredAfter) return true;
+  }
+
+  // 本地 system card 可能追加在已完成回答之后；跳过它再判断真正的内容尾部。
+  for (let i = messages.length - 1; i >= tailStart; i--) {
+    const message = messages[i];
+    if (message.role === 'system' || message.systemCardType.length > 0) continue;
+    return message.role !== 'assistant' || contentPreview(message.content).trim().length === 0;
+  }
+  return false;
+}
+
+function isTurnUserBoundary(message: RemoteMessage): boolean {
+  return message.role === 'user' && message.systemCardType.length === 0
+    && !message.isSyntheticTrigger && !message.presentedAsAgent;
 }
 
 /** 单个工具调用（含配对结果）。 */
@@ -153,6 +284,52 @@ export class RenderTodoItem {
 /** 计划/待办卡。 */
 export class RenderTodoCardItem extends RenderItem {
   todos: RenderTodoItem[] = [];
+  /** 仅当前活动 turn 的计划为 true；历史遗留 in_progress 不应持续旋转。 */
+  isStreaming: boolean = false;
+}
+
+/** 状态变化不进入签名；计划正文相同的快照可复用同一交互状态。 */
+export function todoCardContentSignature(item: RenderTodoCardItem): string {
+  const parts: string[] = [`${item.todos.length}`];
+  for (let i = 0; i < item.todos.length; i++) parts.push(item.todos[i].content.trim());
+  return parts.join('\u001f');
+}
+
+/** 同签名卡片从列表尾部数的相对序号；prepend 更早轮次后保持不变。 */
+export function todoCardRankFromTail(
+  cards: RenderTodoCardItem[],
+  targetKey: string,
+): number {
+  let signature = '';
+  for (let i = 0; i < cards.length; i++) {
+    if (cards[i].key === targetKey) {
+      signature = todoCardContentSignature(cards[i]);
+      break;
+    }
+  }
+  if (signature.length === 0) return 0;
+  let rank = 0;
+  for (let i = cards.length - 1; i >= 0; i--) {
+    if (todoCardContentSignature(cards[i]) !== signature) continue;
+    if (cards[i].key === targetKey) return rank;
+    rank += 1;
+  }
+  return 0;
+}
+
+/** 在新列表中找到相同签名、相同尾部相对序号的卡片。 */
+export function todoCardIndexAtRankFromTail(
+  cards: RenderTodoCardItem[],
+  signature: string,
+  rank: number,
+): number {
+  let currentRank = 0;
+  for (let i = cards.length - 1; i >= 0; i--) {
+    if (todoCardContentSignature(cards[i]) !== signature) continue;
+    if (currentRank === rank) return i;
+    currentRank += 1;
+  }
+  return -1;
 }
 
 /** 工作过程聚合块（thinking / tool_group / todo 收进折叠面板，对齐 iOS work_group）。 */
@@ -236,6 +413,18 @@ export function parseToolUse(message: RemoteMessage): ToolUseInfo {
     info.toolName = readStr(record, 'toolName');
     input = readAny(record, 'input');
   }
+  // 兼容旧 Harmony live projection 把 input 预先 JSON.stringify 后再塞回 content
+  // 的双重编码。结构化字段恢复后，人话摘要才能读取 description/commandActions。
+  if (typeof input === 'string') {
+    const encoded = (input as string).trim();
+    if (encoded.length > 0) {
+      try {
+        input = JSON.parse(encoded) as Object;
+      } catch (e) {
+        // 第三方工具确实可能使用字符串 input；保持原值走通用回退。
+      }
+    }
+  }
   if (input !== undefined) {
     info.inputRaw = JSON.stringify(input);
   }
@@ -259,15 +448,40 @@ export function toolResultUseId(message: RemoteMessage): string {
   return '';
 }
 
-export function toolResultHasError(message: RemoteMessage): boolean {
+function isContentOutputToolName(toolName: string): boolean {
+  const normalized = toolName.toLowerCase();
+  return normalized === 'read' || normalized === 'glob' || normalized === 'grep'
+    || normalized === 'search' || normalized === 'webfetch' || normalized === 'websearch'
+    || normalized === 'file_read' || normalized === 'read_file' || normalized === 'list_files';
+}
+
+export function toolResultHasError(message: RemoteMessage, toolName: string = ''): boolean {
   const content = message.content;
   if (content !== undefined && typeof content === 'object' && !Array.isArray(content)) {
     const record = content as Record<string, Object>;
-    return record['isError'] === true || record['is_error'] === true;
+    if (record['isError'] === true || record['is_error'] === true) return true;
   }
-  // 历史 tool_result 通常只有纯文本正文；正文可能本身就在讨论 error，
-  // 没有结构化信号时宁可不标失败，避免假阳性。
-  return false;
+  const text = contentPreview(content).trim();
+  if (text.length === 0) return false;
+  if (text.includes('<tool_use_error>')) return true;
+  if (isContentOutputToolName(toolName)) {
+    const firstLine = text.split('\n')[0].trim();
+    return /^(error\b|request failed\b|failed to \S|enoent\b|eacces\b|permission denied\b|错误[：:]|(读取|搜索|请求|抓取)失败|无法(读取|访问|打开|获取))/i
+      .test(firstLine);
+  }
+  const firstLine = text.split('\n')[0].trim();
+  return /^(error\b|failed\b|failure\b|exception\b|traceback\b|stderr\b|request failed\b|permission denied\b|错误[：:]|失败[：:]|异常[：:]|拒绝[：:]|超时[：:])/i
+    .test(firstLine)
+    || /\b(exit code [1-9]|non-zero exit|traceback \(most recent call last\)|permission denied|timed out)\b/i
+      .test(text);
+}
+
+/** 连续工具内部也要按历史空洞切组，不能等到遇到非工具消息才 flush。 */
+export function shouldSplitToolGroup(previousEndAt: string, nextCreatedAt: string): boolean {
+  const previous = Date.parse(previousEndAt);
+  const next = Date.parse(nextCreatedAt);
+  return Number.isFinite(previous) && Number.isFinite(next)
+    && next - previous > 30 * 60 * 1000;
 }
 
 /** 从 tool_result JSON 提取生成图片；只接受 Desktop 媒体托管 scheme。 */
@@ -418,6 +632,306 @@ function parseStructuredTodos(list: Object[]): RenderTodoItem[] | null {
 function firstTodoText(record: Record<string, Object>, key: string): string {
   const value = record[key];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+export class TodoPlanInsertion {
+  key: string = '';
+  todos: RenderTodoItem[] = [];
+}
+
+class TodoPlanSession {
+  todos: RenderTodoItem[] = [];
+  firstIndex: number = -1;
+  lastIndex: number = -1;
+  source: string = '';
+}
+
+function planSource(toolName: string): string {
+  if (toolName === 'TodoWrite') return 'todo';
+  if (toolName === 'update_plan') return 'codex';
+  if (toolName === 'TaskCreate' || toolName === 'TaskUpdate'
+    || toolName === 'TaskList' || toolName === 'TaskGet') return 'task';
+  return '';
+}
+
+function planMessageKey(message: RemoteMessage, index: number): string {
+  if (message.clientId.length > 0) return message.clientId;
+  if (message.id.length > 0) return message.id;
+  if (message.toolUseId.length > 0) return message.toolUseId;
+  return `${message.createdAt}-${index}`;
+}
+
+function taskRecord(value: Object | undefined): Record<string, Object> | null {
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, Object>;
+}
+
+function firstTaskString(record: Record<string, Object> | null, keys: string[]): string {
+  if (record === null) return '';
+  for (let i = 0; i < keys.length; i++) {
+    const value = record[keys[i]];
+    if (typeof value === 'string' && (value as string).trim().length > 0) return (value as string).trim();
+  }
+  return '';
+}
+
+function taskId(record: Record<string, Object> | null): string {
+  return firstTaskString(record, ['taskId', 'task_id', 'id']);
+}
+
+function taskContent(record: Record<string, Object> | null): string {
+  return firstTaskString(record,
+    ['subject', 'content', 'description', 'activeForm', 'active_form', 'title', 'text']);
+}
+
+function normalizedTaskStatus(value: Object | undefined): string {
+  if (typeof value !== 'string') return '';
+  const status = (value as string).trim().toLowerCase();
+  if (status === 'completed' || status === 'done' || status === 'success') return 'completed';
+  if (status === 'in_progress' || status === 'inprogress' || status === 'running' || status === 'active') {
+    return 'in_progress';
+  }
+  if (status === 'pending' || status === 'queued' || status === 'todo') return 'pending';
+  if (status === 'deleted' || status === 'removed') return 'deleted';
+  return '';
+}
+
+function parseTaskCreatedLine(line: string): Record<string, Object> | null {
+  const match = /^Task\s+#([^\s]+)\s+created successfully:\s*(.+)$/i.exec(line.trim());
+  if (match === null || match.length < 3) return null;
+  const out: Record<string, Object> = {};
+  out['id'] = match[1];
+  out['status'] = 'pending';
+  out['subject'] = match[2].trim();
+  return out;
+}
+
+function parseTaskSnapshotLine(line: string): Record<string, Object> | null {
+  const match = /^#([^\s]+)\s+\[([^\]]+)\]\s+(.+)$/.exec(line.trim());
+  if (match === null || match.length < 4) return null;
+  let subject = match[3].trim();
+  const trailingMeta = subject.lastIndexOf(' [');
+  if (trailingMeta > 0 && subject.endsWith(']')) subject = subject.slice(0, trailingMeta).trim();
+  if (subject.length === 0) return null;
+  const out: Record<string, Object> = {};
+  out['id'] = match[1];
+  out['status'] = match[2];
+  out['subject'] = subject;
+  return out;
+}
+
+function taskRecordsFromResult(resultText: string): Array<Record<string, Object>> {
+  const out: Array<Record<string, Object>> = [];
+  if (resultText.trim().length === 0) return out;
+  try {
+    const parsed = JSON.parse(resultText) as Object;
+    const record = taskRecord(parsed);
+    if (record !== null) {
+      const tasks = record['tasks'];
+      if (Array.isArray(tasks)) {
+        const list = tasks as Object[];
+        for (let i = 0; i < list.length; i++) {
+          const task = taskRecord(list[i]);
+          if (task !== null) out.push(task);
+        }
+        return out;
+      }
+      const one = taskRecord(record['task']);
+      if (one !== null) return [one];
+      if (taskId(record).length > 0 || taskContent(record).length > 0) return [record];
+    }
+  } catch (e) {
+    // Claude Task 工具的旧结果是人类可读文本，继续按行解析。
+  }
+  const lines = resultText.replace(/\r\n/g, '\n').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const created = parseTaskCreatedLine(lines[i]);
+    if (created !== null) {
+      out.push(created);
+      continue;
+    }
+    const snapshot = parseTaskSnapshotLine(lines[i]);
+    if (snapshot !== null) out.push(snapshot);
+  }
+  return out;
+}
+
+function taskListResultIsAuthoritative(resultText: string): boolean {
+  if (resultText.trim().length === 0) return false;
+  try {
+    const record = taskRecord(JSON.parse(resultText) as Object);
+    return record !== null && Array.isArray(record['tasks']);
+  } catch (e) {
+    return false;
+  }
+}
+
+function currentTaskTodos(taskState: Map<string, RenderTodoItem>): RenderTodoItem[] | null {
+  const out: RenderTodoItem[] = [];
+  taskState.forEach((todo: RenderTodoItem) => {
+    if (todo.content.trim().length > 0) out.push(todo);
+  });
+  return out.length > 0 ? out : null;
+}
+
+function taskToolTargetsExistingTask(
+  toolName: string,
+  input: Record<string, Object> | null,
+  resultText: string,
+  taskState: Map<string, RenderTodoItem>,
+): boolean {
+  if (toolName === 'TaskCreate') return false;
+  const resultTasks = taskRecordsFromResult(resultText);
+  const directId = taskId(input);
+  if (directId.length > 0 && taskState.has(directId)) return true;
+  for (let i = 0; i < resultTasks.length; i++) {
+    const id = taskId(resultTasks[i]);
+    if (id.length > 0 && taskState.has(id)) return true;
+  }
+  return false;
+}
+
+function applyTaskPlanTool(
+  taskState: Map<string, RenderTodoItem>,
+  message: RemoteMessage,
+  toolName: string,
+  input: Record<string, Object> | null,
+  resultText: string,
+): RenderTodoItem[] | null {
+  const resultTasks = taskRecordsFromResult(resultText);
+  if (toolName === 'TaskList') {
+    if (resultTasks.length === 0) {
+      if (taskListResultIsAuthoritative(resultText)) {
+        taskState.clear();
+        return null;
+      }
+      return currentTaskTodos(taskState);
+    }
+    const previous = new Map<string, RenderTodoItem>(taskState);
+    taskState.clear();
+    for (let i = 0; i < resultTasks.length; i++) {
+      const record = resultTasks[i];
+      const id = taskId(record);
+      if (id.length === 0) continue;
+      const status = normalizedTaskStatus(record['status']);
+      if (status === 'deleted') continue;
+      const existing = previous.get(id);
+      const content = taskContent(record) || existing?.content || '';
+      if (content.length === 0) continue;
+      const todo = new RenderTodoItem();
+      todo.content = content;
+      todo.status = status.length > 0 ? status : (existing?.status ?? 'pending');
+      taskState.set(id, todo);
+    }
+    return currentTaskTodos(taskState);
+  }
+
+  const resultTask = resultTasks.length > 0 ? resultTasks[0] : null;
+  if (toolName === 'TaskCreate') {
+    const id = taskId(resultTask) || taskId(input)
+      || `task-create:${message.toolUseId.length > 0 ? message.toolUseId : message.id}`;
+    const content = taskContent(input) || taskContent(resultTask);
+    if (content.length === 0) return currentTaskTodos(taskState);
+    const status = resultTask === null ? '' : normalizedTaskStatus(resultTask['status']);
+    const todo = new RenderTodoItem();
+    todo.content = content;
+    todo.status = status.length > 0 && status !== 'deleted' ? status : 'pending';
+    taskState.set(id, todo);
+    return currentTaskTodos(taskState);
+  }
+
+  const id = taskId(input) || taskId(resultTask);
+  if (id.length === 0) return currentTaskTodos(taskState);
+  const existing = taskState.get(id);
+  const suppliedContent = taskContent(input) || taskContent(resultTask);
+  // 分页窗口若缺少 TaskCreate，不能用 id-only 状态行伪造一张不完整计划卡。
+  if (existing === undefined && suppliedContent.length === 0) return null;
+  const rawStatus = input !== null && input['status'] !== undefined
+    ? input['status'] : (resultTask === null ? undefined : resultTask['status']);
+  const status = normalizedTaskStatus(rawStatus) || existing?.status || 'pending';
+  if (status === 'deleted') {
+    taskState.delete(id);
+    return currentTaskTodos(taskState);
+  }
+  const todo = new RenderTodoItem();
+  todo.content = suppliedContent || existing?.content || '';
+  todo.status = status;
+  if (todo.content.length > 0) taskState.set(id, todo);
+  return currentTaskTodos(taskState);
+}
+
+/**
+ * 按来源 + 完成态划分计划会话，并把卡片插到该会话最后一次更新的位置。
+ * key 固定取首次 plan 调用，历史 prepend / 流式状态更新不会重置折叠态。
+ */
+export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, TodoPlanInsertion> {
+  const resultByUseId = new Map<string, string>();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role !== 'tool_result') continue;
+    const useId = toolResultUseId(message);
+    if (useId.length > 0) resultByUseId.set(useId, contentPreview(message.content));
+  }
+
+  const sessions: TodoPlanSession[] = [];
+  const lastBySource = new Map<string, TodoPlanSession>();
+  const taskState = new Map<string, RenderTodoItem>();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role !== 'tool_use') continue;
+    const tool = parseToolUse(message);
+    const source = planSource(tool.toolName);
+    if (source.length === 0) continue;
+    const resultText = resultByUseId.get(tool.toolUseId) ?? '';
+    const previous = lastBySource.get(source);
+    let previousAllDone = false;
+    if (previous !== undefined && previous.todos.length > 0) {
+      previousAllDone = true;
+      for (let j = 0; j < previous.todos.length; j++) {
+        if (previous.todos[j].status !== 'completed') {
+          previousAllDone = false;
+          break;
+        }
+      }
+    }
+    let input: Record<string, Object> | null = null;
+    try {
+      input = taskRecord(JSON.parse(tool.inputRaw) as Object);
+    } catch (e) {
+      input = null;
+    }
+    const continuesCompletedTask = source === 'task' && previousAllDone
+      && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState);
+    const startsNew = previous === undefined || (previousAllDone && !continuesCompletedTask);
+    if (source === 'task' && startsNew) taskState.clear();
+    const parsed = extractTodos(tool.toolName, tool.inputRaw)
+      ?? (source === 'task'
+        ? applyTaskPlanTool(taskState, message, tool.toolName, input, resultText) : null);
+    if (parsed === null) continue;
+    for (let j = 0; j < parsed.length; j++) parsed[j].seq = j;
+    if (!startsNew && previous !== undefined) {
+      previous.todos = parsed;
+      previous.lastIndex = i;
+    } else {
+      const session = new TodoPlanSession();
+      session.todos = parsed;
+      session.firstIndex = i;
+      session.lastIndex = i;
+      session.source = source;
+      sessions.push(session);
+      lastBySource.set(source, session);
+    }
+  }
+
+  const out = new Map<number, TodoPlanInsertion>();
+  for (let i = 0; i < sessions.length; i++) {
+    const session = sessions[i];
+    const insertion = new TodoPlanInsertion();
+    insertion.key = `todo-${planMessageKey(messages[session.firstIndex], session.firstIndex)}`;
+    insertion.todos = session.todos;
+    out.set(session.lastIndex, insertion);
+  }
+  return out;
 }
 
 /** JSON 摘要（截断避免大 input 撑爆 UI）。 */
@@ -624,6 +1138,35 @@ function buildSegments(text: string, ranges: RenderPasteRange[], isAutomation: b
 
 // ─── 渲染项构建 ──────────────────────────────────────────────────────────────
 
+function hasVisibleAutoResumeBoundary(message: RemoteMessage): boolean {
+  if (message.systemCardType.length > 0) return true;
+  if (message.isSyntheticTrigger || message.role === 'thinking') return false;
+  if (message.role === 'tool_use' || message.role === 'tool_result') return true;
+  let body = contentPreview(message.content);
+  if (message.role === 'user') {
+    const parsed = parseUserContent(message.content);
+    if (parsed.images.length > 0 || parsed.files.length > 0) return true;
+    body = parsed.text;
+  }
+  return body.replace(/[\s\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
+    .length > 0;
+}
+
+/** 同一次中断只展示最新状态；旧行仍留在输入序列中作为 turn boundary。 */
+export function collapseConsecutiveAutoResumeCards(messages: RemoteMessage[]): void {
+  let hasNewerCard = false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    message.autoResumeHidden = false;
+    if (message.systemCardType === 'auto-resume') {
+      message.autoResumeHidden = hasNewerCard;
+      hasNewerCard = true;
+    } else if (hasVisibleAutoResumeBoundary(message)) {
+      hasNewerCard = false;
+    }
+  }
+}
+
 /**
  * 把升序消息数组构建成渲染项列表。
  * 消息流结构：
@@ -639,9 +1182,15 @@ function buildLinearRenderItems(
   isSessionStreaming: boolean = false,
   taskUpdates: Map<string, AgentTaskUpdate> | undefined = undefined,
   renderOrphanTaskUpdates: boolean = false,
+  continuationTurnClientId: string = '',
+  continuationCapability: string = 'unknown',
+  makerTurnRunning: boolean = false,
+  lastUserInputClientId: string = '',
 ): RenderItem[] {
   const items: RenderItem[] = [];
-  let todoSeq = 0;
+  const errorTailClientId = findErrorTailClientId(messages);
+  const finalAssistantIds = turnFinalAssistantIds(messages, isSessionStreaming);
+  const todoInsertAt = findTodoPlanInsertions(messages);
   const renderedTaskKeys = new Set<string>();
 
   // 结果必须只作为 tool_use 的 secondary body 消费。之前把 tool_result 再建成一个
@@ -674,14 +1223,14 @@ function buildLinearRenderItems(
     if (useId.length === 0) continue;
     settledUseIds.add(useId);
     resultAtByUseId.set(useId, m.createdAt);
-    if (toolResultHasError(m)) resultErrorByUseId.set(useId, true);
-    const preview = summarizeText(contentPreview(m.content));
-    const media = extractToolResultImages(contentPreview(m.content));
-    const richMedia = extractToolResultMedia(contentPreview(m.content));
+    const fullResult = contentPreview(m.content);
+    if (toolResultHasError(m, toolNameByUseId.get(useId) ?? '')) resultErrorByUseId.set(useId, true);
+    const media = extractToolResultImages(fullResult);
+    const richMedia = extractToolResultMedia(fullResult);
     if (media.length > 0) mediaByUseId.set(useId, media);
     if (richMedia.length > 0) richMediaByUseId.set(useId, richMedia);
-    if (!shouldHideToolResult(toolNameByUseId.get(useId) ?? '', preview)) {
-      resultByUseId.set(useId, preview);
+    if (!shouldHideToolResult(toolNameByUseId.get(useId) ?? '', fullResult)) {
+      resultByUseId.set(useId, fullResult);
     }
   }
   // 旧历史里仍有“tool_use 紧邻 tool_result、但 useId 没落在 result 行”的数据，
@@ -691,21 +1240,20 @@ function buildLinearRenderItems(
     const result = messages[i + 1];
     if (use.role !== 'tool_use' || result.role !== 'tool_result') continue;
     const useInfo = parseToolUse(use);
-    const resultUseId = toolResultUseId(result);
-    if (resultUseId.length > 0 && resultUseId !== useInfo.toolUseId) continue;
     adjacentSettledMessageIds.add(use.id);
-    if (toolResultHasError(result)) adjacentErrorMessageIds.add(use.id);
-    const preview = summarizeText(contentPreview(result.content));
-    const media = extractToolResultImages(contentPreview(result.content));
-    const richMedia = extractToolResultMedia(contentPreview(result.content));
+    if (toolResultHasError(result, useInfo.toolName)) adjacentErrorMessageIds.add(use.id);
+    const fullResult = contentPreview(result.content);
+    const media = extractToolResultImages(fullResult);
+    const richMedia = extractToolResultMedia(fullResult);
     if (media.length > 0) adjacentMediaByMessageId.set(use.id, media);
     if (richMedia.length > 0) adjacentRichMediaByMessageId.set(use.id, richMedia);
-    if (!shouldHideToolResult(useInfo.toolName, preview)) {
-      adjacentResultByMessageId.set(use.id, preview);
+    if (!shouldHideToolResult(useInfo.toolName, fullResult)) {
+      adjacentResultByMessageId.set(use.id, fullResult);
     }
   }
 
   let pendingTools: RenderToolItem[] = [];
+  let pendingToolEndAt = '';
   // 工具仍在流式追加时，必须保持 tool_group 的 key 不变，否则 ArkUI
   // 会把整组已有步骤当成新节点重建，表现为工作内容跳变/闪烁。
   let pendingFirstKey = '';
@@ -744,31 +1292,12 @@ function buildLinearRenderItems(
     }
     pendingTools = [];
     pendingFirstKey = '';
-  };
-
-  // 同一轮计划更新只保留最新一张 todo 卡；plan tool 本身不再作为普通工具行渲染。
-  let latestTodoCard: RenderTodoCardItem | null = null;
-  const appendTodoCard = (message: RemoteMessage, todos: RenderTodoItem[]): void => {
-    for (let i = 0; i < todos.length; i++) {
-      todos[i].seq = todoSeq;
-      todoSeq += 1;
-    }
-    if (latestTodoCard !== null) {
-      latestTodoCard.todos = todos;
-      return;
-    }
-    const card = new RenderTodoCardItem();
-    card.type = 'todo';
-    card.key = `${message.id}-todo`;
-    card.todos = todos;
-    items.push(card);
-    latestTodoCard = card;
+    pendingToolEndAt = '';
   };
 
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     const role = m.role;
-    if (role === 'user') latestTodoCard = null;
 
     if (role === 'tool_use') {
       const tool = parseToolUse(m);
@@ -808,9 +1337,18 @@ function buildLinearRenderItems(
         continue;
       }
       if (isPlanTool(tool.toolName)) {
-        flushTools();
-        const todos = extractTodos(tool.toolName, tool.inputRaw);
-        if (todos !== null) appendTodoCard(m, todos);
+        const insertion = todoInsertAt.get(i);
+        if (insertion !== undefined) {
+          flushTools();
+          const card = new RenderTodoCardItem();
+          card.type = 'todo';
+          card.key = insertion.key;
+          card.todos = insertion.todos;
+          // 活动态必须在 turn 分组完成后按最后一个已完成边界计算；这里只保留
+          // 协议内容，避免旧历史里的 in_progress 计划被误判为当前执行中。
+          card.isStreaming = false;
+          items.push(card);
+        }
         continue;
       }
       const item = new RenderToolItem();
@@ -835,8 +1373,14 @@ function buildLinearRenderItems(
         item.richMedia = adjacentRichMediaByMessageId.get(m.id) ?? [];
       }
       item.createdAt = m.createdAt;
+      if (pendingTools.length > 0 && shouldSplitToolGroup(pendingToolEndAt, item.createdAt)) {
+        flushTools();
+      }
       if (pendingTools.length === 0) pendingFirstKey = m.id;
       pendingTools.push(item);
+      const itemEndAt = item.settledAt.length > 0 ? item.settledAt : item.createdAt;
+      if (pendingToolEndAt.length === 0
+        || Date.parse(itemEndAt) > Date.parse(pendingToolEndAt)) pendingToolEndAt = itemEndAt;
       continue;
     }
 
@@ -845,17 +1389,15 @@ function buildLinearRenderItems(
     if (role === 'tool_result') continue;
 
     if (role === 'thinking') {
+      const presentation = parseThinkingPresentation(m);
+      if (presentation === null) continue;
       const item = new RenderThinkingItem();
       item.type = 'thinking';
       item.key = m.id;
-      item.body = contentPreview(m.content);
-      if (m.content !== undefined && typeof m.content === 'object' && !Array.isArray(m.content)) {
-        const record = m.content as Record<string, Object>;
-        const dur = readAny(record, 'durationMs');
-        if (typeof dur === 'number' && Number.isFinite(dur)) item.durationMs = Math.max(0, dur);
-        item.redacted = record['isRedacted'] === true;
-      }
-      item.createdAt = m.createdAt;
+      item.body = presentation.body;
+      item.durationMs = presentation.durationMs;
+      item.redacted = presentation.redacted;
+      item.createdAt = presentation.startedAt;
       item.mdBlocks = parseMarkdown(item.body);
       items.push(item);
       continue;
@@ -868,11 +1410,22 @@ function buildLinearRenderItems(
       const item = new RenderMessageItem();
       item.type = 'message';
       item.key = m.id;
-      item.kind = 'system';
+      item.kind = m.systemCardType === 'auto-resume' ? 'user' : 'system';
       item.label = `system:${m.systemCardType}`;
-      item.body = m.systemCardType === 'compact' ? '' : contentPreview(m.content);
-      item.mdBlocks = item.body.length > 0 ? parseMarkdown(item.body) : [];
+      item.body = '';
+      item.mdBlocks = [];
       item.message = m;
+      item.hidden = m.autoResumeHidden;
+      if (m.systemCardType === 'auto-resume') {
+        const clientId = m.clientId.length > 0 ? m.clientId : m.id;
+        item.autoResumeInFlight = isAutoResumeRowInFlight(
+          clientId,
+          continuationTurnClientId,
+          continuationCapability,
+          makerTurnRunning,
+          clientId.length > 0 && clientId === lastUserInputClientId,
+        );
+      }
       items.push(item);
       continue;
     }
@@ -881,6 +1434,24 @@ function buildLinearRenderItems(
       const item = new RenderMessageItem();
       item.type = 'message';
       item.key = m.id;
+      if (m.isSyntheticTrigger) {
+        item.kind = 'user';
+        item.label = '你';
+        item.body = '';
+        item.message = m;
+        item.hidden = true;
+        items.push(item);
+        continue;
+      }
+      if (m.presentedAsAgent) {
+        item.kind = 'system';
+        item.label = m.originLabel.length > 0 ? m.originLabel : 'Cindy';
+        item.body = m.originBody;
+        item.mdBlocks = parseMarkdown(item.body);
+        item.message = m;
+        items.push(item);
+        continue;
+      }
       item.kind = 'user';
       item.label = '你';
       const parsed = parseUserContent(m.content);
@@ -904,6 +1475,12 @@ function buildLinearRenderItems(
     if (item.kind === 'assistant' && item.body.trim().length === 0) continue;
     item.mdBlocks = parseMarkdown(item.body);
     item.message = m;
+    if (item.kind === 'assistant') {
+      const identity = m.id.length > 0 ? m.id : m.clientId;
+      item.isTurnFinalAssistant = identity.length > 0 && finalAssistantIds.has(identity);
+    }
+    if (item.kind === 'error' && errorTailClientId.length > 0
+      && (m.clientId === errorTailClientId || m.id === errorTailClientId)) item.hidden = true;
     items.push(item);
   }
   flushTools();
@@ -941,7 +1518,17 @@ export function buildRenderItems(
   isSessionStreaming: boolean = false,
   taskUpdates: Map<string, AgentTaskUpdate> | undefined = undefined,
   renderOrphanTaskUpdates: boolean = false,
+  continuationTurnClientId: string = '',
+  continuationCapability: string = 'unknown',
+  makerTurnRunning: boolean = false,
 ): RenderItem[] {
+  collapseConsecutiveAutoResumeCards(messages);
+  let lastUserInputClientId = '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== 'user' || readStr(messages[i].agentMeta, 'delivery') === 'steer') continue;
+    lastUserInputClientId = messages[i].clientId.length > 0 ? messages[i].clientId : messages[i].id;
+    break;
+  }
   const presentAgentIds = new Set<string>();
   let hasAgent = false;
   for (let i = 0; i < messages.length; i++) {
@@ -952,7 +1539,8 @@ export function buildRenderItems(
   }
   if (!hasAgent) {
     return buildLinearRenderItems(
-      messages, isSessionStreaming, taskUpdates, renderOrphanTaskUpdates);
+      messages, isSessionStreaming, taskUpdates, renderOrphanTaskUpdates,
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
   }
 
   const byParent = new Map<string, RemoteMessage[]>();
@@ -971,7 +1559,8 @@ export function buildRenderItems(
   const resultMeta = buildSubagentResultMeta(messages);
   const consumed = new Set<string>();
   const out = buildSubagentLevel(
-    topLevel, byParent, resultMeta, isSessionStreaming, taskUpdates, 0, consumed);
+    topLevel, byParent, resultMeta, isSessionStreaming, taskUpdates, 0, consumed,
+    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
 
   const leftover: RemoteMessage[] = [];
   byParent.forEach((bucket: RemoteMessage[], parent: string) => {
@@ -979,7 +1568,9 @@ export function buildRenderItems(
   });
   if (leftover.length > 0) {
     leftover.sort(compareRemoteMessages);
-    const flat = buildLinearRenderItems(leftover, isSessionStreaming, taskUpdates, false);
+    const flat = buildLinearRenderItems(
+      leftover, isSessionStreaming, taskUpdates, false,
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
     for (let i = 0; i < flat.length; i++) out.push(flat[i]);
   }
   if (renderOrphanTaskUpdates && taskUpdates !== undefined) {
@@ -1032,12 +1623,18 @@ function buildSubagentLevel(
   taskUpdates: Map<string, AgentTaskUpdate> | undefined,
   depth: number,
   consumed: Set<string>,
+  continuationTurnClientId: string,
+  continuationCapability: string,
+  makerTurnRunning: boolean,
+  lastUserInputClientId: string,
 ): RenderItem[] {
   const out: RenderItem[] = [];
   let run: RemoteMessage[] = [];
   const flushRun = (): void => {
     if (run.length === 0) return;
-    const built = buildLinearRenderItems(run, streaming, taskUpdates, false);
+    const built = buildLinearRenderItems(
+      run, streaming, taskUpdates, false,
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
     for (let i = 0; i < built.length; i++) out.push(built[i]);
     run = [];
   };
@@ -1046,7 +1643,8 @@ function buildSubagentLevel(
     if (isRawAgentToolUse(message) && depth < MAX_SUBAGENT_NEST_DEPTH) {
       flushRun();
       out.push(buildSubagentGroup(
-        message, byParent, resultMeta, streaming, taskUpdates, depth, consumed));
+        message, byParent, resultMeta, streaming, taskUpdates, depth, consumed,
+        continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId));
     } else {
       run.push(message);
     }
@@ -1063,6 +1661,10 @@ function buildSubagentGroup(
   taskUpdates: Map<string, AgentTaskUpdate> | undefined,
   depth: number,
   consumed: Set<string>,
+  continuationTurnClientId: string,
+  continuationCapability: string,
+  makerTurnRunning: boolean,
+  lastUserInputClientId: string,
 ): RenderSubagentGroupItem {
   const id = rawToolUseId(message);
   if (id.length > 0) consumed.add(id);
@@ -1071,7 +1673,8 @@ function buildSubagentGroup(
   group.type = 'subagent_group';
   group.key = `subagent-${id.length > 0 ? id : message.id}`;
   group.children = buildSubagentLevel(
-    childMessages, byParent, resultMeta, streaming, taskUpdates, depth + 1, consumed);
+    childMessages, byParent, resultMeta, streaming, taskUpdates, depth + 1, consumed,
+    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
   const tool = parseToolUse(message);
   try {
     const input = JSON.parse(tool.inputRaw) as Object;
@@ -1195,9 +1798,12 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
   };
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (item.type === 'message' && (item as RenderMessageItem).kind === 'user') {
+    if (item.type === 'message' && (item as RenderMessageItem).hidden
+      && (item as RenderMessageItem).kind !== 'user') continue;
+    if (item.type === 'message' && ((item as RenderMessageItem).kind === 'user'
+      || (item as RenderMessageItem).message?.role === 'user')) {
       flushTurn(false);
-      out.push(item);
+      if (!(item as RenderMessageItem).hidden) out.push(item);
       const userEnd = itemEndTimestamp(item);
       if (userEnd > 0) {
         prevEndMs = hasPrevEnd ? Math.max(prevEndMs, userEnd) : userEnd;
@@ -1338,6 +1944,11 @@ function groupActiveWorkRuns(items: RenderItem[]): RenderItem[] {
   for (let i = 0; i < items.length; i++) {
     if (isAssistantAnswerCandidate(items[i]) || isCompactBoundaryItem(items[i])) {
       lastCompletedBoundaryIndex = i;
+    }
+  }
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type === 'todo') {
+      (items[i] as RenderTodoCardItem).isStreaming = i > lastCompletedBoundaryIndex;
     }
   }
 

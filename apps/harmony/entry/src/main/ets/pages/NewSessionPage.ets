@@ -7,20 +7,28 @@
 
 import { router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { util } from '@kit.ArkTS';
 import {
   photoAccessHelper, PhotoPickerComponent, PickerController, PickerOptions,
   SelectMode, PickerOrientation, SingleLineConfig, DataType,
 } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
-import { uploadImage, deleteUpload } from '../core/attachments/AttachmentUpload';
-import { RemoteImageRef } from '../core/attachments/AttachmentModels';
+import {
+  uploadImage, deleteUpload, presignGet, isUploadRevisionCurrent,
+} from '../core/attachments/AttachmentUpload';
+import { RemoteImageRef, RemoteSerializedAttachment } from '../core/attachments/AttachmentModels';
+import { ComposerFile } from '../core/attachments/ComposerFileQueue';
 import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
-import { DlChannels, Envelope, PresenceSnapshot } from '../core/device-link/DlProtocol';
+import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readObj, readStr } from '../core/tasks/TaskModels';
-import { normalizeAutoTitle, isDefaultDraftSessionTitle } from './TaskListPresentation';
+import {
+  NewSessionCreationParams,
+  NewSessionEditDraft,
+} from '../core/tasks/NewSessionCreationStore';
+import { normalizeAutoTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
 
 type NewAgentKind = 'claude-code' | 'codex' | 'pi';
@@ -128,6 +136,7 @@ struct NewSessionPage {
   @State input: string = '';
   @State composerFocused: boolean = false;
   @State composerImages: ComposerImage[] = [];
+  @State composerFiles: ComposerFile[] = [];
   @State pickingImages: boolean = false;
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
@@ -158,7 +167,6 @@ struct NewSessionPage {
   @State fastModeCapability: boolean = false;
   @State creating: boolean = false;
   @State error: string = '';
-  @State createdSession: RemoteSession | null = null;
   @State taskRevision: number = 0;
   private recentPickerOptions: PickerOptions = createRecentPickerOptions();
   @State recentPickerController: PickerController = new PickerController();
@@ -167,22 +175,136 @@ struct NewSessionPage {
   private routeDeviceId: string = '';
   private runtimeLoadGeneration: number = 0;
   private agentTouched: boolean = false;
+  /** create-failed 返回编辑后，等待 capabilities 回包再恢复一次运行参数。 */
+  private pendingEditDraft: NewSessionEditDraft | null = null;
+  /** 首条消息附件一旦交给 creation store，页面销毁时不得再回收。 */
+  private attachmentsHandedOff: boolean = false;
+  private attachmentsDisposed: boolean = false;
 
   aboutToAppear(): void {
     const params = (router.getParams() ?? {}) as Record<string, Object>;
     this.routeDeviceId = readStr(params, 'deviceId');
+    const editDraft = AppServices.instance.newSessionCreations.consumeEditDraft();
+    if (editDraft !== null) {
+      this.pendingEditDraft = editDraft;
+      this.routeDeviceId = editDraft.deviceId;
+      this.agentTouched = true;
+      this.selectedAgentKind = this.editDraftAgentKind(editDraft.agentKind);
+      this.workspaceKind = editDraft.workspaceKind === 'project' ? 'project' : 'dialogue';
+      this.workingDir = editDraft.workingDir;
+      this.input = editDraft.text;
+      this.composerImages = this.editDraftImages(editDraft.images);
+      this.composerFiles = this.editDraftFiles(editDraft.files);
+      const missingAttachments = editDraft.images.length - this.composerImages.length
+        + editDraft.files.length - this.composerFiles.length;
+      if (missingAttachments > 0) {
+        this.error = `有 ${missingAttachments} 个附件因数量上限未恢复`;
+      }
+      this.resolveEditDraftImagePreviews();
+    }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
     }));
     this.refreshDevices();
+    this.applyPendingEditRuntime(this.routeDeviceId, this.selectedAgentKind, false);
   }
 
   aboutToDisappear(): void {
     this.runtimeLoadGeneration += 1;
+    if (!this.attachmentsHandedOff) this.disposeUnsentAttachments();
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
     }
     this.unsubs = [];
+  }
+
+  /** 直接返回时使在途上传失效，并回收所有仍由新建页持有的 OSS 引用。 */
+  private disposeUnsentAttachments(): void {
+    if (this.attachmentsDisposed) return;
+    this.attachmentsDisposed = true;
+    const images = this.composerImages.slice();
+    const files = this.composerFiles.slice();
+    this.composerImages = [];
+    this.composerFiles = [];
+    for (let i = 0; i < images.length; i++) {
+      images[i].uploadRevision += 1;
+      images[i].removed = true;
+      this.recycleComposerImage(images[i]);
+    }
+    for (let i = 0; i < files.length; i++) {
+      files[i].uploadRevision += 1;
+      files[i].removed = true;
+      if (files[i].ref !== null) this.recycleComposerFileRef(files[i].ref as RemoteSerializedAttachment);
+    }
+  }
+
+  private editDraftAgentKind(value: string): NewAgentKind {
+    if (value === 'codex') return 'codex';
+    if (value === 'pi') return 'pi';
+    return 'claude-code';
+  }
+
+  private editDraftImages(refs: RemoteImageRef[]): ComposerImage[] {
+    const images: ComposerImage[] = [];
+    for (let i = 0; i < refs.length && images.length < MAX_COMPOSER_IMAGES; i++) {
+      const image = new ComposerImage();
+      image.uri = refs[i].base64.length > 0
+        ? `data:${refs[i].mimeType.length > 0 ? refs[i].mimeType : 'image/png'};base64,${refs[i].base64}`
+        : refs[i].url;
+      image.name = refs[i].originalName.length > 0 ? refs[i].originalName : `image-${i + 1}`;
+      image.status = 'ready';
+      image.ref = refs[i];
+      images.push(image);
+    }
+    return images;
+  }
+
+  private editDraftFiles(refs: RemoteSerializedAttachment[]): ComposerFile[] {
+    const files: ComposerFile[] = [];
+    const available = Math.max(0, MAX_COMPOSER_IMAGES - this.composerImages.length);
+    for (let i = 0; i < refs.length && files.length < available; i++) {
+      const file = new ComposerFile();
+      file.uri = refs[i].path;
+      file.name = refs[i].name.length > 0 ? refs[i].name : `attachment-${i + 1}`;
+      file.size = refs[i].size;
+      file.status = 'ready';
+      file.ref = refs[i];
+      files.push(file);
+    }
+    return files;
+  }
+
+  private resolveEditDraftImagePreviews(): void {
+    for (let i = 0; i < this.composerImages.length; i++) {
+      const image = this.composerImages[i];
+      if (image.ref === null || image.ref.base64.length > 0) continue;
+      const parsed = parseAttachmentOssRef(image.ref.url);
+      if (parsed === null || parsed.ossKey.length === 0) continue;
+      void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+        if (token === null || token.length === 0) return Promise.reject(new Error('未登录'));
+        return presignGet(parsed.ossKey, token);
+      }).then((url: string) => {
+        if (image.removed || this.composerImages.indexOf(image) < 0) return;
+        image.uri = url;
+        this.syncComposerImages();
+      }).catch(() => {
+        // 预览失败不影响引用再次发送。
+      });
+    }
+  }
+
+  private applyPendingEditRuntime(deviceId: string, agent: NewAgentKind, consume: boolean): void {
+    const draft = this.pendingEditDraft;
+    if (draft === null || draft.deviceId !== deviceId
+      || this.editDraftAgentKind(draft.agentKind) !== agent) return;
+    this.model = draft.model;
+    this.providerId = draft.providerId;
+    this.effort = draft.effort;
+    this.permissionMode = draft.permissionMode;
+    this.permissionModeBeforePlan = draft.permissionMode;
+    this.planModeEnabled = draft.planModeEnabled;
+    this.fastMode = draft.fastMode;
+    if (consume) this.pendingEditDraft = null;
   }
 
   private refreshDevices(): void {
@@ -443,22 +565,50 @@ struct NewSessionPage {
     image.uri = uri;
     image.name = `image-${index + 1}`;
     this.composerImages = this.composerImages.concat([image]);
-    buildImageCandidate(uri, index).then((candidate) => {
+    this.startComposerImageUpload(image, index);
+  }
+
+  private isCurrentComposerImageUpload(image: ComposerImage, revision: number): boolean {
+    return isUploadRevisionCurrent(
+      image.uploadRevision, revision, image.removed, this.composerImages.indexOf(image) >= 0);
+  }
+
+  private startComposerImageUpload(
+    image: ComposerImage,
+    index: number,
+    preserveName: boolean = false,
+  ): void {
+    const previousName = preserveName ? image.name : '';
+    image.removed = false;
+    image.status = 'uploading';
+    image.ref = null;
+    image.uploadRevision += 1;
+    const revision = image.uploadRevision;
+    this.syncComposerImages();
+    buildImageCandidate(image.uri, index).then((candidate) => {
+      if (!this.isCurrentComposerImageUpload(image, revision)) {
+        throw new Error('stale image upload');
+      }
+      if (previousName.length > 0) candidate.name = previousName;
       image.name = candidate.name;
       return AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+        if (!this.isCurrentComposerImageUpload(image, revision)) {
+          throw new Error('stale image upload');
+        }
         if (token === null || token.length === 0) throw new Error('未登录');
         return uploadImage(candidate, token);
       });
     }).then((ref: RemoteImageRef) => {
-      image.ref = ref;
-      if (image.removed) {
-        this.recycleComposerImage(image);
+      if (!this.isCurrentComposerImageUpload(image, revision)) {
+        this.recycleComposerImageRef(ref);
         return;
       }
+      image.ref = ref;
+      if (ref.originalName.length > 0) image.name = ref.originalName;
       image.status = 'ready';
       this.syncComposerImages();
     }).catch(() => {
-      if (!image.removed) {
+      if (this.isCurrentComposerImageUpload(image, revision)) {
         image.status = 'failed';
         this.syncComposerImages();
       }
@@ -471,6 +621,7 @@ struct NewSessionPage {
 
   private removeComposerImage(image: ComposerImage): void {
     if (this.creating) return;
+    image.uploadRevision += 1;
     image.removed = true;
     const remaining: ComposerImage[] = [];
     for (let i = 0; i < this.composerImages.length; i++) {
@@ -481,8 +632,11 @@ struct NewSessionPage {
   }
 
   private recycleComposerImage(image: ComposerImage): void {
-    if (image.ref === null) return;
-    const parsed = parseAttachmentOssRef(image.ref.url);
+    if (image.ref !== null) this.recycleComposerImageRef(image.ref);
+  }
+
+  private recycleComposerImageRef(ref: RemoteImageRef): void {
+    const parsed = parseAttachmentOssRef(ref.url);
     if (parsed === null || parsed.ossKey.length === 0) return;
     void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
       if (token !== null && token.length > 0) return deleteUpload(parsed.ossKey, token);
@@ -493,18 +647,15 @@ struct NewSessionPage {
   }
 
   private retryComposerImage(image: ComposerImage): void {
-    if (this.creating) return;
-    image.removed = true;
-    const remaining: ComposerImage[] = [];
-    for (let i = 0; i < this.composerImages.length; i++) {
-      if (this.composerImages[i] !== image) remaining.push(this.composerImages[i]);
-    }
-    this.composerImages = remaining;
-    this.uploadComposerImage(image.uri, this.composerImages.length);
+    if (this.creating || image.removed || image.status !== 'failed') return;
+    const index = this.composerImages.indexOf(image);
+    if (index < 0) return;
+    this.startComposerImageUpload(image, index, true);
   }
 
   private hasComposerContent(): boolean {
-    return this.input.trim().length > 0 || this.composerImages.length > 0;
+    return this.input.trim().length > 0
+      || this.composerImages.length > 0 || this.composerFiles.length > 0;
   }
 
   private readyComposerImages(): RemoteImageRef[] {
@@ -512,6 +663,15 @@ struct NewSessionPage {
     for (let i = 0; i < this.composerImages.length; i++) {
       const image = this.composerImages[i];
       if (image.status === 'ready' && image.ref !== null) ready.push(image.ref);
+    }
+    return ready;
+  }
+
+  private readyComposerFiles(): RemoteSerializedAttachment[] {
+    const ready: RemoteSerializedAttachment[] = [];
+    for (let i = 0; i < this.composerFiles.length; i++) {
+      const file = this.composerFiles[i];
+      if (file.status === 'ready' && file.ref !== null) ready.push(file.ref);
     }
     return ready;
   }
@@ -524,7 +684,30 @@ struct NewSessionPage {
       if (image.status !== 'ready' || image.ref === null) return false;
       readyCount += 1;
     }
+    for (let i = 0; i < this.composerFiles.length; i++) {
+      const file = this.composerFiles[i];
+      if (file.status !== 'ready' || file.ref === null) return false;
+      readyCount += 1;
+    }
     return this.input.trim().length > 0 || readyCount > 0;
+  }
+
+  private removeComposerFile(file: ComposerFile): void {
+    if (this.creating) return;
+    file.uploadRevision += 1;
+    file.removed = true;
+    this.composerFiles = this.composerFiles.filter((item: ComposerFile) => item !== file);
+    if (file.ref === null) return;
+    this.recycleComposerFileRef(file.ref);
+  }
+
+  private recycleComposerFileRef(ref: RemoteSerializedAttachment): void {
+    const parsed = parseAttachmentOssRef(ref.path);
+    if (parsed === null || parsed.ossKey.length === 0) return;
+    void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+      if (token !== null && token.length > 0) return deleteUpload(parsed.ossKey, token);
+      return Promise.resolve();
+    }).catch(() => {});
   }
 
   private resetRuntimeDefaults(agent: NewAgentKind): void {
@@ -926,6 +1109,10 @@ struct NewSessionPage {
       this.fastMode = false;
     } catch (e) {
       // 旧版本被控端可能没有 capabilities；内置默认仍可被 create-session 校验。
+    } finally {
+      if (generation === this.runtimeLoadGeneration) {
+        this.applyPendingEditRuntime(deviceId, agent, true);
+      }
     }
   }
 
@@ -998,7 +1185,7 @@ struct NewSessionPage {
     if (this.browsePath.length > 0) this.selectProject(this.browsePath);
   }
 
-  private createOptions(): Record<string, Object> {
+  private createOptions(sessionId: string = ''): Record<string, Object> {
     const options: Record<string, Object> = {};
     options['agentKind'] = this.selectedAgentKind;
     options['workspaceKind'] = this.workspaceKind;
@@ -1010,55 +1197,33 @@ struct NewSessionPage {
     if (this.providerId.trim().length > 0) options['providerId'] = this.providerId.trim();
     if (this.effort.trim().length > 0) options['effort'] = this.effort.trim();
     if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir.trim();
+    if (sessionId.length > 0) options['id'] = sessionId;
     return options;
   }
 
-  private buildCreatedSession(sessionId: string, result: Record<string, Object>): RemoteSession {
+  private buildOptimisticSession(sessionId: string, text: string): RemoteSession {
     const session = new RemoteSession();
     session.id = sessionId;
     session.workspaceKind = this.workspaceKind;
-    session.workingDir = readStr(result, 'workDir')
-      || (this.workspaceKind === 'project' ? this.workingDir.trim() : '');
+    session.workingDir = this.workspaceKind === 'project' ? this.workingDir.trim() : '';
     session.model = this.model.trim() || fallbackModel(this.selectedAgentKind);
-    session.providerId = this.providerId;
-    session.effort = this.effort;
+    session.providerId = this.providerId.trim();
+    session.effort = this.effort.trim();
     session.permissionMode = !this.planModeNative && this.planModeEnabled ? 'plan' : this.permissionMode;
     session.planModeEnabled = this.planModeEnabled;
     session.fastMode = this.fastMode;
     session.agentKind = this.selectedAgentKind === 'claude-code' ? 'cc' : this.selectedAgentKind;
     session.status = 'active';
-    return session;
-  }
-
-  private async sendToCreatedSession(
-    session: RemoteSession,
-    text: string,
-    images: RemoteImageRef[],
-  ): Promise<void> {
-    // 乐观标题预览：与桌面 / 手机端一致，首条用户消息先以截断文本占位，
-    // 不等被控端自动起名（被控端随后写入的占位也是 normalizeAutoTitle(text)）回流，
-    // 避免侧栏 / 会话头在发送后短暂显示「未命名任务」。被控端推送的权威标题会覆盖本预览。
-    if (text.length > 0 && (session.title.length === 0 || isDefaultDraftSessionTitle(session.title))) {
+    session.pendingLocalCreation = true;
+    if (text.length > 0) {
       session.title = normalizeAutoTitle(text);
+      session.preview = text;
     }
-    await AppServices.instance.messages.sendText(this.selectedDeviceId, session, text, images);
-    await AppServices.instance.tasks.loadSessions(this.selectedDeviceId);
-    const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId);
-    let present = false;
-    for (let i = 0; i < sessions.length; i++) {
-      if (sessions[i].id === session.id) {
-        present = true;
-        break;
-      }
-    }
-    if (!present) {
-      // 权威列表可能早于 sessions:created push 返回，保留占位直到下一次同步覆盖。
-      AppServices.instance.tasks.upsertSession(this.selectedDeviceId, session);
-    }
-    router.pushUrl({
-      url: 'pages/TaskPage',
-      params: { deviceId: this.selectedDeviceId, sessionId: session.id },
-    });
+    const now = new Date().toISOString();
+    session.createdAt = now;
+    session.updatedAt = now;
+    session.userSendAt = now;
+    return session;
   }
 
   private async send(): Promise<void> {
@@ -1079,7 +1244,8 @@ struct NewSessionPage {
       return;
     }
     const readyImages = this.readyComposerImages();
-    if (text.length === 0 && readyImages.length === 0) return;
+    const readyFiles = this.readyComposerFiles();
+    if (text.length === 0 && readyImages.length === 0 && readyFiles.length === 0) return;
     if (!this.canCreateOnDevice(this.selectedDeviceId)) {
       this.error = '请选择一台在线且允许远程控制的电脑';
       return;
@@ -1091,37 +1257,25 @@ struct NewSessionPage {
     }
     this.creating = true;
     this.error = '';
-    try {
-      if (this.createdSession !== null) {
-        await this.sendToCreatedSession(this.createdSession, text, readyImages);
-        return;
-      }
-      await AppServices.instance.openLink(this.selectedDeviceId);
-      const options = new DlInvokeOptions();
-      options.channel = DlChannels.MAKER_CREATE_SESSION;
-      options.args = [this.createOptions()];
-      const envelope: Envelope = await AppServices.instance.client.invoke(this.selectedDeviceId, options);
-      const result = unwrapInvokeResult(envelope);
-      if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
-        throw new Error('新任务创建失败');
-      }
-      const record = result as Record<string, Object>;
-      const sessionId = readStr(record, 'sessionId');
-      if (sessionId.length === 0) throw new Error('电脑没有返回任务编号');
-      const session = this.buildCreatedSession(sessionId, record);
-      // 乐观标题预览：见 sendToCreatedSession 内说明。首条消息以截断文本占位，
-      // 让刚建好的任务在侧栏 / 会话头立即显示，而非「未命名任务」。
-      if (text.length > 0) {
-        session.title = normalizeAutoTitle(text);
-      }
-      this.createdSession = session;
-      AppServices.instance.tasks.upsertSession(this.selectedDeviceId, session);
-      await this.sendToCreatedSession(session, text, readyImages);
-    } catch (e) {
-      this.error = e instanceof Error ? e.message : '创建任务失败，请重试';
-    } finally {
-      this.creating = false;
-    }
+    const sessionId = util.generateRandomUUID();
+    const firstMessageClientId = util.generateRandomUUID();
+    const params = new NewSessionCreationParams();
+    params.deviceId = this.selectedDeviceId;
+    params.session = this.buildOptimisticSession(sessionId, text);
+    params.createOptions = this.createOptions(sessionId);
+    params.firstMessageClientId = firstMessageClientId;
+    params.firstMessageText = text;
+    params.firstMessageImages = readyImages.slice();
+    params.firstMessageFiles = readyFiles.slice();
+    params.planModeArm = this.planModeNative && this.planModeEnabled;
+    params.legacyPlanRestore = !this.planModeNative && this.planModeEnabled
+      ? (this.permissionModeBeforePlan || this.permissionMode) : '';
+    AppServices.instance.newSessionCreations.start(params);
+    this.attachmentsHandedOff = true;
+    router.replaceUrl({
+      url: 'pages/TaskPage',
+      params: { deviceId: params.deviceId, sessionId: sessionId },
+    });
   }
 
   build() {
@@ -1929,6 +2083,7 @@ struct NewSessionPage {
         input: this.input,
         focused: this.composerFocused,
         images: this.composerImages,
+        files: this.composerFiles,
         pickingImages: this.pickingImages,
         sending: this.creating,
         streaming: false,
@@ -1961,6 +2116,8 @@ struct NewSessionPage {
         },
         onRemoveImage: (image: ComposerImage): void => this.removeComposerImage(image),
         onRetryImage: (image: ComposerImage): void => this.retryComposerImage(image),
+        onRemoveFile: (file: ComposerFile): void => this.removeComposerFile(file),
+        onRetryFile: (_file: ComposerFile): void => {},
       })
     }
     .width('100%')

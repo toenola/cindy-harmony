@@ -4,7 +4,7 @@ import { picker } from '@kit.CoreFileKit';
 import { promptAction } from '@kit.ArkUI';
 import { AppServices } from '../AppServices';
 import { RemoteSerializedAttachment } from './AttachmentModels';
-import { deleteUpload, uploadDocument } from './AttachmentUpload';
+import { deleteUpload, uploadDocument, isUploadRevisionCurrent } from './AttachmentUpload';
 import { parseAttachmentOssRef } from './AttachmentOssRef';
 
 export const MAX_COMPOSER_ATTACHMENTS = 20;
@@ -17,6 +17,7 @@ export class ComposerFile {
   errorText: string = '';
   ref: RemoteSerializedAttachment | null = null;
   removed: boolean = false;
+  uploadRevision: number = 0;
 }
 
 export class ComposerFileQueue {
@@ -42,6 +43,39 @@ export class ComposerFileQueue {
       if (this.files[i].status === 'ready' && ref !== null) out.push(ref);
     }
     return out;
+  }
+
+  /** 创建失败时把已上传文件引用放回托盘；图片数量会通过共享容量回调计入上限。 */
+  restoreReady(refs: RemoteSerializedAttachment[]): number {
+    if (refs.length === 0) return 0;
+    const next = this.files.slice();
+    let remaining = this.remainingSlots();
+    let restored = 0;
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i];
+      const duplicate = next.some((item: ComposerFile) => item.ref !== null && (
+        (ref.id.length > 0 && item.ref?.id === ref.id)
+        || (ref.sha256.length > 0 && item.ref?.sha256 === ref.sha256)
+        || (ref.path.length > 0 && item.ref?.path === ref.path)
+      ));
+      if (duplicate) {
+        restored += 1;
+        continue;
+      }
+      if (remaining <= 0) continue;
+      const file = new ComposerFile();
+      file.uri = ref.path;
+      file.name = ref.name.length > 0 ? ref.name : `attachment-${next.length + 1}`;
+      file.size = ref.size;
+      file.status = 'ready';
+      file.ref = ref;
+      next.push(file);
+      remaining -= 1;
+      restored += 1;
+    }
+    this.files = next;
+    this.emit();
+    return restored;
   }
 
   allSettled(): boolean {
@@ -109,21 +143,37 @@ export class ComposerFileQueue {
     file.uri = uri;
     file.name = this.fileName(uri);
     this.files = this.files.concat([file]);
+    this.startUpload(file);
+  }
+
+  private isCurrentUpload(file: ComposerFile, revision: number): boolean {
+    return isUploadRevisionCurrent(
+      file.uploadRevision, revision, file.removed, this.files.indexOf(file) >= 0);
+  }
+
+  private startUpload(file: ComposerFile): void {
+    file.removed = false;
+    file.status = 'uploading';
+    file.errorText = '';
+    file.ref = null;
+    file.uploadRevision += 1;
+    const revision = file.uploadRevision;
     this.emit();
     AppServices.instance.auth.getAccessToken().then((token: string | null) => {
+      if (!this.isCurrentUpload(file, revision)) throw new Error('stale file upload');
       if (token === null || token.length === 0) throw new Error('未登录');
-      return uploadDocument(uri, file.name, token);
+      return uploadDocument(file.uri, file.name, token);
     }).then((attachment: RemoteSerializedAttachment) => {
-      file.ref = attachment;
-      file.size = attachment.size;
-      if (file.removed) {
-        this.recycle(file);
+      if (!this.isCurrentUpload(file, revision)) {
+        this.recycleAttachment(attachment);
         return;
       }
+      file.ref = attachment;
+      file.size = attachment.size;
       file.status = 'ready';
       this.emit();
     }).catch((e: Error) => {
-      if (file.removed) return;
+      if (!this.isCurrentUpload(file, revision)) return;
       file.status = 'failed';
       file.errorText = e.message;
       this.emit();
@@ -132,6 +182,7 @@ export class ComposerFileQueue {
 
   remove(file: ComposerFile): void {
     if (this.isBusy()) return;
+    file.uploadRevision += 1;
     file.removed = true;
     this.files = this.files.filter((item: ComposerFile) => item !== file);
     this.emit();
@@ -139,20 +190,31 @@ export class ComposerFileQueue {
   }
 
   retry(file: ComposerFile): void {
-    if (this.isBusy()) return;
-    file.removed = true;
-    this.files = this.files.filter((item: ComposerFile) => item !== file);
-    this.upload(file.uri);
+    if (this.isBusy() || file.removed || file.status !== 'failed'
+      || this.files.indexOf(file) < 0) return;
+    this.startUpload(file);
   }
 
   removeSent(sent: ComposerFile[]): void {
-    this.files = this.files.filter((item: ComposerFile) => sent.indexOf(item) < 0);
+    const remaining: ComposerFile[] = [];
+    for (let i = 0; i < this.files.length; i++) {
+      if (sent.indexOf(this.files[i]) < 0) {
+        remaining.push(this.files[i]);
+      } else {
+        this.files[i].removed = true;
+        this.files[i].uploadRevision += 1;
+      }
+    }
+    this.files = remaining;
     this.emit();
   }
 
   private recycle(file: ComposerFile): void {
-    if (file.ref === null) return;
-    const parsed = parseAttachmentOssRef(file.ref.path);
+    if (file.ref !== null) this.recycleAttachment(file.ref);
+  }
+
+  private recycleAttachment(ref: RemoteSerializedAttachment): void {
+    const parsed = parseAttachmentOssRef(ref.path);
     if (parsed === null || parsed.ossKey.length === 0) return;
     void AppServices.instance.auth.getAccessToken().then((token: string | null) => {
       if (token !== null && token.length > 0) return deleteUpload(parsed.ossKey, token);

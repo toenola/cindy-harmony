@@ -9,12 +9,17 @@ export default class EntryAbility extends UIAbility {
   private mainWindowStage: window.WindowStage | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.acceptDeepLinkWant(want);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
       hilog.error(DOMAIN, 'CindyHarmony', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onCreate');
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.acceptDeepLinkWant(want);
   }
 
   onDestroy(): void {
@@ -86,6 +91,12 @@ export default class EntryAbility extends UIAbility {
     } catch (err) {
       hilog.error(DOMAIN, 'CindyHarmony',
         'Failed to apply system bar appearance. Cause: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  private acceptDeepLinkWant(want: Want): void {
+    if (typeof want.uri === 'string' && want.uri.length > 0) {
+      AppServices.instance.acceptDeepLinkUri(want.uri);
     }
   }
 

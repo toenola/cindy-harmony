@@ -40,8 +40,14 @@ export class PlanReviewDraft {
   feedbackOpen: boolean = false;
 }
 
+class ActiveInteractionTarget {
+  deviceId: string = '';
+  references: number = 0;
+}
+
 export class InteractionStore {
   private client: DlClient | undefined = undefined;
+  private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
   private listeners: Array<() => void> = [];
   private pendingBySession: Map<string, PendingInteraction[]> = new Map();
   private resolvingRequestIds: Set<string> = new Set();
@@ -50,9 +56,18 @@ export class InteractionStore {
   private planDrafts: Map<string, PlanReviewDraft> = new Map();
   /** push/dismiss 会抬高代次，防打开页面时的慢快照覆盖刚到的实时事件。 */
   private mutationGenerations: Map<string, number> = new Map();
+  /** 同一任务可并发补拉；只允许最后启动的一次快照提交。 */
+  private refreshSequences: Map<string, number> = new Map();
+  private nextRefreshSequence: number = 0;
+  /** 当前真正打开的任务；重连后只补拉这些交互，避免扩大故障半径。 */
+  private activeTargets: Map<string, ActiveInteractionTarget> = new Map();
 
   attach(client: DlClient): void {
     this.client = client;
+  }
+
+  setLinkOpener(fn: (deviceId: string) => Promise<void>): void {
+    this.linkOpener = fn;
   }
 
   onChanged(listener: () => void): () => void {
@@ -75,7 +90,7 @@ export class InteractionStore {
     return this.pendingBySession.get(sessionId) ?? [];
   }
 
-  /** 是否有阻塞交互（打开任务时决定是否显示交互面板）。 */
+  /** 是否有任意待处理交互（仅决定是否显示面板，不等同于 Composer 阻塞）。 */
   hasPending(sessionId: string): boolean {
     const list = this.pendingBySession.get(sessionId);
     return list !== undefined && list.length > 0;
@@ -178,14 +193,57 @@ export class InteractionStore {
       return;
     }
     const generation = this.mutationGenerations.get(sessionId) ?? 0;
+    const sequence = ++this.nextRefreshSequence;
+    this.refreshSequences.set(sessionId, sequence);
     try {
+      if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
       const list = await this.queryPending(client, deviceId, sessionId);
+      if (this.refreshSequences.get(sessionId) !== sequence) return;
       if ((this.mutationGenerations.get(sessionId) ?? 0) !== generation) return;
       this.pendingBySession.set(sessionId, list);
       this.notify();
     } catch (e) {
       // 拉取失败：保留现状（push 会继续补充）。
     }
+  }
+
+  /** 折叠屏可能同时持有同一任务的多个宿主，按引用计数登记。 */
+  activateSession(deviceId: string, sessionId: string): void {
+    if (deviceId.length === 0 || sessionId.length === 0) return;
+    const target = this.activeTargets.get(sessionId) ?? new ActiveInteractionTarget();
+    target.deviceId = deviceId;
+    target.references += 1;
+    this.activeTargets.set(sessionId, target);
+  }
+
+  deactivateSession(deviceId: string, sessionId: string): void {
+    const target = this.activeTargets.get(sessionId);
+    if (target === undefined || target.deviceId !== deviceId) return;
+    target.references -= 1;
+    if (target.references <= 0) this.activeTargets.delete(sessionId);
+  }
+
+  /** Relay 重连后只补拉当前打开任务的 pending interactions。 */
+  async resyncActiveSessions(): Promise<void> {
+    const pending: Promise<void>[] = [];
+    this.activeTargets.forEach((target: ActiveInteractionTarget, sessionId: string) => {
+      pending.push(this.refreshPending(target.deviceId, sessionId));
+    });
+    await Promise.all(pending);
+  }
+
+  /** 登出/连接显式停止时清理账号级交互状态。 */
+  clearAll(): void {
+    this.pendingBySession.clear();
+    this.resolvingRequestIds.clear();
+    this.resolveErrors.clear();
+    this.askDrafts.clear();
+    this.planDrafts.clear();
+    this.mutationGenerations.clear();
+    this.refreshSequences.clear();
+    this.activeTargets.clear();
+    this.nextRefreshSequence += 1;
+    this.notify();
   }
 
   /** 提交决策（对齐 maker:resolve-interaction [requestId, decision]）。 */

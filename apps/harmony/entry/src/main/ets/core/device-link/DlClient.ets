@@ -16,8 +16,8 @@ import {
   Envelope, EnvelopeKind, HelloPayload, HelloAckPayload, LinkOpenPayload,
   PresenceSnapshot, LinkClosePayload, PresenceSetPayload,
   PROTOCOL_VERSION, PING_INTERVAL_MS, PONG_MISS_LIMIT, REQUEST_TIMEOUT_MS,
-  HANDSHAKE_TIMEOUT_MS, RECONNECT_BASE_MS, RECONNECT_MAX_MS,
-  RECONNECT_STABLE_RESET_MS, encodeEnvelope, decodeEnvelope,
+  HANDSHAKE_TIMEOUT_MS, RECONNECT_STABLE_RESET_MS, RELAY_TRY_AGAIN_LATER_CLOSE_CODE,
+  CONTROLLER_CAPABILITIES, computeReconnectDelayMs, encodeEnvelope, decodeEnvelope,
 } from './DlProtocol';
 
 const DOMAIN = 0x0000;
@@ -105,6 +105,8 @@ export class DlClient {
   private status: string = 'stopped'; // 'stopped' | 'connecting' | 'online'
   private stopped = true;
   private reconnectAttempt = 0;
+  /** 连续 1013 只在稳定在线 10s 后清零，防止重连洪峰反复打穿 relay。 */
+  private congestionCloseStreak = 0;
   private reconnectTimer: number = -1;
   private handshakeTimer: number = -1;
   private heartbeatTimer: number = -1;
@@ -133,6 +135,7 @@ export class DlClient {
     if (this.status === 'online') {
       return true;
     }
+    if (this.reconnectTimer >= 0) this.connectNow('wait-until-online');
     const deadline = Date.now() + timeoutMs;
     while (this.status !== 'online' && Date.now() < deadline && !this.stopped) {
       await delay(200);
@@ -146,12 +149,21 @@ export class DlClient {
     if (!this.stopped) return;
     this.stopped = false;
     this.reconnectAttempt = 0;
+    this.congestionCloseStreak = 0;
     void this.connect('start');
   }
 
-  /** 前台恢复等「用户正在等」的场景：清退避立即重连。 */
-  connectNow(reason: string): void {
+  /** 前台恢复可显式绕过当前 1013 timer；普通请求不能打穿拥塞冷却。 */
+  connectNow(reason: string, overrideCongestionCooldown: boolean = false): void {
     if (this.status === 'online') return;
+    if (this.stopped) {
+      this.congestionCloseStreak = 0;
+    } else if (this.congestionCloseStreak > 0 && this.reconnectTimer >= 0
+      && !overrideCongestionCooldown) {
+      hilog.info(DOMAIN, TAG, 'connectNow parked by congestion cooldown streak=%{public}d',
+        this.congestionCloseStreak);
+      return;
+    }
     this.stopped = false;
     this.reconnectAttempt = 0;
     this.clearTimer(this.reconnectTimer);
@@ -242,11 +254,16 @@ export class DlClient {
       this.ws = undefined;
       this.failAllPending(new DlError('NOT_CONNECTED', `closed ${code} ${reason}`));
       this.clearTimer(this.heartbeatTimer);
+      this.clearTimer(this.stableTimer);
+      this.stableTimer = -1;
       // 握手前断开且带 401/unauthorized 特征 → 触发 token 刷新重连。
       if (!this.helloAcked && !this.stopped && /\b401\b|unauthorized/i.test(`${code} ${reason}`)) {
         this.opts.events.onAuthFailed();
       }
-      if (!this.stopped) this.scheduleReconnect(`close-${code}`);
+      if (!this.stopped) {
+        if (code === RELAY_TRY_AGAIN_LATER_CLOSE_CODE) this.congestionCloseStreak += 1;
+        this.scheduleReconnect(`close-${code}`);
+      }
     };
     cb.onError = (err: Error) => {
       if (this.ws !== ws) return;
@@ -261,6 +278,8 @@ export class DlClient {
         this.failAllPending(new DlError('NOT_CONNECTED', `ws error: ${err.message}`));
         this.clearTimer(this.handshakeTimer);
         this.clearTimer(this.heartbeatTimer);
+        this.clearTimer(this.stableTimer);
+        this.stableTimer = -1;
         this.scheduleReconnect('ws-error');
       }
     };
@@ -326,7 +345,10 @@ export class DlClient {
     // 稳定在线后清零退避
     this.clearTimer(this.stableTimer);
     this.stableTimer = setTimeout(() => {
+      this.stableTimer = -1;
+      if (this.stopped || this.status !== 'online') return;
       this.reconnectAttempt = 0;
+      this.congestionCloseStreak = 0;
     }, RECONNECT_STABLE_RESET_MS);
     this.opts.events.onHelloAck(ack);
   }
@@ -418,26 +440,28 @@ export class DlClient {
   }
 
   /** 订阅推送 topic（device-link:subscribe 控制帧）。 */
-  subscribe(deviceId: string, topics: string[]): Promise<Envelope> {
+  subscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
     const arg = new SubscribeArgs();
     arg.topics = topics;
     arg.controllerName = this.opts.getHello().deviceName;
-    arg.capabilities = [];
+    arg.capabilities = CONTROLLER_CAPABILITIES.slice();
     const args: Object[] = [arg];
     const opts = new DlInvokeOptions();
     opts.channel = 'device-link:subscribe';
     opts.args = args;
+    opts.timeoutMs = timeoutMs;
     return this.invoke(deviceId, opts);
   }
 
   /** 注销推送 topic。 */
-  unsubscribe(deviceId: string, topics: string[]): Promise<Envelope> {
+  unsubscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
     const arg = new SubscribeArgs();
     arg.topics = topics;
     const args: Object[] = [arg];
     const opts = new DlInvokeOptions();
     opts.channel = 'device-link:unsubscribe';
     opts.args = args;
+    opts.timeoutMs = timeoutMs;
     return this.invoke(deviceId, opts);
   }
 
@@ -547,12 +571,13 @@ export class DlClient {
   private scheduleReconnect(reason: string): void {
     if (this.stopped) return;
     if (this.reconnectTimer >= 0) return;
-    const delay = Math.min(
-      RECONNECT_MAX_MS,
-      RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt),
-    );
+    const delay = computeReconnectDelayMs(
+      this.reconnectAttempt, this.congestionCloseStreak, Math.random());
     this.reconnectAttempt += 1;
-    hilog.info(DOMAIN, TAG, 'reconnect in %{public}d ms (reason=%{public}s)', delay, reason);
+    this.setStatus('connecting');
+    hilog.info(DOMAIN, TAG,
+      'reconnect in %{public}d ms (reason=%{public}s congestion=%{public}d)',
+      delay, reason, this.congestionCloseStreak);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = -1;
       void this.connect(reason);

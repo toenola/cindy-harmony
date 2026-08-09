@@ -24,6 +24,27 @@ export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 30_000;
 /** hello-ack 后稳定在线该时长才清零退避。 */
 export const RECONNECT_STABLE_RESET_MS = 10_000;
+/** relay 1013 表示服务端拥塞；该信号使用独立的 5s→30s 冷却下限。 */
+export const RELAY_TRY_AGAIN_LATER_CLOSE_CODE = 1013;
+export const RECONNECT_CONGESTION_BASE_MS = 5_000;
+export const RECONNECT_CONGESTION_MAX_MS = 30_000;
+
+/** 普通指数退避与 1013 拥塞下限取较大值，再做 0.7x–1.0x 向下抖动。 */
+export function computeReconnectDelayMs(
+  attemptValue: number,
+  congestionStreakValue: number,
+  randomValue: number,
+): number {
+  const attempt = Number.isFinite(attemptValue) ? Math.max(0, Math.floor(attemptValue)) : 0;
+  const streak = Number.isFinite(congestionStreakValue)
+    ? Math.max(0, Math.floor(congestionStreakValue)) : 0;
+  const random = Number.isFinite(randomValue) ? Math.min(Math.max(randomValue, 0), 1) : 0;
+  const normal = Math.min(RECONNECT_BASE_MS * Math.pow(2, attempt), RECONNECT_MAX_MS);
+  const congestion = streak > 0
+    ? Math.min(RECONNECT_CONGESTION_BASE_MS * Math.pow(2, streak - 1), RECONNECT_CONGESTION_MAX_MS)
+    : 0;
+  return Math.round(Math.max(normal, congestion) * (0.7 + random * 0.3));
+}
 
 // ─── 信封 ────────────────────────────────────────────────────────────────────
 
@@ -206,6 +227,34 @@ export class DlChannels {
   static readonly SESSIONS_PATCHED = 'local-db:sessions:patched';
   static readonly SESSION_ACTIVITY = 'local-db:sessions:activity';
   static readonly SESSION_ERROR_PERSISTED = 'local-db:session:error-persisted';
+}
+
+/** 控制端能消费 maker:event 微批；link-open 与 subscribe 必须同时声明。 */
+export const CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1 = 'maker-event-batch-v1';
+export const CONTROLLER_CAPABILITIES: string[] = [CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1];
+export const MAKER_EVENT_BATCH_CHANNEL = 'maker:event:batch';
+
+/**
+ * 微批只接收同一 sessionId 的原 maker:event payload；坏项逐条跳过且保持顺序。
+ */
+export function expandMakerEventBatchPayload(payload: Object | undefined): Record<string, Object>[] {
+  if (payload === undefined || payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return [];
+  }
+  const batch = payload as Record<string, Object>;
+  const sessionId = batch['sessionId'];
+  const events = batch['events'];
+  if (typeof sessionId !== 'string' || sessionId.length === 0
+    || !Array.isArray(events) || events.length === 0) return [];
+  const out: Record<string, Object>[] = [];
+  const rows = events as Object[];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row === undefined || row === null || typeof row !== 'object' || Array.isArray(row)) continue;
+    const event = row as Record<string, Object>;
+    if (event['sessionId'] === sessionId) out.push(event);
+  }
+  return out;
 }
 
 /** topic：'sessions' 或 'session:<id>'。 */

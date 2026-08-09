@@ -11,34 +11,45 @@
 
 // ─── 通用读取 helpers ────────────────────────────────────────────────────────
 
-export function readStr(obj: Record<string, Object>, key: string): string {
-  const v = obj[key];
-  return typeof v === 'string' ? v : '';
-}
-
-export function readNum(obj: Record<string, Object>, key: string, def: number): number {
-  const v = obj[key];
-  return typeof v === 'number' ? v : def;
-}
-
-export function readBool(obj: Record<string, Object>, key: string, def: boolean): boolean {
-  const v = obj[key];
-  return typeof v === 'boolean' ? v : def;
-}
-
-export function readObj(obj: Record<string, Object>, key: string): Record<string, Object> {
-  const v = obj[key];
-  // JSON 中的可选对象字段可能明确为 null（分支会话的旧消息就是这种形态）。
-  // `typeof null === 'object'`，不排除 null 会把它当成 Record，后续读取嵌套
-  // 字段时抛出 Cannot load property of null，并导致整条消息被丢弃。
-  if (v !== undefined && v !== null && typeof v === 'object' && !Array.isArray(v)) {
-    return v as Record<string, Object>;
+export function recordOrEmpty(value: Object | null | undefined): Record<string, Object> {
+  if (value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, Object>;
   }
   return {};
 }
 
+export function readStr(obj: Record<string, Object> | null | undefined, key: string): string {
+  if (obj === undefined || obj === null) return '';
+  const v = obj[key];
+  return typeof v === 'string' ? v : '';
+}
+
+export function readNum(obj: Record<string, Object> | null | undefined, key: string, def: number): number {
+  if (obj === undefined || obj === null) return def;
+  const v = obj[key];
+  return typeof v === 'number' ? v : def;
+}
+
+export function readBool(obj: Record<string, Object> | null | undefined, key: string, def: boolean): boolean {
+  if (obj === undefined || obj === null) return def;
+  const v = obj[key];
+  return typeof v === 'boolean' ? v : def;
+}
+
+export function readObj(
+  obj: Record<string, Object> | null | undefined,
+  key: string,
+): Record<string, Object> {
+  if (obj === undefined || obj === null) return {};
+  // JSON 中的可选对象字段可能明确为 null（分支会话的旧消息就是这种形态）。
+  // `typeof null === 'object'`，不排除 null 会把它当成 Record，后续读取嵌套
+  // 字段时抛出 Cannot load property of null，并导致整条消息被丢弃。
+  return recordOrEmpty(obj[key]);
+}
+
 /** 任意 JSON 值（消息 content / agentMeta 等，渲染层按类型解释）。 */
-export function readAny(obj: Record<string, Object>, key: string): Object | undefined {
+export function readAny(obj: Record<string, Object> | null | undefined, key: string): Object | undefined {
+  if (obj === undefined || obj === null) return undefined;
   const v = obj[key];
   // 可选 JSON 字段的 null 与缺省值在消息渲染模型中语义相同；保留 null
   // 会让 contentPreview / parseUserContent 把 null 误判成对象。
@@ -114,8 +125,13 @@ export class RemoteSession {
   userSendAt: string = '';
   createdAt: string = '';
   updatedAt: string = '';
+  clearedAt: string = '';
+  activeTurnStartedAt: number = 0;
+  lastTurnEndedAt: number = 0;
   preview: string = '';
   messageCount: number = 0;
+  /** 控制端预生成、首条 enqueue 尚未落定；期间详情页禁止普通远端同步与后续发送。 */
+  pendingLocalCreation: boolean = false;
 }
 
 export function parseSession(raw: Record<string, Object>): RemoteSession {
@@ -155,7 +171,11 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.userSendAt = readStr(raw, 'userSendAt');
   s.createdAt = readStr(raw, 'createdAt');
   s.updatedAt = readStr(raw, 'updatedAt');
+  s.clearedAt = readStr(raw, 'clearedAt');
+  s.activeTurnStartedAt = readNum(raw, 'activeTurnStartedAt', 0);
+  s.lastTurnEndedAt = readNum(raw, 'lastTurnEndedAt', 0);
   s.preview = readStr(raw, 'preview');
+  s.pendingLocalCreation = readBool(raw, 'pendingLocalCreation', false);
   const count = readObj(raw, '_count');
   s.messageCount = readNum(count, 'messages', 0);
   return s;
@@ -183,6 +203,16 @@ export class RemoteMessage {
   agentMeta: Record<string, Object> = {};
   /** 自动化任务注入的消息（agentMeta.origin 非空）——折叠阈值更紧。 */
   automationOrigin: boolean = false;
+  /** 自动续跑注入行属于 UI 指令；保留 turn 边界，但不能退化成普通用户气泡。 */
+  isSyntheticTrigger: boolean = false;
+  /** 同一次中断的旧状态行只参与 turn 边界，不进入最终可见列表。 */
+  autoResumeHidden: boolean = false;
+  /** Hook / Orca worker 虽以 role=user 落库，但来源不是当前用户本人。 */
+  presentedAsAgent: boolean = false;
+  originLabel: string = '';
+  originBody: string = '';
+  /** 仅 Harmony 本地反馈卡；远端窗口重载时继续保留。 */
+  localOnly: boolean = false;
 }
 
 export function parseMessage(raw: Record<string, Object>): RemoteMessage {
@@ -200,6 +230,61 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
   // readAutomationOrigin 同源；其它 origin 不能误用自动化的 4 行收起阈值。
   const agentMeta = readObj(raw, 'agentMeta');
   m.agentMeta = agentMeta;
+  if (m.role === 'user' && readBool(agentMeta, 'autoResume', false)) {
+    const info = readObj(agentMeta, 'autoResumeInfo');
+    const data: Record<string, Object> = {};
+    const keys = Object.keys(info);
+    for (let i = 0; i < keys.length; i++) data[keys[i]] = info[keys[i]];
+    const outcome = readStr(agentMeta, 'autoResumeOutcome');
+    if (outcome === 'succeeded' || outcome === 'failed') data['outcome'] = outcome;
+    m.systemCardType = 'auto-resume';
+    m.systemCardData = data;
+    m.isSyntheticTrigger = true;
+  }
+  if (m.systemCardType.length === 0 && m.role === 'assistant') {
+    const completion = readObj(agentMeta, 'goalCompletion');
+    const notice = readStr(agentMeta, 'goalNotice');
+    if (Object.keys(completion).length > 0) {
+      m.systemCardType = 'goal-complete';
+      m.systemCardData = completion;
+    } else if (notice.length > 0) {
+      m.systemCardType = 'goal-resumed';
+      const data: Record<string, Object> = {};
+      data['kind'] = notice;
+      m.systemCardData = data;
+    }
+  }
+  if (m.systemCardType.length === 0 && m.role === 'agent_switch') {
+    m.systemCardType = 'agent-switch';
+    if (m.content !== undefined && typeof m.content === 'object' && !Array.isArray(m.content)) {
+      m.systemCardData = m.content as Record<string, Object>;
+    }
+  }
+  if (m.role === 'user') {
+    const userText = messageUserText(m.content);
+    if (userText.startsWith('[UI_ACTION_TRIGGER]')) m.isSyntheticTrigger = true;
+    const hookSource = readObj(agentMeta, 'hookSource');
+    const hookIm = readStr(hookSource, 'im');
+    if (hookIm === 'slack' || hookIm === 'telegram' || hookIm === 'x') {
+      m.presentedAsAgent = true;
+      const product = hookIm === 'telegram' ? 'Telegram' : hookIm === 'x' ? 'X' : 'Slack';
+      const channel = readStr(hookSource, 'channelName').slice(0, 160);
+      m.originLabel = channel.length > 0 ? `Cindy · ${product} · ${channel}` : `Cindy · ${product}`;
+      const externalText = readStr(hookSource, 'userText');
+      m.originBody = (externalText.length > 0 ? externalText : userText).slice(0, 20000);
+    } else if (m.content !== undefined && typeof m.content === 'object' && !Array.isArray(m.content)) {
+      const content = m.content as Record<string, Object>;
+      if (readStr(content, 'orcaSource') === 'worker') {
+        m.presentedAsAgent = true;
+        m.originLabel = '协作 Agent';
+        const workerContent = content['content'];
+        m.originBody = typeof workerContent === 'string'
+          ? (workerContent as string).slice(0, 20000)
+          : workerContent === undefined ? '' : JSON.stringify(workerContent).slice(0, 20000);
+      }
+    }
+  }
+  m.localOnly = readBool(raw, 'localOnly', false);
   const turnUsageDetails = readObj(agentMeta, 'turnUsageDetails');
   const turnCost = readObj(agentMeta, 'turnCost');
   m.turnCompleted = readBool(raw, 'turnCompleted', false)
@@ -238,6 +323,18 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
     }
   }
   return m;
+}
+
+function messageUserText(content: Object | undefined): string {
+  if (typeof content === 'string') return content;
+  if (content !== undefined && content !== null && typeof content === 'object' && !Array.isArray(content)) {
+    const record = content as Record<string, Object>;
+    const text = record['text'];
+    if (typeof text === 'string') return text as string;
+    const inner = record['content'];
+    if (typeof inner === 'string') return inner as string;
+  }
+  return '';
 }
 
 /** 按 createdAt 升序排序（稳定排序 + rowid 兜底）。 */
