@@ -17,10 +17,19 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
 import { presignGet } from '../core/attachments/AttachmentUpload';
-import { RemoteImageRef, RemoteMediaFetchResult } from '../core/attachments/AttachmentModels';
+import {
+  RemoteImageRef,
+  RemoteMediaFetchResult,
+  RemoteSerializedAttachment,
+} from '../core/attachments/AttachmentModels';
 import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
 import { ComposerImageQueue, MAX_COMPOSER_IMAGES, createRecentPickerOptions } from '../core/attachments/ComposerImageQueue';
-import { PendingInteraction } from '../core/interactions/InteractionStore';
+import { ComposerFile, ComposerFileQueue } from '../core/attachments/ComposerFileQueue';
+import {
+  AskUserDraft,
+  PendingInteraction,
+  PlanReviewDraft,
+} from '../core/interactions/InteractionStore';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
@@ -28,15 +37,17 @@ import { ComposerImage, ConversationComposer } from '../components/ConversationC
 import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
+  UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
-  UI_MOTION_BASE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
+  uiAnimateFastState,
+  uiAnimateState,
   uiFontSize,
   uiLineHeight,
-  uiOverlayEnterTransition,
+  uiOverlayTransition,
   uiRevealTransition,
 } from '../components/UiKit';
 import {
@@ -52,19 +63,69 @@ import {
   parseModelVisibilityOverrides,
   parseProviderModelOptions,
   permissionModeDescription,
-  permissionModeLabel,
 } from '../core/ComposerCatalog';
-import { unwrapInvokeResult } from '../core/tasks/TaskStore';
+import { SessionMetaPatch, unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readNum, readObj, readStr } from '../core/tasks/TaskModels';
+import {
+  PiSessionTreeNode,
+  PiSessionTreeSnapshot,
+  parsePiNavigateResult,
+  parsePiSessionTree,
+} from '../core/tasks/PiSessionTree';
+import {
+  SessionAgentSwitchIntent,
+  parseSessionAgentSwitchIntent,
+  supportsSessionAgentSwitch,
+} from '../core/tasks/SessionAgentSwitch';
 import {
   RenderItem, RenderMessageItem, RenderThinkingItem,
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
-  RenderWorkGroupItem, RenderTextSegment,
+  RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
 } from '../core/messages/MessageRender';
 import {
+  RenderDiffPayload,
+  RenderDiffSegment,
+  RenderMediaPayload,
+} from '../core/messages/MessagePayload';
+import {
   MdBlock, tokenizeInline, InlineToken, parseMarkdown,
 } from '../core/messages/MarkdownParser';
+import {
+  PendingQueueBubble,
+  QueuedInputItem,
+} from '../core/messages/InputQueueStore';
+import { RewindPreview } from '../core/messages/MessageStore';
+import {
+  ComposerDocument,
+  ComposerNode,
+  SerializedComposerDocument,
+  appendComposerNode,
+  composerDocumentHasContent,
+  composerDocumentProjectedText,
+  emptyComposerDocument,
+  isLongComposerPaste,
+  pastedTextNode,
+  mentionNode,
+  quoteNode,
+  reconcileComposerProjectedText,
+  replaceComposerTextRange,
+  serializeComposerDocument,
+  slashCommandNode,
+  textComposerDocument,
+  textNode,
+} from '../core/messages/ComposerDocument';
+import {
+  RemoteMediaResolveIntent,
+  RemoteMediaViewState,
+  beginManualMediaRetry,
+  beginNativeMediaRecovery,
+  beginRemoteMediaResolve,
+  failNativeMediaLoad,
+  remoteMediaResolveFailed,
+  remoteMediaResolveReady,
+} from '../core/messages/RemoteMediaState';
+import { AgentTaskUpdate, WorkflowProgressEntry } from '../core/messages/AgentTaskStore';
 
 /** 活动 work_group 收起态的实时步骤预览行（对齐 Mobile collapsedBody）。 */
 class WorkPreviewRow {
@@ -73,6 +134,18 @@ class WorkPreviewRow {
   text: string = '';
   done: boolean = false;
   error: boolean = false;
+}
+
+class ComposerPaletteItem {
+  kind: string = '';
+  name: string = '';
+  description: string = '';
+  relPath: string = '';
+}
+
+class PiTreeRow {
+  node: PiSessionTreeNode = new PiSessionTreeNode();
+  depth: number = 0;
 }
 
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
@@ -123,7 +196,18 @@ export struct TaskPageContent {
   @Prop paneSessionId: string = '';
   @State items: RenderItem[] = [];
   @State input: string = '';
+  /** TextArea 只是这一语义文档的投影。 */
+  private composerDocument: ComposerDocument = new ComposerDocument();
+  private composerDraftGeneration: number = 0;
   @State sending: boolean = false;
+  /** Desktop 输入投影产生的排队/派发/失败气泡。 */
+  @State queueBubbles: PendingQueueBubble[] = [];
+  @State queuePaused: boolean = false;
+  @State queueProjectionError: string = '';
+  @State queueBusy: boolean = false;
+  @State selectedQueueClientId: string = '';
+  @State editingQueueClientId: string = '';
+  private stashedComposerInput: string = '';
   @State error: string = '';
   @State loadFailed: boolean = false;
   /** 首次历史请求已经结束；空任务据此从“正在同步”切到真实空态。 */
@@ -177,12 +261,33 @@ export struct TaskPageContent {
   @State composerImages: ComposerImage[] = [];
   @State pickingImages: boolean = false;
   private imageQueue: ComposerImageQueue = new ComposerImageQueue();
+  @State composerFiles: ComposerFile[] = [];
+  @State pickingFiles: boolean = false;
+  private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 发送开始后的输入变更不会被旧请求的成功回调清空。 */
   private composerInputRevision: number = 0;
   /** Composer 加号的原生上下文 Sheet。 */
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
   @State contextSelectedUris: string[] = [];
+  /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
+  @State sessionActionOpen: boolean = false;
+  @State sessionRenameMode: boolean = false;
+  @State sessionRenameDraft: string = '';
+  @State sessionActionBusy: boolean = false;
+  @State sessionTreeOpen: boolean = false;
+  @State sessionTreeLoading: boolean = false;
+  @State sessionTreeSwitchingId: string = '';
+  @State sessionTreeError: string = '';
+  @State sessionTree: PiSessionTreeSnapshot | null = null;
+  private sessionTreeGeneration: number = 0;
+  @State messageActionBusyId: string = '';
+  @State composerPaletteMode: string = '';
+  @State composerPaletteItems: ComposerPaletteItem[] = [];
+  @State composerPaletteLoading: boolean = false;
+  private composerPaletteFrom: number = 0;
+  private composerPaletteQuery: string = '';
+  private composerPaletteGeneration: number = 0;
   @State planModeSupported: boolean = false;
   @State planModeEnabled: boolean = false;
   @State permissionOptions: ComposerChoiceOption[] = [];
@@ -200,6 +305,8 @@ export struct TaskPageContent {
   @State alternateEffortOptions: ComposerChoiceOption[] = [];
   @State alternateFastModeCapability: boolean = false;
   @State sessionAgentSwitchSupported: boolean = false;
+  /** 被控端公开的 pending intent；仅用于提示，不提前改任务行的 agent/model。 */
+  @State pendingAgentSwitchIntent: SessionAgentSwitchIntent | null = null;
   @State modelOptionsTargetId: string = '';
   @State contextRpcBusy: boolean = false;
   @State goalState: GoalModeState | null = null;
@@ -211,18 +318,18 @@ export struct TaskPageContent {
   private recentPickerOptions: PickerOptions = createRecentPickerOptions();
   @State recentPickerController: PickerController = new PickerController();
   private permissionModeBeforePlan: string = 'default';
+  private agentSwitchReadGeneration: number = 0;
+  private agentSwitchWriteGeneration: number = 0;
+  private agentSwitchConfirmed: boolean = false;
   /** 历史图片：ref.url → 可加载的 OSS URL（懒解析 + 缓存）。 */
   @State imageSources: Map<string, string> = new Map();
+  @State imageStates: Map<string, RemoteMediaViewState> = new Map();
   private imageResolutions: Map<string, Promise<string>> = new Map();
   private ossUrlCache: Map<string, string> = new Map();
   /** 全屏预览中的图片 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
   /** 挂起的交互请求（Permission / Ask User / Plan Review）。 */
   @State pendingInteractions: PendingInteraction[] = [];
-  /** Ask User 选项选择（requestId → 选中的 label 列表）。 */
-  @State askSelections: Map<string, string[]> = new Map();
-  /** Ask User 自定义输入（requestId → 文本）。 */
-  @State askCustomInputs: Map<string, string> = new Map();
   /** 当前设备是否关闭远程控制（只读提示）。 */
   @State deviceDisabled: boolean = false;
   /** 活动工作组的实时计时基准；与 Mobile 每 500ms 刷新一次。 */
@@ -238,6 +345,15 @@ export struct TaskPageContent {
       this.pickingImages = picking;
     };
     this.imageQueue.isBusy = (): boolean => this.sending;
+    this.imageQueue.occupiedByOtherAttachments = (): number => this.fileQueue.files.length;
+    this.fileQueue.onChanged = (files: ComposerFile[]): void => {
+      this.composerFiles = files;
+    };
+    this.fileQueue.onPickingChanged = (picking: boolean): void => {
+      this.pickingFiles = picking;
+    };
+    this.fileQueue.isBusy = (): boolean => this.sending;
+    this.fileQueue.occupiedByOtherAttachments = (): number => this.imageQueue.images.length;
     const params = router.getParams() as Record<string, Object>;
     this.deviceId = this.paneDeviceId.length > 0
       ? this.paneDeviceId
@@ -260,11 +376,25 @@ export struct TaskPageContent {
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
+    this.agentSwitchConfirmed = false;
+    this.pendingAgentSwitchIntent = null;
+    this.composerDocument = emptyComposerDocument();
+    this.input = '';
+    this.imageSources = new Map();
+    this.imageStates = new Map();
+    this.imageResolutions.clear();
 
     this.unsubs.push(AppServices.instance.messages.onChanged(() => {
       this.refreshItems();
     }));
     this.refreshItems();
+
+    // 输入队列由应用级 Store 持有；页面仅镜像展示并触发操作。
+    this.unsubs.push(AppServices.instance.inputQueue.onChanged(() => {
+      this.refreshQueueState();
+    }));
+    this.refreshQueueState();
+    void AppServices.instance.inputQueue.refresh(this.deviceId, this.sessionId);
 
     // 交互确认：订阅挂起交互 + 拉快照。
     this.unsubs.push(AppServices.instance.interactions.onChanged(() => {
@@ -290,21 +420,46 @@ export struct TaskPageContent {
     this.goalState = AppServices.instance.goals.getState(this.sessionId);
     void AppServices.instance.goals.refresh(this.deviceId, this.sessionId);
     void this.loadComposerCapabilities();
+    void this.invokeContextRpc('notification:clear-session-attention', [this.sessionId, 'explicit']).catch(() => {
+      // 已读清除是幂等增强；旧被控端不支持时不阻塞详情页。
+    });
 
     this.beginInitialLoad();
+    this.restoreComposerDraft();
   }
 
   aboutToDisappear(): void {
     this.initialScrollGeneration += 1;
     this.initialLoadGeneration += 1;
+    this.agentSwitchReadGeneration += 1;
+    this.agentSwitchWriteGeneration += 1;
     this.initialScrollSettling = false;
     this.contextSheetOpen = false;
+    this.sessionActionOpen = false;
+    this.sessionTreeOpen = false;
+    this.sessionTreeGeneration += 1;
+    this.composerPaletteGeneration += 1;
+    this.composerPaletteMode = '';
+    this.composerDraftGeneration += 1;
+    void AppServices.instance.composerDrafts.flush(this.sessionId);
+    if (this.editingQueueClientId.length > 0) {
+      void AppServices.instance.inputQueue.setEditLock(
+        this.deviceId, this.sessionId, this.editingQueueClientId, false).catch(() => {
+      });
+    }
     this.stopWorkClock();
     for (const u of this.unsubs) {
       u();
     }
     this.unsubs = [];
     void AppServices.instance.messages.closeSession(this.sessionId);
+  }
+
+  private refreshQueueState(): void {
+    const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
+    this.queueBubbles = AppServices.instance.inputQueue.getBubbles(this.sessionId);
+    this.queuePaused = projection.queuePaused;
+    this.queueProjectionError = projection.error;
   }
 
   /**
@@ -374,6 +529,11 @@ export struct TaskPageContent {
     if (session.permissionMode.length > 0 && session.permissionMode !== 'plan') {
       this.permissionModeBeforePlan = session.permissionMode;
     }
+    if (this.pendingAgentSwitchIntent !== null
+      && this.pendingAgentSwitchIntent.targetAgentKind === this.currentAgentTab()
+      && this.pendingAgentSwitchIntent.model === session.model) {
+      this.pendingAgentSwitchIntent = null;
+    }
   }
 
   private agentKindForCapability(session: RemoteSession): string {
@@ -425,6 +585,7 @@ export struct TaskPageContent {
       await this.loadProviderModelOptions(this.currentAgentTab());
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
       this.modelAgentTab = this.currentAgentTab();
+      void this.loadPendingAgentSwitchIntent();
       if (this.session()?.permissionMode === 'plan') {
         let rememberedSupported = false;
         for (let i = 0; i < this.permissionOptions.length; i++) {
@@ -455,6 +616,29 @@ export struct TaskPageContent {
       this.effortOptions = [];
       this.fastModeCapability = false;
       this.sessionAgentSwitchSupported = false;
+      this.pendingAgentSwitchIntent = null;
+    }
+  }
+
+  private canSwitchSessionAgent(): boolean {
+    return supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
+  }
+
+  private async loadPendingAgentSwitchIntent(): Promise<void> {
+    const session = this.session();
+    const generation = ++this.agentSwitchReadGeneration;
+    if (!supportsSessionAgentSwitch(session, this.sessionAgentSwitchSupported) || session === undefined) {
+      this.pendingAgentSwitchIntent = null;
+      return;
+    }
+    try {
+      const result = await this.invokeContextRpc('maker:get-session-agent-switch-intent', [session.id]);
+      if (generation !== this.agentSwitchReadGeneration || this.sessionId !== session.id) return;
+      this.pendingAgentSwitchIntent = parseSessionAgentSwitchIntent(result);
+    } catch (e) {
+      if (generation !== this.agentSwitchReadGeneration || this.sessionId !== session.id) return;
+      // 旧被控端可能没有只读 intent RPC；入口能力仍由 capabilities 决定。
+      this.pendingAgentSwitchIntent = null;
     }
   }
 
@@ -537,16 +721,6 @@ export struct TaskPageContent {
       return '';
     }
     return session.permissionMode === 'plan' ? this.permissionModeBeforePlan : session.permissionMode;
-  }
-
-  private currentPermissionLabel(): string {
-    const mode = this.effectivePermissionMode();
-    for (let i = 0; i < this.permissionOptions.length; i++) {
-      if (this.permissionOptions[i].id === mode) {
-        return this.permissionOptions[i].label;
-      }
-    }
-    return permissionModeLabel(mode, mode);
   }
 
   private currentAgentTab(): string {
@@ -759,7 +933,7 @@ export struct TaskPageContent {
 
   private async browseModelAgent(kind: string): Promise<void> {
     if (kind === this.modelAgentTab || this.contextRpcBusy) return;
-    if (!this.sessionAgentSwitchSupported) {
+    if (!this.canSwitchSessionAgent()) {
       promptAction.showToast({ message: '当前任务不支持切换 Agent' });
       return;
     }
@@ -849,6 +1023,29 @@ export struct TaskPageContent {
     }
     const targetAgent = this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
     const currentAgent = this.currentAgentTab();
+    if (targetAgent !== currentAgent && !this.canSwitchSessionAgent()) {
+      promptAction.showToast({ message: '当前任务不支持切换 Agent' });
+      return;
+    }
+    if (targetAgent !== currentAgent && !this.agentSwitchConfirmed) {
+      this.getUIContext().showAlertDialog({
+        title: `切换到 ${modelAgentLabel(targetAgent)}`,
+        message: '当前任务的上下文会保留，Agent 将在安全边界切换；正在运行时会等本轮结束后生效。',
+        primaryButton: {
+          value: '取消',
+          action: () => {
+          },
+        },
+        secondaryButton: {
+          value: '继续',
+          action: () => {
+            this.agentSwitchConfirmed = true;
+            void this.selectComposerModel(option, keepOpen);
+          },
+        },
+      });
+      return;
+    }
     if (session.model === option.id && targetAgent === currentAgent) {
       if (keepOpen) this.contextSheetPage = 'model-options';
       else this.contextSheetOpen = false;
@@ -858,12 +1055,15 @@ export struct TaskPageContent {
     try {
       let result: Object | undefined;
       if (targetAgent !== currentAgent) {
+        const writeGeneration = ++this.agentSwitchWriteGeneration;
         const effort = option.defaultEffort.length > 0
           ? option.defaultEffort
           : (option.efforts.length > 0 ? option.efforts[0] : '');
         result = await this.invokeContextRpc('maker:switch-session-agent', [
           session.id, targetAgent, option.id, option.providerId, effort, false,
         ]);
+        if (writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) return;
+        await this.loadPendingAgentSwitchIntent();
       } else {
         const args: Object[] = option.providerId.length > 0
           ? [session.id, option.id, option.providerId]
@@ -953,8 +1153,7 @@ export struct TaskPageContent {
       }
       await AppServices.instance.goals.start(this.deviceId, this.sessionId, objective, limits);
       this.goalState = AppServices.instance.goals.getState(this.sessionId);
-      this.input = '';
-      this.composerInputRevision += 1;
+      this.setComposerDocument(emptyComposerDocument());
       this.contextSheetOpen = false;
       this.contextSheetPage = 'main';
       this.followLatestSoon();
@@ -1023,8 +1222,13 @@ export struct TaskPageContent {
   }
 
   private send(): void {
-    const text = this.input.trim();
+    const serialized: SerializedComposerDocument = serializeComposerDocument(this.composerDocument);
+    const text = serialized.text;
     if (this.sending) return;
+    if (this.editingQueueClientId.length > 0) {
+      this.saveQueueEdit(text);
+      return;
+    }
     if (this.deviceDisabled) {
       promptAction.showToast({ message: '设备已关闭远程控制，仅可查看' });
       return;
@@ -1037,34 +1241,175 @@ export struct TaskPageContent {
       promptAction.showToast({ message: '请重试或移除上传失败的图片' });
       return;
     }
+    if (this.fileQueue.hasUploading()) {
+      promptAction.showToast({ message: '文件上传中，请稍候' });
+      return;
+    }
+    if (this.fileQueue.hasFailed()) {
+      promptAction.showToast({ message: '请重试或移除上传失败的文件' });
+      return;
+    }
     const readyImages = this.imageQueue.readyImages();
-    if (text.length === 0 && readyImages.length === 0) return;
+    const readyFiles = this.fileQueue.readyFiles();
+    if (text.length === 0 && readyImages.length === 0 && readyFiles.length === 0) return;
     const s = this.session();
     if (s === undefined) {
       this.error = '任务信息缺失，请返回列表重新进入';
       return;
     }
-    const sentInputRevision = this.composerInputRevision;
     const sentImages = this.imageQueue.images.slice();
+    const sentFiles = this.fileQueue.files.slice();
+    // 点发送后当帧清空 composer；同一个 clientId 的 pending 气泡立即进入消息流。
+    this.composerDocument = emptyComposerDocument();
+    this.input = '';
+    this.composerInputRevision += 1;
+    AppServices.instance.composerDrafts.clear(this.sessionId);
+    this.imageQueue.removeSent(sentImages);
+    this.fileQueue.removeSent(sentFiles);
     this.sending = true;
     this.error = '';
-    AppServices.instance.messages.sendText(this.deviceId, s, text, readyImages).then(() => {
-      if (this.composerInputRevision === sentInputRevision) {
-        this.input = '';
-        this.composerInputRevision += 1;
-      }
-      this.imageQueue.removeSent(sentImages);
+    AppServices.instance.inputQueue.enqueueDocument(
+      this.deviceId, s, serialized, readyImages, readyFiles).then(() => {
       this.sending = false;
+      this.followLatestSoon();
     }).catch((e: Error) => {
       this.sending = false;
-      this.error = `发送失败：${e.message}`;
+      this.error = `消息未确认发送：${e.message}`;
+    });
+  }
+
+  private queueItem(clientId: string): QueuedInputItem | null {
+    const queue = AppServices.instance.inputQueue.getProjection(this.sessionId).pendingQueue;
+    for (let i = 0; i < queue.length; i++) {
+      if (queue[i].clientId === clientId) return queue[i];
+    }
+    return null;
+  }
+
+  private beginQueueEdit(clientId: string): void {
+    if (this.queueBusy || this.editingQueueClientId === clientId) return;
+    const item = this.queueItem(clientId);
+    if (item === null) return;
+    const previous = this.editingQueueClientId;
+    const start = (): void => {
+      this.stashedComposerInput = previous.length > 0 ? this.stashedComposerInput : this.input;
+      this.editingQueueClientId = clientId;
+      this.setComposerDocument(textComposerDocument(item.text), false);
+      this.selectedQueueClientId = '';
+      void AppServices.instance.inputQueue.setEditLock(
+        this.deviceId, this.sessionId, clientId, true).catch(() => {
+        this.cancelQueueEdit();
+        promptAction.showToast({ message: '无法锁定这条队列消息' });
+      });
+    };
+    if (previous.length > 0) {
+      void AppServices.instance.inputQueue.setEditLock(
+        this.deviceId, this.sessionId, previous, false).finally(start);
+    } else {
+      start();
+    }
+  }
+
+  private saveQueueEdit(text: string): void {
+    const clientId = this.editingQueueClientId;
+    if (clientId.length === 0 || text.length === 0 || this.queueBusy) return;
+    this.queueBusy = true;
+    this.sending = true;
+    AppServices.instance.inputQueue.updateText(
+      this.deviceId, this.sessionId, clientId, text,
+    ).then(() => AppServices.instance.inputQueue.setEditLock(
+      this.deviceId, this.sessionId, clientId, false,
+    )).then(() => {
+      this.editingQueueClientId = '';
+      this.composerDocument = textComposerDocument(this.stashedComposerInput);
+      this.input = this.stashedComposerInput;
+      this.stashedComposerInput = '';
+      this.composerInputRevision += 1;
+    }).catch(() => {
+      promptAction.showToast({ message: '队列消息未保存，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
+      this.sending = false;
+    });
+  }
+
+  private cancelQueueEdit(): void {
+    const clientId = this.editingQueueClientId;
+    if (clientId.length === 0) return;
+    this.editingQueueClientId = '';
+    this.composerDocument = textComposerDocument(this.stashedComposerInput);
+    this.input = this.stashedComposerInput;
+    this.stashedComposerInput = '';
+    this.composerInputRevision += 1;
+    void AppServices.instance.inputQueue.setEditLock(
+      this.deviceId, this.sessionId, clientId, false).catch(() => {
+    });
+  }
+
+  private removeQueueItem(clientId: string): void {
+    if (this.queueBusy) return;
+    this.queueBusy = true;
+    this.selectedQueueClientId = '';
+    if (this.editingQueueClientId === clientId) this.cancelQueueEdit();
+    AppServices.instance.inputQueue.remove(this.deviceId, this.sessionId, clientId).catch(() => {
+      promptAction.showToast({ message: '队列消息未删除，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private moveQueueItem(clientId: string, direction: number): void {
+    if (this.queueBusy) return;
+    const queue = AppServices.instance.inputQueue.getProjection(this.sessionId).pendingQueue;
+    const index = queue.findIndex((item: QueuedInputItem) => item.clientId === clientId);
+    if (index < 0) return;
+    const targetIndex = direction < 0 ? index - 1 : index + 2;
+    if (targetIndex < 0 || targetIndex > queue.length) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.move(
+      this.deviceId, this.sessionId, clientId, targetIndex,
+    ).catch(() => {
+      promptAction.showToast({ message: '队列顺序未更新，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private steerQueueItem(clientId: string): void {
+    if (this.queueBusy || !this.sessionStreaming) return;
+    this.queueBusy = true;
+    this.selectedQueueClientId = '';
+    AppServices.instance.inputQueue.steer(this.deviceId, this.sessionId, clientId).catch(() => {
+      promptAction.showToast({ message: '插话未发送，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private retryQueueItem(clientId: string): void {
+    if (this.queueBusy) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.retry(this.deviceId, this.sessionId, clientId).catch(() => {
+      promptAction.showToast({ message: '消息仍未发送，请检查连接' });
+    }).finally(() => {
+      this.queueBusy = false;
+    });
+  }
+
+  private resumeQueue(): void {
+    if (this.queueBusy) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.resume(this.deviceId, this.sessionId).catch(() => {
+      promptAction.showToast({ message: '队列未恢复，请重试' });
+    }).finally(() => {
+      this.queueBusy = false;
     });
   }
 
   // ─── Composer 上下文与图片附件 ──────────────────────────────────────────────
 
   private openContextSheet(): void {
-    if (this.sending || this.pickingImages || this.deviceDisabled) {
+    if (this.sending || this.pickingImages || this.pickingFiles || this.deviceDisabled) {
       return;
     }
     this.contextSheetPage = 'main';
@@ -1137,8 +1482,24 @@ export struct TaskPageContent {
     this.imageQueue.takePhoto(getContext(this) as common.UIAbilityContext);
   }
 
+  private pickFiles(): void {
+    if (this.pickingFiles || this.sending) return;
+    if (this.fileQueue.remainingSlots() <= 0) {
+      promptAction.showToast({ message: '每条消息最多添加 20 个附件' });
+      return;
+    }
+    this.contextSheetOpen = false;
+    this.fileQueue.pick(getContext(this) as common.UIAbilityContext);
+  }
+
   private abort(): void {
-    AppServices.instance.messages.abort(this.deviceId, this.sessionId).catch(() => {
+    if (this.queueBusy) return;
+    this.queueBusy = true;
+    AppServices.instance.inputQueue.stop(this.deviceId, this.sessionId).catch(() => {
+      // 兼容尚未实现 input queue 的旧 Desktop。
+      return AppServices.instance.messages.abort(this.deviceId, this.sessionId);
+    }).finally(() => {
+      this.queueBusy = false;
     });
   }
 
@@ -1168,8 +1529,18 @@ export struct TaskPageContent {
     this.syncMessageCount();
     const previousTailToken = this.renderTailToken(this.items);
     const messages = AppServices.instance.messages.getMessagesWithStreaming(this.sessionId);
+    const deliveredClientIds = new Set<string>();
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].clientId.length > 0) deliveredClientIds.add(messages[i].clientId);
+    }
+    AppServices.instance.inputQueue.setDeliveredClientIds(this.sessionId, deliveredClientIds);
     const streaming = AppServices.instance.messages.isSessionStreaming(this.sessionId);
-    const nextItems = buildRenderItems(messages, streaming);
+    const nextItems = buildRenderItems(
+      messages,
+      streaming,
+      AppServices.instance.messages.getTaskUpdates(this.sessionId),
+      AppServices.instance.messages.isMakerTurnRunning(this.sessionId),
+    );
     const nextTailToken = this.renderTailToken(nextItems);
     const tailChanged = previousTailToken.length > 0 && previousTailToken !== nextTailToken;
     this.sessionStreaming = streaming;
@@ -1211,6 +1582,17 @@ export struct TaskPageContent {
     if (item.type === 'tool_media') {
       const media = item as RenderToolMediaItem;
       return `${item.key}:media:${media.images.length}`;
+    }
+    if (item.type === 'agent_task') {
+      const task = item as RenderAgentTaskItem;
+      const status = task.update !== null
+        ? task.update.status : (task.tool !== null && task.tool.hasResult ? 'completed' : 'running');
+      const progress = task.update !== null ? task.update.workflowProgress.length : 0;
+      return `${item.key}:agent:${status}:${progress}`;
+    }
+    if (item.type === 'subagent_group') {
+      const group = item as RenderSubagentGroupItem;
+      return `${item.key}:subagent:${group.status}:${group.children.length}:${this.renderTailToken(group.children)}`;
     }
     if (item.type === 'thinking') {
       return `${item.key}:thinking:${(item as RenderThinkingItem).body.length}`;
@@ -1560,6 +1942,30 @@ export struct TaskPageContent {
     return list.concat([key]);
   }
 
+  private toggleTextBlock(key: string): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, key);
+    });
+  }
+
+  private toggleThinkingBlock(key: string): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.expandedThinking = this.toggleExpanded(this.expandedThinking, key);
+    });
+  }
+
+  private toggleWorkGroup(key: string): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.expandedWorkGroups = this.toggleExpanded(this.expandedWorkGroups, key);
+    });
+  }
+
+  private toggleToolDetails(key: string): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.expandedTools = this.toggleExpanded(this.expandedTools, key);
+    });
+  }
+
   private isIn(list: string[], key: string): boolean {
     return list.indexOf(key) >= 0;
   }
@@ -1641,19 +2047,194 @@ export struct TaskPageContent {
   }
 
   private closeSearch(): void {
-    this.searchOpen = false;
-    this.searchQuery = '';
-    this.searchActiveIndex = 0;
+    uiAnimateState(this.getUIContext(), () => {
+      this.searchOpen = false;
+      this.searchQuery = '';
+      this.searchActiveIndex = 0;
+    });
+  }
+
+  private openSearch(): void {
+    uiAnimateState(this.getUIContext(), () => {
+      this.searchOpen = true;
+    });
+  }
+
+  private closeImagePreview(): void {
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.previewImageUrl = '';
+    });
   }
 
   private hasComposerContent(): boolean {
-    return this.input.trim().length > 0 || this.composerImages.length > 0;
+    return composerDocumentHasContent(this.composerDocument)
+      || this.composerImages.length > 0 || this.composerFiles.length > 0;
   }
 
   private canSend(): boolean {
     if (this.sending || this.deviceDisabled) return false;
-    if (!this.imageQueue.allSettled()) return false;
-    return this.input.trim().length > 0 || this.imageQueue.readyImages().length > 0;
+    if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) return false;
+    return composerDocumentHasContent(this.composerDocument)
+      || this.imageQueue.readyImages().length > 0 || this.fileQueue.readyFiles().length > 0;
+  }
+
+  private restoreComposerDraft(): void {
+    const sessionId = this.sessionId;
+    const generation = ++this.composerDraftGeneration;
+    void AppServices.instance.composerDrafts.read(sessionId).then((document: ComposerDocument | null) => {
+      if (generation !== this.composerDraftGeneration || sessionId !== this.sessionId || document === null) return;
+      this.setComposerDocument(document, false);
+    });
+  }
+
+  private setComposerDocument(document: ComposerDocument, persist: boolean = true): void {
+    this.composerDocument = document;
+    this.input = composerDocumentProjectedText(document);
+    this.composerInputRevision += 1;
+    if (persist && this.editingQueueClientId.length === 0) {
+      AppServices.instance.composerDrafts.save(this.sessionId, document);
+    }
+  }
+
+  private applyComposerTextChange(value: string): void {
+    const previous = composerDocumentProjectedText(this.composerDocument);
+    let prefix = 0;
+    while (prefix < previous.length && prefix < value.length
+      && previous.charCodeAt(prefix) === value.charCodeAt(prefix)) prefix += 1;
+    let suffix = 0;
+    while (suffix < previous.length - prefix && suffix < value.length - prefix
+      && previous.charCodeAt(previous.length - 1 - suffix)
+        === value.charCodeAt(value.length - 1 - suffix)) suffix += 1;
+    const inserted = value.slice(prefix, value.length - suffix);
+    const document = isLongComposerPaste(inserted)
+      ? replaceComposerTextRange(this.composerDocument, prefix, previous.length - suffix,
+        [pastedTextNode(inserted)])
+      : reconcileComposerProjectedText(this.composerDocument, value);
+    this.setComposerDocument(document);
+    this.updateComposerPalette(value);
+  }
+
+  private updateComposerPalette(value: string): void {
+    let mode = '';
+    let query = '';
+    let from = 0;
+    if (value.startsWith('/') && !/\s/.test(value.slice(1))) {
+      mode = 'slash';
+      query = value.slice(1);
+    } else {
+      const at = value.lastIndexOf('@');
+      if (at >= 0 && (at === 0 || /\s/.test(value[at - 1]))) {
+        const run = value.slice(at + 1);
+        if (!/\s/.test(run)) {
+          mode = 'at';
+          query = run;
+          from = at;
+        }
+      }
+    }
+    if (mode.length === 0) {
+      this.composerPaletteGeneration += 1;
+      this.composerPaletteMode = '';
+      this.composerPaletteItems = [];
+      this.composerPaletteLoading = false;
+      return;
+    }
+    this.composerPaletteMode = mode;
+    this.composerPaletteQuery = query;
+    this.composerPaletteFrom = from;
+    void this.loadComposerPalette(mode, query);
+  }
+
+  private parsePaletteRows(value: Object | undefined, field: string, kindFallback: string): ComposerPaletteItem[] {
+    if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return [];
+    const record = value as Record<string, Object>;
+    if (record['success'] === false || !Array.isArray(record[field])) return [];
+    const rows = record[field] as Object[];
+    const out: ComposerPaletteItem[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const row = raw as Record<string, Object>;
+      const item = new ComposerPaletteItem();
+      item.kind = readStr(row, 'kind') || readStr(row, 'type') || kindFallback;
+      item.name = readStr(row, 'name');
+      item.description = readStr(row, 'description');
+      item.relPath = readStr(row, 'relPath');
+      if (item.name.length > 0 || item.relPath.length > 0) out.push(item);
+    }
+    return out;
+  }
+
+  private async loadComposerPalette(mode: string, query: string): Promise<void> {
+    const generation = ++this.composerPaletteGeneration;
+    this.composerPaletteLoading = true;
+    try {
+      let items: ComposerPaletteItem[] = [];
+      const session = this.session();
+      if (mode === 'slash') {
+        const agent = this.agentKindForCapability(session ?? new RemoteSession());
+        const options: Record<string, Object> = {};
+        if ((session?.workingDir ?? '').length > 0) options['workingDir'] = session?.workingDir ?? '';
+        const results = await Promise.all([
+          this.invokeContextRpc('maker:list-agent-commands', [agent]).catch(() => undefined),
+          this.invokeContextRpc('maker:list-agent-skills', [agent, options]).catch(() => undefined),
+          this.invokeContextRpc('maker:list-desktop-commands', []).catch(() => undefined),
+        ]);
+        const skills = this.parsePaletteRows(results[1], 'skills', 'agent-skill');
+        const desktop = this.parsePaletteRows(results[2], 'commands', 'desktop')
+          .filter((item: ComposerPaletteItem) => item.name === 'learn');
+        const builtins = this.parsePaletteRows(results[0], 'commands', 'agent-builtin');
+        const seen = new Set<string>();
+        const merged = skills.concat(desktop).concat(builtins);
+        for (let i = 0; i < merged.length; i++) {
+          const key = merged[i].name.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          if (query.length === 0 || key.startsWith(query.toLowerCase())) items.push(merged[i]);
+          if (items.length >= 8) break;
+        }
+      } else {
+        const options: Record<string, Object> = {};
+        options['workingDir'] = session?.workingDir ?? '';
+        options['cap'] = 2000;
+        options['query'] = query;
+        const result = await this.invokeContextRpc('maker:scan-at-resources', [
+          this.agentKindForCapability(session ?? new RemoteSession()), options,
+        ]);
+        items = this.parsePaletteRows(result, 'items', 'file').slice(0, 8);
+      }
+      if (generation !== this.composerPaletteGeneration || mode !== this.composerPaletteMode
+        || query !== this.composerPaletteQuery) return;
+      this.composerPaletteItems = items;
+    } catch (e) {
+      if (generation === this.composerPaletteGeneration) this.composerPaletteItems = [];
+    } finally {
+      if (generation === this.composerPaletteGeneration) this.composerPaletteLoading = false;
+    }
+  }
+
+  private paletteMentionRaw(item: ComposerPaletteItem): string {
+    const path = item.relPath.length > 0 ? item.relPath : item.name;
+    const normalized = item.kind === 'dir' && !path.endsWith('/') ? `${path}/` : path;
+    return /\s/.test(normalized) || normalized.indexOf('"') >= 0
+      ? `@"${normalized.replace(/"/g, '\\"')}"` : `@${normalized}`;
+  }
+
+  private selectComposerPaletteItem(item: ComposerPaletteItem): void {
+    const to = composerDocumentProjectedText(this.composerDocument).length;
+    let replacement: ComposerNode[] = [];
+    if (this.composerPaletteMode === 'slash') {
+      replacement = [slashCommandNode(item.name), textNode(' ')];
+    } else {
+      const raw = this.paletteMentionRaw(item);
+      replacement = [mentionNode(item.kind, item.name, raw), textNode(' ')];
+    }
+    this.setComposerDocument(replaceComposerTextRange(
+      this.composerDocument, this.composerPaletteFrom, to, replacement));
+    this.composerPaletteGeneration += 1;
+    this.composerPaletteMode = '';
+    this.composerPaletteItems = [];
+    setTimeout(() => focusControl.requestFocus('task-composer-input'), 0);
   }
 
   build() {
@@ -1700,6 +2281,9 @@ export struct TaskPageContent {
           .border({ width: { top: 1 }, color: { top: $r('app.color.chat_header_divider') } })
       } else if (this.pendingInteractions.length === 0) {
         // Mobile 中可由本机完成的 pending 会接管 Composer，避免等待确认时继续发送。
+        if (this.composerPaletteMode.length > 0) {
+          this.composerPalettePanel()
+        }
         this.composerBar()
       }
 
@@ -1710,27 +2294,34 @@ export struct TaskPageContent {
             .width('100%')
             .height('100%')
             .objectFit(ImageFit.Contain)
-          Text('×')
-            .fontSize(uiFontSize(22))
-            .fontColor($r('app.color.chat_overlay_text'))
-            .backgroundColor($r('app.color.overlay'))
-            .width(36)
-            .height(36)
-            .textAlign(TextAlign.Center)
-            .borderRadius(18)
-            .position({ x: 16, y: 48 })
-            .onClick(() => {
-              this.previewImageUrl = '';
-            })
+          Button() {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(uiFontSize(16))
+              .fontColor([$r('app.color.chat_overlay_text')])
+          }
+          .type(ButtonType.Circle)
+          .width(40)
+          .height(40)
+          .padding(0)
+          .backgroundColor($r('app.color.overlay'))
+          .clickEffect(UI_ICON_CLICK_EFFECT)
+          .position({ x: 16, y: 48 })
+          .onClick(() => this.closeImagePreview())
         }
         .width('100%')
         .height('100%')
         .position({ x: 0, y: 0 })
         .zIndex(99)
         .backgroundColor($r('app.color.chat_overlay_surface'))
-        .onClick(() => {
-          this.previewImageUrl = '';
-        })
+        .transition(uiOverlayTransition())
+        .onClick(() => this.closeImagePreview())
+      }
+
+      if (this.sessionActionOpen) {
+        this.sessionActionLayer()
+      }
+      if (this.sessionTreeOpen) {
+        this.sessionTreeLayer()
       }
     }
     .width('100%')
@@ -1747,23 +2338,334 @@ export struct TaskPageContent {
     })
   }
 
-  /** iOS 同层级会话 Header：50vp 内容高、44vp 返回热区与 38vp 动作槽。 */
+  private contextUsageLabel(): string {
+    const session = this.session();
+    if (session === undefined) return '';
+    if (session.contextWindow > 0) {
+      const percent = Math.min(100, Math.round(session.contextTokens * 100 / session.contextWindow));
+      return `${session.contextTokens.toLocaleString()} / ${session.contextWindow.toLocaleString()} tokens · ${percent}%`;
+    }
+    if (session.totalTokenUsage > 0) return `${session.totalTokenUsage.toLocaleString()} tokens`;
+    return '';
+  }
+
+  @Builder
+  sessionActionLayer() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.task_list_overlay'))
+        .onClick(() => this.closeSessionActions())
+
+      Scroll() {
+        Column({ space: 8 }) {
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text(this.sessionTitle())
+                .fontSize(uiFontSize(16))
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(`${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.session()?.model || '默认模型'}`)
+                .fontSize(uiFontSize(12))
+                .fontColor($r('app.color.text_secondary'))
+                .maxLines(1)
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Button() {
+              SymbolGlyph($r('sys.symbol.xmark'))
+                .fontSize(uiFontSize(14))
+                .fontColor([$r('app.color.text_secondary')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .padding(0)
+            .backgroundColor($r('app.color.bg_chip'))
+            .onClick(() => this.closeSessionActions())
+          }
+          .width('100%')
+          .padding({ bottom: 4 })
+
+          if (this.sessionRenameMode) {
+            TextInput({ placeholder: '任务名称', text: this.sessionRenameDraft })
+              .fontSize(uiFontSize(15))
+              .fontColor($r('app.color.text_primary'))
+              .caretColor($r('app.color.accent'))
+              .height(44)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor($r('app.color.bg_chip'))
+              .border({ width: 1, color: $r('app.color.border') })
+              .borderRadius(UI_RADIUS_CONTROL)
+              .enabled(!this.sessionActionBusy)
+              .onChange((value: string) => this.sessionRenameDraft = value)
+            Row({ space: 8 }) {
+              Button('取消')
+                .layoutWeight(1)
+                .height(40)
+                .fontSize(uiFontSize(14))
+                .fontColor($r('app.color.text_primary'))
+                .backgroundColor($r('app.color.bg_chip'))
+                .borderRadius(UI_RADIUS_PILL)
+                .enabled(!this.sessionActionBusy)
+                .onClick(() => this.sessionRenameMode = false)
+              Button(this.sessionActionBusy ? '保存中…' : '保存')
+                .layoutWeight(1)
+                .height(40)
+                .fontSize(uiFontSize(14))
+                .fontColor($r('app.color.chat_cta_text'))
+                .backgroundColor($r('app.color.chat_cta'))
+                .borderRadius(UI_RADIUS_PILL)
+                .enabled(!this.sessionActionBusy && this.sessionRenameDraft.trim().length > 0)
+                .onClick(() => this.saveSessionRename())
+            }
+          } else {
+            this.sessionActionOption('重命名', $r('sys.symbol.doc_text'), false,
+              () => this.sessionRenameMode = true)
+            this.sessionActionOption('AI 起名', $r('sys.symbol.wand_and_stars'), false,
+              () => void this.generateSessionRename())
+            this.sessionActionOption('复制任务链接', $r('sys.symbol.link'), false, () => {
+              this.copyPlainText(`cindy://session/${encodeURIComponent(this.sessionId)}`, '已复制任务链接');
+            })
+            if ((this.session()?.agentKind ?? '') === 'pi') {
+              this.sessionActionOption('任务分支', $r('sys.symbol.split'), false,
+                () => this.openSessionTree())
+            }
+            this.sessionActionOption((this.session()?.pinnedAt ?? '').length > 0 ? '取消置顶' : '置顶',
+              $r('sys.symbol.pin'), false, () => this.toggleSessionPinned())
+            this.sessionActionOption(this.session()?.status === 'archived' ? '恢复任务' : '归档任务',
+              $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
+
+            if ((this.session()?.workingDir ?? '').length > 0) {
+              this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
+                this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
+              })
+            }
+            if ((this.session()?.worktreePath ?? '').length > 0) {
+              this.sessionMetadataRow('Worktree', this.session()?.worktreePath ?? '', () => {
+                this.copyPlainText(this.session()?.worktreePath ?? '', '已复制 Worktree 路径');
+              })
+            }
+            if (this.contextUsageLabel().length > 0) {
+              this.sessionMetadataRow('上下文用量', this.contextUsageLabel(), () => {})
+            }
+            ForEach(this.session()?.extraDirs ?? [], (path: string, index: number) => {
+              this.sessionMetadataRow(index === 0 ? '附加目录' : '', path,
+                () => this.copyPlainText(path, '已复制附加目录'))
+            }, (path: string, index: number) => `${index}-${path}`)
+            if ((this.session()?.parentSessionId ?? '').length > 0) {
+              this.sessionMetadataRow('父任务', this.session()?.parentSessionId ?? '', () => {
+                this.copyPlainText(this.session()?.parentSessionId ?? '', '已复制父任务 ID');
+              })
+            }
+            if ((this.session()?.orcaRole ?? '').length > 0) {
+              this.sessionMetadataRow('协作分支', this.session()?.orcaRole ?? '', () => {})
+            }
+
+            this.sessionActionOption('删除任务', $r('sys.symbol.trash'), true,
+              () => this.confirmDeleteSession())
+          }
+        }
+        .width('100%')
+        .padding(16)
+      }
+      .width('calc(100% - 24vp)')
+      .constraintSize({ maxWidth: 620, maxHeight: '82%' })
+      .margin({ left: 12, right: 12, bottom: 12 })
+      .backgroundColor($r('app.color.task_list_menu_surface'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
+      .transition(uiOverlayTransition())
+    }
+    .width('100%')
+    .height('100%')
+    .position({ x: 0, y: 0 })
+    .zIndex(98)
+  }
+
+  @Builder
+  sessionActionOption(label: string, symbol: Resource, danger: boolean, action: () => void) {
+    Button() {
+      Row({ space: 10 }) {
+        SymbolGlyph(symbol)
+          .fontSize(uiFontSize(17))
+          .fontColor([danger ? $r('app.color.danger') : $r('app.color.text_secondary')])
+          .width(24)
+        Text(label)
+          .fontSize(uiFontSize(15))
+          .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+          .layoutWeight(1)
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+    }
+    .type(ButtonType.Normal)
+    .width('100%')
+    .height(44)
+    .padding({ left: 10, right: 10 })
+    .backgroundColor(Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTROL)
+    .enabled(!this.sessionActionBusy)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(action)
+  }
+
+  private piTreeRows(): PiTreeRow[] {
+    const out: PiTreeRow[] = [];
+    const tree = this.sessionTree;
+    if (tree === null) return out;
+    const append = (nodes: PiSessionTreeNode[], depth: number): void => {
+      for (let i = 0; i < nodes.length; i++) {
+        const row = new PiTreeRow();
+        row.node = nodes[i];
+        row.depth = depth;
+        out.push(row);
+        append(nodes[i].children, depth + 1);
+      }
+    };
+    append(tree.roots, 0);
+    return out;
+  }
+
+  private piRoleLabel(role: string): string {
+    if (role === 'user') return '用户';
+    if (role === 'assistant') return '助手';
+    if (role === 'tool') return '工具';
+    if (role === 'summary') return '摘要';
+    return role.length > 0 ? role : '分支';
+  }
+
+  @Builder
+  sessionTreeLayer() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column().width('100%').height('100%').backgroundColor($r('app.color.overlay'))
+        .onClick(() => this.closeSessionTree())
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          Text('任务分支')
+            .fontSize(uiFontSize(18))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          Button() {
+            SymbolGlyph($r('sys.symbol.xmark')).fontSize(uiFontSize(14))
+              .fontColor([$r('app.color.text_secondary')])
+          }
+          .type(ButtonType.Circle).width(36).height(36).padding(0)
+          .backgroundColor($r('app.color.bg_chip')).onClick(() => this.closeSessionTree())
+        }
+        .width('100%')
+        if (this.sessionStreaming) {
+          Text('任务运行中，结束后才能切换分支')
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary')).width('100%')
+        }
+        if (this.sessionTreeLoading) {
+          Row({ space: 8 }) {
+            LoadingProgress().width(16).height(16)
+            Text('正在读取分支').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+          }.height(120).justifyContent(FlexAlign.Center)
+        } else if (this.sessionTreeError.length > 0) {
+          Column({ space: 8 }) {
+            Text(this.sessionTreeError).fontSize(uiFontSize(13)).fontColor($r('app.color.danger'))
+            Button('重试').onClick(() => void this.loadSessionTree())
+          }.height(120).justifyContent(FlexAlign.Center)
+        } else if (this.piTreeRows().length === 0) {
+          Text('当前任务还没有可切换的分支')
+            .fontSize(uiFontSize(13)).fontColor($r('app.color.text_tertiary'))
+            .height(120)
+        } else {
+          List({ space: 0 }) {
+            ForEach(this.piTreeRows(), (row: PiTreeRow) => {
+              ListItem() {
+                Row({ space: 8 }) {
+                  Text(this.piRoleLabel(row.node.role))
+                    .fontSize(uiFontSize(11)).fontColor($r('app.color.text_tertiary')).width(42)
+                  Column({ space: 2 }) {
+                    Text(row.node.label.length > 0 ? row.node.label : row.node.preview)
+                      .fontSize(uiFontSize(13)).fontColor($r('app.color.text_primary'))
+                      .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+                    if (this.sessionTree?.leafId === row.node.id) {
+                      Text('当前分支').fontSize(uiFontSize(11)).fontColor($r('app.color.accent'))
+                    }
+                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                  if (this.sessionTreeSwitchingId === row.node.id) {
+                    LoadingProgress().width(15).height(15)
+                  } else {
+                    this.disclosureChevron(false, $r('app.color.text_tertiary'))
+                  }
+                }
+                .width('100%').constraintSize({ minHeight: 52 })
+                .padding({ left: 8 + Math.min(row.depth, 8) * 14, right: 8, top: 6, bottom: 6 })
+                .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
+                .enabled(!this.sessionStreaming && this.sessionTreeSwitchingId.length === 0
+                  && this.sessionTree?.leafId !== row.node.id)
+                .clickEffect(UI_LIST_CLICK_EFFECT)
+                .onClick(() => void this.navigateSessionTree(row.node.id))
+              }
+            }, (row: PiTreeRow) => row.node.id)
+          }
+          .width('100%').layoutWeight(1)
+        }
+      }
+      .width('calc(100% - 24vp)').constraintSize({ maxWidth: 620, maxHeight: '82%' })
+      .padding(16).margin({ left: 12, right: 12, bottom: 12 })
+      .backgroundColor($r('app.color.task_list_menu_surface'))
+      .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_CONTAINER)
+      .transition(uiOverlayTransition())
+    }
+    .width('100%').height('100%').zIndex(101)
+  }
+
+  @Builder
+  sessionMetadataRow(label: string, value: string, action: () => void) {
+    Row({ space: 10 }) {
+      Text(label)
+        .fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_tertiary'))
+        .width(72)
+      Text(value)
+        .fontSize(uiFontSize(13))
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(action)
+  }
+
+  /** Header 与搜索栏共用的圆形图标按钮，统一触控反馈和选中态。 */
+  @Builder
+  taskIconButton(symbol: Resource, size: number, selected: boolean, enabled: boolean, action: () => void) {
+    Button() {
+      SymbolGlyph(symbol)
+        .fontSize(uiFontSize(20))
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .type(ButtonType.Circle)
+    .width(size)
+    .height(size)
+    .padding(0)
+    .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .enabled(enabled)
+    .opacity(enabled ? 1 : 0.4)
+    .onClick(action)
+  }
+
+  /** iOS 同层级会话 Header：50vp 内容高、44vp 返回热区与 40vp 动作槽。 */
   @Builder
   taskHeader() {
     Row({ space: 4 }) {
       if (!this.isEmbedded()) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .width(44)
-        .height(44)
-        .borderRadius(22)
-        .backgroundColor(Color.Transparent)
-        .padding(0)
-        .margin({ left: -8 })
-        .onClick(() => router.back())
+        this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => router.back())
       }
 
       Column({ space: 1 }) {
@@ -1792,47 +2694,18 @@ export struct TaskPageContent {
       .padding({ left: 4 })
 
       if ((this.session()?.workingDir ?? '').length > 0) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.folder'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .width(38)
-        .height(38)
-        .padding(0)
-        .borderRadius(19)
-        .backgroundColor(Color.Transparent)
-        .onClick(() => this.showProjectActions())
+        this.taskIconButton($r('sys.symbol.folder'), 40, false, true, () => this.showProjectActions())
       }
 
       if (this.items.length > 0) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .width(38)
-        .height(38)
-        .padding(0)
-        .borderRadius(19)
-        .backgroundColor(this.searchOpen ? $r('app.color.bg_chip') : Color.Transparent)
-        .onClick(() => {
+        this.taskIconButton($r('sys.symbol.magnifyingglass'), 40, this.searchOpen, true, () => {
           if (this.searchOpen) this.closeSearch();
-          else this.searchOpen = true;
+          else this.openSearch();
         })
       }
 
-      Button() {
-        SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-          .fontSize(uiFontSize(20))
-          .fontColor([$r('app.color.text_primary')])
-      }
-      .width(38)
-      .height(38)
-      .padding(0)
-      .borderRadius(19)
-      .backgroundColor(Color.Transparent)
-      .onClick(() => this.showSessionActions())
+      this.taskIconButton($r('sys.symbol.ellipsis_circle'), 40, false, true,
+        () => this.showSessionActions())
     }
     .width('100%')
     .constraintSize({ minHeight: 50 })
@@ -1852,7 +2725,7 @@ export struct TaskPageContent {
         .textFont({ size: uiFontSize(15) })
         .layoutWeight(1)
         .backgroundColor($r('app.color.bg_card'))
-        .borderRadius(18)
+        .borderRadius(UI_RADIUS_PILL)
         .onChange((value: string) => {
           this.searchQuery = value;
           this.searchActiveIndex = 0;
@@ -1866,41 +2739,11 @@ export struct TaskPageContent {
           .constraintSize({ minWidth: 32 })
           .textAlign(TextAlign.Center)
       }
-      Button() {
-        SymbolGlyph($r('sys.symbol.chevron_up'))
-          .fontSize(uiFontSize(16))
-          .fontColor([$r('app.color.chat_text_secondary')])
-      }
-      .width(34)
-      .height(34)
-      .padding(0)
-      .borderRadius(17)
-      .backgroundColor(Color.Transparent)
-      .enabled(this.searchHitIndices().length > 0)
-      .onClick(() => this.moveSearch(-1))
-      Button() {
-        SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(uiFontSize(16))
-          .fontColor([$r('app.color.chat_text_secondary')])
-      }
-      .width(34)
-      .height(34)
-      .padding(0)
-      .borderRadius(17)
-      .backgroundColor(Color.Transparent)
-      .enabled(this.searchHitIndices().length > 0)
-      .onClick(() => this.moveSearch(1))
-      Button() {
-        SymbolGlyph($r('sys.symbol.xmark'))
-          .fontSize(uiFontSize(15))
-          .fontColor([$r('app.color.chat_text_secondary')])
-      }
-      .width(34)
-      .height(34)
-      .padding(0)
-      .borderRadius(17)
-      .backgroundColor(Color.Transparent)
-      .onClick(() => this.closeSearch())
+      this.taskIconButton($r('sys.symbol.chevron_up'), 36, false,
+        this.searchHitIndices().length > 0, () => this.moveSearch(-1))
+      this.taskIconButton($r('sys.symbol.chevron_down'), 36, false,
+        this.searchHitIndices().length > 0, () => this.moveSearch(1))
+      this.taskIconButton($r('sys.symbol.xmark'), 36, false, true, () => this.closeSearch())
     }
     .width('100%')
     .padding({ left: 12, right: 8, top: 6, bottom: 6 })
@@ -1908,12 +2751,148 @@ export struct TaskPageContent {
       ? $r('app.color.bg_page')
       : $r('app.color.chat_header_surface'))
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.chat_header_divider') } })
+    .transition(uiRevealTransition())
+  }
+
+  private pendingQueueStatusText(item: PendingQueueBubble): string {
+    if (item.phase === 'sending') return '正在发送…';
+    if (item.phase === 'settling') return '已发送，正在同步…';
+    if (item.phase === 'editing') return '正在编辑';
+    if (item.phase === 'paused') return `队列 ${item.queueIndex} · 已暂停`;
+    if (item.phase === 'failed') return '发送失败';
+    return `队列 ${item.queueIndex}`;
+  }
+
+  @Builder
+  queueInlineAction(label: string, danger: boolean, enabled: boolean, action: () => void) {
+    Button(label)
+      .type(ButtonType.Normal)
+      .height(30)
+      .padding({ left: 12, right: 12 })
+      .fontSize(uiFontSize(12))
+      .fontWeight(FontWeight.Medium)
+      .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_PILL)
+      .enabled(enabled)
+      .opacity(enabled ? 1 : 0.45)
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(action)
+  }
+
+  @Builder
+  pendingQueueBubble(item: PendingQueueBubble) {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        if (item.phase === 'sending' || item.phase === 'settling') {
+          LoadingProgress()
+            .width(13)
+            .height(13)
+            .color($r('app.color.text_tertiary'))
+        }
+        Text(this.pendingQueueStatusText(item))
+          .fontSize(uiFontSize(11))
+          .fontColor(item.phase === 'failed'
+            ? $r('app.color.danger') : $r('app.color.text_tertiary'))
+        Row().layoutWeight(1)
+        if (item.images.length > 0) {
+          Text(`${item.images.length} 张图片`)
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        if (item.files.length > 0) {
+          Text(`${item.files.length} 个文件`)
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+        }
+      }
+      .width('100%')
+
+      if (item.text.length > 0) {
+        Text(item.text)
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+          .maxLines(8)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+
+      if (item.errorText.length > 0) {
+        Text(item.errorText)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.danger'))
+          .maxLines(2)
+          .width('100%')
+      }
+
+      if (this.selectedQueueClientId === item.clientId || item.phase === 'failed') {
+        Row({ space: 6 }) {
+          if (item.phase === 'failed') {
+            this.queueInlineAction('重试发送', false, !this.queueBusy,
+              () => this.retryQueueItem(item.clientId))
+          } else if (item.phase === 'queued' || item.phase === 'paused') {
+            this.queueInlineAction('上移', false, item.queueIndex > 1 && !this.queueBusy,
+              () => this.moveQueueItem(item.clientId, -1))
+            this.queueInlineAction('下移', false,
+              item.queueIndex < AppServices.instance.inputQueue
+                .getProjection(this.sessionId).pendingQueue.length && !this.queueBusy,
+              () => this.moveQueueItem(item.clientId, 1))
+            this.queueInlineAction('编辑', false, !this.queueBusy,
+              () => this.beginQueueEdit(item.clientId))
+            this.queueInlineAction('插话', false, this.sessionStreaming && !this.queueBusy,
+              () => this.steerQueueItem(item.clientId))
+          }
+          Row().layoutWeight(1)
+          this.queueInlineAction('删除消息', true, !this.queueBusy,
+            () => this.removeQueueItem(item.clientId))
+        }
+        .width('100%')
+        .transition(uiRevealTransition())
+      }
+    }
+    .width('88%')
+    .alignSelf(ItemAlign.End)
+    .alignItems(HorizontalAlign.Start)
+    .padding(12)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: item.phase === 'failed'
+      ? $r('app.color.danger') : $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => {
+      if (item.phase === 'queued' || item.phase === 'paused') {
+        this.selectedQueueClientId = this.selectedQueueClientId === item.clientId ? '' : item.clientId;
+      }
+    })
+  }
+
+  @Builder
+  queueStateBanner() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.clock'))
+        .fontSize(uiFontSize(14))
+        .fontColor([$r('app.color.text_secondary')])
+      Text(this.queueProjectionError.length > 0 ? '待发送队列需要处理' : '待发送队列已暂停')
+        .fontSize(uiFontSize(12))
+        .fontColor(this.queueProjectionError.length > 0
+          ? $r('app.color.danger') : $r('app.color.text_secondary'))
+        .layoutWeight(1)
+      if (this.queuePaused) {
+        this.queueInlineAction('继续发送', false, !this.queueBusy, () => this.resumeQueue())
+      }
+    }
+    .width('100%')
+    .padding({ left: 12, right: 8, top: 8, bottom: 8 })
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
   }
 
   @Builder
   messageArea() {
     Stack({ alignContent: Alignment.BottomEnd }) {
-      if (this.items.length === 0) {
+      if (this.items.length === 0 && this.queueBubbles.length === 0) {
         Column({ space: 8 }) {
           if (this.loadFailed) {
             Text('加载失败，请检查连接后重试')
@@ -1925,8 +2904,9 @@ export struct TaskPageContent {
               .fontColor($r('app.color.text_primary'))
               .height(32)
               .padding({ left: 12, right: 12 })
-              .borderRadius(16)
+              .borderRadius(UI_RADIUS_PILL)
               .backgroundColor($r('app.color.bg_chip'))
+              .clickEffect(UI_CLICK_EFFECT)
               .onClick(() => this.retryLoad())
           } else if (!this.initialLoadResolved && this.showInitialSync) {
             LoadingProgress()
@@ -1959,9 +2939,10 @@ export struct TaskPageContent {
                 .fontColor($r('app.color.text_tertiary'))
                 .height(32)
                 .padding({ left: 12, right: 12 })
-                .borderRadius(16)
+                .borderRadius(UI_RADIUS_PILL)
                 .backgroundColor(Color.Transparent)
                 .enabled(!this.loadingOlder)
+                .clickEffect(UI_CLICK_EFFECT)
                 .onClick(() => this.loadOlder())
             }
           }
@@ -1970,6 +2951,16 @@ export struct TaskPageContent {
               this.renderItem(item)
             }
           }, (item: RenderItem) => item.key)
+          if (this.queuePaused || this.queueProjectionError.length > 0) {
+            ListItem() {
+              this.queueStateBanner()
+            }
+          }
+          ForEach(this.queueBubbles, (item: PendingQueueBubble) => {
+            ListItem() {
+              this.pendingQueueBubble(item)
+            }
+          }, (item: PendingQueueBubble) => `message-${item.clientId}`)
         }
         .width('100%')
         .height('100%')
@@ -2002,7 +2993,7 @@ export struct TaskPageContent {
         })
       }
 
-      if (this.items.length > 0 && !this.followingLatest) {
+      if ((this.items.length > 0 || this.queueBubbles.length > 0) && !this.followingLatest) {
         Button() {
           Stack({ alignContent: Alignment.Center }) {
             SymbolGlyph($r('sys.symbol.chevron_down'))
@@ -2022,10 +3013,12 @@ export struct TaskPageContent {
         .width(36)
         .height(36)
         .padding(0)
-        .borderRadius(18)
+        .borderRadius(UI_RADIUS_PILL)
         .backgroundColor($r('app.color.chat_fab_surface'))
         .border({ width: 1, color: $r('app.color.chat_fab_border') })
         .margin({ right: 23, bottom: 12 })
+        .clickEffect(UI_ICON_CLICK_EFFECT)
+        .transition(uiRevealTransition())
         .onClick(() => this.jumpToLatest())
       }
     }
@@ -2037,11 +3030,78 @@ export struct TaskPageContent {
 
   /** Mobile 同款 Composer：活动状态独立于 50vp 输入胶囊，焦点态再展开为卡片。 */
   @Builder
+  composerPalettePanel() {
+    Column({ space: 2 }) {
+      Row({ space: 8 }) {
+        SymbolGlyph(this.composerPaletteMode === 'slash'
+          ? $r('sys.symbol.list_bullet') : $r('sys.symbol.at'))
+          .fontSize(uiFontSize(14))
+          .fontColor([$r('app.color.text_secondary')])
+        Text(this.composerPaletteMode === 'slash' ? '命令与技能' : '文件、目录与 Agent')
+          .fontSize(uiFontSize(12))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_secondary'))
+          .layoutWeight(1)
+        if (this.composerPaletteLoading) {
+          LoadingProgress().width(14).height(14).color($r('app.color.accent'))
+        }
+      }
+      .width('100%')
+      .height(30)
+      .padding({ left: 12, right: 12 })
+
+      if (!this.composerPaletteLoading && this.composerPaletteItems.length === 0) {
+        Text(this.composerPaletteMode === 'slash' ? '没有匹配的命令' : '没有匹配的资源')
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_tertiary'))
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 10, bottom: 12 })
+      } else {
+        List({ space: 0 }) {
+          ForEach(this.composerPaletteItems, (item: ComposerPaletteItem) => {
+            ListItem() {
+              Row({ space: 10 }) {
+                Text(this.composerPaletteMode === 'slash' ? `/${item.name}` : item.name)
+                  .fontSize(uiFontSize(14))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                  .constraintSize({ minWidth: 92 })
+                Text(item.description.length > 0 ? item.description : item.relPath)
+                  .fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+              }
+              .width('100%')
+              .height(42)
+              .padding({ left: 12, right: 12 })
+              .clickEffect(UI_LIST_CLICK_EFFECT)
+              .onClick(() => this.selectComposerPaletteItem(item))
+            }
+          }, (item: ComposerPaletteItem) => `${item.kind}:${item.name}:${item.relPath}`)
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: 220 })
+      }
+    }
+    .width('calc(100% - 24vp)')
+    .constraintSize({ maxWidth: 736 })
+    .alignSelf(ItemAlign.Center)
+    .margin({ left: 12, right: 12, top: 4 })
+    .backgroundColor($r('app.color.task_list_menu_surface'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiRevealTransition())
+  }
+
+  @Builder
   composerBar() {
     ConversationComposer({
       input: this.input,
       focused: this.composerFocused,
       images: this.composerImages,
+      files: this.composerFiles,
       sending: this.sending,
       streaming: this.sessionStreaming,
       hasContent: this.hasComposerContent(),
@@ -2059,8 +3119,7 @@ export struct TaskPageContent {
       showStreamingStatus: true,
       inputId: 'task-composer-input',
       onInputChange: (value: string): void => {
-        this.input = value;
-        this.composerInputRevision += 1;
+        this.applyComposerTextChange(value);
       },
       onFocusChange: (focused: boolean): void => {
         this.composerFocused = focused;
@@ -2075,6 +3134,8 @@ export struct TaskPageContent {
       onAbort: (): void => this.abort(),
       onRemoveImage: (image: ComposerImage): void => this.imageQueue.remove(image),
       onRetryImage: (image: ComposerImage): void => this.imageQueue.retry(image),
+      onRemoveFile: (file: ComposerFile): void => this.fileQueue.remove(file),
+      onRetryFile: (file: ComposerFile): void => this.fileQueue.retry(file),
     })
   }
 
@@ -2084,18 +3145,10 @@ export struct TaskPageContent {
     Column() {
       Row() {
         if (this.contextSheetPage !== 'main') {
-          Button() {
-            SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(uiFontSize(20))
-              .fontColor([$r('app.color.text_primary')])
-          }
-          .width(36)
-          .height(36)
-          .padding(0)
-          .borderRadius(18)
-          .backgroundColor(Color.Transparent)
-          .onClick(() => {
-            this.contextSheetPage = this.contextSheetPage === 'model-options' ? 'model' : 'main';
+          this.taskIconButton($r('sys.symbol.chevron_left'), 36, false, true, () => {
+            uiAnimateState(this.getUIContext(), () => {
+              this.contextSheetPage = this.contextSheetPage === 'model-options' ? 'model' : 'main';
+            });
           })
         } else {
           Row().width(36).height(36)
@@ -2166,8 +3219,9 @@ export struct TaskPageContent {
             .fontSize(uiFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
-            .borderRadius(8)
+            .borderRadius(UI_RADIUS_CONTROL)
             .margin({ left: 16, right: 16, bottom: 10 })
+            .clickEffect(UI_CLICK_EFFECT)
             .onClick(() => this.addRecentSelection())
         }
 
@@ -2219,6 +3273,8 @@ export struct TaskPageContent {
         this.contextActionRow($r('sys.symbol.snapshot'), '截图', '', () => this.pickScreenshots())
         Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
         this.contextActionRow($r('sys.symbol.camera'), '拍照', '', () => this.takePhoto())
+        Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        this.contextActionRow($r('sys.symbol.doc'), '文件', 'PDF、Office 与文本文件', () => this.pickFiles())
       }
       .width('100%')
       .padding({ bottom: 24 })
@@ -2260,6 +3316,7 @@ export struct TaskPageContent {
           .constraintSize({ minHeight: 58 })
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .opacity(this.contextRpcBusy ? 0.55 : 1)
+          .clickEffect(UI_LIST_CLICK_EFFECT)
           .onClick(() => this.requestPermissionMode(option))
           Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
         }, (option: ComposerChoiceOption) => option.id)
@@ -2341,11 +3398,12 @@ export struct TaskPageContent {
         .layoutWeight(1)
         .height(42)
         .padding(0)
-        .borderRadius(21)
+        .borderRadius(UI_RADIUS_PILL)
         .backgroundColor(this.modelAgentIsActive(kind)
           ? $r('app.color.chat_cta') : Color.Transparent)
         .enabled(!this.contextRpcBusy
-          && (this.modelAgentIsActive(kind) || this.sessionAgentSwitchSupported))
+          && (this.modelAgentIsActive(kind) || this.canSwitchSessionAgent()))
+        .clickEffect(UI_CLICK_EFFECT)
         .onClick(() => {
           void this.browseModelAgent(kind);
         })
@@ -2356,7 +3414,7 @@ export struct TaskPageContent {
     .padding(5)
     .backgroundColor($r('app.color.bg_chip'))
     .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(26)
+    .borderRadius(UI_RADIUS_PILL)
     .margin({ left: 16, right: 16, top: 10 })
   }
 
@@ -2378,7 +3436,7 @@ export struct TaskPageContent {
               .fontSize(uiFontSize(12))
               .fontColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.bg_chip'))
-              .borderRadius(8)
+              .borderRadius(UI_RADIUS_CONTROL)
               .padding({ left: 7, right: 7, top: 2, bottom: 2 })
           }
           if (this.modelEffortText(option).length > 0) {
@@ -2407,10 +3465,11 @@ export struct TaskPageContent {
       .width(38)
       .height(38)
       .padding(0)
-      .borderRadius(19)
+      .borderRadius(UI_RADIUS_PILL)
       .backgroundColor(Color.Transparent)
       .enabled(!this.contextRpcBusy && this.modelOptionHasOptions(option))
       .opacity(this.modelOptionHasOptions(option) ? 1 : 0.4)
+      .clickEffect(UI_ICON_CLICK_EFFECT)
       .onClick(() => this.openModelOptions(option))
     }
     .width('calc(100% - 32vp)')
@@ -2419,8 +3478,9 @@ export struct TaskPageContent {
     .margin({ left: 16, right: 16 })
     .backgroundColor(this.modelOptionIsCurrent(option)
       ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(33)
+    .borderRadius(UI_RADIUS_PILL)
     .opacity(this.contextRpcBusy ? 0.6 : 1)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => {
       void this.selectComposerModel(option);
     })
@@ -2430,7 +3490,35 @@ export struct TaskPageContent {
   modelContextView() {
     Scroll() {
       Column({ space: 12 }) {
-        this.modelAgentSwitcher()
+        if (this.canSwitchSessionAgent()) {
+          this.modelAgentSwitcher()
+        }
+
+        if (this.pendingAgentSwitchIntent !== null) {
+          Row({ space: 9 }) {
+            SymbolGlyph($r('sys.symbol.clock'))
+              .fontSize(uiFontSize(15))
+              .fontColor([$r('app.color.text_secondary')])
+            Column({ space: 2 }) {
+              Text('Agent 切换等待中')
+                .fontSize(uiFontSize(13))
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+              Text(`${modelAgentLabel(this.pendingAgentSwitchIntent.targetAgentKind)} · ${this.pendingAgentSwitchIntent.model}`)
+                .fontSize(uiFontSize(12))
+                .fontColor($r('app.color.text_secondary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('calc(100% - 32vp)')
+          .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+          .margin({ left: 16, right: 16 })
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_CONTROL)
+        }
 
         Row({ space: 8 }) {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
@@ -2452,7 +3540,7 @@ export struct TaskPageContent {
         .height(44)
         .padding({ left: 14, right: 12 })
         .border({ width: 1, color: $r('app.color.border') })
-        .borderRadius(22)
+        .borderRadius(UI_RADIUS_PILL)
         .margin({ left: 16, right: 16, top: 2, bottom: 2 })
 
         Column() {
@@ -2517,9 +3605,10 @@ export struct TaskPageContent {
                     ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
                   .backgroundColor(this.modelOptionEffortSelected(option)
                     ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-                  .borderRadius(19)
+                  .borderRadius(UI_RADIUS_PILL)
                   .margin({ right: 8, bottom: 8 })
                   .enabled(!this.contextRpcBusy)
+                  .clickEffect(UI_CLICK_EFFECT)
                   .onClick(() => {
                     void this.selectComposerEffort(option);
                   })
@@ -2571,7 +3660,7 @@ export struct TaskPageContent {
     }
     .width(36)
     .height(36)
-    .borderRadius(8)
+    .borderRadius(UI_RADIUS_CONTROL)
     .backgroundColor($r('app.color.bg_chip'))
   }
 
@@ -2602,6 +3691,7 @@ export struct TaskPageContent {
     .width('100%')
     .constraintSize({ minHeight: 56 })
     .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(action)
   }
 
@@ -2627,7 +3717,7 @@ export struct TaskPageContent {
               .padding(10)
               .backgroundColor($r('app.color.composer_surface'))
               .border({ width: 1, color: $r('app.color.composer_border') })
-              .borderRadius(8)
+              .borderRadius(UI_RADIUS_CONTROL)
               .onChange((value: string) => {
                 this.goalObjective = value;
               })
@@ -2649,7 +3739,7 @@ export struct TaskPageContent {
                 .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
-                .borderRadius(8)
+                .borderRadius(UI_RADIUS_CONTROL)
                 .onChange((value: string) => {
                   this.goalMaxTurns = value;
                 })
@@ -2665,7 +3755,7 @@ export struct TaskPageContent {
                 .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
-                .borderRadius(8)
+                .borderRadius(UI_RADIUS_CONTROL)
                 .onChange((value: string) => {
                   this.goalBudgetTokens = value;
                 })
@@ -2681,7 +3771,7 @@ export struct TaskPageContent {
                 .fontSize(uiFontSize(14))
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
-                .borderRadius(8)
+                .borderRadius(UI_RADIUS_CONTROL)
                 .onChange((value: string) => {
                   this.goalNoProgressLimit = value;
                 })
@@ -2697,8 +3787,9 @@ export struct TaskPageContent {
             .fontSize(uiFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
-            .borderRadius(8)
+            .borderRadius(UI_RADIUS_CONTROL)
             .enabled(!this.goalActionBusy && this.goalObjective.trim().length > 0)
+            .clickEffect(UI_CLICK_EFFECT)
             .onClick(() => {
               void this.startGoal();
             })
@@ -2752,8 +3843,9 @@ export struct TaskPageContent {
                 .layoutWeight(1)
                 .fontColor($r('app.color.text_primary'))
                 .backgroundColor($r('app.color.bg_chip'))
-                .borderRadius(8)
+                .borderRadius(UI_RADIUS_CONTROL)
                 .enabled(!this.goalActionBusy)
+                .clickEffect(UI_CLICK_EFFECT)
                 .onClick(() => {
                   void this.pauseOrResumeGoal();
                 })
@@ -2763,8 +3855,9 @@ export struct TaskPageContent {
               .layoutWeight(1)
               .fontColor($r('app.color.danger'))
               .backgroundColor($r('app.color.bg_chip'))
-              .borderRadius(8)
+              .borderRadius(UI_RADIUS_CONTROL)
               .enabled(!this.goalActionBusy)
+              .clickEffect(UI_CLICK_EFFECT)
               .onClick(() => this.confirmClearGoal())
           }
           .width('100%')
@@ -2796,6 +3889,10 @@ export struct TaskPageContent {
       this.toolGroupBlock(item as RenderToolGroupItem)
     } else if (item.type === 'tool_media') {
       this.toolMediaBlock(item as RenderToolMediaItem)
+    } else if (item.type === 'agent_task') {
+      this.agentTaskBlock(item as RenderAgentTaskItem)
+    } else if (item.type === 'subagent_group') {
+      this.subagentGroupBlock(item as RenderSubagentGroupItem)
     } else if (item.type === 'todo') {
       this.todoBlock(item as RenderTodoCardItem)
     } else if (item.type === 'work_group') {
@@ -2803,27 +3900,297 @@ export struct TaskPageContent {
     }
   }
 
-  /** 工具产出的图片：独立于工作过程折叠块，保留完整可见结果。 */
+  private agentTaskStatus(item: RenderAgentTaskItem): string {
+    if (item.update !== null) return item.update.status;
+    return item.tool !== null && item.tool.hasResult ? 'completed' : 'running';
+  }
+
+  private agentTaskProvider(item: RenderAgentTaskItem): string {
+    if (item.update !== null) return item.update.provider;
+    if (item.tool !== null && item.tool.toolName.startsWith('collab:')) return 'codex';
+    if (item.tool !== null && item.tool.toolName === 'subagent') return 'pi';
+    return 'claude-code';
+  }
+
+  private agentTaskInputValue(item: RenderAgentTaskItem, keys: string[]): string {
+    if (item.tool === null || item.tool.inputRaw.length === 0) return '';
+    try {
+      const parsed = JSON.parse(item.tool.inputRaw) as Object;
+      if (parsed === undefined || parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+      const record = parsed as Record<string, Object>;
+      for (let i = 0; i < keys.length; i++) {
+        const value = readStr(record, keys[i]);
+        if (value.length > 0) return summarizeText(value, 120);
+      }
+    } catch (e) {
+      return '';
+    }
+    return '';
+  }
+
+  private agentTaskTitle(item: RenderAgentTaskItem): string {
+    if (item.update !== null && item.update.title.length > 0) return item.update.title;
+    const input = this.agentTaskInputValue(item, ['description', 'name', 'task', 'prompt']);
+    return input.length > 0 ? input : 'Agent 任务';
+  }
+
+  private agentTaskDescription(item: RenderAgentTaskItem): string {
+    if (item.update !== null && item.update.description.length > 0) return item.update.description;
+    return this.agentTaskInputValue(item, ['prompt', 'description', 'task']);
+  }
+
+  private agentTaskSummary(item: RenderAgentTaskItem): string {
+    if (item.tool !== null && item.tool.resultText.length > 0) return item.tool.resultText;
+    return item.update !== null ? item.update.summary : '';
+  }
+
+  private agentTaskStatusLabel(status: string): string {
+    if (status === 'completed') return '已完成';
+    if (status === 'failed') return '失败';
+    if (status === 'stopped') return '已停止';
+    return '运行中';
+  }
+
+  private agentTaskHasDetails(item: RenderAgentTaskItem): boolean {
+    return this.agentTaskDescription(item).length > 0
+      || this.agentTaskSummary(item).length > 0
+      || (item.update !== null && (item.update.workflowProgress.length > 0
+        || item.update.outputFile.length > 0 || item.update.lastToolName.length > 0));
+  }
+
+  @Builder
+  agentTaskBlock(item: RenderAgentTaskItem) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        if (this.agentTaskStatus(item) === 'running') {
+          LoadingProgress().width(16).height(16).color($r('app.color.text_tertiary'))
+        } else if (this.agentTaskStatus(item) === 'failed') {
+          SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
+            .fontSize(uiFontSize(16))
+            .fontColor([$r('app.color.danger')])
+        } else {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(uiFontSize(15))
+            .fontColor([$r('app.color.text_tertiary')])
+        }
+        Column({ space: 1 }) {
+          Text(this.agentTaskTitle(item))
+            .fontSize(uiFontSize(14))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+          Text(`${modelAgentLabel(this.agentTaskProvider(item))} · ${this.agentTaskStatusLabel(this.agentTaskStatus(item))}`)
+            .fontSize(uiFontSize(12))
+            .fontColor(this.agentTaskStatus(item) === 'failed'
+              ? $r('app.color.danger') : $r('app.color.text_tertiary'))
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        if (this.agentTaskHasDetails(item)) {
+          this.disclosureChevron(
+            this.isIn(this.expandedTools, item.key), $r('app.color.text_tertiary'))
+        }
+      }
+      .width('100%')
+      .clickEffect(this.agentTaskHasDetails(item) ? UI_LIST_CLICK_EFFECT : undefined)
+      .onClick(() => {
+        if (this.agentTaskHasDetails(item)) this.toggleToolDetails(item.key);
+      })
+
+      if (this.agentTaskHasDetails(item) && this.isIn(this.expandedTools, item.key)) {
+        Column({ space: 6 }) {
+          if (this.agentTaskDescription(item).length > 0) {
+            Text(this.agentTaskDescription(item))
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(18))
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+          }
+          if (item.update !== null && item.update.workflowProgress.length > 0) {
+            ForEach(item.update.workflowProgress, (step: WorkflowProgressEntry) => {
+              Row({ space: 6 }) {
+                Text(step.state === 'done' ? '✓' : (step.state === 'error' ? '!' : '•'))
+                  .fontSize(uiFontSize(12))
+                  .fontColor(step.state === 'error'
+                    ? $r('app.color.danger') : $r('app.color.text_tertiary'))
+                Text(step.label.length > 0 ? step.label : (step.title.length > 0 ? step.title : '工作步骤'))
+                  .fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+              }
+              .width('100%')
+            }, (step: WorkflowProgressEntry) => `${item.key}-${step.type}-${step.index}`)
+          }
+          if (this.agentTaskSummary(item).length > 0) {
+            Text(this.agentTaskSummary(item))
+              .fontSize(uiFontSize(12))
+              .fontFamily('monospace')
+              .lineHeight(uiLineHeight(18))
+              .fontColor($r('app.color.chat_text_secondary'))
+              .maxLines(12)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+          }
+          if (item.update !== null && item.update.lastToolName.length > 0) {
+            Text(`最近工具：${item.update.lastToolName}`)
+              .fontSize(uiFontSize(11))
+              .fontColor($r('app.color.text_tertiary'))
+              .width('100%')
+          }
+        }
+        .width('100%')
+        .padding({ left: 24, top: 2 })
+        .transition(uiRevealTransition())
+      }
+    }
+    .width('100%')
+    .padding({ left: 10, right: 10, top: 10, bottom: 10 })
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .margin({ top: 3, bottom: 3 })
+  }
+
+  private subagentTitle(item: RenderSubagentGroupItem): string {
+    if (item.update !== null && item.update.title.length > 0) return item.update.title;
+    if (item.description.length > 0) return item.description;
+    if (item.subagentType.length > 0) return item.subagentType;
+    return '子 Agent';
+  }
+
+  @Builder
+  subagentGroupBlock(item: RenderSubagentGroupItem) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        if (item.status === 'running') {
+          LoadingProgress().width(15).height(15).color($r('app.color.text_tertiary'))
+        } else {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(uiFontSize(14))
+            .fontColor([$r('app.color.text_tertiary')])
+        }
+        Column({ space: 1 }) {
+          Text(this.subagentTitle(item))
+            .fontSize(uiFontSize(14))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+          Text(item.status === 'running'
+            ? '正在协作' : (item.durationMs >= 0 ? `已完成 · ${this.formatDuration(item.durationMs)}` : '已完成'))
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        this.disclosureChevron(
+          this.isIn(this.expandedWorkGroups, item.key), $r('app.color.text_tertiary'))
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 38 })
+      .clickEffect(UI_LIST_CLICK_EFFECT)
+      .onClick(() => this.toggleWorkGroup(item.key))
+
+      if (this.isIn(this.expandedWorkGroups, item.key)) {
+        Column({ space: 5 }) {
+          ForEach(item.children, (child: RenderItem) => {
+            this.renderItem(child)
+          }, (child: RenderItem) => `${item.key}-${child.key}`)
+          if (item.summary.length > 0) {
+            Text(item.summary)
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(18))
+              .fontColor($r('app.color.chat_text_secondary'))
+              .maxLines(12)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .padding({ top: 4 })
+          }
+        }
+        .width('100%')
+        .padding({ left: 12, top: 2, bottom: 2 })
+        .border({ width: { left: 2 }, color: { left: $r('app.color.border') } })
+        .transition(uiRevealTransition())
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ top: 5, bottom: 5 })
+  }
+
+  /** 工具产出的媒体：独立于工作过程折叠块，保留完整可见结果。 */
   @Builder
   toolMediaBlock(item: RenderToolMediaItem) {
     Column({ space: 6 }) {
       Text('媒体结果')
         .fontSize(uiFontSize(12))
         .fontColor($r('app.color.text_tertiary'))
-      List({ space: 8 }) {
-        ForEach(item.images, (ref: RemoteImageRef) => {
-          ListItem() {
-            this.toolMediaImage(ref)
-          }
-        }, (ref: RemoteImageRef) => `${item.key}-${ref.url}`)
+      if (item.images.length > 0) {
+        List({ space: 8 }) {
+          ForEach(item.images, (ref: RemoteImageRef) => {
+            ListItem() {
+              this.toolMediaImage(ref)
+            }
+          }, (ref: RemoteImageRef) => `${item.key}-${ref.url}`)
+        }
+        .listDirection(Axis.Horizontal)
+        .height(176)
+        .width('100%')
       }
-      .listDirection(Axis.Horizontal)
-      .height(176)
-      .width('100%')
+      if (item.media.length > 0) {
+        ForEach(item.media, (payload: RenderMediaPayload) => {
+          if (payload.kind !== 'image') {
+            this.toolMediaFile(payload)
+          }
+        }, (payload: RenderMediaPayload) => `${item.key}-${payload.kind}-${payload.url}`)
+      }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
     .padding({ top: 4, bottom: 4 })
+  }
+
+  @Builder
+  toolMediaFile(payload: RenderMediaPayload) {
+    Row({ space: 10 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph(payload.kind === 'video'
+          ? $r('sys.symbol.play') : $r('sys.symbol.waveform'))
+          .fontSize(uiFontSize(18))
+          .fontColor([$r('app.color.text_primary')])
+      }
+      .width(36)
+      .height(36)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_CONTROL)
+      Column({ space: 2 }) {
+        Text(payload.title.length > 0 ? payload.title : (payload.kind === 'video' ? '视频' : '音频'))
+          .fontSize(uiFontSize(14))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(payload.kind === 'video' ? '点击播放视频' : '点击播放音频')
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      this.disclosureChevron(false, $r('app.color.text_tertiary'))
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 56 })
+    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => void this.openToolMedia(payload))
   }
 
   @Builder
@@ -2832,9 +4199,13 @@ export struct TaskPageContent {
       Image(this.imageSources.get(ref.url) ?? '')
         .width(220)
         .height(165)
-        .borderRadius(8)
+        .borderRadius(UI_RADIUS_CONTROL)
         .objectFit(ImageFit.Contain)
+        .clickEffect(UI_CLICK_EFFECT)
         .onClick(() => this.openImagePreview(ref))
+        .onError(() => this.handleNativeImageError(ref.url, ref))
+    } else if (this.imageStatus(ref.url) === 'error') {
+      this.mediaErrorFrame(220, 165, () => this.retryImage(ref.url, ref))
     } else {
       Row({ space: 6 }) {
         LoadingProgress()
@@ -2850,8 +4221,19 @@ export struct TaskPageContent {
       .height(165)
       .justifyContent(FlexAlign.Center)
       .backgroundColor($r('app.color.bg_chip'))
-      .borderRadius(8)
+      .borderRadius(UI_RADIUS_CONTROL)
     }
+  }
+
+  /** 折叠入口统一使用旋转的右箭头，避免切换两个 glyph 时产生跳帧。 */
+  @Builder
+  disclosureChevron(expanded: boolean, tint: Resource) {
+    SymbolGlyph($r('sys.symbol.chevron_right'))
+      .fontSize(uiFontSize(13))
+      .fontColor([tint])
+      .width(16)
+      .rotate({ angle: expanded ? 90 : 0 })
+      .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
   }
 
   /**
@@ -2883,17 +4265,16 @@ export struct TaskPageContent {
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_tertiary'))
         }
-        SymbolGlyph(this.isIn(this.expandedWorkGroups, item.key)
-          ? $r('sys.symbol.chevron_down')
-          : $r('sys.symbol.chevron_right'))
-          .fontSize(uiFontSize(13))
-          .fontColor([$r('app.color.text_tertiary')])
-          .width(16)
+        this.disclosureChevron(
+          this.isIn(this.expandedWorkGroups, item.key),
+          $r('app.color.text_tertiary'),
+        )
       }
       .constraintSize({ minHeight: 22 })
       .padding({ top: 2, bottom: 2 })
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => {
-        this.expandedWorkGroups = this.toggleExpanded(this.expandedWorkGroups, item.key);
+        this.toggleWorkGroup(item.key);
       })
       .width('100%')
 
@@ -2908,6 +4289,7 @@ export struct TaskPageContent {
         .width('100%')
         .padding({ left: 10, top: 2, bottom: 2 })
         .border({ width: { left: 2 }, color: { left: $r('app.color.border') } })
+        .transition(uiRevealTransition())
       }
 
       if (this.isIn(this.expandedWorkGroups, item.key)) {
@@ -2922,6 +4304,7 @@ export struct TaskPageContent {
         .width('100%')
         .padding({ left: 10, top: 2, bottom: 2 })
         .border({ width: { left: 2 }, color: { left: $r('app.color.border') } })
+        .transition(uiRevealTransition())
       }
     }
     .width('100%')
@@ -2997,7 +4380,7 @@ export struct TaskPageContent {
       .padding({ left: 9, right: 9, top: 5, bottom: 5 })
       .backgroundColor($r('app.color.bg_chip'))
       .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(16)
+      .borderRadius(UI_RADIUS_PILL)
       Divider()
         .color($r('app.color.border'))
         .layoutWeight(1)
@@ -3009,12 +4392,47 @@ export struct TaskPageContent {
   /** 历史消息图片缩略图（点击全屏预览）。 */
   @Builder
   imageThumb(ref: RemoteImageRef) {
-    Image(this.imageSources.get(ref.url) ?? '')
+    if ((this.imageSources.get(ref.url) ?? '').length > 0) {
+      Image(this.imageSources.get(ref.url) ?? '')
+        .width(88)
+        .height(88)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .objectFit(ImageFit.Contain)
+        .clickEffect(UI_CLICK_EFFECT)
+        .onClick(() => this.openImagePreview(ref))
+        .onError(() => this.handleNativeImageError(ref.url, ref))
+    } else if (this.imageStatus(ref.url) === 'error') {
+      this.mediaErrorFrame(88, 88, () => this.retryImage(ref.url, ref))
+    } else {
+      Row() {
+        LoadingProgress().width(16).height(16)
+      }
       .width(88)
       .height(88)
-      .borderRadius(8)
-      .objectFit(ImageFit.Contain)
-      .onClick(() => this.openImagePreview(ref))
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_CONTROL)
+    }
+  }
+
+  @Builder
+  mediaErrorFrame(width: number, height: number, retry: () => void) {
+    Column({ space: 5 }) {
+      SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
+        .fontSize(uiFontSize(17))
+        .fontColor([$r('app.color.text_tertiary')])
+      Text('加载失败 · 重试')
+        .fontSize(uiFontSize(11))
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(1)
+    }
+    .width(width)
+    .height(height)
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_CLICK_EFFECT)
+    .onClick(retry)
   }
 
   /** 交互卡分派（按 kind）。 */
@@ -3026,6 +4444,10 @@ export struct TaskPageContent {
       this.askUserCard(item)
     } else if (item.kind === 'plan_review') {
       this.planReviewCard(item)
+    } else if (item.kind === 'issue_confirm') {
+      this.desktopOnlyInteractionCard(item, 'Issue 确认', '请回到电脑端确认标题与正文后再继续。')
+    } else if (item.kind === 'plugin_setup') {
+      this.pluginSetupCard(item)
     } else {
       Text(`交互请求（${item.kind}）`)
         .fontSize(uiFontSize(13))
@@ -3036,6 +4458,78 @@ export struct TaskPageContent {
         .border({ width: 1, color: $r('app.color.border') })
         .borderRadius(UI_RADIUS_CONTAINER)
     }
+  }
+
+  @Builder
+  desktopOnlyInteractionCard(item: PendingInteraction, title: string, message: string) {
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.doc_text'), title)
+      Text(message)
+        .fontSize(uiFontSize(13))
+        .lineHeight(uiLineHeight(19))
+        .fontColor($r('app.color.text_secondary'))
+        .width('100%')
+      if (this.requestStr(item, 'title').length > 0) {
+        Text(this.requestStr(item, 'title'))
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .padding(10)
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_CONTROL)
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(14)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiOverlayTransition())
+  }
+
+  @Builder
+  pluginSetupCard(item: PendingInteraction) {
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.gearshape'), '插件配置')
+      Text(this.pluginSetupTitle(item))
+        .fontSize(uiFontSize(14))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .width('100%')
+      Text(this.requestBool(item, 'terminal')
+        ? '电脑端已完成这次配置。'
+        : '敏感配置和授权需要在电脑端完成，这里仅显示进度。')
+        .fontSize(uiFontSize(13))
+        .lineHeight(uiLineHeight(19))
+        .fontColor($r('app.color.text_secondary'))
+        .width('100%')
+      if (this.pluginSetupCanCancel(item)) {
+        Row() {
+          Row().layoutWeight(1)
+          this.interactionSecondaryButton('取消请求', true,
+            () => this.resolveInteraction(item, this.pluginSetupCancelDecision(item)),
+            !AppServices.instance.interactions.isResolving(item.requestId))
+        }
+        .width('100%')
+      }
+      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
+        Text(AppServices.instance.interactions.resolveError(item.requestId))
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.danger'))
+          .width('100%')
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(14)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .transition(uiOverlayTransition())
   }
 
   /** 交互卡统一头部：图标 + 标题。 */
@@ -3062,7 +4556,7 @@ export struct TaskPageContent {
 
   /** 交互卡次要按钮（拒绝 / 跳过）：描边胶囊。 */
   @Builder
-  interactionSecondaryButton(label: string, danger: boolean, action: () => void) {
+  interactionSecondaryButton(label: string, danger: boolean, action: () => void, enabled: boolean = true) {
     Button(label)
       .type(ButtonType.Normal)
       .height(34)
@@ -3073,13 +4567,15 @@ export struct TaskPageContent {
       .border({ width: 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_PILL)
       .padding({ left: 16, right: 16 })
+      .enabled(enabled)
+      .opacity(enabled ? 1 : 0.55)
       .clickEffect(UI_CLICK_EFFECT)
       .onClick(action)
   }
 
   /** 交互卡主按钮（允许 / 提交 / 批准）：实心反色胶囊。 */
   @Builder
-  interactionPrimaryButton(label: string, action: () => void) {
+  interactionPrimaryButton(label: string, action: () => void, enabled: boolean = true) {
     Button(label)
       .type(ButtonType.Normal)
       .height(34)
@@ -3089,6 +4585,8 @@ export struct TaskPageContent {
       .backgroundColor($r('app.color.chat_cta'))
       .borderRadius(UI_RADIUS_PILL)
       .padding({ left: 16, right: 16 })
+      .enabled(enabled)
+      .opacity(enabled ? 1 : 0.55)
       .clickEffect(UI_CLICK_EFFECT)
       .onClick(action)
   }
@@ -3113,16 +4611,25 @@ export struct TaskPageContent {
       }
       Row({ space: 8 }) {
         this.interactionSecondaryButton('拒绝', true,
-          () => this.resolveInteraction(item, this.permissionDecision(item, 'deny')))
+          () => this.resolveInteraction(item, this.permissionDecision(item, 'deny')),
+          !this.interactionBusy(item))
         Row().layoutWeight(1)
         this.interactionPrimaryButton('允许一次',
-          () => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')))
+          () => this.resolveInteraction(item, this.permissionDecision(item, 'allow-once')),
+          !this.interactionBusy(item))
         if (this.permissionCanAlwaysAllow(item)) {
           this.interactionPrimaryButton('始终允许',
-            () => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')))
+            () => this.resolveInteraction(item, this.permissionDecision(item, 'always-allow')),
+            !this.interactionBusy(item))
         }
       }
       .width('100%')
+      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
+        Text(AppServices.instance.interactions.resolveError(item.requestId))
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.danger'))
+          .width('100%')
+      }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -3130,7 +4637,7 @@ export struct TaskPageContent {
     .backgroundColor($r('app.color.bg_card'))
     .border({ width: 1, color: $r('app.color.border') })
     .borderRadius(UI_RADIUS_CONTAINER)
-    .transition(uiOverlayEnterTransition())
+    .transition(uiOverlayTransition())
   }
 
   /** Ask User 卡：问题 + 选项（单选/多选）+ 自定义输入 + 提交。 */
@@ -3138,69 +4645,105 @@ export struct TaskPageContent {
   askUserCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.ellipsis_message'), '请确认')
-      Text(this.askQuestion(item))
-        .fontSize(uiFontSize(14))
-        .lineHeight(uiLineHeight(20))
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
+      if (this.askQuestionCount(item) === 0) {
+        Text('问题内容暂不可用，可继续让电脑端处理。')
+          .fontSize(uiFontSize(13))
+          .lineHeight(uiLineHeight(19))
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+        Row() {
+          Row().layoutWeight(1)
+          this.interactionPrimaryButton('继续',
+            () => this.resolveInteraction(item, this.askEmptyDecision()),
+            !this.interactionBusy(item))
+        }
         .width('100%')
-      if (this.askOptions(item).length > 0) {
-        ForEach(this.askOptions(item), (opt: string) => {
-          Row({ space: 8 }) {
-            Stack({ alignContent: Alignment.Center }) {
-              if (this.isAskSelected(item, opt)) {
-                SymbolGlyph($r('sys.symbol.checkmark'))
-                  .fontSize(uiFontSize(12))
-                  .fontColor([$r('app.color.text_primary')])
+      } else {
+        Row({ space: 8 }) {
+          Text(`问题 ${this.askCurrentIndex(item) + 1} / ${this.askQuestionCount(item)}`)
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_tertiary'))
+          Text(this.askMultiSelect(item) ? '可多选' : '单选')
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        .width('100%')
+
+        Text(this.askQuestion(item))
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+
+        if (this.askOptions(item).length > 0) {
+          ForEach(this.askOptions(item), (opt: string) => {
+            Row({ space: 8 }) {
+              Stack({ alignContent: Alignment.Center }) {
+                if (this.isAskSelected(item, opt)) {
+                  SymbolGlyph($r('sys.symbol.checkmark'))
+                    .fontSize(uiFontSize(12))
+                    .fontColor([$r('app.color.chat_cta_text')])
+                }
               }
+              .width(18)
+              .height(18)
+              .backgroundColor(this.isAskSelected(item, opt)
+                ? $r('app.color.chat_cta') : Color.Transparent)
+              .border({ width: 1, color: $r('app.color.border') })
+              .borderRadius(this.askMultiSelect(item) ? UI_RADIUS_CONTROL : UI_RADIUS_PILL)
+              Text(opt)
+                .fontSize(uiFontSize(13))
+                .fontColor($r('app.color.text_primary'))
+                .layoutWeight(1)
             }
-            .width(18)
-            .height(18)
+            .width('100%')
+            .constraintSize({ minHeight: 40 })
+            .padding({ left: 10, right: 10 })
             .backgroundColor(this.isAskSelected(item, opt)
               ? $r('app.color.bg_chip') : Color.Transparent)
             .border({ width: 1, color: $r('app.color.border') })
             .borderRadius(UI_RADIUS_CONTROL)
-            Text(opt)
-              .fontSize(uiFontSize(13))
-              .fontColor($r('app.color.text_primary'))
-              .layoutWeight(1)
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 36 })
-          .padding({ left: 10, right: 10 })
-          .backgroundColor(this.isAskSelected(item, opt)
-            ? $r('app.color.bg_chip') : Color.Transparent)
-          .border({ width: 1, color: $r('app.color.border') })
-          .borderRadius(UI_RADIUS_CONTROL)
-          .clickEffect(UI_CLICK_EFFECT)
-          .onClick(() => this.toggleAskSelection(item, opt))
-        }, (opt: string) => `${item.requestId}-${opt}`)
-      }
-      if (this.askAllowsCustom(item)) {
-        TextInput({ placeholder: '自定义输入…', text: this.askCustomInputs.get(item.requestId) ?? '' })
-          .onChange((v: string) => {
-            const next = new Map(this.askCustomInputs);
-            next.set(item.requestId, v);
-            this.askCustomInputs = next;
-          })
+            .enabled(!this.interactionBusy(item))
+            .clickEffect(UI_CLICK_EFFECT)
+            .onClick(() => this.toggleAskSelection(item, opt))
+          }, (opt: string) => `${item.requestId}-${this.askCurrentIndex(item)}-${opt}`)
+        }
+
+        TextInput({ placeholder: '自定义回答…', text: this.askCustomInput(item) })
+          .onChange((v: string) => this.updateAskCustomInput(item, v))
           .fontSize(uiFontSize(13))
           .fontColor($r('app.color.text_primary'))
           .placeholderColor($r('app.color.text_placeholder'))
           .caretColor($r('app.color.chat_input_caret'))
-          .height(36)
+          .height(40)
           .padding({ left: 12, right: 12 })
           .backgroundColor($r('app.color.bg_page'))
           .border({ width: 1, color: $r('app.color.border') })
           .borderRadius(UI_RADIUS_PILL)
+          .enabled(!this.interactionBusy(item))
+
+        if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
+          Text(AppServices.instance.interactions.resolveError(item.requestId))
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.danger'))
+            .width('100%')
+        }
+
+        Row({ space: 8 }) {
+          if (this.askCurrentIndex(item) > 0) {
+            this.interactionSecondaryButton('上一题', false,
+              () => this.moveAskQuestion(item, -1), !this.interactionBusy(item))
+          }
+          this.interactionSecondaryButton('跳过', false,
+            () => this.skipAskQuestion(item), !this.interactionBusy(item))
+          Row().layoutWeight(1)
+          this.interactionPrimaryButton(this.askIsLast(item) ? '提交回答' : '下一题',
+            () => this.submitAskQuestion(item),
+            !this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0)
+        }
+        .width('100%')
       }
-      Row({ space: 8 }) {
-        this.interactionSecondaryButton('跳过', false,
-          () => this.resolveInteraction(item, this.askSkip(item)))
-        Row().layoutWeight(1)
-        this.interactionPrimaryButton('提交回答',
-          () => this.resolveInteraction(item, this.askDecision(item)))
-      }
-      .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -3208,7 +4751,7 @@ export struct TaskPageContent {
     .backgroundColor($r('app.color.bg_card'))
     .border({ width: 1, color: $r('app.color.border') })
     .borderRadius(UI_RADIUS_CONTAINER)
-    .transition(uiOverlayEnterTransition())
+    .transition(uiOverlayTransition())
   }
 
   /** Plan Review 卡：计划查看 + 批准 / 反馈拒绝。 */
@@ -3216,23 +4759,94 @@ export struct TaskPageContent {
   planReviewCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.doc_text'), '计划审批')
-      Text(this.planText(item))
-        .fontSize(uiFontSize(12))
-        .lineHeight(uiLineHeight(18))
-        .fontColor($r('app.color.code_text'))
-        .maxLines(8)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-        .padding(10)
-        .backgroundColor($r('app.color.bg_code'))
-        .border({ width: 1, color: $r('app.color.border') })
-        .borderRadius(UI_RADIUS_CONTROL)
       Row({ space: 8 }) {
-        this.interactionSecondaryButton('拒绝', true,
-          () => this.resolveInteraction(item, this.planDecision(item, false, '')))
+        Text(this.planDraftEdited(item) ? '已编辑' : '请检查完整计划后再批准')
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+          .layoutWeight(1)
+        Button(this.planDraft(item).editMode ? '完成编辑' : '编辑')
+          .type(ButtonType.Normal)
+          .height(30)
+          .padding({ left: 12, right: 12 })
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_PILL)
+          .enabled(!this.interactionBusy(item))
+          .onClick(() => this.togglePlanEdit(item))
+        if (!this.planDraft(item).editMode) {
+          Button(this.planDraft(item).expanded ? '收起' : '查看全文')
+            .type(ButtonType.Normal)
+            .height(30)
+            .padding({ left: 12, right: 12 })
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_PILL)
+            .onClick(() => this.togglePlanExpanded(item))
+        }
+      }
+      .width('100%')
+
+      if (this.planDraft(item).editMode) {
+        TextArea({ text: this.planText(item), placeholder: '输入计划内容' })
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.code_text'))
+          .caretColor($r('app.color.chat_input_caret'))
+          .height(220)
+          .padding(10)
+          .backgroundColor($r('app.color.bg_code'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .enabled(!this.interactionBusy(item))
+          .onChange((value: string) => this.updatePlanText(item, value))
+      } else {
+        Text(this.planText(item).length > 0 ? this.planText(item) : '计划内容为空')
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.code_text'))
+          .maxLines(this.planDraft(item).expanded ? 1000 : 8)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .padding(10)
+          .backgroundColor($r('app.color.bg_code'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+      }
+
+      if (this.planDraft(item).feedbackOpen) {
+        TextArea({ text: this.planDraft(item).feedback, placeholder: '说明需要修改的内容…' })
+          .fontSize(uiFontSize(13))
+          .lineHeight(uiLineHeight(19))
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_placeholder'))
+          .caretColor($r('app.color.chat_input_caret'))
+          .constraintSize({ minHeight: 76, maxHeight: 140 })
+          .padding(10)
+          .backgroundColor($r('app.color.bg_page'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .enabled(!this.interactionBusy(item))
+          .onChange((value: string) => this.updatePlanFeedback(item, value))
+      }
+
+      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
+        Text(AppServices.instance.interactions.resolveError(item.requestId))
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.danger'))
+          .width('100%')
+      }
+
+      Row({ space: 8 }) {
+        this.interactionSecondaryButton(this.planDraft(item).feedbackOpen ? '提交反馈' : '反馈修改', true,
+          () => this.requestPlanFeedback(item),
+          !this.interactionBusy(item)
+            && (!this.planDraft(item).feedbackOpen || this.planDraft(item).feedback.trim().length > 0))
         Row().layoutWeight(1)
         this.interactionPrimaryButton('批准计划',
-          () => this.resolveInteraction(item, this.planDecision(item, true, this.planText(item))))
+          () => this.resolveInteraction(item, this.planDecision(item, true)),
+          !this.interactionBusy(item) && this.planText(item).trim().length > 0)
       }
       .width('100%')
     }
@@ -3242,11 +4856,76 @@ export struct TaskPageContent {
     .backgroundColor($r('app.color.bg_card'))
     .border({ width: 1, color: $r('app.color.border') })
     .borderRadius(UI_RADIUS_CONTAINER)
-    .transition(uiOverlayEnterTransition())
+    .transition(uiOverlayTransition())
   }
 
   private hasVisibleMessageBody(item: RenderMessageItem): boolean {
     return item.body.trim().length > 0 || item.mdBlocks.length > 0 || item.segments.length > 0;
+  }
+
+  private attachmentTitle(file: RemoteSerializedAttachment): string {
+    if (file.name.length > 0) return file.name;
+    if (file.originalName.length > 0) return file.originalName;
+    return '附件';
+  }
+
+  private attachmentMeta(file: RemoteSerializedAttachment): string {
+    const parts: string[] = [];
+    if (file.ext.length > 0) parts.push(file.ext.toUpperCase());
+    else if (file.category.length > 0) parts.push(file.category.toUpperCase());
+    if (file.size > 0) parts.push(this.fileSizeLabel(file.size));
+    return parts.length > 0 ? parts.join(' · ') : '文件';
+  }
+
+  private fileSizeLabel(bytes: number): string {
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  private async openMessageFile(file: RemoteSerializedAttachment): Promise<void> {
+    const raw = file.url.length > 0 ? file.url : file.path;
+    const url = await this.resolveDownloadableUrl(raw, file.mimeType, false);
+    if (url.length === 0) {
+      promptAction.showToast({ message: '暂时无法预览这个文件' });
+      return;
+    }
+    this.openUrl(url);
+  }
+
+  private async openToolMedia(payload: RenderMediaPayload): Promise<void> {
+    const url = await this.resolveDownloadableUrl(payload.url, payload.mimeType, true);
+    if (url.length === 0) {
+      promptAction.showToast({ message: '媒体暂时不可用，请稍后重试' });
+      return;
+    }
+    this.openUrl(url);
+  }
+
+  private async resolveDownloadableUrl(raw: string, mimeType: string, skipCache: boolean): Promise<string> {
+    const url = normalizeImageUrlScheme(raw.trim());
+    if (url.startsWith('http://') || url.startsWith('https://')) return url;
+    const parsed = parseAttachmentOssRef(url);
+    if (parsed !== null) {
+      try {
+        return await this.resolveOssUrl(parsed.ossKey);
+      } catch (e) {
+        return '';
+      }
+    }
+    if (!/^(?:xdt-image|xdt-video|xdt-audio|cindy-media|xdt-file):\/\//i.test(url)) return '';
+    try {
+      const fetched = await AppServices.instance.messages.fetchRemoteMedia(
+        this.deviceId, url, false, skipCache);
+      if (fetched.ossKey.length > 0) return await this.resolveOssUrl(fetched.ossKey);
+      if (fetched.inlineBase64.length > 0 && mimeType.toLowerCase().startsWith('image/')) {
+        const resolvedMime = mimeType.length > 0 ? mimeType : fetched.mimeType;
+        return `data:${resolvedMime};base64,${fetched.inlineBase64}`;
+      }
+      return '';
+    } catch (e) {
+      return '';
+    }
   }
 
   private messageVerticalPadding(item: RenderMessageItem): number {
@@ -3311,12 +4990,27 @@ export struct TaskPageContent {
       .fontSize(uiFontSize(12))
       .lineHeight(uiLineHeight(18))
       .fontColor($r('app.color.accent'))
+      .padding({ top: 4, bottom: 4 })
+      .clickEffect(UI_CLICK_EFFECT)
       .onClick(() => {
-        this.expandedTextBlocks = this.toggleExpanded(
-          this.expandedTextBlocks,
-          this.plainMessageExpandKey(item),
-        );
+        this.toggleTextBlock(this.plainMessageExpandKey(item));
       })
+  }
+
+  @Builder
+  messageActionButton(symbol: Resource, action: () => void) {
+    Button() {
+      SymbolGlyph(symbol)
+        .fontSize(uiFontSize(14))
+        .fontColor([$r('app.color.chat_text_secondary')])
+    }
+    .type(ButtonType.Circle)
+    .width(32)
+    .height(32)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .onClick(action)
   }
 
   @Builder
@@ -3350,6 +5044,20 @@ export struct TaskPageContent {
         }
         .listDirection(Axis.Horizontal)
         .height(88)
+        .width(item.kind === 'user' ? '86%' : '100%')
+        .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
+      }
+
+      if (item.files.length > 0) {
+        List({ space: 6 }) {
+          ForEach(item.files, (file: RemoteSerializedAttachment) => {
+            ListItem() {
+              this.messageFileChip(file)
+            }
+          }, (file: RemoteSerializedAttachment) => `${item.key}-${file.path}-${file.name}`)
+        }
+        .listDirection(Axis.Horizontal)
+        .height(58)
         .width(item.kind === 'user' ? '86%' : '100%')
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
       }
@@ -3392,11 +5100,10 @@ export struct TaskPageContent {
               .fontSize(uiFontSize(12))
               .lineHeight(uiLineHeight(18))
               .fontColor($r('app.color.accent'))
+              .padding({ top: 4, bottom: 4 })
+              .clickEffect(UI_CLICK_EFFECT)
               .onClick(() => {
-                this.expandedTextBlocks = this.toggleExpanded(
-                  this.expandedTextBlocks,
-                  this.plainMessageExpandKey(item),
-                );
+                this.toggleTextBlock(this.plainMessageExpandKey(item));
               })
           }
 
@@ -3414,7 +5121,7 @@ export struct TaskPageContent {
         .alignItems(HorizontalAlign.Start)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
         .backgroundColor(item.kind === 'user' ? $r('app.color.bg_card') : Color.Transparent)
-        .borderRadius(item.kind === 'user' ? 12 : 0)
+        .borderRadius(item.kind === 'user' ? UI_RADIUS_CONTAINER : 0)
         .border({
           width: item.kind === 'user' ? 1 : 0,
           color: $r('app.color.chat_bubble_border'),
@@ -3437,41 +5144,11 @@ export struct TaskPageContent {
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ right: 2 })
           }
-          Button() {
-            SymbolGlyph($r('sys.symbol.rectangle_on_rectangle'))
-              .fontSize(uiFontSize(14))
-              .fontColor([$r('app.color.chat_text_secondary')])
-          }
-          .width(24)
-          .height(24)
-          .padding(0)
-          .borderRadius(12)
-          .backgroundColor(Color.Transparent)
-          .onClick(() => this.copyMessage(item))
+          this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), () => this.copyMessage(item))
           if (this.canFork(item)) {
-            Button() {
-              SymbolGlyph($r('sys.symbol.split'))
-                .fontSize(uiFontSize(14))
-                .fontColor([$r('app.color.chat_text_secondary')])
-            }
-            .width(24)
-            .height(24)
-            .padding(0)
-            .borderRadius(12)
-            .backgroundColor(Color.Transparent)
-            .onClick(() => this.confirmFork(item))
+            this.messageActionButton($r('sys.symbol.split'), () => this.confirmFork(item))
           }
-          Button() {
-            SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-              .fontSize(uiFontSize(14))
-              .fontColor([$r('app.color.chat_text_secondary')])
-          }
-          .width(24)
-          .height(24)
-          .padding(0)
-          .borderRadius(12)
-          .backgroundColor(Color.Transparent)
-          .onClick(() => this.showMessageActions(item))
+          this.messageActionButton($r('sys.symbol.ellipsis_circle'), () => this.showMessageActions(item))
           if (item.kind === 'assistant') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
               .fontSize(uiFontSize(12))
@@ -3486,12 +5163,50 @@ export struct TaskPageContent {
             }
           }
         }
-        .height(24)
+        .height(32)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
       }
     }
     .width('100%')
     .alignItems(item.kind === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
+  }
+
+  @Builder
+  messageFileChip(file: RemoteSerializedAttachment) {
+    Row({ space: 8 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.doc_text'))
+          .fontSize(uiFontSize(16))
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .width(32)
+      .height(32)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_CONTROL)
+      Column({ space: 1 }) {
+        Text(this.attachmentTitle(file))
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.attachmentMeta(file))
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      this.disclosureChevron(false, $r('app.color.text_tertiary'))
+    }
+    .width(230)
+    .height(56)
+    .padding({ left: 8, right: 8 })
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => void this.openMessageFile(file))
   }
 
   /** 粘贴段 chip：文件图标 + display 摘要，点击展开全文（对齐 iOS InlineReferenceChip）。 */
@@ -3508,16 +5223,18 @@ export struct TaskPageContent {
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
-        Text(this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`) ? '▾' : '▸')
-          .fontSize(uiFontSize(11))
-          .fontColor($r('app.color.text_tertiary'))
+        this.disclosureChevron(
+          this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`),
+          $r('app.color.text_tertiary'),
+        )
       }
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
       .backgroundColor($r('app.color.bg_chip'))
-      .borderRadius(8)
+      .borderRadius(UI_RADIUS_CONTROL)
       .width('100%')
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => {
-        this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
+        this.toggleTextBlock(`${item.key}-${seg.seq}`);
       })
 
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
@@ -3525,8 +5242,10 @@ export struct TaskPageContent {
         Text('收起')
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
+          .padding({ top: 4, bottom: 4 })
+          .clickEffect(UI_CLICK_EFFECT)
           .onClick(() => {
-            this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
+            this.toggleTextBlock(`${item.key}-${seg.seq}`);
           })
       }
     }
@@ -3543,8 +5262,10 @@ export struct TaskPageContent {
         Text('收起')
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
+          .padding({ top: 4, bottom: 4 })
+          .clickEffect(UI_CLICK_EFFECT)
           .onClick(() => {
-            this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
+            this.toggleTextBlock(`${item.key}-${seg.seq}`);
           })
       } else {
         // 自动化消息使用更紧的 4/3 行策略；手打消息保持 14/10。
@@ -3554,14 +5275,17 @@ export struct TaskPageContent {
           .maxLines(this.collapsedMessageLines(item))
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
+          .clickEffect(UI_LIST_CLICK_EFFECT)
           .onClick(() => {
-            this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
+            this.toggleTextBlock(`${item.key}-${seg.seq}`);
           })
         Text('展开全文')
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
+          .padding({ top: 4, bottom: 4 })
+          .clickEffect(UI_CLICK_EFFECT)
           .onClick(() => {
-            this.expandedTextBlocks = this.toggleExpanded(this.expandedTextBlocks, `${item.key}-${seg.seq}`);
+            this.toggleTextBlock(`${item.key}-${seg.seq}`);
           })
       }
     }
@@ -3573,19 +5297,21 @@ export struct TaskPageContent {
   thinkingBlock(item: RenderThinkingItem) {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
-        SymbolGlyph(this.isIn(this.expandedThinking, item.key)
-          ? $r('sys.symbol.chevron_down')
-          : $r('sys.symbol.chevron_right'))
-          .fontSize(uiFontSize(13))
-          .fontColor([$r('app.color.chat_text_secondary')])
-          .width(16)
+        this.disclosureChevron(
+          this.isIn(this.expandedThinking, item.key),
+          $r('app.color.chat_text_secondary'),
+        )
         Text(this.thinkingTitle(item))
           .fontSize(uiFontSize(14))
           .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
       }
+      .width('100%')
+      .constraintSize({ minHeight: 32 })
+      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => {
-        this.expandedThinking = this.toggleExpanded(this.expandedThinking, item.key);
+        this.toggleThinkingBlock(item.key);
       })
 
       if (this.isIn(this.expandedThinking, item.key)) {
@@ -3604,6 +5330,7 @@ export struct TaskPageContent {
             .width('100%')
             .padding({ left: 12, top: 2, bottom: 2 })
             .border({ width: { left: 2 }, color: { left: $r('app.color.composer_border') } })
+            .transition(uiRevealTransition())
         }
       }
     }
@@ -3631,7 +5358,16 @@ export struct TaskPageContent {
   }
 
   private toolHasDetails(t: RenderToolItem): boolean {
-    return t.inputText.length > 0 || (t.hasResult && t.resultText.length > 0);
+    return t.inputText.length > 0 || (t.hasResult && t.resultText.length > 0) || t.diff !== null;
+  }
+
+  private diffLines(value: string, prefix: string): string {
+    const lines = value.replace(/\r\n/g, '\n').split('\n');
+    const out: string[] = [];
+    const limit = Math.min(lines.length, 80);
+    for (let i = 0; i < limit; i++) out.push(`${prefix}${lines[i]}`);
+    if (lines.length > limit) out.push(`${prefix}…`);
+    return out.join('\n');
   }
 
   @Builder
@@ -3663,20 +5399,19 @@ export struct TaskPageContent {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         if (this.toolHasDetails(t)) {
-          SymbolGlyph(this.isIn(this.expandedTools, this.toolKey(t))
-            ? $r('sys.symbol.chevron_down')
-            : $r('sys.symbol.chevron_right'))
-            .fontSize(uiFontSize(13))
-            .fontColor([$r('app.color.text_tertiary')])
-            .width(16)
+          this.disclosureChevron(
+            this.isIn(this.expandedTools, this.toolKey(t)),
+            $r('app.color.text_tertiary'),
+          )
         }
       }
       .width('100%')
       .constraintSize({ minHeight: 28 })
       .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+      .clickEffect(this.toolHasDetails(t) ? UI_LIST_CLICK_EFFECT : undefined)
       .onClick(() => {
         if (this.toolHasDetails(t)) {
-          this.expandedTools = this.toggleExpanded(this.expandedTools, this.toolKey(t));
+          this.toggleToolDetails(this.toolKey(t));
         }
       })
 
@@ -3698,17 +5433,85 @@ export struct TaskPageContent {
               .lineHeight(uiLineHeight(18))
               .width('100%')
           }
+          if (t.diff !== null) {
+            this.diffCard(t.diff as RenderDiffPayload)
+          }
         }
         .width('100%')
         .padding(8)
         .margin({ left: 8, right: 8, bottom: 4 })
         .backgroundColor($r('app.color.bg_code'))
         .border({ width: 1, color: $r('app.color.composer_border') })
-        .borderRadius(12)
+        .borderRadius(UI_RADIUS_CONTAINER)
+        .transition(uiRevealTransition())
       }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  diffCard(diff: RenderDiffPayload) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        SymbolGlyph($r('sys.symbol.doc_text'))
+          .fontSize(uiFontSize(14))
+          .fontColor([$r('app.color.text_secondary')])
+        Text(diff.filePath)
+          .fontSize(uiFontSize(12))
+          .fontFamily('monospace')
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        Text(`+${diff.insertions}`)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.success'))
+        Text(`−${diff.deletions}`)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.danger'))
+      }
+      .width('100%')
+      ForEach(diff.segments, (segment: RenderDiffSegment) => {
+        if (segment.label.length > 0) {
+          Text(segment.label)
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+            .width('100%')
+        }
+        if (segment.oldString.length > 0) {
+          Text(this.diffLines(segment.oldString, '− '))
+            .fontSize(uiFontSize(11))
+            .fontFamily('monospace')
+            .fontColor($r('app.color.danger'))
+            .lineHeight(uiLineHeight(17))
+            .maxLines(12)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding(6)
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
+        }
+        if (segment.newString.length > 0) {
+          Text(this.diffLines(segment.newString, '+ '))
+            .fontSize(uiFontSize(11))
+            .fontFamily('monospace')
+            .fontColor($r('app.color.success'))
+            .lineHeight(uiLineHeight(17))
+            .maxLines(12)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding(6)
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
+        }
+      }, (segment: RenderDiffSegment) => segment.key)
+    }
+    .width('100%')
+    .padding(8)
+    .backgroundColor($r('app.color.bg_page'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
   }
 
   @Builder
@@ -3747,7 +5550,7 @@ export struct TaskPageContent {
     .alignItems(HorizontalAlign.Start)
     .padding(10)
     .backgroundColor($r('app.color.bg_card'))
-    .borderRadius(12)
+    .borderRadius(UI_RADIUS_CONTAINER)
     .border({ width: 1, color: $r('app.color.border') })
     .margin({ top: 4, bottom: 4 })
   }
@@ -3795,8 +5598,13 @@ export struct TaskPageContent {
         .width(this.markdownImageWidth(token))
         .height(this.markdownImageHeight(token))
         .objectFit(ImageFit.Contain)
-        .borderRadius(8)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .clickEffect(UI_CLICK_EFFECT)
         .onClick(() => this.openInlineImagePreview(token.url))
+        .onError(() => this.handleNativeImageError(token.url, this.markdownImageRef(token)))
+    } else if (this.imageStatus(token.url) === 'error') {
+      this.mediaErrorFrame(this.markdownImageWidth(token), this.markdownImageHeight(token),
+        () => this.retryImage(token.url, this.markdownImageRef(token)))
     } else {
       Row({ space: 6 }) {
         LoadingProgress()
@@ -3812,7 +5620,7 @@ export struct TaskPageContent {
       .height(32)
       .padding({ left: 8, right: 8 })
       .backgroundColor($r('app.color.bg_chip'))
-      .borderRadius(8)
+      .borderRadius(UI_RADIUS_CONTROL)
     }
   }
 
@@ -3877,6 +5685,19 @@ export struct TaskPageContent {
           .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
           .width('100%')
       }
+    } else if (b.type === 'math') {
+      this.richSourceBlock('公式', b.code, 'math')
+    } else if (b.type === 'code'
+      && (b.lang.toLowerCase() === 'mermaid' || b.lang.toLowerCase() === 'math'
+        || b.lang.toLowerCase() === 'latex' || b.lang.toLowerCase() === 'tex'
+        || b.lang.toLowerCase() === 'html' || b.lang.toLowerCase() === 'diff')) {
+      this.richSourceBlock(
+        b.lang.toLowerCase() === 'mermaid' ? 'Mermaid 图表'
+          : (b.lang.toLowerCase() === 'html' ? 'HTML 预览'
+            : (b.lang.toLowerCase() === 'diff' ? '变更内容' : '公式')),
+        b.code,
+        b.lang.toLowerCase(),
+      )
     } else if (b.type === 'code') {
       Column({ space: 4 }) {
         Text(b.code)
@@ -3887,7 +5708,7 @@ export struct TaskPageContent {
           .padding(10)
           .backgroundColor($r('app.color.bg_code'))
           .border({ width: 1, color: $r('app.color.border') })
-          .borderRadius(12)
+          .borderRadius(UI_RADIUS_CONTAINER)
           .width('100%')
           .textAlign(TextAlign.Start)
       }
@@ -3900,6 +5721,29 @@ export struct TaskPageContent {
         .color($r('app.color.border'))
         .margin({ top: 6, bottom: 6 })
     }
+  }
+
+  @Builder
+  richSourceBlock(title: string, source: string, kind: string) {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        SymbolGlyph($r('sys.symbol.doc_text'))
+          .fontSize(uiFontSize(13)).fontColor([$r('app.color.text_secondary')])
+        Text(title).fontSize(uiFontSize(12)).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary')).layoutWeight(1)
+        Text(kind === 'html' ? '静态安全模式' : '源码')
+          .fontSize(uiFontSize(10)).fontColor($r('app.color.text_tertiary'))
+      }.width('100%')
+      Text(source)
+        .fontSize(uiFontSize(kind === 'math' || kind === 'latex' || kind === 'tex' ? 14 : 12))
+        .fontFamily(kind === 'math' || kind === 'latex' || kind === 'tex' ? 'serif' : 'monospace')
+        .fontColor($r('app.color.code_text')).lineHeight(uiLineHeight(19))
+        .maxLines(24).textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%').padding(10).backgroundColor($r('app.color.bg_code'))
+        .borderRadius(UI_RADIUS_CONTROL)
+    }
+    .width('100%').padding(10).backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_CONTAINER)
   }
 
   private tableHeaderTokens(b: MdBlock, index: number): InlineToken[] {
@@ -4129,43 +5973,205 @@ export struct TaskPageContent {
   }
 
   private showSessionActions(): void {
-    const workingDir = this.session()?.workingDir ?? '';
-    if (workingDir.length > 0) {
-      this.getUIContext().showActionSheet({
-        title: '任务操作',
-        message: this.sessionTitle(),
-        sheets: [{
-          title: '复制任务 ID',
-          action: () => this.copyPlainText(this.sessionId, '已复制任务 ID'),
-        }, {
-          title: '复制任务标题',
-          action: () => this.copyPlainText(this.sessionTitle(), '已复制任务标题'),
-        }, {
-          title: '复制项目路径',
-          action: () => this.copyPlainText(workingDir, '已复制项目路径'),
-        }],
-      });
+    this.sessionRenameDraft = this.sessionTitle();
+    this.sessionRenameMode = false;
+    uiAnimateState(this.getUIContext(), () => {
+      this.sessionActionOpen = true;
+    });
+  }
+
+  private closeSessionActions(): void {
+    if (this.sessionActionBusy) return;
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.sessionActionOpen = false;
+      this.sessionRenameMode = false;
+    });
+  }
+
+  private openSessionTree(): void {
+    this.sessionActionOpen = false;
+    this.sessionTreeOpen = true;
+    this.sessionTreeError = '';
+    void this.loadSessionTree();
+  }
+
+  private closeSessionTree(): void {
+    if (this.sessionTreeSwitchingId.length > 0) return;
+    this.sessionTreeGeneration += 1;
+    this.sessionTreeOpen = false;
+  }
+
+  private async loadSessionTree(): Promise<void> {
+    const generation = ++this.sessionTreeGeneration;
+    this.sessionTreeLoading = true;
+    this.sessionTreeError = '';
+    try {
+      const result = await this.invokeContextRpc('maker:get-session-tree', [this.sessionId]);
+      if (generation !== this.sessionTreeGeneration || !this.sessionTreeOpen) return;
+      const tree = parsePiSessionTree(result);
+      if (tree === null) throw new Error('invalid tree');
+      this.sessionTree = tree;
+    } catch (e) {
+      if (generation === this.sessionTreeGeneration) this.sessionTreeError = '暂时无法读取任务分支';
+    } finally {
+      if (generation === this.sessionTreeGeneration) this.sessionTreeLoading = false;
+    }
+  }
+
+  private async navigateSessionTree(entryId: string): Promise<void> {
+    if (this.sessionStreaming || this.sessionTreeSwitchingId.length > 0
+      || this.sessionTree?.leafId === entryId) return;
+    const generation = ++this.sessionTreeGeneration;
+    this.sessionTreeSwitchingId = entryId;
+    this.sessionTreeError = '';
+    const options: Record<string, Object> = {};
+    try {
+      const raw = await this.invokeContextRpc(
+        'maker:navigate-session-tree', [this.sessionId, entryId, options]);
+      if (generation !== this.sessionTreeGeneration || !this.sessionTreeOpen) return;
+      const result = parsePiNavigateResult(raw);
+      if (result === null) throw new Error('invalid result');
+      if (result.cancelled) return;
+      if (result.tree !== null) this.sessionTree = result.tree;
+      if (result.draftText.length > 0) this.setComposerDocument(textComposerDocument(result.draftText));
+      const replaced = await AppServices.instance.messages.replaceSessionWindow(this.deviceId, this.sessionId);
+      if (generation !== this.sessionTreeGeneration) return;
+      if (!replaced) throw new Error('history replace failed');
+      await Promise.all([
+        AppServices.instance.tasks.loadSessions(this.deviceId),
+        AppServices.instance.interactions.refreshPending(this.deviceId, this.sessionId),
+        AppServices.instance.inputQueue.refresh(this.deviceId, this.sessionId),
+      ]);
+      this.sessionTreeOpen = false;
+    } catch (e) {
+      if (generation === this.sessionTreeGeneration) this.sessionTreeError = '切换分支失败，请重试';
+    } finally {
+      if (generation === this.sessionTreeGeneration) this.sessionTreeSwitchingId = '';
+    }
+  }
+
+  private async patchCurrentSession(patch: SessionMetaPatch, leaveDetail: boolean = false): Promise<boolean> {
+    if (this.sessionActionBusy) return false;
+    this.sessionActionBusy = true;
+    const ok = await AppServices.instance.tasks.patchSession(this.deviceId, this.sessionId, patch);
+    this.sessionActionBusy = false;
+    if (!ok) {
+      promptAction.showToast({ message: '任务更新失败，请重试' });
+      return false;
+    }
+    this.closeSessionActions();
+    if (leaveDetail && !this.isEmbedded()) router.back();
+    return true;
+  }
+
+  private saveSessionRename(): void {
+    const title = this.sessionRenameDraft.trim();
+    if (title.length === 0) return;
+    const patch = new SessionMetaPatch();
+    patch.title = title;
+    void this.patchCurrentSession(patch);
+  }
+
+  private async generateSessionRename(): Promise<void> {
+    if (this.sessionActionBusy) return;
+    this.sessionActionBusy = true;
+    const title = await AppServices.instance.tasks.regenerateTitle(this.deviceId, this.sessionId);
+    this.sessionActionBusy = false;
+    if (title.length === 0) {
+      promptAction.showToast({ message: '暂时无法生成标题' });
       return;
     }
-    this.getUIContext().showActionSheet({
-      title: '任务操作',
-      message: this.sessionTitle(),
-      sheets: [{
-        title: '复制任务 ID',
-        action: () => this.copyPlainText(this.sessionId, '已复制任务 ID'),
-      }, {
-        title: '复制任务标题',
-        action: () => this.copyPlainText(this.sessionTitle(), '已复制任务标题'),
-      }],
+    this.sessionRenameDraft = title;
+    this.sessionRenameMode = true;
+  }
+
+  private toggleSessionPinned(): void {
+    const session = this.session();
+    if (session === undefined) return;
+    const patch = new SessionMetaPatch();
+    patch.pinnedAt = session.pinnedAt.length > 0 ? null : new Date().toISOString();
+    void this.patchCurrentSession(patch);
+  }
+
+  private archiveOrRestoreSession(): void {
+    const session = this.session();
+    if (session === undefined) return;
+    const patch = new SessionMetaPatch();
+    patch.status = session.status === 'archived' ? 'active' : 'archived';
+    if (patch.status === 'archived') patch.pinnedAt = null;
+    void this.patchCurrentSession(patch, patch.status === 'archived');
+  }
+
+  private confirmDeleteSession(): void {
+    this.getUIContext().showAlertDialog({
+      title: '删除任务？',
+      message: '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: $r('app.color.danger'),
+        action: () => {
+          const patch = new SessionMetaPatch();
+          patch.status = 'deleted';
+          void this.patchCurrentSession(patch, true);
+        },
+      },
     });
   }
 
   private addMessageToComposer(item: RenderMessageItem): void {
     const body = item.body.trim();
     if (body.length === 0) return;
-    this.input = this.input.trim().length === 0 ? body : `${this.input}\n\n${body}`;
-    this.composerInputRevision += 1;
+    const next = this.input.trim().length === 0 ? body : `${this.input}\n\n${body}`;
+    this.setComposerDocument(reconcileComposerProjectedText(this.composerDocument, next));
     promptAction.showToast({ message: '已添加到输入框' });
+  }
+
+  private quoteMessageInComposer(item: RenderMessageItem): void {
+    const body = item.body.trim();
+    if (body.length === 0) return;
+    this.setComposerDocument(appendComposerNode(this.composerDocument, quoteNode(body)));
+    promptAction.showToast({ message: '已引用到输入框' });
+  }
+
+  private copyMessageLink(item: RenderMessageItem): void {
+    const clientId = item.message?.clientId ?? '';
+    if (clientId.length === 0) {
+      promptAction.showToast({ message: '无法定位消息' });
+      return;
+    }
+    const link = `cindy://session/${encodeURIComponent(this.sessionId)}?message=${encodeURIComponent(clientId)}`;
+    this.copyPlainText(link, '已复制消息链接');
+  }
+
+  private confirmDeleteMessage(item: RenderMessageItem): void {
+    const clientId = item.message?.clientId ?? '';
+    if (clientId.length === 0 || this.sessionStreaming || this.messageActionBusyId.length > 0) return;
+    this.getUIContext().showAlertDialog({
+      title: '删除消息？',
+      message: item.kind === 'assistant' ? '这会删除同一轮中的全部 AI 输出。' : '这条消息将从任务记录中移除。',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: $r('app.color.danger'),
+        action: () => void this.deleteMessage(clientId),
+      },
+    });
+  }
+
+  private async deleteMessage(clientId: string): Promise<void> {
+    this.messageActionBusyId = clientId;
+    try {
+      const deleted = await AppServices.instance.messages.deleteMessage(
+        this.deviceId, this.sessionId, clientId);
+      if (deleted.length === 0) throw new Error('empty delete result');
+      await AppServices.instance.messages.reloadSession(this.deviceId, this.sessionId);
+      promptAction.showToast({ message: deleted.length > 1 ? `已删除 ${deleted.length} 条消息` : '消息已删除' });
+    } catch (e) {
+      promptAction.showToast({ message: '删除失败，请稍后重试' });
+    } finally {
+      this.messageActionBusyId = '';
+    }
   }
 
   private showMessageActions(item: RenderMessageItem): void {
@@ -4178,11 +6184,20 @@ export struct TaskPageContent {
           title: '添加到输入框',
           action: () => this.addMessageToComposer(item),
         }, {
+          title: '引用消息',
+          action: () => this.quoteMessageInComposer(item),
+        }, {
+          title: '复制消息链接',
+          action: () => this.copyMessageLink(item),
+        }, {
           title: '复制消息 ID',
           action: () => this.copyPlainText(messageId, '已复制消息 ID'),
         }, {
           title: '回退到这里',
           action: () => this.confirmRewind(item),
+        }, {
+          title: this.sessionStreaming ? '生成中不可删除' : '删除消息',
+          action: () => this.confirmDeleteMessage(item),
         }],
       });
       return;
@@ -4194,8 +6209,17 @@ export struct TaskPageContent {
         title: '添加到输入框',
         action: () => this.addMessageToComposer(item),
       }, {
+        title: '引用消息',
+        action: () => this.quoteMessageInComposer(item),
+      }, {
+        title: '复制消息链接',
+        action: () => this.copyMessageLink(item),
+      }, {
         title: '复制消息 ID',
         action: () => this.copyPlainText(messageId, '已复制消息 ID'),
+      }, {
+        title: this.sessionStreaming ? '生成中不可删除' : '删除消息',
+        action: () => this.confirmDeleteMessage(item),
       }],
     });
   }
@@ -4232,20 +6256,47 @@ export struct TaskPageContent {
         promptAction.showToast({ message: '无法定位消息' });
         return;
       }
+      void this.previewRewind(clientId, item.body);
+    });
+  }
+
+  private rewindPreviewMessage(preview: RewindPreview): string {
+    const lines: string[] = ['将回退到这条消息，之后的消息会被移除。'];
+    if (preview.filesChanged.length > 0) {
+      lines.push(`文件影响：${preview.filesChanged.length} 个文件，+${preview.insertions} / -${preview.deletions}`);
+      const limit = Math.min(4, preview.filesChanged.length);
+      for (let i = 0; i < limit; i++) lines.push(`• ${preview.filesChanged[i]}`);
+      if (preview.filesChanged.length > limit) lines.push(`另有 ${preview.filesChanged.length - limit} 个文件`);
+    }
+    if (!preview.canRewind) {
+      lines.push(preview.error.length > 0
+        ? `文件无法恢复：${preview.error}。仍可只回退对话。`
+        : '文件无法恢复，仍可只回退对话。');
+    }
+    return lines.join('\n');
+  }
+
+  private async previewRewind(clientId: string, draftText: string): Promise<void> {
+    try {
+      const preview = await AppServices.instance.messages.rewindPreview(
+        this.deviceId, this.sessionId, clientId);
       AlertDialog.show({
         title: '回退任务',
-        message: '将回退到这条消息，之后的消息会被移除。',
-        primaryButton: {
-          value: '取消',
-          action: () => {
-          },
-        },
+        message: this.rewindPreviewMessage(preview),
+        primaryButton: { value: '取消', action: () => {} },
         secondaryButton: {
-          value: '回退',
-          action: () => this.doRewind(clientId),
+          value: preview.canRewind ? '回退' : '只回退对话',
+          action: () => void this.doRewind(clientId, draftText),
         },
       });
-    });
+    } catch (e) {
+      AlertDialog.show({
+        title: '回退任务',
+        message: '暂时无法读取文件影响。你仍可回退对话，之后的消息会被移除。',
+        primaryButton: { value: '取消', action: () => {} },
+        secondaryButton: { value: '继续回退', action: () => void this.doRewind(clientId, draftText) },
+      });
+    }
   }
 
   /** 取消息的 clientId（messages:list 返回完整行，含 clientId）。 */
@@ -4312,19 +6363,72 @@ export struct TaskPageContent {
   }
 
   private ensureImageSource(key: string, ref: RemoteImageRef): void {
-    if (key.length === 0 || this.imageSources.has(key) || this.imageResolutions.has(key)) return;
-    const pending = this.resolveImageUrl(ref);
+    if (key.length === 0) return;
+    const current = this.imageStates.get(key);
+    if (current !== undefined && current.sourceKey === ref.url
+      && (current.status === 'loading' || current.status === 'ready' || current.status === 'error')) return;
+    const intent = beginRemoteMediaResolve(current, ref.url);
+    this.setImageState(key, intent.state);
+    this.startImageResolve(key, ref, intent);
+  }
+
+  private startImageResolve(key: string, ref: RemoteImageRef, intent: RemoteMediaResolveIntent): void {
+    const pending = this.resolveImageUrl(ref, intent.forceRefresh, intent.skipCache);
     this.imageResolutions.set(key, pending);
     pending.then((url: string) => {
-      if (url.length > 0) {
+      const current = this.imageStates.get(key);
+      if (current === undefined) return;
+      const nextState = remoteMediaResolveReady(current, intent.generation, url);
+      this.setImageState(key, nextState);
+      if (nextState.status === 'ready') {
         const next = new Map(this.imageSources);
-        next.set(key, url);
+        next.set(key, nextState.resolvedUrl);
         this.imageSources = next;
       }
       this.imageResolutions.delete(key);
-    }).catch(() => {
+    }).catch((error: Error) => {
+      const current = this.imageStates.get(key);
+      if (current !== undefined) {
+        this.setImageState(key, remoteMediaResolveFailed(current, intent.generation, error.message));
+      }
       this.imageResolutions.delete(key);
     });
+  }
+
+  private setImageState(key: string, state: RemoteMediaViewState): void {
+    const next = new Map(this.imageStates);
+    next.set(key, state);
+    this.imageStates = next;
+  }
+
+  private imageStatus(key: string): string {
+    return this.imageStates.get(key)?.status ?? 'idle';
+  }
+
+  private handleNativeImageError(key: string, ref: RemoteImageRef): void {
+    const current = this.imageStates.get(key);
+    if (current === undefined) return;
+    const recovery = beginNativeMediaRecovery(current);
+    const sources = new Map(this.imageSources);
+    sources.delete(key);
+    this.imageSources = sources;
+    if (recovery !== null) {
+      this.setImageState(key, recovery.state);
+      this.startImageResolve(key, ref, recovery);
+      return;
+    }
+    this.setImageState(key, failNativeMediaLoad(current));
+  }
+
+  private retryImage(key: string, ref: RemoteImageRef): void {
+    const current = this.imageStates.get(key);
+    if (current === undefined) {
+      this.ensureImageSource(key, ref);
+      return;
+    }
+    const intent = beginManualMediaRetry(current);
+    this.setImageState(key, intent.state);
+    this.startImageResolve(key, ref, intent);
   }
 
   private markdownImageRef(token: InlineToken): RemoteImageRef {
@@ -4393,7 +6497,11 @@ export struct TaskPageContent {
    * - cindy/xdt OSS 引用走 presign-get；
    * - Desktop 本地媒体引用走 device-link:media:fetch，再兼容 inline 缩略图和 OSS。
    */
-  private resolveImageUrl(ref: RemoteImageRef): Promise<string> {
+  private resolveImageUrl(
+    ref: RemoteImageRef,
+    forceRefresh: boolean = false,
+    skipCache: boolean = false,
+  ): Promise<string> {
     const url = normalizeImageUrlScheme(ref.url.trim());
     if (url.startsWith('http://') || url.startsWith('https://')) {
       return Promise.resolve(url);
@@ -4403,6 +6511,7 @@ export struct TaskPageContent {
     }
     const parsed = parseAttachmentOssRef(url);
     if (parsed !== null) {
+      if (forceRefresh) this.ossUrlCache.delete(parsed.ossKey);
       return this.resolveOssUrl(parsed.ossKey).catch(() => {
         return '';
       });
@@ -4411,7 +6520,7 @@ export struct TaskPageContent {
       return Promise.resolve('');
     }
 
-    return AppServices.instance.messages.fetchRemoteMedia(this.deviceId, url, true).then(
+    return AppServices.instance.messages.fetchRemoteMedia(this.deviceId, url, true, skipCache).then(
       (fetched: RemoteMediaFetchResult) => {
         if (fetched.inlineBase64.length > 0) {
           const mimeType = fetched.mimeType.length > 0
@@ -4423,6 +6532,7 @@ export struct TaskPageContent {
         if (fetched.ossKey.length === 0) {
           return '';
         }
+        if (forceRefresh) this.ossUrlCache.delete(fetched.ossKey);
         return this.resolveOssUrl(fetched.ossKey);
       },
     ).catch(() => {
@@ -4469,23 +6579,32 @@ export struct TaskPageContent {
   private openInlineImagePreview(url: string): void {
     const src = this.imageSources.get(url) ?? '';
     if (src.length > 0) {
-      this.previewImageUrl = src;
+      uiAnimateFastState(this.getUIContext(), () => {
+        this.previewImageUrl = src;
+      });
     }
   }
 
   private openImagePreview(ref: RemoteImageRef): void {
     const src = this.imageSources.get(ref.url) ?? '';
     if (src.length > 0) {
-      this.previewImageUrl = src;
+      uiAnimateFastState(this.getUIContext(), () => {
+        this.previewImageUrl = src;
+      });
     }
   }
 
   // ─── 交互确认（Permission / Ask User / Plan Review）──────────────────────────
 
   private resolveInteraction(item: PendingInteraction, decision: Record<string, Object>): void {
-    AppServices.instance.interactions.resolve(this.deviceId, item.requestId, decision).catch(() => {
+    AppServices.instance.interactions.resolve(
+      this.deviceId, item.sessionId, item.requestId, decision).catch(() => {
       promptAction.showToast({ message: '提交失败，请重试' });
     });
+  }
+
+  private interactionBusy(item: PendingInteraction): boolean {
+    return AppServices.instance.interactions.isResolving(item.requestId);
   }
 
   private requestStr(item: PendingInteraction, key: string): string {
@@ -4504,6 +6623,27 @@ export struct TaskPageContent {
   private requestBool(item: PendingInteraction, key: string): boolean {
     const v = item.raw[key];
     return v === true;
+  }
+
+  private pluginSetupTitle(item: PendingInteraction): string {
+    const ghostName = this.requestStr(item, 'ghostName');
+    if (ghostName.length > 0) return ghostName;
+    const pluginName = this.requestStr(item, 'pluginName');
+    return pluginName.length > 0 ? pluginName : '等待电脑端配置';
+  }
+
+  private pluginSetupCanCancel(item: PendingInteraction): boolean {
+    if (this.requestBool(item, 'terminal')) return false;
+    const revision = item.raw['revision'];
+    return typeof revision === 'number' && Number.isInteger(revision) && revision >= 0;
+  }
+
+  private pluginSetupCancelDecision(item: PendingInteraction): Record<string, Object> {
+    const decision: Record<string, Object> = {};
+    decision['kind'] = 'plugin_setup';
+    decision['action'] = 'cancel';
+    decision['expectedRevision'] = typeof item.raw['revision'] === 'number' ? item.raw['revision'] : 0;
+    return decision;
   }
 
   // ── Permission ──
@@ -4563,34 +6703,55 @@ export struct TaskPageContent {
   }
 
   // ── Ask User ──
-  /** questions 是数组，取第一个问题（多步骤一期先逐题 resolve）。 */
-  private firstQuestion(item: PendingInteraction): Record<string, Object> {
+  private askQuestions(item: PendingInteraction): Record<string, Object>[] {
     const raw = item.raw['questions'];
+    const out: Record<string, Object>[] = [];
     if (Array.isArray(raw)) {
       const list: Object[] = raw as Object[];
-      if (list.length > 0) {
-        const first = list[0];
-        if (first !== undefined && typeof first === 'object' && !Array.isArray(first)) {
-          return first as Record<string, Object>;
+      for (let i = 0; i < list.length; i++) {
+        const value = list[i];
+        if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+        const question = value as Record<string, Object>;
+        if (typeof question['question'] === 'string' && (question['question'] as string).length > 0) {
+          out.push(question);
         }
       }
     }
-    return {};
+    return out;
+  }
+
+  private askQuestionCount(item: PendingInteraction): number {
+    return this.askQuestions(item).length;
+  }
+
+  private askDraft(item: PendingInteraction): AskUserDraft {
+    return AppServices.instance.interactions.readAskDraft(item.requestId) ?? new AskUserDraft();
+  }
+
+  private askCurrentIndex(item: PendingInteraction): number {
+    const count = this.askQuestionCount(item);
+    if (count === 0) return 0;
+    return Math.min(Math.max(this.askDraft(item).currentIndex, 0), count - 1);
+  }
+
+  private currentAskQuestion(item: PendingInteraction): Record<string, Object> {
+    const questions = this.askQuestions(item);
+    return questions.length === 0 ? {} : questions[this.askCurrentIndex(item)];
   }
 
   private askQuestion(item: PendingInteraction): string {
-    const q = this.firstQuestion(item);
+    const q = this.currentAskQuestion(item);
     const v = q['question'];
     return typeof v === 'string' ? v : '';
   }
 
   private askMultiSelect(item: PendingInteraction): boolean {
-    const q = this.firstQuestion(item);
+    const q = this.currentAskQuestion(item);
     return q['multiSelect'] === true;
   }
 
   private askOptions(item: PendingInteraction): string[] {
-    const q = this.firstQuestion(item);
+    const q = this.currentAskQuestion(item);
     const raw = q['options'];
     const out: string[] = [];
     if (Array.isArray(raw)) {
@@ -4608,77 +6769,243 @@ export struct TaskPageContent {
     return out;
   }
 
-  private askAllowsCustom(item: PendingInteraction): boolean {
-    const q = this.firstQuestion(item);
-    const allows = q['allowsCustomAnswer'];
-    return allows === true || allows === undefined;
+  private askCustomInput(item: PendingInteraction): string {
+    return this.askDraft(item).customInput;
   }
 
   private isAskSelected(item: PendingInteraction, label: string): boolean {
-    const selected = this.askSelections.get(item.requestId);
-    return selected !== undefined && selected.indexOf(label) >= 0;
+    return this.askDraft(item).selectedLabels.indexOf(label) >= 0;
   }
 
   private toggleAskSelection(item: PendingInteraction, label: string): void {
-    const selected = this.askSelections.get(item.requestId) ?? [];
-    const idx = selected.indexOf(label);
-    let next: string[];
-    if (idx >= 0) {
-      next = selected.slice(0, idx).concat(selected.slice(idx + 1));
+    const draft = this.askDraft(item);
+    if (!this.askMultiSelect(item)) {
+      draft.selectedLabels = [label];
+      draft.customInput = '';
+      draft.showCustomInput = false;
     } else {
-      next = selected.concat([label]);
+      const idx = draft.selectedLabels.indexOf(label);
+      if (idx >= 0) {
+        draft.selectedLabels = draft.selectedLabels.slice(0, idx).concat(draft.selectedLabels.slice(idx + 1));
+      } else {
+        draft.selectedLabels = draft.selectedLabels.concat([label]);
+      }
     }
-    const map = new Map(this.askSelections);
-    map.set(item.requestId, next);
-    this.askSelections = map;
+    this.recordCurrentAskAnswer(item, draft);
+    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
   }
 
-  private askDecision(item: PendingInteraction): Record<string, Object> {
-    const q = this.firstQuestion(item);
-    const qv = q['question'];
-    const question = typeof qv === 'string' ? qv : '';
-    const selected = this.askSelections.get(item.requestId) ?? [];
-    const custom = (this.askCustomInputs.get(item.requestId) ?? '').trim();
-    const parts = selected.slice();
-    if (custom.length > 0) {
-      parts.push(custom);
+  private updateAskCustomInput(item: PendingInteraction, value: string): void {
+    const draft = this.askDraft(item);
+    draft.customInput = value;
+    draft.showCustomInput = value.length > 0;
+    if (!this.askMultiSelect(item) && value.length > 0) draft.selectedLabels = [];
+    this.recordCurrentAskAnswer(item, draft);
+    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+  }
+
+  private askCurrentAnswer(item: PendingInteraction): string {
+    return this.answerFromAskDraft(item, this.askDraft(item));
+  }
+
+  private answerFromAskDraft(item: PendingInteraction, draft: AskUserDraft): string {
+    const custom = draft.customInput.trim();
+    if (!this.askMultiSelect(item)) {
+      if (custom.length > 0) return custom;
+      return draft.selectedLabels.length > 0 ? draft.selectedLabels[0] : '';
     }
-    // 多选按协议编码为 JSON 数组；单选直接文本。
-    const answer = this.askMultiSelect(item) ? JSON.stringify(parts) : parts.join('\n');
+    const selected: string[] = [];
+    const options = this.askOptions(item);
+    for (let i = 0; i < options.length; i++) {
+      if (draft.selectedLabels.indexOf(options[i]) >= 0) selected.push(options[i]);
+    }
+    if (custom.length > 0) selected.push(custom);
+    return selected.length > 0 ? JSON.stringify(selected) : '';
+  }
+
+  private recordCurrentAskAnswer(item: PendingInteraction, draft: AskUserDraft): void {
+    const question = this.askQuestion(item);
+    if (question.length > 0) draft.answers.set(question, this.answerFromAskDraft(item, draft));
+  }
+
+  private restoreAskControls(item: PendingInteraction, draft: AskUserDraft): void {
+    draft.selectedLabels = [];
+    draft.customInput = '';
+    draft.showCustomInput = false;
+    const answer = draft.answers.get(this.askQuestionAt(item, draft.currentIndex)) ?? '';
+    if (answer.length === 0) return;
+    const options = this.askOptionsAt(item, draft.currentIndex);
+    if (this.askMultiSelectAt(item, draft.currentIndex)) {
+      try {
+        const parsed = JSON.parse(answer) as Object;
+        if (!Array.isArray(parsed)) return;
+        const values = parsed as Object[];
+        for (let i = 0; i < values.length; i++) {
+          if (typeof values[i] !== 'string') continue;
+          const value = values[i] as string;
+          if (options.indexOf(value) >= 0) draft.selectedLabels.push(value);
+          else if (draft.customInput.length === 0) draft.customInput = value;
+        }
+        draft.showCustomInput = draft.customInput.length > 0;
+      } catch (e) {
+      }
+      return;
+    }
+    if (options.indexOf(answer) >= 0) {
+      draft.selectedLabels = [answer];
+    } else {
+      draft.customInput = answer;
+      draft.showCustomInput = true;
+    }
+  }
+
+  private askQuestionAt(item: PendingInteraction, index: number): string {
+    const questions = this.askQuestions(item);
+    if (index < 0 || index >= questions.length) return '';
+    const value = questions[index]['question'];
+    return typeof value === 'string' ? value : '';
+  }
+
+  private askMultiSelectAt(item: PendingInteraction, index: number): boolean {
+    const questions = this.askQuestions(item);
+    return index >= 0 && index < questions.length && questions[index]['multiSelect'] === true;
+  }
+
+  private askOptionsAt(item: PendingInteraction, index: number): string[] {
+    const questions = this.askQuestions(item);
+    if (index < 0 || index >= questions.length) return [];
+    const raw = questions[index]['options'];
+    const out: string[] = [];
+    if (!Array.isArray(raw)) return out;
+    const options = raw as Object[];
+    for (let i = 0; i < options.length; i++) {
+      if (options[i] === null || typeof options[i] !== 'object' || Array.isArray(options[i])) continue;
+      const label = (options[i] as Record<string, Object>)['label'];
+      if (typeof label === 'string' && label.length > 0) out.push(label);
+    }
+    return out;
+  }
+
+  private moveAskQuestion(item: PendingInteraction, delta: number): void {
+    const draft = this.askDraft(item);
+    this.recordCurrentAskAnswer(item, draft);
+    const max = Math.max(0, this.askQuestionCount(item) - 1);
+    draft.currentIndex = Math.min(Math.max(draft.currentIndex + delta, 0), max);
+    this.restoreAskControls(item, draft);
+    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+  }
+
+  private askIsLast(item: PendingInteraction): boolean {
+    return this.askCurrentIndex(item) >= this.askQuestionCount(item) - 1;
+  }
+
+  private submitAskQuestion(item: PendingInteraction): void {
+    const draft = this.askDraft(item);
+    const answer = this.answerFromAskDraft(item, draft);
+    if (answer.trim().length === 0) return;
+    this.recordCurrentAskAnswer(item, draft);
+    if (!this.askIsLast(item)) {
+      draft.currentIndex += 1;
+      this.restoreAskControls(item, draft);
+      AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+      return;
+    }
+    this.resolveInteraction(item, this.askDecisionFromDraft(draft));
+  }
+
+  private skipAskQuestion(item: PendingInteraction): void {
+    const draft = this.askDraft(item);
+    draft.answers.set(this.askQuestion(item), '');
+    if (!this.askIsLast(item)) {
+      draft.currentIndex += 1;
+      this.restoreAskControls(item, draft);
+      AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+      return;
+    }
+    this.resolveInteraction(item, this.askDecisionFromDraft(draft));
+  }
+
+  private askDecisionFromDraft(draft: AskUserDraft): Record<string, Object> {
     const answers: Record<string, Object> = {};
-    answers[question] = answer;
+    draft.answers.forEach((value: string, key: string) => {
+      answers[key] = value;
+    });
     const d: Record<string, Object> = {};
     d['kind'] = 'ask_user_question';
     d['answers'] = answers;
     return d;
   }
 
-  /** Skip：跳过当前问题（空答案，桌面端继续下一题/结束）。 */
-  private askSkip(item: PendingInteraction): Record<string, Object> {
-    const q = this.firstQuestion(item);
-    const qv = q['question'];
-    const question = typeof qv === 'string' ? qv : '';
-    const answers: Record<string, Object> = {};
-    answers[question] = '';
+  private askEmptyDecision(): Record<string, Object> {
     const d: Record<string, Object> = {};
+    const answers: Record<string, Object> = {};
     d['kind'] = 'ask_user_question';
     d['answers'] = answers;
     return d;
   }
 
   // ── Plan Review ──
-  private planText(item: PendingInteraction): string {
-    return this.requestStr(item, 'plan');
+  private planDraft(item: PendingInteraction): PlanReviewDraft {
+    const existing = AppServices.instance.interactions.readPlanDraft(item.requestId);
+    if (existing !== null) return existing;
+    const draft = new PlanReviewDraft();
+    draft.planText = this.requestStr(item, 'plan');
+    return draft;
   }
 
-  private planDecision(item: PendingInteraction, approved: boolean, plan: string): Record<string, Object> {
+  private planText(item: PendingInteraction): string {
+    return this.planDraft(item).planText;
+  }
+
+  private planDraftEdited(item: PendingInteraction): boolean {
+    return this.planText(item) !== this.requestStr(item, 'plan');
+  }
+
+  private togglePlanEdit(item: PendingInteraction): void {
+    const draft = this.planDraft(item);
+    draft.editMode = !draft.editMode;
+    if (draft.editMode) draft.expanded = true;
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+  }
+
+  private togglePlanExpanded(item: PendingInteraction): void {
+    const draft = this.planDraft(item);
+    draft.expanded = !draft.expanded;
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+  }
+
+  private updatePlanText(item: PendingInteraction, value: string): void {
+    const draft = this.planDraft(item);
+    draft.planText = value;
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+  }
+
+  private updatePlanFeedback(item: PendingInteraction, value: string): void {
+    const draft = this.planDraft(item);
+    draft.feedback = value;
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+  }
+
+  private requestPlanFeedback(item: PendingInteraction): void {
+    const draft = this.planDraft(item);
+    if (!draft.feedbackOpen) {
+      draft.feedbackOpen = true;
+      AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+      return;
+    }
+    if (draft.feedback.trim().length === 0) return;
+    this.resolveInteraction(item, this.planDecision(item, false));
+  }
+
+  private planDecision(item: PendingInteraction, approved: boolean): Record<string, Object> {
+    const draft = this.planDraft(item);
     const d: Record<string, Object> = {};
     d['kind'] = 'plan_review';
     d['behavior'] = approved ? 'allow' : 'deny';
     if (approved) {
-      d['editedPlan'] = plan;
+      d['editedPlan'] = draft.planText;
     } else {
-      d['reason'] = 'User rejected';
+      d['reason'] = draft.feedback.trim();
     }
     return d;
   }
@@ -4697,17 +7024,18 @@ export struct TaskPageContent {
     });
   }
 
-  private doRewind(clientId: string): void {
-    AppServices.instance.messages.rewindCommit(this.deviceId, this.sessionId, clientId).then((newSessionId: string) => {
-      if (newSessionId.length > 0) {
-        promptAction.showToast({ message: '已回退' });
-        if (!this.isEmbedded()) router.back();
-      } else {
-        promptAction.showToast({ message: '回退失败' });
-      }
-    }).catch(() => {
+  private async doRewind(clientId: string, draftText: string): Promise<void> {
+    try {
+      const session = await AppServices.instance.messages.rewindCommit(
+        this.deviceId, this.sessionId, clientId);
+      if (session === null || session.id.length === 0) throw new Error('invalid rewind result');
+      AppServices.instance.tasks.upsertSession(this.deviceId, session);
+      await AppServices.instance.messages.reloadSession(this.deviceId, this.sessionId);
+      this.setComposerDocument(textComposerDocument(draftText));
+      promptAction.showToast({ message: '已回退，可编辑原消息后重新发送' });
+    } catch (e) {
       promptAction.showToast({ message: '回退失败' });
-    });
+    }
   }
 }
 

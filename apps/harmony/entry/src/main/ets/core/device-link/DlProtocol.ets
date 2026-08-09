@@ -181,6 +181,18 @@ export class DlChannels {
   /** 发送消息 / 停止执行。 */
   static readonly MAKER_SEND = 'maker:send';
   static readonly MAKER_ABORT = 'maker:abort-session';
+  /** 输入队列（与 Mobile transport 的公开通道同源）。 */
+  static readonly INPUT_GET_PROJECTION = 'maker:input:get-projection';
+  static readonly INPUT_ENQUEUE = 'maker:input:enqueue';
+  static readonly INPUT_STEER = 'maker:input:steer';
+  static readonly INPUT_STOP = 'maker:input:stop';
+  static readonly INPUT_RESUME = 'maker:input:resume';
+  static readonly INPUT_RETRY_ERROR = 'maker:input:retry-last-error';
+  static readonly INPUT_CLEAR_ERROR = 'maker:input:clear-error';
+  static readonly INPUT_REMOVE = 'maker:input:remove';
+  static readonly INPUT_UPDATE_CONTENT = 'maker:input:update-content';
+  static readonly INPUT_MOVE = 'maker:input:move';
+  static readonly INPUT_SET_EDIT_LOCK = 'maker:input:set-edit-lock';
   /** 当前被控端处于 turn 中的会话快照。 */
   static readonly MAKER_LIST_ACTIVE = 'maker:list-active';
   /** 指定会话是否处于 turn 中。 */

@@ -39,14 +39,30 @@ export const UI_CURVE_MOVE: Curve = Curve.EaseInOut;
 /** 列表行/卡片的统一按压反馈（HarmonyOS 推荐 spring 动效）。 */
 export const UI_CLICK_EFFECT: ClickEffect = {
   level: ClickEffectLevel.LIGHT,
-  scale: 0.97,
+  scale: 0.98,
 };
 
-/** 透明 icon 按钮的按压反馈（幅度更小，避免跳动）。 */
+/** 列表和菜单整行的按压反馈：只做极轻缩放，避免宽组件边缘明显跳动。 */
+export const UI_LIST_CLICK_EFFECT: ClickEffect = {
+  level: ClickEffectLevel.LIGHT,
+  scale: 0.995,
+};
+
+/** 透明 icon 按钮的按压反馈（幅度更小，避免图标跳动）。 */
 export const UI_ICON_CLICK_EFFECT: ClickEffect = {
   level: ClickEffectLevel.LIGHT,
-  scale: 0.9,
+  scale: 0.96,
 };
+
+/** 统一触发普通状态变化，供折叠、选中和局部内容切换使用。 */
+export function uiAnimateState(context: UIContext, apply: () => void): void {
+  context.animateTo({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE }, apply);
+}
+
+/** 统一触发轻量可见性变化，供菜单、遮罩和即时提示使用。 */
+export function uiAnimateFastState(context: UIContext, apply: () => void): void {
+  context.animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, apply);
+}
 
 /** 轻量浮层（菜单 / 弹层）的进入过渡：淡入 + 轻微下移归位。 */
 export function uiOverlayEnterTransition(): TransitionEffect {
@@ -62,8 +78,15 @@ export function uiOverlayExitTransition(): TransitionEffect {
     .animation({ duration: UI_MOTION_INSTANT, curve: UI_CURVE_EXIT });
 }
 
+/** 轻量浮层完整进退场：进入轻移淡入，退出原地快速淡出。 */
+export function uiOverlayTransition(): TransitionEffect {
+  return TransitionEffect.asymmetric(uiOverlayEnterTransition(), uiOverlayExitTransition());
+}
+
 /** 区块内容出现/消失的通用过渡（折叠展开、提示条等）。 */
 export function uiRevealTransition(): TransitionEffect {
-  return TransitionEffect.OPACITY
-    .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE });
+  return TransitionEffect.asymmetric(
+    TransitionEffect.OPACITY.animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_ENTER }),
+    TransitionEffect.OPACITY.animation({ duration: UI_MOTION_INSTANT, curve: UI_CURVE_EXIT }),
+  );
 }

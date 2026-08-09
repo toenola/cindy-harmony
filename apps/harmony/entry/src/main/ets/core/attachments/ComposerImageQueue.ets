@@ -42,6 +42,7 @@ export class ComposerImageQueue {
   onPickingChanged: (picking: boolean) => void = () => {};
   /** 页面级忙碌判定（发送中/创建中），忙碌时禁止增删图片。 */
   isBusy: () => boolean = () => false;
+  occupiedByOtherAttachments: () => number = () => 0;
 
   images: ComposerImage[] = [];
   picking: boolean = false;
@@ -56,7 +57,7 @@ export class ComposerImageQueue {
   }
 
   remainingSlots(): number {
-    return Math.max(0, MAX_COMPOSER_IMAGES - this.images.length);
+    return Math.max(0, MAX_COMPOSER_IMAGES - this.occupiedByOtherAttachments() - this.images.length);
   }
 
   readyImages(): RemoteImageRef[] {

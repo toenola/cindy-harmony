@@ -1,5 +1,6 @@
 import { promptAction } from '@kit.ArkUI';
 import { RemoteImageRef } from '../core/attachments/AttachmentModels';
+import { ComposerFile } from '../core/attachments/ComposerFileQueue';
 import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
@@ -34,6 +35,7 @@ export struct ConversationComposer {
   @Prop input: string = '';
   @Prop focused: boolean = false;
   @Prop images: ComposerImage[] = [];
+  @Prop files: ComposerFile[] = [];
   @Prop sending: boolean = false;
   @Prop streaming: boolean = false;
   @Prop hasContent: boolean = false;
@@ -62,17 +64,38 @@ export struct ConversationComposer {
   onAbort: () => void = () => {};
   onRemoveImage: (image: ComposerImage) => void = () => {};
   onRetryImage: (image: ComposerImage) => void = () => {};
+  onRemoveFile: (file: ComposerFile) => void = () => {};
+  onRetryFile: (file: ComposerFile) => void = () => {};
+  @State inputMaxHeight: number = 120;
+  @State resizing: boolean = false;
+  private resizeStartY: number = 0;
+  private resizeStartHeight: number = 120;
+
+  private resizeInput(event: TouchEvent): void {
+    if (event.type === TouchType.Cancel) {
+      this.resizing = false;
+      return;
+    }
+    if (event.changedTouches.length === 0) return;
+    const y = event.changedTouches[0].displayY;
+    if (event.type === TouchType.Down) {
+      this.resizeStartY = y;
+      this.resizeStartHeight = this.inputMaxHeight;
+      this.resizing = true;
+    } else if (event.type === TouchType.Move) {
+      // 向上拖高；跟手阶段不用缓动。
+      this.inputMaxHeight = Math.max(96, Math.min(280, this.resizeStartHeight + this.resizeStartY - y));
+    } else if (event.type === TouchType.Up) {
+      this.resizing = false;
+    }
+  }
 
   private hasModelChip(): boolean {
     return this.hasModelOptions && (this.focused || this.images.length > 0);
   }
 
-  private hasControlRow(): boolean {
-    return this.focused || this.images.length > 0;
-  }
-
   private expanded(): boolean {
-    return this.focused || this.images.length > 0;
+    return this.focused || this.images.length > 0 || this.files.length > 0;
   }
 
   private tapPrimaryAction(): void {
@@ -129,6 +152,55 @@ export struct ConversationComposer {
     .padding({ right: 8 })
   }
 
+  @Builder
+  composerFileItem(file: ComposerFile) {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.doc'))
+        .fontSize(uiFontSize(18))
+        .fontColor([$r('app.color.text_secondary')])
+      Column({ space: 1 }) {
+        Text(file.name)
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(file.status === 'uploading' ? '上传中…'
+          : file.status === 'failed' ? (file.errorText || '上传失败')
+            : file.size > 0 ? `${(file.size / 1024).toFixed(1)} KB` : '已就绪')
+          .fontSize(uiFontSize(10))
+          .fontColor(file.status === 'failed' ? $r('app.color.danger') : $r('app.color.text_tertiary'))
+          .maxLines(1)
+      }
+      .width(112)
+      .alignItems(HorizontalAlign.Start)
+      if (file.status === 'failed') {
+        Button('重试')
+          .height(26)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.accent'))
+          .padding({ left: 8, right: 8 })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => this.onRetryFile(file))
+      }
+      Button() {
+        SymbolGlyph($r('sys.symbol.xmark'))
+          .fontSize(uiFontSize(10))
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .type(ButtonType.Circle)
+      .width(26)
+      .height(26)
+      .padding(0)
+      .backgroundColor($r('app.color.bg_chip'))
+      .onClick(() => this.onRemoveFile(file))
+    }
+    .height(54)
+    .padding({ left: 10, right: 6 })
+    .margin({ right: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_CONTROL)
+  }
+
   /** 胶囊内的圆形 icon 按钮（加号 / 权限）。 */
   @Builder
   composerIconButton(symbol: Resource, tint: Resource, enabled: boolean, action: () => void) {
@@ -138,8 +210,8 @@ export struct ConversationComposer {
         .fontColor([tint])
     }
     .type(ButtonType.Circle)
-    .width(34)
-    .height(34)
+    .width(40)
+    .height(40)
     .padding(0)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
@@ -168,6 +240,20 @@ export struct ConversationComposer {
       }
 
       Column({ space: 6 }) {
+        if (this.expanded()) {
+          Row() {
+            Row()
+              .width(36)
+              .height(4)
+              .backgroundColor(this.resizing
+                ? $r('app.color.accent') : $r('app.color.border'))
+              .borderRadius(UI_RADIUS_PILL)
+          }
+          .width('100%')
+          .height(12)
+          .justifyContent(FlexAlign.Center)
+          .onTouch((event: TouchEvent) => this.resizeInput(event))
+        }
         if (this.images.length > 0) {
           List({ space: 0 }) {
             ForEach(this.images, (image: ComposerImage) => {
@@ -182,22 +268,20 @@ export struct ConversationComposer {
           .transition(uiRevealTransition())
         }
 
-        if (this.focused) {
-          Row() {
-            Divider()
-              .width(36)
-              .strokeWidth(4)
-              .color($r('app.color.composer_border'))
-              .borderRadius(2)
+        if (this.files.length > 0) {
+          List({ space: 0 }) {
+            ForEach(this.files, (file: ComposerFile) => {
+              ListItem() { this.composerFileItem(file) }
+            }, (file: ComposerFile) => file.uri)
           }
-          .height(10)
+          .listDirection(Axis.Horizontal)
           .width('100%')
-          .justifyContent(FlexAlign.Center)
+          .height(60)
           .transition(uiRevealTransition())
         }
 
         Row({ space: 6 }) {
-          if (this.hasControlRow()) {
+          if (this.expanded()) {
             if (this.showAddButton) {
               this.composerIconButton(
                 $r('sys.symbol.plus'),
@@ -245,8 +329,8 @@ export struct ConversationComposer {
             .textAlign(TextAlign.Start)
             .padding({ left: 4, right: 4 })
             .constraintSize({
-              minHeight: 34,
-              maxHeight: this.expanded() ? 120 : 40,
+              minHeight: 40,
+              maxHeight: this.expanded() ? this.inputMaxHeight : 40,
             })
             .layoutWeight(1)
             .onFocus(() => this.onFocusChange(true))
@@ -309,8 +393,8 @@ export struct ConversationComposer {
             }
           }
           .type(ButtonType.Circle)
-          .width(34)
-          .height(34)
+          .width(40)
+          .height(40)
           .padding(0)
           .borderRadius(UI_RADIUS_PILL)
           .backgroundColor((this.streaming && !this.hasContent) || this.canSend
@@ -329,12 +413,13 @@ export struct ConversationComposer {
       .padding({
         left: 10,
         right: 10,
-        top: this.expanded() ? 6 : 3,
-        bottom: this.expanded() ? 6 : 3,
+        top: this.expanded() ? 8 : 4,
+        bottom: this.expanded() ? 8 : 4,
       })
       .backgroundColor($r('app.color.composer_surface'))
       .border({ width: 1, color: $r('app.color.composer_border') })
-      .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : UI_RADIUS_PILL)
+      // 收起态使用实际高度的一半做胶囊圆角，避免动画在 999→12 间插值抖动。
+      .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 24)
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')

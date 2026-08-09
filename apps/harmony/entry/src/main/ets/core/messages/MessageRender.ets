@@ -16,7 +16,19 @@ import {
   RemoteMessage, readStr, readObj, readAny,
 } from '../tasks/TaskModels';
 import { parseMarkdown, MdBlock } from './MarkdownParser';
-import { RemoteImageRef } from '../attachments/AttachmentModels';
+import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
+import {
+  RenderDiffPayload,
+  RenderMediaPayload,
+  buildToolDiff,
+  extractToolResultMedia,
+  parseMessageFiles,
+} from './MessagePayload';
+import {
+  AgentTaskUpdate,
+  findAgentTaskUpdate,
+  isAgentTaskToolName,
+} from './AgentTaskStore';
 
 // ─── 渲染项类型 ──────────────────────────────────────────────────────────────
 
@@ -58,6 +70,8 @@ export class RenderMessageItem extends RenderItem {
   segments: RenderTextSegment[] = [];
   /** user 消息携带的图片引用（content.images，URL 为 cindy-oss-attach 或 OSS 直链）。 */
   images: RemoteImageRef[] = [];
+  /** user 消息携带的普通文件；与 Mobile 一致放在正文气泡外。 */
+  files: RemoteSerializedAttachment[] = [];
   message: RemoteMessage | undefined = undefined;
 }
 
@@ -92,6 +106,10 @@ export class RenderToolItem {
   settledAt: string = '';
   /** 配对 tool_result 中可直接展示的托管图片。 */
   media: RemoteImageRef[] = [];
+  /** 视频、音频和图片的统一媒体描述；images 字段继续保留兼容旧视图。 */
+  richMedia: RenderMediaPayload[] = [];
+  /** Edit / MultiEdit / Write 的结构化变更预览。 */
+  diff: RenderDiffPayload | null = null;
   /** 调用发起时间 ISO（work_group 时长计算用）。 */
   createdAt: string = '';
 }
@@ -105,6 +123,25 @@ export class RenderToolGroupItem extends RenderItem {
 export class RenderToolMediaItem extends RenderItem {
   tools: RenderToolItem[] = [];
   images: RemoteImageRef[] = [];
+  media: RenderMediaPayload[] = [];
+}
+
+/** Task / Agent / subagent / collab:* 的独立任务卡。 */
+export class RenderAgentTaskItem extends RenderItem {
+  tool: RenderToolItem | null = null;
+  update: AgentTaskUpdate | null = null;
+  createdAt: string = '';
+}
+
+/** Claude Agent parentUuid 递归组；最大五层，异常桶回退平铺。 */
+export class RenderSubagentGroupItem extends RenderItem {
+  children: RenderItem[] = [];
+  description: string = '';
+  subagentType: string = '';
+  summary: string = '';
+  status: string = 'completed';
+  durationMs: number = -1;
+  update: AgentTaskUpdate | null = null;
 }
 
 export class RenderTodoItem {
@@ -409,6 +446,7 @@ export class ParsedUserContent {
   text: string = '';
   ranges: RenderPasteRange[] = [];
   images: RemoteImageRef[] = [];
+  files: RemoteSerializedAttachment[] = [];
 }
 
 /**
@@ -480,6 +518,7 @@ function parseUserContent(content: Object | undefined): ParsedUserContent {
         }
       }
     }
+    out.files = parseMessageFiles(content);
   }
   return out;
 }
@@ -595,9 +634,15 @@ function buildSegments(text: string, ranges: RenderPasteRange[], isAutomation: b
  *   TodoWrite/update_plan/Task* → 额外产出 todo 卡
  *   system/error/agent_switch → 系统消息块
  */
-export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: boolean = false): RenderItem[] {
+function buildLinearRenderItems(
+  messages: RemoteMessage[],
+  isSessionStreaming: boolean = false,
+  taskUpdates: Map<string, AgentTaskUpdate> | undefined = undefined,
+  renderOrphanTaskUpdates: boolean = false,
+): RenderItem[] {
   const items: RenderItem[] = [];
   let todoSeq = 0;
+  const renderedTaskKeys = new Set<string>();
 
   // 结果必须只作为 tool_use 的 secondary body 消费。之前把 tool_result 再建成一个
   // tool_group，导致同一条 Bash 在鸿蒙端出现两次，正是截图里“重复调用 bash”的来源。
@@ -606,9 +651,11 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
   const resultAtByUseId = new Map<string, string>();
   const resultErrorByUseId = new Map<string, boolean>();
   const mediaByUseId = new Map<string, RemoteImageRef[]>();
+  const richMediaByUseId = new Map<string, RenderMediaPayload[]>();
   const settledUseIds = new Set<string>();
   const adjacentResultByMessageId = new Map<string, string>();
   const adjacentMediaByMessageId = new Map<string, RemoteImageRef[]>();
+  const adjacentRichMediaByMessageId = new Map<string, RenderMediaPayload[]>();
   const adjacentErrorMessageIds = new Set<string>();
   const adjacentSettledMessageIds = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
@@ -630,7 +677,9 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     if (toolResultHasError(m)) resultErrorByUseId.set(useId, true);
     const preview = summarizeText(contentPreview(m.content));
     const media = extractToolResultImages(contentPreview(m.content));
+    const richMedia = extractToolResultMedia(contentPreview(m.content));
     if (media.length > 0) mediaByUseId.set(useId, media);
+    if (richMedia.length > 0) richMediaByUseId.set(useId, richMedia);
     if (!shouldHideToolResult(toolNameByUseId.get(useId) ?? '', preview)) {
       resultByUseId.set(useId, preview);
     }
@@ -648,7 +697,9 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     if (toolResultHasError(result)) adjacentErrorMessageIds.add(use.id);
     const preview = summarizeText(contentPreview(result.content));
     const media = extractToolResultImages(contentPreview(result.content));
+    const richMedia = extractToolResultMedia(contentPreview(result.content));
     if (media.length > 0) adjacentMediaByMessageId.set(use.id, media);
+    if (richMedia.length > 0) adjacentRichMediaByMessageId.set(use.id, richMedia);
     if (!shouldHideToolResult(useInfo.toolName, preview)) {
       adjacentResultByMessageId.set(use.id, preview);
     }
@@ -667,7 +718,7 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     items.push(group);
     const mediaTools: RenderToolItem[] = [];
     for (let i = 0; i < pendingTools.length; i++) {
-      if (pendingTools[i].media.length > 0) mediaTools.push(pendingTools[i]);
+      if (pendingTools[i].richMedia.length > 0 || pendingTools[i].media.length > 0) mediaTools.push(pendingTools[i]);
     }
     if (mediaTools.length > 0) {
       const media = new RenderToolMediaItem();
@@ -681,6 +732,12 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
           if (seenMedia.has(ref.url)) continue;
           seenMedia.add(ref.url);
           media.images.push(ref);
+        }
+        for (let j = 0; j < mediaTools[i].richMedia.length; j++) {
+          const payload = mediaTools[i].richMedia[j];
+          if (seenMedia.has(payload.url)) continue;
+          seenMedia.add(payload.url);
+          media.media.push(payload);
         }
       }
       items.push(media);
@@ -715,6 +772,41 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
 
     if (role === 'tool_use') {
       const tool = parseToolUse(m);
+      if (isAgentTaskToolName(tool.toolName)) {
+        flushTools();
+        const task = new RenderToolItem();
+        task.toolUseId = tool.toolUseId;
+        task.toolName = tool.toolName;
+        task.inputRaw = tool.inputRaw;
+        task.inputText = tool.inputText;
+        task.createdAt = m.createdAt;
+        if (task.toolUseId.length > 0 && settledUseIds.has(task.toolUseId)) {
+          task.resultText = resultByUseId.get(task.toolUseId) ?? '';
+          task.hasResult = true;
+          task.hasError = resultErrorByUseId.get(task.toolUseId) ?? false;
+          task.settledAt = resultAtByUseId.get(task.toolUseId) ?? '';
+        } else if (adjacentSettledMessageIds.has(m.id)) {
+          task.resultText = adjacentResultByMessageId.get(m.id) ?? '';
+          task.hasResult = true;
+          task.hasError = adjacentErrorMessageIds.has(m.id);
+        }
+        const clientKey = m.clientId.length > 0 ? m.clientId : m.id;
+        const update = findAgentTaskUpdate(taskUpdates, task.toolUseId, clientKey);
+        const card = new RenderAgentTaskItem();
+        card.type = 'agent_task';
+        const linkKey = task.toolUseId.length > 0 ? task.toolUseId : clientKey;
+        card.key = `task-${linkKey}`;
+        card.tool = task;
+        card.update = update ?? null;
+        card.createdAt = m.createdAt;
+        renderedTaskKeys.add(linkKey);
+        if (update !== undefined) {
+          renderedTaskKeys.add(update.taskId);
+          if (update.parentToolUseId.length > 0) renderedTaskKeys.add(update.parentToolUseId);
+        }
+        items.push(card);
+        continue;
+      }
       if (isPlanTool(tool.toolName)) {
         flushTools();
         const todos = extractTodos(tool.toolName, tool.inputRaw);
@@ -727,17 +819,20 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
       item.toolName = tool.toolName;
       item.inputRaw = tool.inputRaw;
       item.inputText = tool.inputText.length > 0 ? summarizeText(tool.inputText) : '';
+      item.diff = buildToolDiff(tool.toolName, tool.inputRaw);
       if (item.toolUseId.length > 0 && settledUseIds.has(item.toolUseId)) {
         item.resultText = resultByUseId.get(item.toolUseId) ?? '';
         item.hasResult = true;
         item.hasError = resultErrorByUseId.get(item.toolUseId) ?? false;
         item.settledAt = resultAtByUseId.get(item.toolUseId) ?? '';
         item.media = mediaByUseId.get(item.toolUseId) ?? [];
+        item.richMedia = richMediaByUseId.get(item.toolUseId) ?? [];
       } else if (adjacentSettledMessageIds.has(m.id)) {
         item.resultText = adjacentResultByMessageId.get(m.id) ?? '';
         item.hasResult = true;
         item.hasError = adjacentErrorMessageIds.has(m.id);
         item.media = adjacentMediaByMessageId.get(m.id) ?? [];
+        item.richMedia = adjacentRichMediaByMessageId.get(m.id) ?? [];
       }
       item.createdAt = m.createdAt;
       if (pendingTools.length === 0) pendingFirstKey = m.id;
@@ -793,6 +888,7 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
       item.segments = buildSegments(parsed.text, parsed.ranges, m.automationOrigin);
       item.mdBlocks = item.segments.length > 0 ? item.segments[0].mdBlocks : parseMarkdown(item.body);
       item.images = parsed.images;
+      item.files = parsed.files;
       item.message = m;
       items.push(item);
       continue;
@@ -811,8 +907,231 @@ export function buildRenderItems(messages: RemoteMessage[], isSessionStreaming: 
     items.push(item);
   }
   flushTools();
+  if (renderOrphanTaskUpdates && taskUpdates !== undefined) {
+    const seen = new Set<string>();
+    taskUpdates.forEach((update: AgentTaskUpdate) => {
+      const primaryKey = update.parentToolUseId.length > 0 ? update.parentToolUseId : update.taskId;
+      if (seen.has(update.taskId) || renderedTaskKeys.has(primaryKey) || renderedTaskKeys.has(update.taskId)) return;
+      seen.add(update.taskId);
+      const card = new RenderAgentTaskItem();
+      card.type = 'agent_task';
+      card.key = `task-update-${primaryKey}`;
+      card.update = update;
+      card.createdAt = update.updatedAt.length > 0 ? update.updatedAt : update.createdAt;
+      items.push(card);
+    });
+  }
   scopeUnsettledToolsToActiveTail(items);
   return groupMessageWorkRuns(items, isSessionStreaming);
+}
+
+const MAX_SUBAGENT_NEST_DEPTH = 5;
+
+class SubagentResultMeta {
+  createdAtMs: number = 0;
+  summary: string = '';
+}
+
+/**
+ * 五层 parentUuid 递归分组。父 Agent 不在当前分页窗口、超深、环和未消费桶
+ * 一律回退平铺；每条原始消息只进入一个线性构建窗口。
+ */
+export function buildRenderItems(
+  messages: RemoteMessage[],
+  isSessionStreaming: boolean = false,
+  taskUpdates: Map<string, AgentTaskUpdate> | undefined = undefined,
+  renderOrphanTaskUpdates: boolean = false,
+): RenderItem[] {
+  const presentAgentIds = new Set<string>();
+  let hasAgent = false;
+  for (let i = 0; i < messages.length; i++) {
+    if (!isRawAgentToolUse(messages[i])) continue;
+    hasAgent = true;
+    const id = rawToolUseId(messages[i]);
+    if (id.length > 0) presentAgentIds.add(id);
+  }
+  if (!hasAgent) {
+    return buildLinearRenderItems(
+      messages, isSessionStreaming, taskUpdates, renderOrphanTaskUpdates);
+  }
+
+  const byParent = new Map<string, RemoteMessage[]>();
+  const topLevel: RemoteMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const parent = readStr(messages[i].agentMeta, 'parentUuid');
+    if (parent.length > 0 && presentAgentIds.has(parent)) {
+      const bucket = byParent.get(parent) ?? [];
+      bucket.push(messages[i]);
+      byParent.set(parent, bucket);
+    } else {
+      topLevel.push(messages[i]);
+    }
+  }
+  byParent.forEach((bucket: RemoteMessage[]) => bucket.sort(compareRemoteMessages));
+  const resultMeta = buildSubagentResultMeta(messages);
+  const consumed = new Set<string>();
+  const out = buildSubagentLevel(
+    topLevel, byParent, resultMeta, isSessionStreaming, taskUpdates, 0, consumed);
+
+  const leftover: RemoteMessage[] = [];
+  byParent.forEach((bucket: RemoteMessage[], parent: string) => {
+    if (!consumed.has(parent)) for (let i = 0; i < bucket.length; i++) leftover.push(bucket[i]);
+  });
+  if (leftover.length > 0) {
+    leftover.sort(compareRemoteMessages);
+    const flat = buildLinearRenderItems(leftover, isSessionStreaming, taskUpdates, false);
+    for (let i = 0; i < flat.length; i++) out.push(flat[i]);
+  }
+  if (renderOrphanTaskUpdates && taskUpdates !== undefined) {
+    appendUnrenderedTaskUpdates(out, taskUpdates);
+  }
+  return out;
+}
+
+function rawToolUseId(message: RemoteMessage): string {
+  const direct = message.toolUseId;
+  if (direct.length > 0) return direct;
+  if (message.content !== undefined && typeof message.content === 'object' && !Array.isArray(message.content)) {
+    return readStr(message.content as Record<string, Object>, 'toolUseId');
+  }
+  return '';
+}
+
+function isRawAgentToolUse(message: RemoteMessage): boolean {
+  return message.role === 'tool_use' && parseToolUse(message).toolName === 'Agent';
+}
+
+function compareRemoteMessages(left: RemoteMessage, right: RemoteMessage): number {
+  const byTime = left.createdAt.localeCompare(right.createdAt);
+  if (byTime !== 0) return byTime;
+  const leftKey = left.id.length > 0 ? left.id : left.clientId;
+  const rightKey = right.id.length > 0 ? right.id : right.clientId;
+  return leftKey.localeCompare(rightKey);
+}
+
+function buildSubagentResultMeta(messages: RemoteMessage[]): Map<string, SubagentResultMeta> {
+  const out = new Map<string, SubagentResultMeta>();
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role !== 'tool_result') continue;
+    const id = toolResultUseId(messages[i]);
+    if (id.length === 0) continue;
+    const item = new SubagentResultMeta();
+    const timestamp = Date.parse(messages[i].createdAt);
+    item.createdAtMs = Number.isFinite(timestamp) ? timestamp : 0;
+    item.summary = contentPreview(messages[i].content);
+    out.set(id, item);
+  }
+  return out;
+}
+
+function buildSubagentLevel(
+  level: RemoteMessage[],
+  byParent: Map<string, RemoteMessage[]>,
+  resultMeta: Map<string, SubagentResultMeta>,
+  streaming: boolean,
+  taskUpdates: Map<string, AgentTaskUpdate> | undefined,
+  depth: number,
+  consumed: Set<string>,
+): RenderItem[] {
+  const out: RenderItem[] = [];
+  let run: RemoteMessage[] = [];
+  const flushRun = (): void => {
+    if (run.length === 0) return;
+    const built = buildLinearRenderItems(run, streaming, taskUpdates, false);
+    for (let i = 0; i < built.length; i++) out.push(built[i]);
+    run = [];
+  };
+  for (let i = 0; i < level.length; i++) {
+    const message = level[i];
+    if (isRawAgentToolUse(message) && depth < MAX_SUBAGENT_NEST_DEPTH) {
+      flushRun();
+      out.push(buildSubagentGroup(
+        message, byParent, resultMeta, streaming, taskUpdates, depth, consumed));
+    } else {
+      run.push(message);
+    }
+  }
+  flushRun();
+  return out;
+}
+
+function buildSubagentGroup(
+  message: RemoteMessage,
+  byParent: Map<string, RemoteMessage[]>,
+  resultMeta: Map<string, SubagentResultMeta>,
+  streaming: boolean,
+  taskUpdates: Map<string, AgentTaskUpdate> | undefined,
+  depth: number,
+  consumed: Set<string>,
+): RenderSubagentGroupItem {
+  const id = rawToolUseId(message);
+  if (id.length > 0) consumed.add(id);
+  const childMessages = id.length > 0 ? (byParent.get(id) ?? []) : [];
+  const group = new RenderSubagentGroupItem();
+  group.type = 'subagent_group';
+  group.key = `subagent-${id.length > 0 ? id : message.id}`;
+  group.children = buildSubagentLevel(
+    childMessages, byParent, resultMeta, streaming, taskUpdates, depth + 1, consumed);
+  const tool = parseToolUse(message);
+  try {
+    const input = JSON.parse(tool.inputRaw) as Object;
+    if (input !== undefined && input !== null && typeof input === 'object' && !Array.isArray(input)) {
+      group.description = readStr(input as Record<string, Object>, 'description');
+      group.subagentType = readStr(input as Record<string, Object>, 'subagent_type');
+    }
+  } catch (e) {
+    // 损坏的历史 input 不影响 children 展示。
+  }
+  const result = id.length > 0 ? resultMeta.get(id) : undefined;
+  if (result !== undefined) group.summary = result.summary;
+  group.status = result !== undefined ? 'completed' : (streaming ? 'running' : 'completed');
+  const start = Date.parse(message.createdAt);
+  if (result !== undefined && Number.isFinite(start) && result.createdAtMs >= start) {
+    group.durationMs = result.createdAtMs - start;
+  }
+  group.update = findAgentTaskUpdate(
+    taskUpdates, id, message.clientId.length > 0 ? message.clientId : message.id) ?? null;
+  return group;
+}
+
+function appendUnrenderedTaskUpdates(
+  items: RenderItem[],
+  updates: Map<string, AgentTaskUpdate>,
+): void {
+  const rendered = new Set<string>();
+  collectRenderedTaskKeys(items, rendered);
+  const seen = new Set<string>();
+  updates.forEach((update: AgentTaskUpdate) => {
+    const primary = update.parentToolUseId.length > 0 ? update.parentToolUseId : update.taskId;
+    if (seen.has(update.taskId) || rendered.has(primary) || rendered.has(update.taskId)) return;
+    seen.add(update.taskId);
+    const card = new RenderAgentTaskItem();
+    card.type = 'agent_task';
+    card.key = `task-update-${primary}`;
+    card.update = update;
+    card.createdAt = update.updatedAt.length > 0 ? update.updatedAt : update.createdAt;
+    items.push(card);
+  });
+}
+
+function collectRenderedTaskKeys(items: RenderItem[], out: Set<string>): void {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type === 'agent_task') {
+      const task = item as RenderAgentTaskItem;
+      if (task.tool !== null && task.tool.toolUseId.length > 0) out.add(task.tool.toolUseId);
+      if (task.update !== null) {
+        out.add(task.update.taskId);
+        if (task.update.parentToolUseId.length > 0) out.add(task.update.parentToolUseId);
+      }
+    } else if (item.type === 'subagent_group') {
+      const group = item as RenderSubagentGroupItem;
+      out.add(item.key.replace(/^subagent-/, ''));
+      collectRenderedTaskKeys(group.children, out);
+    } else if (item.type === 'work_group') {
+      collectRenderedTaskKeys((item as RenderWorkGroupItem).children, out);
+    }
+  }
 }
 
 /**
@@ -1062,6 +1381,12 @@ function isCompactBoundaryItem(item: RenderItem): boolean {
 }
 
 function isWorkActivityItem(item: RenderItem): boolean {
+  if (item.type === 'agent_task') {
+    const task = item as RenderAgentTaskItem;
+    return task.update !== null
+      ? task.update.status !== 'running'
+      : task.tool !== null && task.tool.hasResult;
+  }
   return item.type === 'thinking' || item.type === 'tool_group';
 }
 
@@ -1145,6 +1470,7 @@ function itemStartTimestamp(item: RenderItem): number {
     const message = (item as RenderMessageItem).message;
     return message === undefined ? 0 : parseIsoMs(message.createdAt);
   }
+  if (item.type === 'agent_task') return parseIsoMs((item as RenderAgentTaskItem).createdAt);
   if (item.type === 'work_group') {
     const children = (item as RenderWorkGroupItem).children;
     return children.length > 0 ? itemStartTimestamp(children[0]) : 0;
@@ -1170,6 +1496,13 @@ function itemEndTimestamp(item: RenderItem): number {
     const children = (item as RenderWorkGroupItem).children;
     let latest = 0;
     for (let i = 0; i < children.length; i++) latest = Math.max(latest, itemEndTimestamp(children[i]));
+    return latest;
+  }
+  if (item.type === 'agent_task') {
+    const task = item as RenderAgentTaskItem;
+    let latest = parseIsoMs(task.createdAt);
+    if (task.update !== null) latest = Math.max(latest, parseIsoMs(task.update.updatedAt));
+    if (task.tool !== null) latest = Math.max(latest, parseIsoMs(task.tool.settledAt));
     return latest;
   }
   return itemStartTimestamp(item);

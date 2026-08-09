@@ -16,6 +16,19 @@ import {
   readStr, readObj,
 } from './TaskModels';
 
+export class SessionMetaPatch {
+  title: string | undefined = undefined;
+  pinnedAt: string | null | undefined = undefined;
+  status: string | undefined = undefined;
+}
+
+export class SessionLiveActivity {
+  phase: string = '';
+  attention: boolean = false;
+  compactDetail: string = '';
+  interactionKind: string = '';
+}
+
 export class TaskStore {
   private client: DlClient | undefined = undefined;
   private listeners: Array<() => void> = [];
@@ -23,6 +36,9 @@ export class TaskStore {
   private sessionsByDevice: Map<string, RemoteSession[]> = new Map();
   private sessionLoadRevisions: Map<string, number> = new Map();
   private pendingActivityByDevice: Map<string, Map<string, string>> = new Map();
+  private liveActivityBySession: Map<string, SessionLiveActivity> = new Map();
+  /** 同一任务的元数据写使用字段级代次；旧响应/旧失败不能覆盖新操作。 */
+  private metaWriteGenerations: Map<string, number> = new Map();
   /** 本机 deviceId（hello-ack 返回）；presence / REST 里的自己一律不进列表。 */
   private selfDeviceId: string = '';
 
@@ -134,6 +150,10 @@ export class TaskStore {
     return this.sessionsByDevice.get(deviceId) ?? [];
   }
 
+  getLiveActivity(sessionId: string): SessionLiveActivity | null {
+    return this.liveActivityBySession.get(sessionId) ?? null;
+  }
+
   /** 新建任务拿到 sessionId 后先占位，避免 sessions:created push 晚到导致详情页空壳。 */
   upsertSession(deviceId: string, session: RemoteSession): void {
     const list = this.sessionsByDevice.get(deviceId) ?? [];
@@ -152,7 +172,7 @@ export class TaskStore {
     this.notify();
   }
 
-  /** 拉取某设备的 active 任务列表；false 表示失败或结果已过期。 */
+  /** 拉取某设备的 active + archived 列表；deleted 永不进入本地投影。 */
   async loadSessions(deviceId: string): Promise<boolean> {
     const client = this.client;
     if (!client) return false;
@@ -163,7 +183,7 @@ export class TaskStore {
       opts.channel = DlChannels.SESSIONS_LIST;
       const includePinned: Record<string, Object> = {};
       includePinned['includePinned'] = true;
-      opts.args = [200, 'active', includePinned];
+      opts.args = [200, 'all', includePinned];
       const env = await client.invoke(deviceId, opts);
       if (this.sessionLoadRevisions.get(deviceId) !== revision) return false;
       const device = this.devices.get(deviceId);
@@ -174,11 +194,132 @@ export class TaskStore {
       this.sessionsByDevice.set(deviceId, sessions);
       this.pendingActivityByDevice.delete(deviceId);
       this.notify();
+      void this.refreshActiveSessions(deviceId);
       return true;
     } catch (e) {
       // 调用方根据 false 做有界退避；旧列表继续保留。
       return false;
     }
+  }
+
+  /** maker:list-active 是列表运行态的权威补快照；只消费明确的 boolean 状态。 */
+  async refreshActiveSessions(deviceId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    try {
+      const opts = new DlInvokeOptions();
+      opts.channel = 'maker:list-active';
+      opts.args = [];
+      const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (!Array.isArray(result)) return;
+      const rows = result as Object[];
+      let changed = false;
+      for (let i = 0; i < rows.length; i++) {
+        const raw = rows[i];
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const row = raw as Record<string, Object>;
+        const sessionId = readStr(row, 'sessionId');
+        const rawRunning = row['isTurnRunning'];
+        if (sessionId.length === 0 || typeof rawRunning !== 'boolean') continue;
+        const current = this.liveActivityBySession.get(sessionId);
+        if (rawRunning) {
+          const activity = current ?? new SessionLiveActivity();
+          activity.phase = 'running';
+          this.liveActivityBySession.set(sessionId, activity);
+          changed = true;
+        } else if (current !== undefined && current.phase === 'running') {
+          this.liveActivityBySession.delete(sessionId);
+          changed = true;
+        }
+      }
+      if (changed) this.notify();
+    } catch (e) {
+      // 老被控端没有可选快照时继续依赖 sessions activity push。
+    }
+  }
+
+  /**
+   * 统一任务元数据写入口。先乐观更新，再用被控端完整 RemoteSession 对账；
+   * 同任务旧响应不得覆盖后发操作，失败则恢复整行并重拉权威列表。
+   */
+  async patchSession(deviceId: string, sessionId: string, patch: SessionMetaPatch): Promise<boolean> {
+    const client = this.client;
+    if (!client || sessionId.length === 0) return false;
+    const list = this.sessionsByDevice.get(deviceId) ?? [];
+    let before: RemoteSession | undefined = undefined;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === sessionId) {
+        before = list[i];
+        break;
+      }
+    }
+    if (before === undefined) return false;
+    const generation = (this.metaWriteGenerations.get(sessionId) ?? 0) + 1;
+    this.metaWriteGenerations.set(sessionId, generation);
+    this.applyOptimisticMetaPatch(deviceId, before, patch);
+    try {
+      const opts = new DlInvokeOptions();
+      opts.channel = 'local-db:sessions:patch-meta';
+      opts.args = [sessionId, patch];
+      const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (this.metaWriteGenerations.get(sessionId) !== generation) return true;
+      if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
+        const session = parseSession(result as Record<string, Object>);
+        if (session.status === 'deleted') this.removeSession(deviceId, sessionId);
+        else this.upsertSession(deviceId, session);
+      } else {
+        void this.loadSessions(deviceId);
+      }
+      return true;
+    } catch (e) {
+      if (this.metaWriteGenerations.get(sessionId) === generation) {
+        this.upsertSession(deviceId, before);
+        void this.loadSessions(deviceId);
+      }
+      return false;
+    }
+  }
+
+  async regenerateTitle(deviceId: string, sessionId: string): Promise<string> {
+    const client = this.client;
+    if (!client || sessionId.length === 0) return '';
+    try {
+      const request: Record<string, Object> = {};
+      request['sessionId'] = sessionId;
+      const opts = new DlInvokeOptions();
+      opts.channel = 'maker:regenerate-title';
+      opts.args = [request];
+      const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) return '';
+      return readStr(result as Record<string, Object>, 'title');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  private applyOptimisticMetaPatch(
+    deviceId: string,
+    before: RemoteSession,
+    patch: SessionMetaPatch,
+  ): void {
+    const emptyPatch: Record<string, Object> = {};
+    const next = this.mergeSession(before, emptyPatch);
+    if (patch.title !== undefined) next.title = patch.title;
+    if (patch.pinnedAt !== undefined) next.pinnedAt = patch.pinnedAt ?? '';
+    if (patch.status !== undefined) next.status = patch.status;
+    next.updatedAt = new Date().toISOString();
+    if (next.status === 'deleted') this.removeSession(deviceId, next.id);
+    else this.upsertSession(deviceId, next);
+  }
+
+  private removeSession(deviceId: string, sessionId: string): void {
+    const list = this.sessionsByDevice.get(deviceId);
+    if (list === undefined) return;
+    const filtered = list.filter((item: RemoteSession) => item.id !== sessionId);
+    if (filtered.length === list.length) return;
+    this.sessionsByDevice.set(deviceId, filtered);
+    this.liveActivityBySession.delete(sessionId);
+    this.notify();
   }
 
   /** sessions topic 的 push 分发。 */
@@ -239,6 +380,20 @@ export class TaskStore {
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
     const detail = readStr(p, 'compactDetail');
+    const phase = readStr(p, 'phase');
+    const attention = p['attention'] === true;
+    const interactionKind = readStr(p, 'interactionKind');
+    if ((phase === 'completed' || phase === 'error') && !attention) {
+      this.liveActivityBySession.delete(sessionId);
+    } else if (phase === 'running' || phase === 'needs-interaction'
+      || phase === 'completed' || phase === 'error') {
+      const activity = new SessionLiveActivity();
+      activity.phase = phase;
+      activity.attention = attention;
+      activity.compactDetail = detail;
+      activity.interactionKind = interactionKind;
+      this.liveActivityBySession.set(sessionId, activity);
+    }
     if (detail.length > 0) this.rememberActivity(deviceId, sessionId, detail);
     const list = this.sessionsByDevice.get(deviceId);
     if (!list) {
@@ -285,6 +440,8 @@ export class TaskStore {
     merged.userId = base.userId;
     merged.title = base.title;
     merged.workingDir = base.workingDir;
+    merged.worktreePath = base.worktreePath;
+    merged.extraDirs = base.extraDirs.slice();
     merged.remoteHostId = base.remoteHostId;
     merged.workspaceKind = base.workspaceKind;
     merged.model = base.model;
@@ -293,10 +450,15 @@ export class TaskStore {
     merged.permissionMode = base.permissionMode;
     merged.planModeEnabled = base.planModeEnabled;
     merged.fastMode = base.fastMode;
+    merged.sdkSessionId = base.sdkSessionId;
+    merged.totalTokenUsage = base.totalTokenUsage;
+    merged.contextTokens = base.contextTokens;
+    merged.contextWindow = base.contextWindow;
     merged.status = base.status;
     merged.agentKind = base.agentKind;
     merged.source = base.source;
     merged.orcaRole = base.orcaRole;
+    merged.parentSessionId = base.parentSessionId;
     merged.pinnedAt = base.pinnedAt;
     merged.userSendAt = base.userSendAt;
     merged.createdAt = base.createdAt;
@@ -314,6 +476,8 @@ export class TaskStore {
     out['userId'] = s.userId;
     out['title'] = s.title;
     out['workingDir'] = s.workingDir;
+    out['worktreePath'] = s.worktreePath;
+    out['extraDirs'] = s.extraDirs;
     out['remoteHostId'] = s.remoteHostId;
     out['workspaceKind'] = s.workspaceKind;
     out['model'] = s.model;
@@ -322,10 +486,15 @@ export class TaskStore {
     out['permissionMode'] = s.permissionMode;
     out['planModeEnabled'] = s.planModeEnabled;
     out['fastMode'] = s.fastMode;
+    out['sdkSessionId'] = s.sdkSessionId;
+    out['totalTokenUsage'] = s.totalTokenUsage;
+    out['contextTokens'] = s.contextTokens;
+    out['contextWindow'] = s.contextWindow;
     out['status'] = s.status;
     out['agentKind'] = s.agentKind;
     out['source'] = s.source;
     out['orcaRole'] = s.orcaRole;
+    out['parentSessionId'] = s.parentSessionId;
     out['pinnedAt'] = s.pinnedAt;
     out['userSendAt'] = s.userSendAt;
     out['createdAt'] = s.createdAt;

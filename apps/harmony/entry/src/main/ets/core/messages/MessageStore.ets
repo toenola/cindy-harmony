@@ -17,12 +17,31 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
 import {
-  RemoteMessage, RemoteSession, parseMessage, sortMessagesAsc,
-  readStr, readObj, readBool,
+  RemoteMessage, RemoteSession, parseMessage, parseSession, sortMessagesAsc,
+  readStr, readObj, readBool, readNum,
 } from '../tasks/TaskModels';
 import { RemoteImageRef, RemoteMediaFetchResult } from '../attachments/AttachmentModels';
 import { summarizeText } from './MessageRender';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
+import {
+  AgentTaskUpdate,
+  applyAgentTaskUpdateEvent,
+  isSameAgentTaskAlias,
+  normalizeAgentTaskUpdate,
+} from './AgentTaskStore';
+import {
+  findHistoryWindowGap,
+  historyPageCoversMs,
+  historyPageTailCursor,
+  historyPageTailMs,
+  historyWindowGapKey,
+  HISTORY_BACKFILL_MAX_GAPS_PER_VISIT,
+  HISTORY_BACKFILL_MAX_REQUESTS,
+  HISTORY_BACKFILL_MAX_ROWS,
+  HISTORY_GAP_MAX_CONSIDERED_PER_VISIT,
+  HISTORY_GAP_PROBE_MAX_STEPS,
+  HistoryWindowGap,
+} from './HistoryGap';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -66,6 +85,15 @@ class HistoryPage {
   hasMore: boolean = false;
 }
 
+/** Rewind 的文件影响预览；文件回退失败不等于对话不能回退。 */
+export class RewindPreview {
+  canRewind: boolean = true;
+  error: string = '';
+  filesChanged: string[] = [];
+  insertions: number = 0;
+  deletions: number = 0;
+}
+
 /** maker:send 的 user 消息形态（对齐 mobile chatMessage）。 */
 class UserMessageArgs {
   type: string = 'user';
@@ -99,12 +127,20 @@ export class MessageStore {
   private runningBySession: Map<string, boolean> = new Map();
   /** 远程运行态查询的代次，防止旧快照覆盖在途 maker 事件。 */
   private runningStateRevisions: Map<string, number> = new Map();
+  /** maker status 的真实 turn 边界；孤儿 Agent 卡只能在本边界内显示。 */
+  private makerTurnRunningBySession: Map<string, boolean> = new Map();
+  private taskUpdatesBySession: Map<string, Map<string, AgentTaskUpdate>> = new Map();
+  private parkedTaskUpdatesBySession: Map<string, Map<string, AgentTaskUpdate>> = new Map();
   /** 历史加载失败标记（TaskPage 显示重试入口）。 */
   private loadFailedBySession: Map<string, boolean> = new Map();
   /** 发送消息的客户端 id；同时作为 Desktop transcript 的幂等键。 */
   private sendSequence: number = 0;
   /** 打开会话前先确保控制链路（AppServices 注入，内部做 link-open + 幂等）。 */
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
+  /** 历史补洞代次：切会话/重新 heal 后旧请求不得继续 merge。 */
+  private historyHealGenerations: Map<string, number> = new Map();
+  /** 本次访问已经探测过的合法停顿/缺口，避免反复请求同一处。 */
+  private consideredHistoryGaps: Map<string, Set<string>> = new Map();
 
   attach(client: DlClient): void {
     this.client = client;
@@ -134,6 +170,14 @@ export class MessageStore {
 
   getMessages(sessionId: string): RemoteMessage[] {
     return this.messagesBySession.get(sessionId) ?? [];
+  }
+
+  getTaskUpdates(sessionId: string): Map<string, AgentTaskUpdate> {
+    return this.taskUpdatesBySession.get(sessionId) ?? new Map<string, AgentTaskUpdate>();
+  }
+
+  isMakerTurnRunning(sessionId: string): boolean {
+    return this.makerTurnRunningBySession.get(sessionId) === true;
   }
 
   /** 当前会话是否仍在执行；maker 运行态优先于历史投影。 */
@@ -186,6 +230,7 @@ export class MessageStore {
     if (this.subscribed.get(sessionId) === deviceId) {
       // 已打开：重新拉一次历史（重进页面恢复用）。
       const loaded = await this.loadInitial(deviceId, sessionId);
+      if (loaded) this.scheduleHistoryHeal(deviceId, sessionId, true);
       void this.refreshSessionRunningState(deviceId, sessionId);
       return loaded;
     }
@@ -202,6 +247,7 @@ export class MessageStore {
     client.subscribe(deviceId, [sessionTopic(sessionId)]).catch(() => {
     });
     const loaded = await this.loadInitial(deviceId, sessionId);
+    if (loaded) this.scheduleHistoryHeal(deviceId, sessionId, true);
     void this.refreshSessionRunningState(deviceId, sessionId);
     return loaded;
   }
@@ -216,7 +262,13 @@ export class MessageStore {
     this.loadFailedBySession.delete(sessionId);
     this.streamingBySession.delete(sessionId);
     this.runningBySession.delete(sessionId);
+    this.makerTurnRunningBySession.delete(sessionId);
+    this.taskUpdatesBySession.delete(sessionId);
+    this.parkedTaskUpdatesBySession.delete(sessionId);
     this.runningStateRevisions.delete(sessionId);
+    this.historyHealGenerations.set(sessionId,
+      (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
+    this.consideredHistoryGaps.delete(sessionId);
     if (deviceId !== undefined) {
       const client = this.client;
       if (client) {
@@ -265,9 +317,119 @@ export class MessageStore {
       this.messagesBySession.set(sessionId, merged);
       this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.notify();
+      this.scheduleHistoryHeal(deviceId, sessionId, true);
       void this.refreshSessionRunningState(deviceId, sessionId);
     } catch (e) {
       // healing 失败：保持现有消息，等下一次重连恢复。
+    }
+  }
+
+  /**
+   * 重连/重进后补齐窗口内部缺口。探测与翻页都只复用 messages:list(before)，
+   * 与 Mobile 同源且不新增 Harmony 专用协议。
+   */
+  private scheduleHistoryHeal(deviceId: string, sessionId: string, resetVisit: boolean): void {
+    const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
+    this.historyHealGenerations.set(sessionId, generation);
+    if (resetVisit || !this.consideredHistoryGaps.has(sessionId)) {
+      this.consideredHistoryGaps.set(sessionId, new Set<string>());
+    }
+    void this.healHistoryWindow(deviceId, sessionId, generation);
+  }
+
+  private historyHealCancelled(sessionId: string, generation: number): boolean {
+    return this.historyHealGenerations.get(sessionId) !== generation
+      || !this.subscribed.has(sessionId);
+  }
+
+  private mergeHistoryRows(sessionId: string, rows: RemoteMessage[]): void {
+    if (rows.length === 0) return;
+    const current = this.messagesBySession.get(sessionId) ?? [];
+    const merged = this.mergeWithoutDuplicates(rows, current);
+    merged.sort(sortMessagesAsc);
+    this.messagesBySession.set(sessionId, merged);
+  }
+
+  private async healHistoryWindow(
+    deviceId: string,
+    sessionId: string,
+    generation: number,
+  ): Promise<void> {
+    const considered = this.consideredHistoryGaps.get(sessionId) ?? new Set<string>();
+    this.consideredHistoryGaps.set(sessionId, considered);
+    let examined = 0;
+    let pagedGaps = 0;
+    while (examined < HISTORY_GAP_MAX_CONSIDERED_PER_VISIT
+      && pagedGaps < HISTORY_BACKFILL_MAX_GAPS_PER_VISIT
+      && !this.historyHealCancelled(sessionId, generation)) {
+      const gap = findHistoryWindowGap(
+        this.messagesBySession.get(sessionId) ?? [], considered);
+      if (gap === null) return;
+      considered.add(historyWindowGapKey(gap));
+      examined += 1;
+      const outcome = await this.backfillHistoryGap(deviceId, sessionId, generation, gap);
+      if (outcome === 'cancelled') return;
+      if (outcome !== 'contiguous' && outcome !== 'failed') pagedGaps += 1;
+      if (outcome === 'failed') return;
+      this.notify();
+    }
+  }
+
+  private async backfillHistoryGap(
+    deviceId: string,
+    sessionId: string,
+    generation: number,
+    gap: HistoryWindowGap,
+  ): Promise<string> {
+    let before = gap.newerId;
+    let rows = 0;
+    let requests = 0;
+    try {
+      // 先用一行探测合法停顿；同毫秒组最多向前推进 8 次。
+      for (let step = 0; step < HISTORY_GAP_PROBE_MAX_STEPS; step++) {
+        if (this.historyHealCancelled(sessionId, generation)) return 'cancelled';
+        const probe = await this.requestMessagesList(deviceId, sessionId, 1, before);
+        if (this.historyHealCancelled(sessionId, generation)) return 'cancelled';
+        requests += 1;
+        if (probe.items.length === 0) return 'exhausted';
+        const next = historyPageTailCursor(probe.items);
+        const ms = historyPageTailMs(probe.items);
+        if (next.length === 0 || ms < 0) {
+          this.mergeHistoryRows(sessionId, probe.items);
+          rows += probe.items.length;
+          break;
+        }
+        if (ms <= gap.olderMs) return 'contiguous';
+        this.mergeHistoryRows(sessionId, probe.items);
+        rows += probe.items.length;
+        before = next;
+        if (ms !== gap.newerMs) break;
+      }
+
+      while (rows < HISTORY_BACKFILL_MAX_ROWS && requests < HISTORY_BACKFILL_MAX_REQUESTS) {
+        if (this.historyHealCancelled(sessionId, generation)) return 'cancelled';
+        const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, before);
+        if (this.historyHealCancelled(sessionId, generation)) return 'cancelled';
+        requests += 1;
+        if (page.items.length === 0) return 'exhausted';
+        this.mergeHistoryRows(sessionId, page.items);
+        rows += page.items.length;
+        if (historyPageCoversMs(page.items, gap.olderMs)) {
+          hilog.info(DOMAIN, TAG,
+            'history gap healed session=%{public}s rows=%{public}d requests=%{public}d',
+            sessionId.slice(0, 8), rows, requests);
+          return 'covered';
+        }
+        const next = historyPageTailCursor(page.items);
+        if (next.length === 0 || next === before) return 'exhausted';
+        before = next;
+      }
+      return 'budget';
+    } catch (e) {
+      const message = e instanceof Error ? e.message : JSON.stringify(e);
+      hilog.warn(DOMAIN, TAG, 'history gap heal failed session=%{public}s err=%{public}s',
+        sessionId.slice(0, 8), message);
+      return 'failed';
     }
   }
 
@@ -323,6 +485,20 @@ export class MessageStore {
     const type = readStr(ev, 'type');
     const data = readObj(ev, 'data');
     this.bumpRunningStateRevision(sessionId);
+
+    if (type === 'agent_task_update') {
+      const rawSource = readStr(ev, 'source');
+      const source = rawSource === 'codex' || rawSource === 'pi' || rawSource === 'claude-code'
+        ? rawSource : '';
+      const previous = this.recallParkedTaskUpdates(
+        sessionId, data, source, this.taskUpdatesBySession.get(sessionId));
+      const next = applyAgentTaskUpdateEvent(previous, data, source, new Date().toISOString());
+      if (next !== null) {
+        this.taskUpdatesBySession.set(sessionId, next);
+        this.notify();
+      }
+      return;
+    }
 
     if (type === 'compact_boundary') {
       // 压缩边界结束旧投影，但通常仍属于同一产品 turn；后续事件会重新建立新投影。
@@ -395,12 +571,17 @@ export class MessageStore {
         ? data['isRunning'] as boolean
         : undefined;
       if (isRunning === true) {
+        if (this.makerTurnRunningBySession.get(sessionId) !== true) {
+          this.sweepTaskUpdatesAtTurnStart(sessionId);
+        }
+        this.makerTurnRunningBySession.set(sessionId, true);
         this.markSessionRunning(sessionId, true);
       } else if (isRunning === false) {
         if (hasTurnContinuation(ev)) {
           // provider segment ends, but the product turn continues.
           this.markSessionRunning(sessionId, true);
         } else {
+          this.makerTurnRunningBySession.delete(sessionId);
           this.finalizeSessionStreaming(sessionId);
         }
       }
@@ -418,6 +599,7 @@ export class MessageStore {
         // SDK segment 结束但产品 turn 仍会继续，不能把 Composer 切回停止态。
         this.markSessionRunning(sessionId, true);
       } else {
+        this.makerTurnRunningBySession.delete(sessionId);
         this.finalizeSessionStreaming(sessionId);
       }
       this.notify();
@@ -426,12 +608,46 @@ export class MessageStore {
     if (type === 'error') {
       const terminal = readBool(data, 'isTerminal', !readBool(data, 'willRetry', false));
       if (terminal) {
+        this.makerTurnRunningBySession.delete(sessionId);
         this.finalizeSessionStreaming(sessionId);
       } else {
         this.markSessionRunning(sessionId, true);
       }
       this.notify();
     }
+  }
+
+  private sweepTaskUpdatesAtTurnStart(sessionId: string): void {
+    this.parkedTaskUpdatesBySession.delete(sessionId);
+    const current = this.taskUpdatesBySession.get(sessionId);
+    if (current === undefined || current.size === 0) return;
+    const parked = new Map<string, AgentTaskUpdate>();
+    current.forEach((update: AgentTaskUpdate, key: string) => {
+      if (update.provider === 'codex' && update.status === 'running') parked.set(key, update);
+    });
+    if (parked.size > 0) this.parkedTaskUpdatesBySession.set(sessionId, parked);
+    this.taskUpdatesBySession.delete(sessionId);
+  }
+
+  private recallParkedTaskUpdates(
+    sessionId: string,
+    data: Object | undefined,
+    source: string,
+    previous: Map<string, AgentTaskUpdate> | undefined,
+  ): Map<string, AgentTaskUpdate> | undefined {
+    const parked = this.parkedTaskUpdatesBySession.get(sessionId);
+    if (parked === undefined || parked.size === 0) return previous;
+    const probe = normalizeAgentTaskUpdate(data, source);
+    if (probe === null) return previous;
+    let recalled: Map<string, AgentTaskUpdate> | undefined = undefined;
+    parked.forEach((update: AgentTaskUpdate, key: string) => {
+      if (!isSameAgentTaskAlias(update, probe)) return;
+      if (recalled === undefined) recalled = new Map<string, AgentTaskUpdate>(previous ?? new Map());
+      recalled.set(key, update);
+      parked.delete(key);
+    });
+    if (parked.size === 0) this.parkedTaskUpdatesBySession.delete(sessionId);
+    return recalled ?? previous;
   }
 
 
@@ -491,6 +707,7 @@ export class MessageStore {
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0 || readStr(p, 'status') !== 'closed') return;
     this.bumpRunningStateRevision(sessionId);
+    this.makerTurnRunningBySession.delete(sessionId);
     this.finalizeSessionStreaming(sessionId);
     this.notify();
   }
@@ -512,10 +729,12 @@ export class MessageStore {
         this.finishStreamingProjection(sessionId);
       }
     } else if (phase === 'completed' || phase === 'error') {
+      this.makerTurnRunningBySession.delete(sessionId);
       this.finalizeSessionStreaming(sessionId);
     } else if (rawRunning === true) {
       this.markSessionRunning(sessionId, true);
     } else if (rawRunning === false) {
+      this.makerTurnRunningBySession.delete(sessionId);
       this.finalizeSessionStreaming(sessionId);
     } else {
       return;
@@ -540,6 +759,7 @@ export class MessageStore {
       if (result) {
         this.markSessionRunning(sessionId, true);
       } else {
+        this.makerTurnRunningBySession.delete(sessionId);
         this.finalizeSessionStreaming(sessionId);
       }
       this.notify();
@@ -697,6 +917,37 @@ export class MessageStore {
         sessionId.slice(0, 8), msg);
       this.loadFailedBySession.set(sessionId, true);
       this.notify();
+      return false;
+    }
+  }
+
+  /** 破坏性消息操作完成后重拉当前整窗，避免旧分页与服务端截断结果混合。 */
+  async reloadSession(deviceId: string, sessionId: string): Promise<boolean> {
+    this.historyHealGenerations.set(sessionId,
+      (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
+    this.consideredHistoryGaps.delete(sessionId);
+    return this.loadInitial(deviceId, sessionId);
+  }
+
+  /** Pi 分支切换后的权威替换；旧分支消息不能与新窗口 merge。 */
+  async replaceSessionWindow(deviceId: string, sessionId: string): Promise<boolean> {
+    const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
+    this.historyHealGenerations.set(sessionId, generation);
+    this.consideredHistoryGaps.delete(sessionId);
+    try {
+      const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
+      if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
+        || this.subscribed.get(sessionId) !== deviceId) return false;
+      page.items.sort(sortMessagesAsc);
+      this.messagesBySession.set(sessionId, page.items);
+      this.hasMoreBySession.set(sessionId, this.hasMoreAfterPage(sessionId, page, page.items));
+      this.streamingBySession.delete(sessionId);
+      this.runningBySession.delete(sessionId);
+      this.makerTurnRunningBySession.delete(sessionId);
+      this.loadFailedBySession.delete(sessionId);
+      this.notify();
+      return true;
+    } catch (e) {
       return false;
     }
   }
@@ -904,6 +1155,7 @@ export class MessageStore {
     deviceId: string,
     url: string,
     thumbnail: boolean = true,
+    skipCache: boolean = false,
   ): Promise<RemoteMediaFetchResult> {
     const client = this.client;
     if (!client) {
@@ -913,6 +1165,9 @@ export class MessageStore {
     request['url'] = url;
     if (thumbnail) {
       request['thumbnail'] = true;
+    }
+    if (skipCache) {
+      request['skipCache'] = true;
     }
     const opts = new DlInvokeOptions();
     opts.channel = DlChannels.MEDIA_FETCH;
@@ -1019,35 +1274,77 @@ export class MessageStore {
     return readStr(result, 'id');
   }
 
-  /** Rewind 预览（对齐 maker:rewind:preview，返回影响摘要文本）。 */
-  async rewindPreview(deviceId: string, sessionId: string, clientId: string): Promise<string> {
+  /** Rewind 预览（对齐 maker:rewind:preview）。 */
+  async rewindPreview(deviceId: string, sessionId: string, clientId: string): Promise<RewindPreview> {
     const client = this.client;
-    if (!client) return '';
+    if (!client) return new RewindPreview();
     const args: Object[] = [sessionId, clientId];
     const opts = new DlInvokeOptions();
     opts.channel = 'maker:rewind:preview';
     opts.args = args;
     const env = await client.invoke(deviceId, opts);
     const result = unwrapInvokeResult(env) as Record<string, Object>;
-    // 预览响应含影响范围等；一期简化取 summary（桌面端可回空，展示由 commit 结果决定）。
-    const summary = readStr(result, 'summary');
-    if (summary.length > 0) {
-      return summary;
+    const preview = new RewindPreview();
+    preview.canRewind = readBool(result, 'canRewind', true);
+    preview.error = readStr(result, 'error');
+    preview.insertions = readNum(result, 'insertions', 0);
+    preview.deletions = readNum(result, 'deletions', 0);
+    const rawFiles = result['filesChanged'];
+    if (Array.isArray(rawFiles)) {
+      const files = rawFiles as Object[];
+      for (let i = 0; i < files.length; i++) {
+        if (typeof files[i] === 'string') preview.filesChanged.push(files[i] as string);
+      }
     }
-    return result['ok'] === true ? 'ok' : '';
+    return preview;
   }
 
-  /** Rewind 提交：回退到该消息（对齐 maker:rewind:commit，返回新会话 id）。 */
-  async rewindCommit(deviceId: string, sessionId: string, clientId: string): Promise<string> {
+  /** Rewind 提交：返回更新后的同一任务，绝不是新任务 id。 */
+  async rewindCommit(deviceId: string, sessionId: string, clientId: string): Promise<RemoteSession | null> {
     const client = this.client;
-    if (!client) return '';
+    if (!client) return null;
     const args: Object[] = [sessionId, clientId];
     const opts = new DlInvokeOptions();
     opts.channel = 'maker:rewind:commit';
     opts.args = args;
     const env = await client.invoke(deviceId, opts);
     const result = unwrapInvokeResult(env) as Record<string, Object>;
-    return readStr(result, 'id');
+    if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
+      return null;
+    }
+    return parseSession(result);
+  }
+
+  /** 删除一条可见消息；assistant 可能由服务端扩展为同一轮的多条 clientId。 */
+  async deleteMessage(deviceId: string, sessionId: string, clientId: string): Promise<string[]> {
+    const client = this.client;
+    if (!client) return [];
+    const opts = new DlInvokeOptions();
+    opts.channel = 'maker:message:delete';
+    opts.args = [sessionId, clientId];
+    const result = unwrapInvokeResult(await client.invoke(deviceId, opts)) as Record<string, Object>;
+    const deleted: string[] = [];
+    const rawIds = result['clientIds'];
+    if (Array.isArray(rawIds)) {
+      const ids = rawIds as Object[];
+      for (let i = 0; i < ids.length; i++) {
+        if (typeof ids[i] === 'string') deleted.push(ids[i] as string);
+      }
+    }
+    if (deleted.length === 0) {
+      const single = readStr(result, 'clientId');
+      if (single.length > 0) deleted.push(single);
+    }
+    if (deleted.length > 0) {
+      const current = this.messagesBySession.get(sessionId) ?? [];
+      const next: RemoteMessage[] = [];
+      for (let i = 0; i < current.length; i++) {
+        if (deleted.indexOf(current[i].clientId) < 0) next.push(current[i]);
+      }
+      this.messagesBySession.set(sessionId, next);
+      this.notify();
+    }
+    return deleted;
   }
 
   // ─── 内部 ───────────────────────────────────────────────────────────────────

@@ -87,6 +87,8 @@ export class RemoteSession {
   userId: string = '';
   title: string = '';
   workingDir: string = '';
+  worktreePath: string = '';
+  extraDirs: string[] = [];
   /** SSH 会话的被控端 host alias；本地会话为空。 */
   remoteHostId: string = '';
   workspaceKind: string = 'project';
@@ -97,11 +99,17 @@ export class RemoteSession {
   permissionMode: string = '';
   planModeEnabled: boolean = false;
   fastMode: boolean = false;
+  /** Desktop SDK thread id；输入队列 lazy-create 时必须透传以保留上下文。 */
+  sdkSessionId: string = '';
+  totalTokenUsage: number = 0;
+  contextTokens: number = 0;
+  contextWindow: number = 0;
   status: string = 'active'; // 'active' | 'archived' | 'deleted'
   /** 'cc' | 'codex' | 'pi'（被控端 mapper 透出） */
   agentKind: string = '';
   source: string = '';
   orcaRole: string = '';
+  parentSessionId: string = '';
   pinnedAt: string = '';
   userSendAt: string = '';
   createdAt: string = '';
@@ -116,6 +124,14 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.userId = readStr(raw, 'userId');
   s.title = readStr(raw, 'title');
   s.workingDir = readStr(raw, 'workingDir');
+  s.worktreePath = readStr(raw, 'worktreePath');
+  const rawExtraDirs = raw['extraDirs'];
+  if (Array.isArray(rawExtraDirs)) {
+    const values = rawExtraDirs as Object[];
+    for (let i = 0; i < values.length; i++) {
+      if (typeof values[i] === 'string') s.extraDirs.push(values[i] as string);
+    }
+  }
   s.remoteHostId = readStr(raw, 'remoteHostId');
   s.workspaceKind = readStr(raw, 'workspaceKind');
   if (s.workspaceKind.length === 0) s.workspaceKind = 'project';
@@ -125,11 +141,16 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.permissionMode = readStr(raw, 'permissionMode');
   s.planModeEnabled = readBool(raw, 'planModeEnabled', false);
   s.fastMode = readBool(raw, 'fastMode', false);
+  s.sdkSessionId = readStr(raw, 'sdkSessionId');
+  s.totalTokenUsage = readNum(raw, 'totalTokenUsage', 0);
+  s.contextTokens = readNum(raw, 'contextTokens', 0);
+  s.contextWindow = readNum(raw, 'contextWindow', 0);
   s.status = readStr(raw, 'status');
   if (s.status.length === 0) s.status = 'active';
   s.agentKind = readStr(raw, 'agentKind');
   s.source = readStr(raw, 'source');
   s.orcaRole = readStr(raw, 'orcaRole');
+  s.parentSessionId = readStr(raw, 'parentSessionId');
   s.pinnedAt = readStr(raw, 'pinnedAt');
   s.userSendAt = readStr(raw, 'userSendAt');
   s.createdAt = readStr(raw, 'createdAt');

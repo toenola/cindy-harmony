@@ -11,10 +11,10 @@ import { AppConfig } from '../../AppConfig';
 import { HarmonyHttp } from '../../network/HarmonyHttp';
 import {
   AttachmentPresignResult, ImageAttachmentCandidate, RemoteImageRef,
-  MAX_ATTACHMENT_BYTES,
+  RemoteSerializedAttachment, MAX_ATTACHMENT_BYTES,
 } from './AttachmentModels';
 import { AttachmentOssRef, buildAttachmentOssRef } from './AttachmentOssRef';
-import { preprocessImage } from './ImagePreprocess';
+import { preprocessImage, readFileBytes } from './ImagePreprocess';
 
 export class AttachmentUploadError extends Error {
   constructor(message: string) {
@@ -207,4 +207,78 @@ export async function uploadImage(
   imageRef.size = processed.size;
   imageRef.sha256 = sha;
   return imageRef;
+}
+
+const OFFICE_EXTENSIONS: string[] = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
+const TEXT_EXTENSIONS: string[] = [
+  'txt', 'text', 'md', 'markdown', 'mdx', 'rst', 'log', 'csv', 'tsv', 'json', 'json5',
+  'jsonc', 'jsonl', 'yaml', 'yml', 'xml', 'toml', 'ini', 'conf', 'cfg', 'properties',
+  'js', 'ts', 'tsx', 'jsx', 'mjs', 'cjs', 'py', 'go', 'rs', 'java', 'c', 'cpp', 'cc',
+  'h', 'hpp', 'cs', 'rb', 'php', 'swift', 'kt', 'kts', 'sh', 'bash', 'zsh', 'fish',
+  'html', 'htm', 'css', 'scss', 'less', 'vue', 'svelte', 'sql', 'graphql', 'proto',
+  'diff', 'patch', 'tex', 'bib', 'srt', 'vtt', 'env', 'lock',
+];
+
+export function attachmentCategoryForName(name: string): string {
+  const ext = uploadExtForName(name);
+  if (ext === 'pdf') return 'pdf';
+  if (OFFICE_EXTENSIONS.indexOf(ext) >= 0) return 'office';
+  if (TEXT_EXTENSIONS.indexOf(ext) >= 0) return 'text';
+  const lower = name.toLowerCase();
+  if (lower === 'dockerfile' || lower === 'makefile' || lower === 'gemfile'
+    || lower === 'rakefile' || lower === 'jenkinsfile' || lower.startsWith('.')) return 'text';
+  return '';
+}
+
+export function attachmentMimeType(name: string, category: string): string {
+  const ext = uploadExtForName(name);
+  if (category === 'pdf') return 'application/pdf';
+  if (category === 'text') return 'text/plain';
+  if (ext === 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === 'xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === 'pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  if (ext === 'doc') return 'application/msword';
+  if (ext === 'xls') return 'application/vnd.ms-excel';
+  if (ext === 'ppt') return 'application/vnd.ms-powerpoint';
+  return 'application/octet-stream';
+}
+
+/** 普通文档上传：不做图片重编码，保留原文件 SHA 与体积。 */
+export async function uploadDocument(
+  uri: string,
+  name: string,
+  token: string,
+): Promise<RemoteSerializedAttachment> {
+  const category = attachmentCategoryForName(name);
+  if (category.length === 0) throw new AttachmentUploadError('不支持这种文件类型');
+  const bytes = await readFileBytes(uri);
+  if (bytes.byteLength <= 0) throw new AttachmentUploadError('不能添加空文件');
+  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new AttachmentUploadError('文件超过 30MB');
+  const mimeType = attachmentMimeType(name, category);
+  const sha = await sha256Hex(bytes);
+  const presigned = await presignUpload(bytes.byteLength, mimeType, uploadExtForName(name), token);
+  try {
+    await putUpload(presigned.putUrl, bytes, mimeType);
+  } catch (e) {
+    try { await deleteUpload(presigned.key, token); } catch (e2) {}
+    if (e instanceof Error) throw e;
+    throw new AttachmentUploadError('upload failed');
+  }
+  const oss = new AttachmentOssRef();
+  oss.ossKey = presigned.key;
+  oss.mimeType = mimeType;
+  oss.originalName = name;
+  oss.size = bytes.byteLength;
+  oss.sha256 = sha;
+  const attachment = new RemoteSerializedAttachment();
+  attachment.id = `harmony-upload:${presigned.key}`;
+  attachment.name = name;
+  attachment.originalName = name;
+  attachment.path = buildAttachmentOssRef(oss);
+  attachment.ext = uploadExtForName(name);
+  attachment.size = bytes.byteLength;
+  attachment.sha256 = sha;
+  attachment.category = category;
+  attachment.mimeType = mimeType;
+  return attachment;
 }

@@ -5,8 +5,7 @@
  * - 块级：标题、段落、有序/无序列表、引用、代码块（``` 围栏）、表格、分隔线
  * - 行内：`code`、**strong**、[text](url)
  *
- * 不做：嵌套列表、转义完整语义、复杂 HTML。渲染端按 MdBlock 结构逐块渲染
- * 为 ArkUI 组件；复杂内容（Mermaid / Math）走 ArkWeb（切片 2.4）。
+ * 不做：嵌套列表、转义完整语义、执行型 HTML。渲染端按 MdBlock 结构逐块渲染。
  */
 
 // ─── 行内 token ──────────────────────────────────────────────────────────────
@@ -222,7 +221,7 @@ export function tokenizeInline(text: string): InlineToken[] {
 let mdSeq = 0;
 
 export class MdBlock {
-  type: string = ''; // 'heading' | 'paragraph' | 'list' | 'quote' | 'code' | 'table' | 'divider'
+  type: string = ''; // heading | paragraph | list | quote | code | math | table | divider
   /** 块序号（ForEach key 用，避免同型同文块 key 重复）。 */
   seq: number = 0;
   level: number = 0;
@@ -289,6 +288,20 @@ export function parseMarkdown(text: string): MdBlock[] {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
+
+    // 只识别明确闭合的 display math；未闭合 $$ 保持普通正文。
+    if (line.trim() === '$$') {
+      let close = i + 1;
+      while (close < lines.length && lines[close].trim() !== '$$') close += 1;
+      if (close < lines.length) {
+        const block = makeBlock();
+        block.type = 'math';
+        block.code = lines.slice(i + 1, close).join('\n');
+        blocks.push(block);
+        i = close + 1;
+        continue;
+      }
+    }
 
     // 代码块
     const fence = /^```(\S*)\s*$/.exec(line);
@@ -413,6 +426,7 @@ export function parseMarkdown(text: string): MdBlock[] {
       if (t.length === 0
         || /^(#{1,6})\s/.test(t)
         || /^```/.test(t)
+        || t === '$$'
         || /^(\s*)[-*+]\s/.test(t)
         || /^(\s*)\d+[.)]\s/.test(t)
         || t.startsWith('>')

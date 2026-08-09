@@ -8,10 +8,12 @@
  * 胶囊交互元素；行点击使用系统 clickEffect 弹性反馈，菜单淡入淡出。
  */
 
-import { display, router } from '@kit.ArkUI';
+import { display, promptAction, router } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
+import { SessionLiveActivity, SessionMetaPatch } from '../core/tasks/TaskStore';
+import { TaskListPreferences } from '../core/tasks/TaskListPreferenceStore';
 import { TaskPageContent } from './TaskPage';
 import {
   isWideTaskLayout,
@@ -26,18 +28,19 @@ import {
   taskProjectKey,
   taskProjectName,
   taskRelativeTime,
-  taskVisibleOnHome,
 } from './TaskListPresentation';
 import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
-  UI_CURVE_ENTER,
+  UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
-  uiOverlayEnterTransition,
+  uiAnimateFastState,
+  uiAnimateState,
+  uiOverlayTransition,
   uiRevealTransition,
 } from '../components/UiKit';
 
@@ -48,6 +51,8 @@ const PROJECT_INLINE_LIMIT = 5;
 
 type TaskAgentFilter = 'all' | 'cc' | 'codex' | 'pi';
 type TaskActivityFilter = 'all' | '1d' | '7d' | '30d';
+type TaskListTab = 'projects' | 'dialogues';
+type TaskStatusFilter = 'active' | 'waiting' | 'automation' | 'archived' | 'all';
 
 class TaskListEntry {
   key: string = '';
@@ -76,11 +81,25 @@ struct TaskListPage {
   @State projectFilterKeys: string[] = [];
   @State agentFilter: TaskAgentFilter = 'all';
   @State activityFilter: TaskActivityFilter = 'all';
-  @State pinnedCollapsed: boolean = false;
-  @State projectsSectionCollapsed: boolean = false;
-  @State dialoguesCollapsed: boolean = false;
+  @State activeListTab: TaskListTab = 'projects';
+  @State statusFilter: TaskStatusFilter = 'active';
+  @State searchOpen: boolean = false;
+  @State searchQuery: string = '';
+  @State refreshing: boolean = false;
+  @State actionEntryKey: string = '';
+  @State renameMode: boolean = false;
+  @State renameDraft: string = '';
+  @State sessionActionBusy: boolean = false;
+  @State bulkMode: boolean = false;
+  @State selectedEntryKeys: string[] = [];
+  // 置顶和单个项目组每次打开应用默认收起；手动展开状态只在本页面存活期间保留。
+  @State pinnedCollapsed: boolean = true;
   @State collapsedProjectKeys: string[] = [];
   @State expandedProjectKeys: string[] = [];
+  private projectCollapseInitialized: boolean = false;
+  private savedOpenProjectKeys: string[] = [];
+  private preferencesHydrated: boolean = false;
+  private selectedDeviceNameHint: string = '';
   @State connectionStatus: string = 'connecting';
   @State now: number = Date.now();
   @State viewportWidth: number = 0;
@@ -107,10 +126,14 @@ struct TaskListPage {
       this.selectedSessionId = readStr(params, 'sessionId');
       this.routeParamsInitialized = true;
     }
+    this.hydratePreferences();
     this.connectionStatus = AppServices.instance.client.getStatus();
     this.observeFoldStatus();
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
+      this.refreshProjection();
+    }));
+    this.unsubs.push(AppServices.instance.interactions.onChanged(() => {
       this.refreshProjection();
     }));
     this.unsubs.push(AppServices.instance.onStatus((status: string) => {
@@ -134,8 +157,47 @@ struct TaskListPage {
       this.clockTimer = -1;
     }
     this.stopFoldStatusObservation();
+    void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
     this.filterMenuOpen = false;
+  }
+
+  private hydratePreferences(): void {
+    if (this.preferencesHydrated) return;
+    this.preferencesHydrated = true;
+    const prefs = AppServices.instance.taskListPreferences.read();
+    if (this.selectedDeviceId.length === 0) this.selectedDeviceId = prefs.selectedDeviceId;
+    this.selectedDeviceNameHint = prefs.selectedDeviceName;
+    this.activeListTab = prefs.activeListTab as TaskListTab;
+    this.statusFilter = prefs.statusFilter as TaskStatusFilter;
+    this.searchQuery = prefs.searchQuery;
+    this.searchOpen = prefs.searchQuery.length > 0;
+    this.projectFilterKeys = prefs.projectFilterKeys.slice();
+    this.agentFilter = prefs.agentFilter as TaskAgentFilter;
+    this.activityFilter = prefs.activityFilter as TaskActivityFilter;
+    this.savedOpenProjectKeys = prefs.openProjectKeys.slice();
+    this.expandedProjectKeys = prefs.fullyExpandedProjectKeys.slice();
+    this.pinnedCollapsed = prefs.pinnedCollapsed;
+  }
+
+  private persistPreferences(): void {
+    if (!this.preferencesHydrated) return;
+    const prefs = new TaskListPreferences();
+    prefs.selectedDeviceId = this.selectedDeviceId;
+    prefs.selectedDeviceName = this.selectedDeviceLabel();
+    prefs.activeListTab = this.activeListTab;
+    prefs.statusFilter = this.statusFilter;
+    prefs.searchQuery = this.searchQuery.slice(0, 256);
+    prefs.projectFilterKeys = this.projectFilterKeys.slice();
+    prefs.agentFilter = this.agentFilter;
+    prefs.activityFilter = this.activityFilter;
+    const groups = this.projectGroups();
+    for (let i = 0; i < groups.length; i++) {
+      if (!this.projectCollapsed(groups[i].key)) prefs.openProjectKeys.push(groups[i].key);
+    }
+    prefs.fullyExpandedProjectKeys = this.expandedProjectKeys.slice();
+    prefs.pinnedCollapsed = this.pinnedCollapsed;
+    AppServices.instance.taskListPreferences.save(prefs);
   }
 
   private observeFoldStatus(): void {
@@ -171,7 +233,7 @@ struct TaskListPage {
       const sessions = AppServices.instance.tasks.getSessions(device.deviceId);
       for (let sessionIndex = 0; sessionIndex < sessions.length; sessionIndex++) {
         const session = sessions[sessionIndex];
-        if (!taskVisibleOnHome(session)) continue;
+        if (session.status === 'deleted' || session.orcaRole === 'worker') continue;
         const entry = new TaskListEntry();
         entry.key = `${device.deviceId}:${session.id}`;
         entry.deviceId = device.deviceId;
@@ -188,12 +250,25 @@ struct TaskListPage {
     });
     this.devices = devices;
     this.entries = next;
+    this.collapseProjectGroupsOnce();
     this.ensureWideSelection();
+  }
+
+  /**
+   * 首次拿到会话数据时让各项目组默认收起；之后的数据刷新不覆盖用户手动展开的状态。
+   */
+  private collapseProjectGroupsOnce(): void {
+    if (this.projectCollapseInitialized) return;
+    if (this.entries.length === 0) return;
+    this.projectCollapseInitialized = true;
+    const keys: string[] = [];
+    for (const group of this.projectGroups()) keys.push(group.key);
+    this.collapsedProjectKeys = keys.filter((key: string) => this.savedOpenProjectKeys.indexOf(key) < 0);
   }
 
   private ensureWideSelection(): void {
     if (!isWideTaskLayout(this.viewportWidth, this.foldStatus)) return;
-    const scoped = this.scopedEntries();
+    const scoped = this.activeListEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].deviceId === this.selectedSessionDeviceId
         && scoped[i].session.id === this.selectedSessionId) {
@@ -237,8 +312,20 @@ struct TaskListPage {
   }
 
   private selectSession(entry: TaskListEntry): void {
-    this.selectedSessionDeviceId = entry.deviceId;
-    this.selectedSessionId = entry.session.id;
+    uiAnimateState(this.getUIContext(), () => {
+      this.selectedSessionDeviceId = entry.deviceId;
+      this.selectedSessionId = entry.session.id;
+    });
+  }
+
+  private selectListTab(tab: TaskListTab): void {
+    if (this.activeListTab === tab) return;
+    uiAnimateState(this.getUIContext(), () => {
+      this.activeListTab = tab;
+    });
+    this.ensureWideSelection();
+    this.persistPreferences();
+    this.persistPreferences();
   }
 
   private handleDividerTouch(event: TouchEvent): void {
@@ -273,6 +360,10 @@ struct TaskListPage {
   }
 
   private openSession(entry: TaskListEntry): void {
+    if (this.bulkMode) {
+      this.toggleBulkEntry(entry);
+      return;
+    }
     this.selectSession(entry);
     if (this.splitLayoutEnabled()) return;
     router.pushUrl({
@@ -292,9 +383,9 @@ struct TaskListPage {
     });
   }
 
-  /** 菜单开合统一走 animateTo，保证浮层进退场过渡完整播放。 */
+  /** 菜单开合统一走轻量可见性动效，保证浮层进退场完整播放。 */
   private animateMenu(apply: () => void): void {
-    animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, apply);
+    uiAnimateFastState(this.getUIContext(), apply);
   }
 
   private openDeviceScopeMenu(): void {
@@ -331,6 +422,7 @@ struct TaskListPage {
       this.filterMenuOpen = false;
     });
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private selectedDeviceLabel(): string {
@@ -340,7 +432,8 @@ struct TaskListPage {
         return this.devices[i].deviceName;
       }
     }
-    return AppServices.instance.tasks.getDeviceName(this.selectedDeviceId);
+    const resolved = AppServices.instance.tasks.getDeviceName(this.selectedDeviceId);
+    return resolved.length > 0 ? resolved : this.selectedDeviceNameHint;
   }
 
   private deviceScopedEntries(): TaskListEntry[] {
@@ -359,6 +452,7 @@ struct TaskListPage {
     for (let i = 0; i < source.length; i++) {
       const entry = source[i];
       const session = entry.session;
+      if (!this.entryMatchesStatus(entry) || !this.entryMatchesSearch(entry)) continue;
       const isDialogue = session.workspaceKind === 'dialogue' || session.workingDir.length === 0;
       if (this.projectFilterKeys.length > 0) {
         if (isDialogue || this.projectFilterKeys.indexOf(taskProjectKey(entry.deviceId, session.workingDir)) < 0) {
@@ -375,6 +469,38 @@ struct TaskListPage {
     return out;
   }
 
+  private entryMatchesStatus(entry: TaskListEntry): boolean {
+    const session = entry.session;
+    if (this.statusFilter === 'all') return session.status !== 'deleted';
+    if (this.statusFilter === 'archived') return session.status === 'archived';
+    if (session.status !== 'active') return false;
+    if (this.statusFilter === 'automation') {
+      return session.source === 'scheduler' || session.title.startsWith('[Schedule]');
+    }
+    if (this.statusFilter === 'waiting') {
+      return AppServices.instance.interactions.getPending(session.id).length > 0;
+    }
+    return true;
+  }
+
+  private entryMatchesSearch(entry: TaskListEntry): boolean {
+    const query = this.searchQuery.trim().toLowerCase();
+    if (query.length === 0) return true;
+    const session = entry.session;
+    const haystack = [
+      taskDisplayTitle(session),
+      session.workingDir,
+      session.worktreePath,
+      session.model,
+      session.agentKind,
+      session.status,
+      session.source,
+      session.preview,
+      entry.deviceName,
+    ].join('\n').toLowerCase();
+    return haystack.indexOf(query) >= 0;
+  }
+
   private activityFilterDays(): number {
     if (this.activityFilter === '1d') return 1;
     if (this.activityFilter === '7d') return 7;
@@ -385,7 +511,266 @@ struct TaskListPage {
   private taskFilterActive(): boolean {
     return this.projectFilterKeys.length > 0
       || this.agentFilter !== 'all'
-      || this.activityFilter !== 'all';
+      || this.activityFilter !== 'all'
+      || this.statusFilter !== 'active'
+      || this.searchQuery.trim().length > 0;
+  }
+
+  private selectStatusFilter(filter: TaskStatusFilter): void {
+    if (this.statusFilter === filter) return;
+    uiAnimateState(this.getUIContext(), () => {
+      this.statusFilter = filter;
+      this.selectedEntryKeys = [];
+      this.bulkMode = false;
+    });
+    this.ensureWideSelection();
+    this.persistPreferences();
+  }
+
+  private toggleSearch(): void {
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.searchOpen = !this.searchOpen;
+      if (!this.searchOpen) this.searchQuery = '';
+    });
+    this.ensureWideSelection();
+    this.persistPreferences();
+  }
+
+  private async refreshAllDevices(): Promise<void> {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    const devices = this.devices.slice();
+    for (let i = 0; i < devices.length; i++) {
+      if (devices[i].online && devices[i].remoteControlEnabled) {
+        await AppServices.instance.tasks.loadSessions(devices[i].deviceId);
+      }
+    }
+    this.refreshing = false;
+  }
+
+  private entryForKey(key: string): TaskListEntry | null {
+    for (let i = 0; i < this.entries.length; i++) {
+      if (this.entries[i].key === key) return this.entries[i];
+    }
+    return null;
+  }
+
+  private actionEntry(): TaskListEntry | null {
+    return this.entryForKey(this.actionEntryKey);
+  }
+
+  private actionSession(): RemoteSession {
+    return this.actionEntry()?.session ?? new RemoteSession();
+  }
+
+  private togglePinnedActionEntry(): void {
+    const entry = this.actionEntry();
+    if (entry !== null) void this.togglePinned(entry);
+  }
+
+  private archiveActionEntry(): void {
+    const entry = this.actionEntry();
+    if (entry !== null) void this.archiveOrRestore(entry);
+  }
+
+  private deleteActionEntry(): void {
+    const entry = this.actionEntry();
+    if (entry !== null) this.confirmDelete(entry);
+  }
+
+  private openSessionActions(entry: TaskListEntry): void {
+    this.renameMode = false;
+    this.renameDraft = taskDisplayTitle(entry.session);
+    this.actionEntryKey = entry.key;
+  }
+
+  private closeSessionActions(): void {
+    if (this.sessionActionBusy) return;
+    this.actionEntryKey = '';
+    this.renameMode = false;
+    this.renameDraft = '';
+  }
+
+  private async applySessionPatch(entry: TaskListEntry, patch: SessionMetaPatch): Promise<boolean> {
+    this.sessionActionBusy = true;
+    const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
+    this.sessionActionBusy = false;
+    if (!ok) promptAction.showToast({ message: '任务更新失败，请重试' });
+    return ok;
+  }
+
+  private async saveRename(): Promise<void> {
+    const entry = this.actionEntry();
+    const title = this.renameDraft.trim();
+    if (entry === null || title.length === 0 || this.sessionActionBusy) return;
+    const patch = new SessionMetaPatch();
+    patch.title = title;
+    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
+  }
+
+  private async generateRename(): Promise<void> {
+    const entry = this.actionEntry();
+    if (entry === null || this.sessionActionBusy) return;
+    this.sessionActionBusy = true;
+    const title = await AppServices.instance.tasks.regenerateTitle(entry.deviceId, entry.session.id);
+    this.sessionActionBusy = false;
+    if (title.length === 0) {
+      promptAction.showToast({ message: '暂时无法生成标题' });
+      return;
+    }
+    this.renameDraft = title;
+    this.renameMode = true;
+  }
+
+  private async togglePinned(entry: TaskListEntry): Promise<void> {
+    const patch = new SessionMetaPatch();
+    patch.pinnedAt = entry.session.pinnedAt.length > 0 ? null : new Date().toISOString();
+    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
+  }
+
+  private async archiveOrRestore(entry: TaskListEntry): Promise<void> {
+    const patch = new SessionMetaPatch();
+    if (entry.session.status === 'archived') {
+      patch.status = 'active';
+    } else {
+      patch.status = 'archived';
+      patch.pinnedAt = null;
+    }
+    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
+  }
+
+  private confirmDelete(entry: TaskListEntry): void {
+    this.getUIContext().showAlertDialog({
+      title: '删除任务？',
+      message: '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        },
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: $r('app.color.danger'),
+        action: () => {
+          void this.deleteSession(entry);
+        },
+      },
+    });
+  }
+
+  private async deleteSession(entry: TaskListEntry): Promise<void> {
+    const patch = new SessionMetaPatch();
+    patch.status = 'deleted';
+    if (await this.applySessionPatch(entry, patch)) {
+      if (entry.key === this.selectedTaskKey()) {
+        this.selectedSessionDeviceId = '';
+        this.selectedSessionId = '';
+      }
+      this.closeSessionActions();
+    }
+  }
+
+  private beginBulkSelection(entry: TaskListEntry): void {
+    this.bulkMode = true;
+    if (this.selectedEntryKeys.indexOf(entry.key) < 0) {
+      this.selectedEntryKeys = this.selectedEntryKeys.concat([entry.key]);
+    }
+  }
+
+  private toggleBulkEntry(entry: TaskListEntry): void {
+    const index = this.selectedEntryKeys.indexOf(entry.key);
+    if (index >= 0) {
+      this.selectedEntryKeys = this.selectedEntryKeys.filter((key: string) => key !== entry.key);
+      if (this.selectedEntryKeys.length === 0) this.bulkMode = false;
+    } else {
+      this.selectedEntryKeys = this.selectedEntryKeys.concat([entry.key]);
+    }
+  }
+
+  private cancelBulkSelection(): void {
+    this.bulkMode = false;
+    this.selectedEntryKeys = [];
+  }
+
+  private bulkAction(action: string): void {
+    const count = this.selectedEntryKeys.length;
+    if (count === 0 || this.sessionActionBusy) return;
+    this.getUIContext().showAlertDialog({
+      title: `处理 ${count} 个任务？`,
+      message: action === 'delete' ? '选中的任务将被删除。' : '将对选中的适用任务执行此操作。',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        },
+      },
+      secondaryButton: {
+        value: '继续',
+        fontColor: action === 'delete' ? $r('app.color.danger') : $r('app.color.text_primary'),
+        action: () => {
+          void this.applyBulkAction(action);
+        },
+      },
+    });
+  }
+
+  private async applyBulkAction(action: string): Promise<void> {
+    if (this.sessionActionBusy) return;
+    this.sessionActionBusy = true;
+    const keys = this.selectedEntryKeys.slice();
+    const retained: string[] = [];
+    let failed = 0;
+    let skipped = 0;
+    for (let i = 0; i < keys.length; i++) {
+      const entry = this.entryForKey(keys[i]);
+      if (entry === null) continue;
+      const patch = new SessionMetaPatch();
+      if (action === 'pin') {
+        if (entry.session.status !== 'active' || entry.session.pinnedAt.length > 0) {
+          retained.push(keys[i]);
+          skipped += 1;
+          continue;
+        }
+        patch.pinnedAt = new Date().toISOString();
+      } else if (action === 'unpin') {
+        if (entry.session.pinnedAt.length === 0) {
+          retained.push(keys[i]);
+          skipped += 1;
+          continue;
+        }
+        patch.pinnedAt = null;
+      } else if (action === 'archive') {
+        if (entry.session.status !== 'active') {
+          retained.push(keys[i]);
+          skipped += 1;
+          continue;
+        }
+        patch.status = 'archived';
+        patch.pinnedAt = null;
+      } else if (action === 'restore') {
+        if (entry.session.status !== 'archived') {
+          retained.push(keys[i]);
+          skipped += 1;
+          continue;
+        }
+        patch.status = 'active';
+      } else if (action === 'delete') {
+        patch.status = 'deleted';
+      }
+      const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
+      if (!ok) {
+        failed += 1;
+        retained.push(keys[i]);
+      }
+    }
+    this.sessionActionBusy = false;
+    this.selectedEntryKeys = retained;
+    this.bulkMode = retained.length > 0;
+    if (failed > 0 || skipped > 0) {
+      const parts: string[] = [];
+      if (failed > 0) parts.push(`${failed} 个失败`);
+      if (skipped > 0) parts.push(`${skipped} 个不适用`);
+      promptAction.showToast({ message: `${parts.join('，')}，已保留选择` });
+    }
   }
 
   private projectFilterGroups(): TaskProjectGroup[] {
@@ -395,6 +780,7 @@ struct TaskListPage {
   private setProjectFilterAll(): void {
     this.projectFilterKeys = [];
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private toggleProjectFilter(key: string): void {
@@ -406,26 +792,32 @@ struct TaskListPage {
       this.projectFilterKeys = this.projectFilterKeys.concat([key]);
     }
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private setAgentFilter(filter: TaskAgentFilter): void {
     this.agentFilter = filter;
     this.closeFilterMenu();
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private setActivityFilter(filter: TaskActivityFilter): void {
     this.activityFilter = filter;
     this.closeFilterMenu();
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private clearTaskFilters(): void {
     this.projectFilterKeys = [];
     this.agentFilter = 'all';
     this.activityFilter = 'all';
+    this.statusFilter = 'active';
+    this.searchQuery = '';
     this.closeFilterMenu();
     this.ensureWideSelection();
+    this.persistPreferences();
   }
 
   private projectFilterLabel(): string {
@@ -510,6 +902,25 @@ struct TaskListPage {
     return out;
   }
 
+  /** 当前 Tab 可见的任务；置顶任务独立展示，因此在两个 Tab 中都保持可达。 */
+  private activeListEntries(): TaskListEntry[] {
+    const out: TaskListEntry[] = [];
+    const pinned = this.pinnedEntries();
+    for (let i = 0; i < pinned.length; i++) out.push(pinned[i]);
+    if (this.activeListTab === 'dialogues') {
+      const dialogues = this.dialogueEntries();
+      for (let i = 0; i < dialogues.length; i++) out.push(dialogues[i]);
+      return out;
+    }
+    const groups = this.projectGroups();
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      for (let entryIndex = 0; entryIndex < groups[groupIndex].entries.length; entryIndex++) {
+        out.push(groups[groupIndex].entries[entryIndex]);
+      }
+    }
+    return out;
+  }
+
   private allProjectsCollapsed(): boolean {
     const groups = this.projectGroups();
     if (groups.length === 0) return false;
@@ -523,12 +934,18 @@ struct TaskListPage {
     const groups = this.projectGroups();
     if (groups.length === 0) return;
     if (this.allProjectsCollapsed()) {
-      this.collapsedProjectKeys = [];
+      uiAnimateState(this.getUIContext(), () => {
+        this.collapsedProjectKeys = [];
+      });
+      this.persistPreferences();
       return;
     }
     const keys: string[] = [];
     for (let i = 0; i < groups.length; i++) keys.push(groups[i].key);
-    this.collapsedProjectKeys = keys;
+    uiAnimateState(this.getUIContext(), () => {
+      this.collapsedProjectKeys = keys;
+    });
+    this.persistPreferences();
   }
 
   private projectCollapsed(key: string): boolean {
@@ -537,11 +954,14 @@ struct TaskListPage {
 
   private toggleProject(key: string): void {
     const index = this.collapsedProjectKeys.indexOf(key);
-    if (index >= 0) {
-      this.collapsedProjectKeys = this.collapsedProjectKeys.filter((value: string) => value !== key);
-    } else {
-      this.collapsedProjectKeys = this.collapsedProjectKeys.concat([key]);
-    }
+    uiAnimateState(this.getUIContext(), () => {
+      if (index >= 0) {
+        this.collapsedProjectKeys = this.collapsedProjectKeys.filter((value: string) => value !== key);
+      } else {
+        this.collapsedProjectKeys = this.collapsedProjectKeys.concat([key]);
+      }
+    });
+    this.persistPreferences();
   }
 
   private projectFullyExpanded(key: string): boolean {
@@ -556,11 +976,14 @@ struct TaskListPage {
   }
 
   private toggleProjectExpanded(key: string): void {
-    if (this.projectFullyExpanded(key)) {
-      this.expandedProjectKeys = this.expandedProjectKeys.filter((value: string) => value !== key);
-    } else {
-      this.expandedProjectKeys = this.expandedProjectKeys.concat([key]);
-    }
+    uiAnimateState(this.getUIContext(), () => {
+      if (this.projectFullyExpanded(key)) {
+        this.expandedProjectKeys = this.expandedProjectKeys.filter((value: string) => value !== key);
+      } else {
+        this.expandedProjectKeys = this.expandedProjectKeys.concat([key]);
+      }
+    });
+    this.persistPreferences();
   }
 
   private availableDeviceCount(): number {
@@ -588,6 +1011,22 @@ struct TaskListPage {
     return '新任务会显示在这里';
   }
 
+  private activeTabEmptyTitle(): string {
+    if (this.taskFilterActive()) {
+      return this.activeListTab === 'projects' ? '没有符合条件的项目任务' : '没有符合条件的对话任务';
+    }
+    return this.activeListTab === 'projects' ? '暂无项目任务' : '暂无对话任务';
+  }
+
+  private activeTabEmptyCopy(): string {
+    if (this.taskFilterActive()) {
+      return this.activeListTab === 'projects'
+        ? '可以调整项目、代理或最近活动筛选'
+        : '项目筛选不适用于对话，可以清除筛选后查看';
+    }
+    return this.activeListTab === 'projects' ? '新建项目任务后会显示在这里' : '新建对话任务后会显示在这里';
+  }
+
   build() {
     Stack() {
       Row() {
@@ -610,6 +1049,12 @@ struct TaskListPage {
       if (this.filterMenuOpen) {
         this.filterMenuLayer()
       }
+      if (this.actionEntryKey.length > 0) {
+        this.sessionActionLayer()
+      }
+      if (this.bulkMode) {
+        this.bulkActionBar()
+      }
     }
     .backgroundColor($r('app.color.bg_page'))
     .width('100%')
@@ -627,6 +1072,11 @@ struct TaskListPage {
       if (this.connectionStatus !== 'online') {
         this.connectionBanner()
       }
+      this.taskListTabs()
+      if (this.searchOpen) {
+        this.taskSearchField()
+      }
+      this.taskStatusFilters()
       // 不再外加 Stack/Box 等套层。原来的
       // `Stack(...) { this.taskList() }.layoutWeight(1)` 即使改用默认
       // TopStart 也会在折叠屏窄列里让首条 ListItem 漂到中段，原因是
@@ -644,10 +1094,6 @@ struct TaskListPage {
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
-    .border({
-      width: { right: this.splitLayoutEnabled() ? 1 : 0 },
-      color: { right: $r('app.color.border') },
-    })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
   }
 
@@ -655,13 +1101,23 @@ struct TaskListPage {
   splitDivider() {
     Stack({ alignContent: Alignment.Center }) {
       Row()
-        .width(4)
-        .height(24)
-        .backgroundColor(this.dividerActive
-          ? $r('app.color.accent')
-          : $r('app.color.text_tertiary'))
-        .borderRadius(UI_RADIUS_PILL)
-        .opacity(this.dividerActive ? 1 : 0.5)
+        .width(1)
+        .height('100%')
+        .backgroundColor($r('app.color.border'))
+      Stack({ alignContent: Alignment.Center }) {
+        Row()
+          .width(3)
+          .height(20)
+          .backgroundColor(this.dividerActive
+            ? $r('app.color.accent')
+            : $r('app.color.text_tertiary'))
+          .borderRadius(UI_RADIUS_PILL)
+      }
+      .width(12)
+      .height(44)
+      .backgroundColor($r('app.color.task_list_group_surface'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_PILL)
     }
     .width(20)
     .height('100%')
@@ -730,30 +1186,17 @@ struct TaskListPage {
         this.openDeviceScopeMenu();
       })
 
-      this.headerCircleButton('C', () => this.openSettings())
+      this.headerSymbolButton($r('sys.symbol.gearshape'), () => this.openSettings())
+      this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch())
+      this.headerSymbolButton($r('sys.symbol.arrow_clockwise'), () => {
+        void this.refreshAllDevices();
+      })
       this.headerSymbolButton($r('sys.symbol.plus'), () => this.openNewSession())
     }
     .width('100%')
     .height(60)
     .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 12 })
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
-  }
-
-  @Builder
-  headerCircleButton(label: string, action: () => void) {
-    Button() {
-      Text(label)
-        .fontSize(15)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .backgroundColor($r('app.color.bg_chip'))
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .onClick(action)
   }
 
   @Builder
@@ -767,7 +1210,7 @@ struct TaskListPage {
     .width(40)
     .height(40)
     .padding(0)
-    .backgroundColor($r('app.color.bg_chip'))
+    .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
     .onClick(action)
   }
@@ -791,6 +1234,170 @@ struct TaskListPage {
     .height(36)
     .padding({ left: LIST_INSET, right: LIST_INSET })
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
+  }
+
+  @Builder
+  taskListTabs() {
+    Row({ space: 8 }) {
+      Button() {
+        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
+          .fontSize(15)
+          .fontColor([this.taskFilterActive()
+            ? $r('app.color.accent')
+            : $r('app.color.text_secondary')])
+      }
+      .type(ButtonType.Circle)
+      .width(36)
+      .height(36)
+      .padding(0)
+      .backgroundColor($r('app.color.bg_chip'))
+      .clickEffect(UI_ICON_CLICK_EFFECT)
+      .onClick(() => this.openFilterMenu())
+
+      Row({ space: 2 }) {
+        this.listTabButton('项目', 'projects')
+        this.listTabButton('对话', 'dialogues')
+      }
+      .layoutWeight(1)
+      .height(40)
+      .padding(3)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_PILL)
+
+      Button() {
+        Stack({ alignContent: Alignment.Center }) {
+          SymbolGlyph($r('sys.symbol.chevron_up'))
+            .fontSize(9)
+            .fontColor([$r('app.color.text_secondary')])
+            .translate({ y: -3.5 })
+          SymbolGlyph($r('sys.symbol.chevron_down'))
+            .fontSize(9)
+            .fontColor([$r('app.color.text_secondary')])
+            .translate({ y: 3.5 })
+        }
+        .width(16)
+        .height(18)
+      }
+      .type(ButtonType.Circle)
+      .width(36)
+      .height(36)
+      .padding(0)
+      .backgroundColor($r('app.color.bg_chip'))
+      .clickEffect(UI_ICON_CLICK_EFFECT)
+      .enabled(this.activeListTab === 'projects' && this.projectGroups().length > 0)
+      .opacity(this.activeListTab === 'projects' ? 1 : 0)
+      .onClick(() => this.toggleAllProjects())
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: LIST_INSET, right: LIST_INSET, top: 8, bottom: 8 })
+    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
+  }
+
+  @Builder
+  listTabButton(label: string, tab: TaskListTab) {
+    Button() {
+      Text(label)
+        .fontSize(14)
+        .fontWeight(this.activeListTab === tab ? FontWeight.Medium : FontWeight.Regular)
+        .fontColor(this.activeListTab === tab
+          ? $r('app.color.text_primary')
+          : $r('app.color.text_secondary'))
+    }
+    .type(ButtonType.Normal)
+    .layoutWeight(1)
+    .height(34)
+    .padding(0)
+    .backgroundColor(this.activeListTab === tab
+      ? $r('app.color.task_list_group_surface')
+      : Color.Transparent)
+    .border({
+      width: this.activeListTab === tab ? 1 : 0,
+      color: $r('app.color.border'),
+    })
+    .borderRadius(UI_RADIUS_PILL)
+    .clickEffect(UI_CLICK_EFFECT)
+    .onClick(() => this.selectListTab(tab))
+  }
+
+  @Builder
+  taskSearchField() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.magnifyingglass'))
+        .fontSize(16)
+        .fontColor([$r('app.color.text_secondary')])
+      TextInput({ placeholder: '搜索标题、项目、模型或消息…', text: this.searchQuery })
+        .fontSize(14)
+        .fontColor($r('app.color.text_primary'))
+        .placeholderColor($r('app.color.text_placeholder'))
+        .caretColor($r('app.color.accent'))
+        .backgroundColor(Color.Transparent)
+        .layoutWeight(1)
+        .height(40)
+        .padding(0)
+        .onChange((value: string) => {
+          this.searchQuery = value;
+          this.ensureWideSelection();
+          this.persistPreferences();
+        })
+      if (this.searchQuery.length > 0) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(13)
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .type(ButtonType.Circle)
+        .width(32)
+        .height(32)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          this.searchQuery = '';
+          this.ensureWideSelection();
+          this.persistPreferences();
+        })
+      }
+    }
+    .width('calc(100% - 32vp)')
+    .height(44)
+    .margin({ left: LIST_INSET, right: LIST_INSET, bottom: 6 })
+    .padding({ left: 12, right: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_PILL)
+    .transition(uiRevealTransition())
+  }
+
+  @Builder
+  taskStatusFilters() {
+    Row({ space: 4 }) {
+      this.statusFilterButton('活跃', 'active')
+      this.statusFilterButton('待处理', 'waiting')
+      this.statusFilterButton('自动化', 'automation')
+      this.statusFilterButton('归档', 'archived')
+      this.statusFilterButton('全部', 'all')
+    }
+    .width('100%')
+    .height(44)
+    .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 8 })
+    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
+  }
+
+  @Builder
+  statusFilterButton(label: string, filter: TaskStatusFilter) {
+    Button(label)
+      .type(ButtonType.Normal)
+      .layoutWeight(1)
+      .height(32)
+      .padding({ left: 2, right: 2 })
+      .fontSize(12)
+      .fontWeight(this.statusFilter === filter ? FontWeight.Medium : FontWeight.Normal)
+      .fontColor(this.statusFilter === filter
+        ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+      .backgroundColor(this.statusFilter === filter
+        ? $r('app.color.chat_cta') : Color.Transparent)
+      .borderRadius(UI_RADIUS_PILL)
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(() => this.selectStatusFilter(filter))
   }
 
   @Builder
@@ -838,7 +1445,10 @@ struct TaskListPage {
             `${this.pinnedEntries().length}`,
             $r('sys.symbol.pin'),
             () => {
-              this.pinnedCollapsed = !this.pinnedCollapsed;
+              uiAnimateState(this.getUIContext(), () => {
+                this.pinnedCollapsed = !this.pinnedCollapsed;
+              });
+              this.persistPreferences();
             })
         }
         if (!this.pinnedCollapsed) {
@@ -846,51 +1456,80 @@ struct TaskListPage {
             ListItem() {
               this.sessionRow(entry, false)
             }
+            .swipeAction({
+              start: {
+                builder: () => {
+                  this.swipePinAction(entry)
+                },
+                actionAreaDistance: 56,
+                onAction: () => {
+                  void this.togglePinned(entry);
+                },
+              },
+              end: {
+                builder: () => {
+                  this.swipeArchiveAction(entry)
+                },
+                actionAreaDistance: 56,
+                onAction: () => {
+                  void this.archiveOrRestore(entry);
+                },
+              },
+              edgeEffect: SwipeEdgeEffect.Spring,
+            })
           }, (entry: TaskListEntry) => `pinned:${entry.key}`)
         }
       }
 
-      if (this.projectGroups().length > 0
-        || this.projectFilterGroups().length > 0
-        || this.taskFilterActive()) {
-        ListItem() {
-          this.projectSectionHeader()
-        }
-        if (!this.projectsSectionCollapsed) {
+      if (this.activeListTab === 'projects') {
+        if (this.projectGroups().length > 0) {
           ForEach(this.projectGroups(), (group: TaskProjectGroup) => {
             ListItem() {
               this.projectGroup(group)
             }
+            .transition(uiRevealTransition())
           }, (group: TaskProjectGroup) => `project:${group.key}`)
+        } else {
+          ListItem() {
+            this.activeTabEmptyState()
+          }
         }
-      }
-
-      if (this.dialogueEntries().length > 0) {
-        ListItem() {
-          this.sectionHeader(
-            this.dialoguesCollapsed,
-            '对话',
-            `${this.dialogueEntries().length}`,
-            $r('sys.symbol.message'),
-            () => {
-              this.dialoguesCollapsed = !this.dialoguesCollapsed;
-            })
-        }
-        if (!this.dialoguesCollapsed) {
+      } else {
+        if (this.dialogueEntries().length > 0) {
           ForEach(this.dialogueEntries(), (entry: TaskListEntry) => {
             ListItem() {
               this.sessionRow(entry, false)
             }
+            .swipeAction({
+              start: {
+                builder: () => {
+                  this.swipePinAction(entry)
+                },
+                actionAreaDistance: 56,
+                onAction: () => {
+                  void this.togglePinned(entry);
+                },
+              },
+              end: {
+                builder: () => {
+                  this.swipeArchiveAction(entry)
+                },
+                actionAreaDistance: 56,
+                onAction: () => {
+                  void this.archiveOrRestore(entry);
+                },
+              },
+              edgeEffect: SwipeEdgeEffect.Spring,
+            })
+            .transition(uiRevealTransition())
           }, (entry: TaskListEntry) => `dialogue:${entry.key}`)
+        } else {
+          ListItem() {
+            this.activeTabEmptyState()
+          }
         }
       }
 
-      // 作为真实列表项保留 FAB 避让区，避免 List padding 把屏底附近的后续行判成不可见。
-      ListItem() {
-        Row()
-          .width('100%')
-          .height(112)
-      }
     }
     .width('100%')
     .layoutWeight(1)
@@ -898,6 +1537,37 @@ struct TaskListPage {
     .padding({ top: 8 })
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+  }
+
+  @Builder
+  activeTabEmptyState() {
+    Column({ space: 8 }) {
+      Text(this.activeTabEmptyTitle())
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+      Text(this.activeTabEmptyCopy())
+        .fontSize(13)
+        .lineHeight(19)
+        .fontColor($r('app.color.text_secondary'))
+        .textAlign(TextAlign.Center)
+      if (this.taskFilterActive()) {
+        Button('清除筛选')
+          .height(34)
+          .fontSize(13)
+          .fontColor($r('app.color.text_primary'))
+          .padding({ left: 16, right: 16 })
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_PILL)
+          .clickEffect(UI_CLICK_EFFECT)
+          .onClick(() => this.clearTaskFilters())
+      }
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 180 })
+    .justifyContent(FlexAlign.Center)
+    .padding({ left: 24, right: 24 })
+    .transition(uiRevealTransition())
   }
 
   /**
@@ -922,7 +1592,7 @@ struct TaskListPage {
     .width('100%')
     .height(44)
     .padding({ left: LIST_INSET, right: LIST_INSET })
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(action)
   }
 
@@ -936,75 +1606,18 @@ struct TaskListPage {
       .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
   }
 
-  @Builder
-  projectSectionHeader() {
-    Row({ space: 4 }) {
-      Row({ space: 8 }) {
-        this.collapseChevron(this.projectsSectionCollapsed)
-        SymbolGlyph($r('sys.symbol.folder'))
-          .fontSize(16)
-          .fontColor([$r('app.color.text_secondary')])
-        Text('项目')
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-      }
-      .layoutWeight(1)
-      .clickEffect(UI_CLICK_EFFECT)
-      .onClick(() => {
-        this.projectsSectionCollapsed = !this.projectsSectionCollapsed;
-      })
-
-      Button() {
-        Stack({ alignContent: Alignment.Center }) {
-          SymbolGlyph($r('sys.symbol.chevron_up'))
-            .fontSize(9)
-            .fontColor([$r('app.color.text_secondary')])
-            .translate({ y: -3.5 })
-          SymbolGlyph($r('sys.symbol.chevron_down'))
-            .fontSize(9)
-            .fontColor([$r('app.color.text_secondary')])
-            .translate({ y: 3.5 })
-        }
-        .width(16)
-        .height(18)
-      }
-      .type(ButtonType.Normal)
-      .width(32)
-      .height(32)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .onClick(() => this.toggleAllProjects())
-
-      Button() {
-        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(15)
-          .fontColor([this.taskFilterActive()
-            ? $r('app.color.accent')
-            : $r('app.color.text_secondary')])
-      }
-      .type(ButtonType.Normal)
-      .width(32)
-      .height(32)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .onClick(() => this.openFilterMenu())
-    }
-    .width('100%')
-    .height(44)
-    .padding({ left: LIST_INSET, right: LIST_INSET - 4 })
-  }
-
   /**
-   * 任务行：置顶/对话区的独立卡片与项目组内行共用同一份内容与选中态；
-   * inGroup 行去掉外卡背景，依靠组容器归纳。
+   * 任务行：置顶/对话区的独立行与项目组内行共用同一份内容与选中态；
+   * inGroup 行通过标题对齐和缩进表达项目层级。
    */
   @Builder
   sessionRow(entry: TaskListEntry, inGroup: boolean) {
     Row({ space: 10 }) {
-      this.agentMark(entry.session.agentKind)
+      if (this.bulkMode) {
+        this.bulkSelectionMark(this.selectedEntryKeys.indexOf(entry.key) >= 0)
+      } else {
+        this.agentMark(entry.session.agentKind)
+      }
       Column({ space: 4 }) {
         Row({ space: 10 }) {
           Text(taskDisplayTitle(entry.session))
@@ -1015,10 +1628,7 @@ struct TaskListPage {
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .layoutWeight(1)
-          Text(taskRelativeTime(taskActivityAt(entry.session), this.now))
-            .fontSize(11)
-            .lineHeight(16)
-            .fontColor($r('app.color.text_tertiary'))
+          this.taskRightStatus(entry)
         }
         .width('100%')
 
@@ -1034,6 +1644,20 @@ struct TaskListPage {
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
+      if (!this.bulkMode) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+            .fontSize(15)
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .type(ButtonType.Circle)
+        .width(34)
+        .height(34)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .clickEffect(UI_ICON_CLICK_EFFECT)
+        .onClick(() => this.openSessionActions(entry))
+      }
     }
     .width('auto')
     .constraintSize({
@@ -1043,19 +1667,127 @@ struct TaskListPage {
     .margin(inGroup
       ? { left: 6, right: 6, bottom: 2 }
       : { left: LIST_INSET, right: LIST_INSET, bottom: 8 })
-    .backgroundColor(this.entrySelected(entry)
+    .backgroundColor(this.entrySelected(entry) || this.selectedEntryKeys.indexOf(entry.key) >= 0
       ? $r('app.color.bg_chip')
       : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTAINER)
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .gesture(
+      LongPressGesture({ repeat: false })
+        .onAction(() => this.beginBulkSelection(entry)),
+    )
     .onClick(() => this.openSession(entry))
+  }
+
+  @Builder
+  bulkSelectionMark(selected: boolean) {
+    Stack({ alignContent: Alignment.Center }) {
+      if (selected) {
+        SymbolGlyph($r('sys.symbol.checkmark'))
+          .fontSize(13)
+          .fontColor([$r('app.color.chat_cta_text')])
+      }
+    }
+    .width(24)
+    .height(24)
+    .backgroundColor(selected ? $r('app.color.chat_cta') : Color.Transparent)
+    .border({ width: 1, color: selected ? $r('app.color.chat_cta') : $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTROL)
+  }
+
+  @Builder
+  swipePinAction(entry: TaskListEntry) {
+    Column({ space: 4 }) {
+      SymbolGlyph($r('sys.symbol.pin'))
+        .fontSize(17)
+        .fontColor([$r('app.color.chat_cta_text')])
+      Text(entry.session.pinnedAt.length > 0 ? '取消置顶' : '置顶')
+        .fontSize(11)
+        .fontColor($r('app.color.chat_cta_text'))
+    }
+    .width(76)
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.chat_cta'))
+    .onClick(() => {
+      void this.togglePinned(entry);
+    })
+  }
+
+  @Builder
+  swipeArchiveAction(entry: TaskListEntry) {
+    Column({ space: 4 }) {
+      SymbolGlyph($r('sys.symbol.archivebox'))
+        .fontSize(17)
+        .fontColor([$r('app.color.chat_cta_text')])
+      Text(entry.session.status === 'archived' ? '恢复' : '归档')
+        .fontSize(11)
+        .fontColor($r('app.color.chat_cta_text'))
+    }
+    .width(76)
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.text_secondary'))
+    .onClick(() => {
+      void this.archiveOrRestore(entry);
+    })
+  }
+
+  private taskRightStatusKind(entry: TaskListEntry): string {
+    const activity = AppServices.instance.tasks.getLiveActivity(entry.session.id);
+    if (activity?.phase === 'error' && activity.attention) return 'error';
+    if (AppServices.instance.interactions.getPending(entry.session.id).length > 0
+      || activity?.phase === 'needs-interaction') return 'waiting';
+    if (activity?.phase === 'running') return 'running';
+    if (activity?.phase === 'completed' && activity.attention) return 'done';
+    return 'time';
+  }
+
+  @Builder
+  taskRightStatus(entry: TaskListEntry) {
+    if (this.taskRightStatusKind(entry) === 'running') {
+      Row({ space: 4 }) {
+        LoadingProgress()
+          .width(13)
+          .height(13)
+          .color($r('app.color.text_secondary'))
+        Text('运行中')
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+      }
+    } else if (this.taskRightStatusKind(entry) === 'waiting') {
+      Row({ space: 5 }) {
+        Circle().width(7).height(7).fill($r('app.color.accent'))
+        Text('待处理')
+          .fontSize(11)
+          .fontColor($r('app.color.accent'))
+      }
+    } else if (this.taskRightStatusKind(entry) === 'error') {
+      Row({ space: 5 }) {
+        Circle().width(7).height(7).fill($r('app.color.danger'))
+        Text('失败')
+          .fontSize(11)
+          .fontColor($r('app.color.danger'))
+      }
+    } else if (this.taskRightStatusKind(entry) === 'done') {
+      Row({ space: 5 }) {
+        Circle().width(7).height(7).fill($r('app.color.success'))
+        Text('已完成')
+          .fontSize(11)
+          .fontColor($r('app.color.success'))
+      }
+    } else {
+      Text(taskRelativeTime(taskActivityAt(entry.session), this.now))
+        .fontSize(11)
+        .lineHeight(16)
+        .fontColor($r('app.color.text_tertiary'))
+    }
   }
 
   @Builder
   projectGroup(group: TaskProjectGroup) {
     Column() {
       Row({ space: 8 }) {
-        this.collapseChevron(this.projectCollapsed(group.key))
         SymbolGlyph($r('sys.symbol.folder'))
           .fontSize(17)
           .fontColor([$r('app.color.text_secondary')])
@@ -1069,11 +1801,12 @@ struct TaskListPage {
         Text(`${group.entries.length}`)
           .fontSize(12)
           .fontColor($r('app.color.text_tertiary'))
+        this.collapseChevron(this.projectCollapsed(group.key))
       }
       .width('100%')
-      .height(48)
-      .padding({ left: 14, right: 14 })
-      .clickEffect(UI_CLICK_EFFECT)
+      .height(52)
+      .padding({ left: LIST_INSET, right: LIST_INSET })
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => this.toggleProject(group.key))
 
       if (!this.projectCollapsed(group.key)) {
@@ -1083,15 +1816,14 @@ struct TaskListPage {
         if (group.entries.length > PROJECT_INLINE_LIMIT) {
           this.projectViewAllRow(group)
         }
-        Row().width('100%').height(6)
       }
+
+      Divider()
+        .strokeWidth(0.5)
+        .color($r('app.color.border'))
+        .margin({ left: LIST_INSET, right: LIST_INSET })
     }
-    .width('auto')
-    .margin({ left: LIST_INSET, right: LIST_INSET, bottom: 10 })
-    .backgroundColor($r('app.color.task_list_group_surface'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(UI_RADIUS_CONTAINER)
-    .clip(true)
+    .width('100%')
   }
 
   @Builder
@@ -1110,9 +1842,9 @@ struct TaskListPage {
     }
     .width('100%')
     .height(44)
-    .padding({ left: 14, right: 14 })
+    .padding({ left: 54, right: LIST_INSET })
     .border({ width: { top: 1 }, color: { top: $r('app.color.border') } })
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.toggleProjectExpanded(group.key))
   }
 
@@ -1138,13 +1870,200 @@ struct TaskListPage {
   }
 
   @Builder
+  sessionActionLayer() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.task_list_overlay'))
+        .onClick(() => this.closeSessionActions())
+
+      Column({ space: 8 }) {
+        if (this.actionEntry() !== null) {
+          Row({ space: 10 }) {
+            this.agentMark(this.actionSession().agentKind)
+            Column({ space: 2 }) {
+              Text(taskDisplayTitle(this.actionSession()))
+                .fontSize(16)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.actionSession().workingDir.length > 0
+                ? this.actionSession().workingDir : '无项目目录')
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Button() {
+              SymbolGlyph($r('sys.symbol.xmark'))
+                .fontSize(14)
+                .fontColor([$r('app.color.text_secondary')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .padding(0)
+            .backgroundColor($r('app.color.bg_chip'))
+            .onClick(() => this.closeSessionActions())
+          }
+          .width('100%')
+          .padding({ bottom: 6 })
+
+          if (this.renameMode) {
+            TextInput({ placeholder: '任务名称', text: this.renameDraft })
+              .fontSize(15)
+              .fontColor($r('app.color.text_primary'))
+              .caretColor($r('app.color.accent'))
+              .height(44)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor($r('app.color.bg_chip'))
+              .border({ width: 1, color: $r('app.color.border') })
+              .borderRadius(UI_RADIUS_CONTROL)
+              .enabled(!this.sessionActionBusy)
+              .onChange((value: string) => {
+                this.renameDraft = value;
+              })
+            Row({ space: 8 }) {
+              Button('取消')
+                .layoutWeight(1)
+                .height(40)
+                .fontSize(14)
+                .fontColor($r('app.color.text_primary'))
+                .backgroundColor($r('app.color.bg_chip'))
+                .borderRadius(UI_RADIUS_PILL)
+                .enabled(!this.sessionActionBusy)
+                .onClick(() => {
+                  this.renameMode = false;
+                })
+              Button(this.sessionActionBusy ? '保存中…' : '保存')
+                .layoutWeight(1)
+                .height(40)
+                .fontSize(14)
+                .fontColor($r('app.color.chat_cta_text'))
+                .backgroundColor($r('app.color.chat_cta'))
+                .borderRadius(UI_RADIUS_PILL)
+                .enabled(!this.sessionActionBusy && this.renameDraft.trim().length > 0)
+                .onClick(() => {
+                  void this.saveRename();
+                })
+            }
+            .width('100%')
+          } else {
+            this.sessionActionOption('重命名', $r('sys.symbol.doc_text'), false, () => {
+              this.renameMode = true;
+            })
+            this.sessionActionOption('AI 起名', $r('sys.symbol.wand_and_stars'), false, () => {
+              void this.generateRename();
+            })
+            this.sessionActionOption(this.actionSession().pinnedAt.length > 0 ? '取消置顶' : '置顶',
+              $r('sys.symbol.pin'), false, () => {
+                this.togglePinnedActionEntry();
+              })
+            this.sessionActionOption(this.actionSession().status === 'archived' ? '恢复任务' : '归档任务',
+              $r('sys.symbol.archivebox'), false, () => {
+                this.archiveActionEntry();
+              })
+            this.sessionActionOption('删除任务', $r('sys.symbol.trash'), true, () => {
+              this.deleteActionEntry();
+            })
+          }
+        }
+      }
+      .width('calc(100% - 24vp)')
+      .padding(16)
+      .margin({ left: 12, right: 12, bottom: 12 })
+      .backgroundColor($r('app.color.task_list_menu_surface'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
+      .transition(uiOverlayTransition())
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
+  sessionActionOption(label: string, symbol: Resource, danger: boolean, action: () => void) {
+    Button() {
+      Row({ space: 10 }) {
+        SymbolGlyph(symbol)
+          .fontSize(17)
+          .fontColor([danger ? $r('app.color.danger') : $r('app.color.text_secondary')])
+          .width(24)
+        Text(label)
+          .fontSize(15)
+          .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+          .layoutWeight(1)
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+    }
+    .type(ButtonType.Normal)
+    .width('100%')
+    .height(44)
+    .padding({ left: 10, right: 10 })
+    .backgroundColor(Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTROL)
+    .enabled(!this.sessionActionBusy)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(action)
+  }
+
+  @Builder
+  bulkActionBar() {
+    Row({ space: 6 }) {
+      Button('取消')
+        .height(38)
+        .fontSize(13)
+        .fontColor($r('app.color.text_primary'))
+        .backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_PILL)
+        .onClick(() => this.cancelBulkSelection())
+      Text(`已选 ${this.selectedEntryKeys.length}`)
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .layoutWeight(1)
+      this.bulkActionButton('置顶', () => this.bulkAction('pin'))
+      this.bulkActionButton('归档', () => this.bulkAction('archive'))
+      this.bulkActionButton('恢复', () => this.bulkAction('restore'))
+      this.bulkActionButton('删除', () => this.bulkAction('delete'), true)
+    }
+    .width('calc(100% - 24vp)')
+    .height(58)
+    .padding({ left: 10, right: 10 })
+    .margin({ left: 12, right: 12, bottom: 12 })
+    .backgroundColor($r('app.color.task_list_menu_surface'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .position({ x: 12, y: 'calc(100% - 70vp)' })
+    .transition(uiOverlayTransition())
+  }
+
+  @Builder
+  bulkActionButton(label: string, action: () => void, danger: boolean = false) {
+    Button(label)
+      .height(34)
+      .padding({ left: 10, right: 10 })
+      .fontSize(12)
+      .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_PILL)
+      .enabled(!this.sessionActionBusy)
+      .onClick(action)
+  }
+
+  @Builder
   filterMenuLayer() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column()
         .width('100%')
         .height('100%')
         .backgroundColor($r('app.color.task_list_overlay'))
-        .transition(TransitionEffect.OPACITY.animation({ duration: UI_MOTION_FAST }))
+        .transition(uiRevealTransition())
         .onClick(() => {
           this.closeFilterMenu();
         })
@@ -1213,11 +2132,14 @@ struct TaskListPage {
       }
       .width(280)
       .padding(8)
-      .margin({ left: LIST_INSET, top: 104 })
+      .margin({
+        left: LIST_INSET,
+        top: this.connectionStatus === 'online' ? 116 : 152,
+      })
       .backgroundColor($r('app.color.task_list_menu_surface'))
       .border({ width: 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayEnterTransition())
+      .transition(uiOverlayTransition())
       .onClick(() => {
         // 截住面板区域点击，避免穿透到遮罩。
       })
@@ -1255,7 +2177,7 @@ struct TaskListPage {
     .padding({ left: 10, right: 12 })
     .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(action)
   }
 
@@ -1286,7 +2208,7 @@ struct TaskListPage {
       ? $r('app.color.bg_chip')
       : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.toggleProjectFilter(group.key))
   }
 
@@ -1297,7 +2219,7 @@ struct TaskListPage {
         .width('100%')
         .height('100%')
         .backgroundColor($r('app.color.task_list_overlay'))
-        .transition(TransitionEffect.OPACITY.animation({ duration: UI_MOTION_FAST }))
+        .transition(uiRevealTransition())
         .onClick(() => {
           this.closeScopeMenu();
         })
@@ -1322,7 +2244,7 @@ struct TaskListPage {
       .backgroundColor($r('app.color.task_list_menu_surface'))
       .border({ width: 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayEnterTransition())
+      .transition(uiOverlayTransition())
       .onClick(() => {
         // 截住面板区域点击，避免穿透到遮罩。
       })
@@ -1352,7 +2274,7 @@ struct TaskListPage {
       ? $r('app.color.bg_chip')
       : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.selectDevice(''))
   }
 
@@ -1389,7 +2311,7 @@ struct TaskListPage {
       ? $r('app.color.bg_chip')
       : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_CLICK_EFFECT)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.selectDevice(device.deviceId))
   }
 

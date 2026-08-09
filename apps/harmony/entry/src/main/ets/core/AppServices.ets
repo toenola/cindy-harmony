@@ -25,6 +25,9 @@ import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
+import { InputQueueStore } from './messages/InputQueueStore';
+import { ComposerDraftStore } from './messages/ComposerDraftStore';
+import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
@@ -42,6 +45,9 @@ export class AppServices {
   readonly auth: AuthStore = new AuthStore();
   readonly tasks: TaskStore = new TaskStore();
   readonly messages: MessageStore = new MessageStore();
+  readonly inputQueue: InputQueueStore = new InputQueueStore();
+  readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
+  readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
   readonly client: DlClient;
@@ -71,9 +77,11 @@ export class AppServices {
       this.syncSessionSubscriptions();
     });
     this.messages.attach(this.client);
+    this.inputQueue.attach(this.client);
     this.interactions.attach(this.client);
     this.goals.attach(this.client);
     this.messages.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
   }
 
@@ -94,9 +102,11 @@ export class AppServices {
     try {
       await Promise.race([
         this.client.openLink(deviceId, opts),
-        delay(8000),
+        delay(8000).then(() => {
+          throw new Error('Device Link open-link timeout');
+        }),
       ]);
-      // 成功才标记，失败/超时允许下次重试。
+      // 只有真实 link-accept 才标记；超时必须允许下一次调用重试。
       this.linkedDevices.add(deviceId);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'openLink failed: %{public}s', JSON.stringify(e));
@@ -104,7 +114,11 @@ export class AppServices {
   }
 
   async init(context: common.Context): Promise<void> {
-    await this.auth.init(context);
+    await Promise.all([
+      this.auth.init(context),
+      this.composerDrafts.init(context),
+      this.taskListPreferences.init(context),
+    ]);
   }
 
   /** 连接状态订阅（登录后调用 start）；返回退订函数。 */
@@ -339,6 +353,9 @@ export class AppServices {
         break;
       case 'maker:interaction-dismissed':
         this.interactions.handleInteractionDismissed(payload);
+        break;
+      case 'maker:input:projection':
+        this.inputQueue.handleProjectionPush(payload);
         break;
       case 'maker:goal:status-changed':
         this.goals.handleStatusChanged(payload);
