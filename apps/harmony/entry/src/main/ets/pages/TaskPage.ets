@@ -11,7 +11,7 @@
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { router, promptAction } from '@kit.ArkUI';
+import { LengthMetrics, router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -149,6 +149,18 @@ import {
   isContinuationText,
 } from '../core/messages/SessionTailPresentation';
 import {
+  formatSessionActivityElapsed,
+  sessionActivityElapsedMs,
+} from '../core/messages/SessionActivityPresentation';
+import {
+  firstVisibleMessageRenderIndex,
+  FOLLOW_LATEST_RETRY_DELAYS,
+  INITIAL_HISTORY_AUTOFILL_PAGES,
+  messageListBottomIndex,
+  messageListRenderNodeKey,
+  shouldAutoLoadEarlier,
+} from './TaskScrollState';
+import {
   ComposerDocument,
   ComposerAtomPresentation,
   ComposerNode,
@@ -187,16 +199,18 @@ import {
   projectToolUseActions,
 } from '../core/messages/ToolUsePresentation';
 
-const TODO_STATUS_ICON_SIZE = 16;
-const TODO_STATUS_STROKE_WIDTH = 1.5;
-const TODO_STATUS_SPINNER_DASH: number[] = [30, 20];
+const TODO_STATUS_ICON_SIZE = 13;
+const TODO_STATUS_STROKE_WIDTH = 1.25;
+const TODO_STATUS_CHECKMARK_SIZE = 9;
+const TODO_STATUS_ACTIVE_DOT_SIZE = 4;
+const TODO_STATUS_SPINNER_DASH: number[] = [24, 16];
 const TODO_STATUS_FRAME_RATE: ExpectedFrameRateRange = {
   min: 60,
   max: 120,
   expected: 120,
 };
 
-/** 与其它步骤状态共用 16vp 可见外径；只旋转外层，圆弧几何保持静态。 */
+/** 步骤状态统一使用 13vp 可见外径；只旋转外层，圆弧几何保持静态。 */
 @Component
 struct TodoRunningStatusIcon {
   @State rotation: number = 0;
@@ -245,6 +259,9 @@ class WorkPreviewRow {
   error: boolean = false;
   explorationKind: string = 'other';
   readKey: string = '';
+  /** 活动收起态也要保留真实工具行，才能与完整工作组共享展开命令/结果状态。 */
+  tool: RenderToolItem | null = null;
+  action: ToolActionPresentation | null = null;
 }
 
 class WorkExplorationCount {
@@ -385,6 +402,10 @@ export struct TaskPageContent {
   /** 初始列表仍在布局/补齐历史时，禁止 onReachStart 抢走底部锚点。 */
   private initialScrollSettling: boolean = true;
   private initialScrollGeneration: number = 0;
+  /** 流式贴底补滚代次；会话切换/主动跳转时作废上一轮布局重试。 */
+  private followScrollGeneration: number = 0;
+  private followScrollScheduled: boolean = false;
+  private followScrollTrailingRequested: boolean = false;
   private initialLoadGeneration: number = 0;
   private sessionOpenResolved: boolean = false;
   private sessionSyncStarted: boolean = false;
@@ -401,13 +422,20 @@ export struct TaskPageContent {
   private visibleEndIndex: number = -1;
   /** 单条/短首屏无法产生 List 滚动索引时，用真实手势触发一次历史分页。 */
   private listTouchStartY: number = 0;
+  private listTouchActive: boolean = false;
   /** 当前手势是否明确表达了“向下回看更早消息”的意图。 */
   private listTouchPulledDown: boolean = false;
   /** 当前手势是否明确向消息尾部移动。 */
   private listTouchPushedUp: boolean = false;
   private listTouchLoadTriggered: boolean = false;
   private historyReviewIntent: boolean = false;
+  /** 冷开短窗口的剩余自动补页次数；真实上翻后不再受此预算限制。 */
+  private initialHistoryAutofillRemaining: number = INITIAL_HISTORY_AUTOFILL_PAGES;
   private historyLastAttemptFirstKey: string = '';
+  /** 新手势、跳尾或离页会作废尚未执行的历史锚点恢复。 */
+  private historyAnchorRestoreGeneration: number = 0;
+  /** 快速响应撞上手指仍按住时，等 Touch Up 再恢复，不丢弃整页锚点。 */
+  private pendingHistoryAnchorRestore: (() => void) | undefined = undefined;
   /** 待发送图片（上传状态，由共享队列同步镜像）。 */
   @State composerImages: ComposerImage[] = [];
   @State pickingImages: boolean = false;
@@ -540,6 +568,9 @@ export struct TaskPageContent {
     this.initialScrolled = false;
     this.initialScrollSettling = true;
     this.initialScrollGeneration += 1;
+    this.followScrollGeneration += 1;
+    this.followScrollScheduled = false;
+    this.followScrollTrailingRequested = false;
     this.initialLoadGeneration += 1;
     this.sessionOpenResolved = false;
     this.initialLoadResolved = false;
@@ -549,11 +580,15 @@ export struct TaskPageContent {
     this.visibleStartIndex = 0;
     this.visibleEndIndex = -1;
     this.listTouchStartY = 0;
+    this.listTouchActive = false;
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
     this.historyReviewIntent = false;
+    this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
     this.historyLastAttemptFirstKey = '';
+    this.historyAnchorRestoreGeneration += 1;
+    this.pendingHistoryAnchorRestore = undefined;
     this.agentSwitchConfirmed = false;
     this.pendingAgentSwitchIntent = null;
     this.composerDocument = emptyComposerDocument();
@@ -610,8 +645,15 @@ export struct TaskPageContent {
 
   aboutToDisappear(): void {
     this.initialScrollGeneration += 1;
+    this.followScrollGeneration += 1;
+    this.followScrollScheduled = false;
+    this.followScrollTrailingRequested = false;
     this.initialLoadGeneration += 1;
     this.messageFocusGeneration += 1;
+    this.historyAnchorRestoreGeneration += 1;
+    this.pendingHistoryAnchorRestore = undefined;
+    this.loadingOlder = false;
+    this.listTouchActive = false;
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.initialScrollSettling = false;
@@ -1908,9 +1950,15 @@ export struct TaskPageContent {
     this.visibleStartIndex = 0;
     this.visibleEndIndex = -1;
     this.listTouchStartY = 0;
+    this.listTouchActive = false;
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
+    this.historyReviewIntent = false;
+    this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
+    this.historyLastAttemptFirstKey = '';
+    this.historyAnchorRestoreGeneration += 1;
+    this.pendingHistoryAnchorRestore = undefined;
     this.syncMessageCount();
     this.beginInitialLoad();
   }
@@ -2041,6 +2089,9 @@ export struct TaskPageContent {
       this.initialScrollSettling = false;
       this.followingLatest = false;
       this.focusedMessageClientId = target;
+      // 深链定位只在首次找目标期间屏蔽自动分页；定位成功后必须解除，
+      // 否则用户随后滚到顶部永远不会触发近顶预取。
+      this.routeMessageClientId = '';
       const generation = this.messageFocusGeneration;
       setTimeout(() => {
         if (generation !== this.messageFocusGeneration) return;
@@ -2076,27 +2127,66 @@ export struct TaskPageContent {
     });
   }
 
-  private lastMessageListIndex(): number {
-    return this.items.length === 0 ? -1 : this.renderListIndex(this.items.length - 1);
+  private hasQueueStateBanner(): boolean {
+    return this.queuePaused || this.queueProjectionError.length > 0
+      || this.queueCredentialWaiting || this.queueAbortPending;
+  }
+
+  /** 固定的尾部 sentinel 索引；必须覆盖消息后的状态卡、尾部卡和排队气泡。 */
+  private bottomSentinelListIndex(): number {
+    return messageListBottomIndex(
+      AppServices.instance.messages.hasMore(this.sessionId),
+      this.items.length,
+      this.hasQueueStateBanner(),
+      this.tailPresentation() !== null,
+      this.queueBubbles.length,
+    );
   }
 
   /** 贴底态的流式补滚；不在用户回看历史或 prepend 期间抢阅读位置。 */
   private followLatestSoon(): void {
-    const generation = this.initialScrollGeneration;
-    setTimeout(() => {
-      if (generation !== this.initialScrollGeneration
+    if (this.followScrollScheduled) {
+      this.followScrollTrailingRequested = true;
+      return;
+    }
+    this.followScrollScheduled = true;
+    this.followScrollTrailingRequested = false;
+    const sessionGeneration = this.initialScrollGeneration;
+    const followGeneration = this.followScrollGeneration;
+    const scroll = (isLast: boolean): void => {
+      if (isLast && followGeneration === this.followScrollGeneration) {
+        this.followScrollScheduled = false;
+        if (this.followScrollTrailingRequested) {
+          this.followScrollTrailingRequested = false;
+          this.followLatestSoon();
+        }
+      }
+      if (sessionGeneration !== this.initialScrollGeneration
+        || followGeneration !== this.followScrollGeneration
         || !this.followingLatest
         || this.loadingOlder
-        || this.items.length === 0) return;
-      this.listScroller.scrollToIndex(this.lastMessageListIndex(), false, ScrollAlign.END);
-    }, 24);
+        || (this.items.length === 0 && this.queueBubbles.length === 0)) return;
+      this.listScroller.scrollToIndex(this.bottomSentinelListIndex(), false, ScrollAlign.END);
+    };
+    for (let i = 0; i < FOLLOW_LATEST_RETRY_DELAYS.length; i++) {
+      const isLast = i === FOLLOW_LATEST_RETRY_DELAYS.length - 1;
+      setTimeout(() => scroll(isLast), FOLLOW_LATEST_RETRY_DELAYS[i]);
+    }
   }
 
   private jumpToLatest(): void {
     this.followingLatest = true;
     this.hasNewMessages = false;
-    if (this.items.length > 0) {
-      this.listScroller.scrollToIndex(this.lastMessageListIndex(), true, ScrollAlign.END);
+    this.historyAnchorRestoreGeneration += 1;
+    if (this.pendingHistoryAnchorRestore !== undefined) {
+      this.pendingHistoryAnchorRestore = undefined;
+      this.loadingOlder = false;
+    }
+    this.followScrollGeneration += 1;
+    this.followScrollScheduled = false;
+    this.followScrollTrailingRequested = false;
+    if (this.items.length > 0 || this.queueBubbles.length > 0) {
+      this.listScroller.scrollToIndex(this.bottomSentinelListIndex(), true, ScrollAlign.END);
     }
   }
 
@@ -2195,6 +2285,12 @@ export struct TaskPageContent {
     return item.durationMs;
   }
 
+  /** 底部“思考中”按产品 turn 独立计时，不复用某一个 work_group 的 startedAt。 */
+  private sessionActivityElapsedText(): string {
+    const startedAt = AppServices.instance.messages.getSessionRunStartedAt(this.sessionId);
+    return formatSessionActivityElapsed(sessionActivityElapsedMs(this.workClockNowMs, startedAt));
+  }
+
   /** 进入会话/重试后定位到最新消息；等待列表完成布局，并阻止首屏翻页抢占锚点。 */
   private scrollToBottomOnce(): void {
     if (this.initialScrolled) {
@@ -2208,11 +2304,11 @@ export struct TaskPageContent {
     this.hasNewMessages = false;
     const generation = this.initialScrollGeneration;
     const scroll = (): void => {
-      if (generation !== this.initialScrollGeneration || this.items.length === 0) return;
-      // List 的默认对齐是 START：滚到最后一项后，后续懒布局会把它重新放回
-      // 中间。明确使用 END，并且不再紧接着调用 scrollEdge(Bottom)；后者在
-      // 虚拟列表尚未完成测量时会再次改写 offset，正是“到底后弹回中间”的来源。
-      this.listScroller.scrollToIndex(this.lastMessageListIndex(), false, ScrollAlign.END);
+      if (generation !== this.initialScrollGeneration || !this.followingLatest
+        || this.loadingOlder || this.items.length === 0) return;
+      // 滚到消息后的固定 sentinel，而不是可能仍在变高的流式消息节点；尾部状态卡
+      // 与排队气泡也由该索引统一纳入真实列表末端。
+      this.listScroller.scrollToIndex(this.bottomSentinelListIndex(), false, ScrollAlign.END);
     };
     setTimeout(scroll, 120);
     setTimeout(scroll, 450);
@@ -2220,6 +2316,9 @@ export struct TaskPageContent {
     setTimeout(() => {
       if (generation === this.initialScrollGeneration) {
         this.initialScrollSettling = false;
+        // 对齐 iOS：若首屏短到仍处于近顶区，最多自动补三页；较长首屏在
+        // 落底后不 nearStart，不会产生额外请求。
+        this.attemptAutoLoadEarlier();
       }
     }, 1050);
   }
@@ -2230,6 +2329,8 @@ export struct TaskPageContent {
     const point = event.changedTouches[0];
     if (event.type === TouchType.Down) {
       this.listTouchStartY = point.displayY;
+      this.listTouchActive = true;
+      this.historyAnchorRestoreGeneration += 1;
       this.listTouchPulledDown = false;
       this.listTouchPushedUp = false;
       this.listTouchLoadTriggered = false;
@@ -2240,10 +2341,15 @@ export struct TaskPageContent {
       // 手指向下超过 8vp 代表明确回看历史。长列表立即解除贴底，后续流式
       // content change 不再把用户拽回末尾；短列表不解除，避免 bounce 误判。
       if (deltaY > 8) {
+        const beginsHistoryGesture = !this.listTouchPulledDown;
         this.listTouchPulledDown = true;
+        // 空页、重复页或网络失败会保留同一首项去重；新的明确下拉手势
+        // 解除这次止损，允许用户恢复网络后重试一次。
+        if (beginsHistoryGesture && !this.loadingOlder) {
+          this.historyLastAttemptFirstKey = '';
+        }
         if (!this.historyReviewIntent) {
           this.historyReviewIntent = true;
-          this.historyLastAttemptFirstKey = '';
         }
         if (this.visibleStartIndex > 0) {
           this.followingLatest = false;
@@ -2253,7 +2359,7 @@ export struct TaskPageContent {
       // 手指向上是回到最新消息的方向；尾项重新可见后恢复贴底跟随。
       if (deltaY < -8) {
         this.listTouchPushedUp = true;
-        if (this.visibleEndIndex >= this.lastMessageListIndex()) {
+        if (this.visibleEndIndex >= this.bottomSentinelListIndex()) {
           this.followingLatest = true;
           this.hasNewMessages = false;
         }
@@ -2261,7 +2367,11 @@ export struct TaskPageContent {
       return;
     }
     if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      if (this.listTouchPushedUp && this.visibleEndIndex >= this.lastMessageListIndex()) {
+      this.listTouchActive = false;
+      const pendingAnchorRestore = this.pendingHistoryAnchorRestore;
+      this.pendingHistoryAnchorRestore = undefined;
+      if (pendingAnchorRestore !== undefined) pendingAnchorRestore();
+      if (this.listTouchPushedUp && this.visibleEndIndex >= this.bottomSentinelListIndex()) {
         this.followingLatest = true;
         this.hasNewMessages = false;
       }
@@ -2272,52 +2382,120 @@ export struct TaskPageContent {
     }
   }
 
-  /** 滚动到顶部：加载更早历史，并锚定到旧内容起始位置（阅读位置保持）。 */
-  private loadOlder(continueSearch: boolean = false): void {
+  /**
+   * 加载一页更早历史。真实上翻保持旧首项锚点；冷开自动补窗则继续贴住尾部，
+   * 避免后台 prepend 把用户从最新消息带到历史位置。
+   */
+  private loadOlder(
+    continueSearch: boolean = false,
+    initialAutofill: boolean = false,
+  ): void {
     if (this.loadingOlder) {
       return;
     }
-    if (!AppServices.instance.messages.hasMore(this.sessionId)) {
+    const hadOlderMessages = AppServices.instance.messages.hasMore(this.sessionId);
+    if (!hadOlderMessages) {
       return;
     }
     const msgs = AppServices.instance.messages.getMessages(this.sessionId);
     if (msgs.length === 0) {
       return;
     }
+    const keepFollowingLatest = initialAutofill
+      && !this.historyReviewIntent && this.followingLatest;
+    if (!keepFollowingLatest) {
+      // 一旦由用户进入历史分页就视为正在阅读旧内容；分页锚定完成前后的流式
+      // 更新都不能再把阅读位置抢回尾部。
+      this.followingLatest = false;
+      this.followScrollGeneration += 1;
+      this.followScrollScheduled = false;
+      this.followScrollTrailingRequested = false;
+      this.historyReviewIntent = true;
+    }
     // 不能用“新增原始消息数”作为 List index：多个 thinking/tool 行会被渲染模型
     // 合成一个 work_group，原始消息下标与可见 ListItem 下标并不相等。
-    const previousFirstRenderAnchor = this.items.length > 0
-      ? this.renderAnchorKey(this.items[0], this.items) : '';
-    this.historyReviewIntent = true;
-    this.historyLastAttemptFirstKey = previousFirstRenderAnchor;
-    const previousRenderCount = this.items.length;
-    this.loadingOlder = true;
-    AppServices.instance.messages.loadOlder(this.deviceId, this.sessionId).then(() => {
-      this.loadingOlder = false;
-      const after = AppServices.instance.messages.getMessages(this.sessionId).length;
-      const added = after - msgs.length;
-      if (added > 0) {
-        // 新加载的更早消息插在头部：回到 prepend 前的第一条渲染项，保持当前阅读点。
-        // 这是桌面/Mobile 的 mVCP 语义在 ArkUI List 上的稳定 key 版本。
-        setTimeout(() => {
-          if (continueSearch && this.searchOpen && this.searchQuery.trim().length > 0) {
-            this.reconcileSearchSelection();
-            const hits = this.searchHits();
-            if (hits.length > 0) this.focusSearchHit(hits[this.searchActiveIndex]);
-            return;
-          }
-          const anchorIndex = this.renderItemIndexContainingAnchor(previousFirstRenderAnchor);
-          if (anchorIndex >= 0) {
-            this.listScroller.scrollToIndex(this.renderListIndex(anchorIndex), false);
-          } else {
-            // fallback 也只能使用可见 render item 数，不能混用原始 DB 行数。
-            const visibleAdded = Math.max(0, this.items.length - previousRenderCount);
-            const fallbackIndex = Math.min(visibleAdded, Math.max(0, this.items.length - 1));
-            this.listScroller.scrollToIndex(this.renderListIndex(fallbackIndex), false);
-          }
-        }, 50);
+    const previousVisibleRenderIndex = firstVisibleMessageRenderIndex(
+      hadOlderMessages,
+      this.visibleStartIndex,
+      this.items.length,
+    );
+    const previousVisibleRenderAnchor = previousVisibleRenderIndex >= 0
+      ? this.renderAnchorKey(this.items[previousVisibleRenderIndex], this.items) : '';
+    let previousVisibleOffsetY = 0;
+    if (previousVisibleRenderIndex >= 0) {
+      try {
+        const rect = this.listScroller.getItemRect(
+          this.renderListIndex(previousVisibleRenderIndex));
+        if (Number.isFinite(rect.y)) previousVisibleOffsetY = rect.y;
+      } catch (e) {
+        // 极短列表或布局切换瞬间可能尚未绑定可见 item；稳定 key 仍可兜底。
       }
-      setTimeout(() => this.attemptAutoLoadEarlier(), 120);
+    }
+    const requestFirstKey = this.items.length > 0
+      ? this.renderAnchorKey(this.items[0], this.items) : '';
+    this.historyLastAttemptFirstKey = requestFirstKey;
+    const previousRenderCount = this.items.length;
+    const anchorRestoreGeneration = ++this.historyAnchorRestoreGeneration;
+    this.loadingOlder = true;
+    AppServices.instance.messages.loadOlder(this.deviceId, this.sessionId).then((added: number) => {
+      const historyHeaderChanged = hadOlderMessages
+        !== AppServices.instance.messages.hasMore(this.sessionId);
+      if (added > 0 || historyHeaderChanged) {
+        const stillFollowingLatest = keepFollowingLatest
+          && !this.historyReviewIntent && this.followingLatest && !this.listTouchActive;
+        if (stillFollowingLatest) {
+          this.loadingOlder = false;
+          // 冷开补窗只向上扩充数据，不改变“正在看最新消息”的意图。
+          this.followLatestSoon();
+        } else {
+          // 新加载的更早消息插在头部：回到 prepend 前的首个可见渲染项，保持阅读点。
+          // 这是桌面/Mobile 的 mVCP 语义在 ArkUI List 上的稳定 key 版本。
+          setTimeout(() => {
+            const restoreAnchor = (): void => {
+              this.loadingOlder = false;
+              if (anchorRestoreGeneration !== this.historyAnchorRestoreGeneration) {
+                setTimeout(() => this.attemptAutoLoadEarlier(), 60);
+                return;
+              }
+              if (continueSearch && this.searchOpen && this.searchQuery.trim().length > 0) {
+                this.reconcileSearchSelection();
+                const hits = this.searchHits();
+                if (hits.length > 0) this.focusSearchHit(hits[this.searchActiveIndex]);
+              } else {
+                const anchorIndex = this.renderItemIndexContainingAnchor(previousVisibleRenderAnchor);
+                if (anchorIndex >= 0) {
+                  this.listScroller.scrollToIndex(
+                    this.renderListIndex(anchorIndex),
+                    false,
+                    ScrollAlign.START,
+                    { extraOffset: LengthMetrics.vp(-previousVisibleOffsetY) },
+                  );
+                } else {
+                  // fallback 也只能使用可见 render item 数，不能混用原始 DB 行数。
+                  const visibleAdded = Math.max(0, this.items.length - previousRenderCount);
+                  const fallbackIndex = Math.min(
+                    Math.max(0, previousVisibleRenderIndex) + visibleAdded,
+                    Math.max(0, this.items.length - 1),
+                  );
+                  this.listScroller.scrollToIndex(this.renderListIndex(fallbackIndex), false);
+                }
+              }
+              setTimeout(() => this.attemptAutoLoadEarlier(), 60);
+            };
+            if (this.listTouchActive) {
+              // ArkUI 不保证活动手势中的 prepend 自动维持内容；等抬手后再执行
+              // 同一锚点，且 loadingOlder 保持 true，避免期间又发起下一页。
+              this.pendingHistoryAnchorRestore = restoreAnchor;
+            } else {
+              restoreAnchor();
+            }
+          }, 50);
+          return;
+        }
+      } else {
+        this.loadingOlder = false;
+      }
+      setTimeout(() => this.attemptAutoLoadEarlier(), 240);
     }).catch(() => {
       this.loadingOlder = false;
     });
@@ -2329,13 +2507,25 @@ export struct TaskPageContent {
   }
 
   private attemptAutoLoadEarlier(): void {
-    if (!this.historyReviewIntent || !this.sessionOpenResolved || this.initialScrollSettling
-      || this.loadingOlder || !this.nearHistoryStart()
-      || !AppServices.instance.messages.hasMore(this.sessionId) || this.items.length === 0) return;
-    const firstKey = this.renderAnchorKey(this.items[0], this.items);
-    if (firstKey.length > 0 && firstKey === this.historyLastAttemptFirstKey) return;
+    const firstKey = this.items.length > 0
+      ? this.renderAnchorKey(this.items[0], this.items) : '';
+    if (this.routeMessageClientId.length > 0 || !shouldAutoLoadEarlier(
+      this.historyReviewIntent,
+      this.initialHistoryAutofillRemaining,
+      this.followingLatest,
+      this.sessionOpenResolved,
+      this.initialScrollSettling,
+      this.loadingOlder,
+      this.nearHistoryStart(),
+      AppServices.instance.messages.hasMore(this.sessionId),
+      this.items.length,
+      firstKey,
+      this.historyLastAttemptFirstKey,
+    )) return;
+    const initialAutofill = !this.historyReviewIntent;
+    if (initialAutofill) this.initialHistoryAutofillRemaining -= 1;
     this.listTouchLoadTriggered = true;
-    this.loadOlder();
+    this.loadOlder(false, initialAutofill);
   }
 
   /** todo 卡标题（对齐 iOS：{completed}/{total} · 进行中内容）。 */
@@ -2456,6 +2646,8 @@ export struct TaskPageContent {
             row.text = action.label;
             row.explorationKind = action.explorationKind;
             row.readKey = action.readKey;
+            row.tool = tool;
+            row.action = action;
             rows.push(row);
           }
         }
@@ -2637,6 +2829,38 @@ export struct TaskPageContent {
       return children.some((child: RenderItem) => this.renderItemContainsAnchor(child, anchor));
     }
     return false;
+  }
+
+  /**
+   * 子 Agent 外层也是普通对象节点：外层不重建时，内部 ForEach 不会重新执行。
+   * 因此把自身 running/completed 与后代工作组的生命周期压成紧凑状态签名；
+   * 新增或移除后代工作组也会改变签名。其它后代内容仍由各自节点更新。
+   */
+  private renderItemLifecycleState(item: RenderItem): string {
+    if (item.type === 'work_group') {
+      const work = item as RenderWorkGroupItem;
+      return work.isStreaming ? 'w1' : 'w0';
+    }
+    if (item.type !== 'subagent_group') return '';
+    const group = item as RenderSubagentGroupItem;
+    const states: string[] = [];
+    for (let i = 0; i < group.children.length; i++) {
+      const state = this.renderItemLifecycleState(group.children[i]);
+      if (state.length > 0) states.push(`${i}:${state.length}:${state}`);
+    }
+    return `s:${group.status.length}:${group.status}:${states.join(',')}`;
+  }
+
+  /** 业务 key 保持稳定，仅让会改变 builder 分支的工作/子 Agent 状态重建节点。 */
+  private renderItemNodeKey(item: RenderItem, prefix: string = ''): string {
+    const streaming = item.type === 'work_group'
+      && (item as RenderWorkGroupItem).isStreaming;
+    return messageListRenderNodeKey(
+      `${prefix}${item.key}`,
+      item.type,
+      streaming,
+      this.renderItemLifecycleState(item),
+    );
   }
 
   private renderItemIndexContainingAnchor(anchor: string): number {
@@ -3825,9 +4049,8 @@ export struct TaskPageContent {
               ? $r('app.color.bg_chip') : Color.Transparent)
             .borderRadius(UI_RADIUS_CONTAINER)
             .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
-          }, (item: RenderItem) => item.key)
-          if (this.queuePaused || this.queueProjectionError.length > 0
-            || this.queueCredentialWaiting || this.queueAbortPending) {
+          }, (item: RenderItem) => this.renderItemNodeKey(item))
+          if (this.hasQueueStateBanner()) {
             ListItem() {
               this.queueStateBanner()
             }
@@ -3842,6 +4065,13 @@ export struct TaskPageContent {
               this.pendingQueueBubble(item)
             }
           }, (item: PendingQueueBubble) => `message-${item.clientId}`)
+          // 稳定尾锚不能复用正在流式增高的消息节点，否则 ArkUI 重测同一项时会
+          // 把 scrollToIndex 的旧几何解释成历史位置，造成每次新内容都反向跳动。
+          ListItem() {
+            Row()
+              .width('100%')
+              .height(1)
+          }
         }
         .width('100%')
         .height('100%')
@@ -3849,7 +4079,7 @@ export struct TaskPageContent {
         .onScrollIndex((start: number, end: number, _center: number) => {
           this.visibleStartIndex = start;
           this.visibleEndIndex = end;
-          if (this.listTouchPushedUp && end >= this.lastMessageListIndex()) {
+          if (this.listTouchPushedUp && end >= this.bottomSentinelListIndex()) {
             this.followingLatest = true;
             this.hasNewMessages = false;
           }
@@ -3978,6 +4208,7 @@ export struct TaskPageContent {
       atoms: composerAtomPresentations(this.composerDocument),
       sending: this.sending,
       streaming: this.sessionStreaming,
+      streamingElapsedText: this.sessionActivityElapsedText(),
       hasContent: this.hasComposerContent(),
       canSend: this.canSend(),
       composerEnabled: !this.deviceDisabled && !this.leavingForCreationEdit
@@ -5013,7 +5244,7 @@ export struct TaskPageContent {
         Column({ space: 5 }) {
           ForEach(item.children, (child: RenderItem) => {
             this.renderItem(child)
-          }, (child: RenderItem) => `${item.key}-${child.key}`)
+          }, (child: RenderItem) => this.renderItemNodeKey(child, `${item.key}-`))
           if (item.summary.length > 0) {
             Text(item.summary)
               .fontSize(uiFontSize(12))
@@ -5227,41 +5458,29 @@ export struct TaskPageContent {
 
   @Builder
   workPreviewRow(row: WorkPreviewRow) {
-    Row({ space: 6 }) {
-      if (row.kind === 'thinking') {
+    if (row.kind === 'tool' && row.tool !== null && row.action !== null) {
+      // Mobile 的 collapsedBody 仍使用完整 ToolActionRow：收起态最近步骤也可
+      // 直接展开命令、输出和 diff，并与工作组完整展开态共享同一个稳定 key。
+      this.toolRow(row.tool as RenderToolItem, row.action as ToolActionPresentation)
+    } else {
+      Row({ space: 6 }) {
         SymbolGlyph($r('sys.symbol.wand_and_stars'))
           .fontSize(uiFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
-      } else if (row.error) {
-        SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-          .fontSize(uiFontSize(15))
-          .fontColor([$r('app.color.danger')])
-          .width(16)
-      } else if (row.done) {
-        SymbolGlyph($r('sys.symbol.checkmark'))
+        Text(row.text)
           .fontSize(uiFontSize(14))
-          .fontColor([$r('app.color.text_tertiary')])
-          .width(16)
-      } else {
-        LoadingProgress()
-          .width(14)
-          .height(14)
-          .color($r('app.color.text_tertiary'))
-          .margin({ left: 1, right: 1 })
+          .lineHeight(uiLineHeight(20))
+          .fontStyle(FontStyle.Italic)
+          .fontColor($r('app.color.chat_text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
       }
-      Text(row.text)
-        .fontSize(uiFontSize(14))
-        .lineHeight(uiLineHeight(20))
-        .fontStyle(row.kind === 'thinking' ? FontStyle.Italic : FontStyle.Normal)
-        .fontColor($r('app.color.chat_text_secondary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .layoutWeight(1)
+      .width('100%')
+      .constraintSize({ minHeight: 28 })
+      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
     }
-    .width('100%')
-    .constraintSize({ minHeight: 28 })
-    .padding({ left: 8, right: 8, top: 2, bottom: 2 })
   }
 
   @Builder
@@ -6829,7 +7048,7 @@ export struct TaskPageContent {
           .height(TODO_STATUS_ICON_SIZE)
           .fill($r('app.color.text_primary'))
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(uiFontSize(11))
+          .fontSize(uiFontSize(TODO_STATUS_CHECKMARK_SIZE))
           .fontColor([$r('app.color.bg_card')])
       } else if (status === 'in_progress' && streaming) {
         TodoRunningStatusIcon()
@@ -6841,8 +7060,8 @@ export struct TaskPageContent {
           .stroke($r('app.color.text_secondary'))
           .strokeWidth(TODO_STATUS_STROKE_WIDTH)
         Circle()
-          .width(5)
-          .height(5)
+          .width(TODO_STATUS_ACTIVE_DOT_SIZE)
+          .height(TODO_STATUS_ACTIVE_DOT_SIZE)
           .fill($r('app.color.text_secondary'))
       } else {
         Circle()

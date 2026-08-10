@@ -20,6 +20,7 @@ const TAG = 'CindyAuth';
 const KEY_ACCESS = 'auth.accessToken';
 const KEY_REFRESH = 'auth.refreshToken';
 const KEY_DEVICE_ID = 'auth.deviceId';
+const KEY_RELAY_USER_ID = 'auth.relayUserId';
 
 export class AuthStore {
   private api: AuthApi = new AuthApi();
@@ -27,8 +28,13 @@ export class AuthStore {
   private deviceId: string = '';
   private accessToken: string = '';
   private refreshToken: string = '';
+  /** relay hello-ack 的稳定账号 id；仅用于隔离可丢弃的本地列表快照。 */
+  private relayUserId: string = '';
+  /** 登录/登出账号代次；旧网络响应不得跨代写回新账号状态。 */
+  private authEpoch: number = 0;
   /** 登录状态（UI 订阅用）。 */
   private listeners: Array<() => void> = [];
+  private logoutCleanup: (() => Promise<void>) | undefined = undefined;
 
   async init(context: common.Context): Promise<void> {
     await this.store.init(context);
@@ -51,8 +57,20 @@ export class AuthStore {
     }
   }
 
+  setLogoutCleanup(cleanup: () => Promise<void>): void {
+    this.logoutCleanup = cleanup;
+  }
+
   get isLoggedIn(): boolean {
     return this.accessToken.length > 0;
+  }
+
+  get cacheAccountId(): string {
+    return this.relayUserId;
+  }
+
+  get sessionEpoch(): number {
+    return this.authEpoch;
   }
 
   async ensureDeviceId(): Promise<string> {
@@ -76,9 +94,11 @@ export class AuthStore {
     await this.ensureDeviceId();
     const access = await this.store.get(KEY_ACCESS, '');
     const refresh = await this.store.get(KEY_REFRESH, '');
+    this.relayUserId = await this.store.get(KEY_RELAY_USER_ID, '');
     if (access.length > 0) {
       this.accessToken = access;
       this.refreshToken = refresh;
+      this.authEpoch += 1;
       this.notifyChanged();
       return true;
     }
@@ -102,6 +122,7 @@ export class AuthStore {
     }
     this.accessToken = outcome.accessToken;
     this.refreshToken = outcome.refreshToken;
+    this.authEpoch += 1;
     // 持久化；写入失败不阻断内存会话（下次启动重新登录即可）。
     void this.store.set(KEY_ACCESS, this.accessToken);
     void this.store.set(KEY_REFRESH, this.refreshToken);
@@ -150,9 +171,26 @@ export class AuthStore {
     return this.getAccessToken();
   }
 
+  /**
+   * hello-ack 到达后记住稳定账号 id。返回 true 表示账号作用域发生变化，调用方
+   * 必须让旧请求/旧快照失效并重新拉取。
+   */
+  rememberRelayUserId(userId: string): boolean {
+    if (userId.length === 0 || userId === this.relayUserId) return false;
+    this.relayUserId = userId;
+    this.authEpoch += 1;
+    void this.store.set(KEY_RELAY_USER_ID, userId);
+    return true;
+  }
+
   async logout(): Promise<void> {
+    this.authEpoch += 1;
     this.accessToken = '';
     this.refreshToken = '';
+    this.relayUserId = '';
+    if (this.logoutCleanup !== undefined) {
+      await this.logoutCleanup();
+    }
     // 只清 token 等敏感信息，保留 deviceId（设备身份与服务端一致）。
     await this.store.clearSensitive();
     this.notifyChanged();

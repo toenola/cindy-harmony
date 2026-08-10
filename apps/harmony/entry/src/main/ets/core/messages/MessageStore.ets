@@ -2,7 +2,7 @@
  * 消息 Store：历史加载 + 流式增量 + 发送/停止。
  *
  * - 打开会话：subscribe `session:<id>` topic → 拉最近一页历史（desc，
- *   limit=50），再反转为升序渲染。
+ *   limit=80），再反转为升序渲染。
  * - push：`local-db:messages:created` 逐条追加（按 id 去重）、
  *   `local-db:messages:deleted` 按 clientId 移除。
  * - 发送：invoke maker:send（createOpts 由会话字段构造，persistUserMessage 由 Harmony 生成）；
@@ -48,19 +48,15 @@ import {
   extendCoverageEarlier,
   extendCoverageLiveTail,
 } from './HistoryWindowCoverage';
-import { revealNearestCompleteHistoryTurn } from './HistoryTurnPaging';
 import { historyRetryLimits, isPayloadTooLargeError } from './MessagePaging';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
 
-// 与 Desktop local-db:messages:list 的默认页大小一致。Harmony 走 Device Link 时，
-// 工具结果可能还要经过压缩/裁页；100 条会让特殊会话在一次响应和 UI 重建中卡很久。
-const HISTORY_PAGE_LIMIT = 50;
+// 与 Mobile/iOS 的会话历史页一致；Device Link 帧过大时 requestMessagesList
+// 会按 80 → 40 → 20 → 10 → 5 → 1 自动降档。
+const HISTORY_PAGE_LIMIT = 80;
 const RECONNECT_MESSAGE_WINDOW_LIMIT = 80;
-/** 单次手势内部连续取页的保险预算；到预算后保留 buffer，下次从同一位置续取。 */
-const HISTORY_TURN_MAX_REQUESTS = 24;
-const HISTORY_TURN_MAX_ROWS = 1200;
 
 function hasTurnContinuation(event: Record<string, Object>): boolean {
   const value = event['turnContinuationId'];
@@ -137,16 +133,14 @@ export class MessageStore {
   /** sessionId -> deviceId（当前订阅关系）。 */
   private subscribed: Map<string, string> = new Map();
   private hasMoreBySession: Map<string, boolean> = new Map();
-  /** 已取回但尚未按完整 turn 揭示的旧行。 */
-  private olderTurnBufferBySession: Map<string, RemoteMessage[]> = new Map();
-  /** buffer 之前是否仍可能存在未取回的权威历史。 */
-  private olderSourceHasMoreBySession: Map<string, boolean> = new Map();
   /** 会话列表透出的服务端消息总数，用于短页（payload 裁剪）时判断还有历史。 */
   private messageCountBySession: Map<string, number> = new Map();
   /** 流式 assistant 消息（maker:event 累积）。 */
   private streamingBySession: Map<string, StreamingMessage> = new Map();
   /** maker 权威运行态；与临时正文投影分开，避免终态事件丢失时 Composer 卡住。 */
   private runningBySession: Map<string, boolean> = new Map();
+  /** 产品级 turn 的本地计时起点；同一轮的多种 running 信号交接不能重置。 */
+  private runStartedAtBySession: Map<string, number> = new Map();
   /** 远程运行态查询的代次，防止旧快照覆盖在途 maker 事件。 */
   private runningStateRevisions: Map<string, number> = new Map();
   /** maker status 的真实 turn 边界；孤儿 Agent 卡只能在本边界内显示。 */
@@ -294,6 +288,11 @@ export class MessageStore {
     return this.makerTurnRunningBySession.get(sessionId) === true;
   }
 
+  /** 底部活动条的独立计时起点；0 表示当前没有运行中的产品 turn。 */
+  getSessionRunStartedAt(sessionId: string): number {
+    return this.runStartedAtBySession.get(sessionId) ?? 0;
+  }
+
   /** 当前会话是否仍在执行；maker 运行态优先于历史投影。 */
   isSessionStreaming(sessionId: string): boolean {
     if (this.runningBySession.get(sessionId) === true) return true;
@@ -323,11 +322,7 @@ export class MessageStore {
     this.messageCountBySession.set(sessionId, count);
     const current = this.messagesBySession.get(sessionId) ?? [];
     if (current.length === 0) return;
-    const buffered = this.olderTurnBufferBySession.get(sessionId) ?? [];
-    const fetched = this.mergeWithoutDuplicates(buffered, current);
-    const sourceHasMore = count > countRealMessages(fetched);
-    this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
-    this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
+    this.hasMoreBySession.set(sessionId, count > countRealMessages(current));
   }
 
   /** 该会话历史是否加载失败（页面据此显示重试）。 */
@@ -385,12 +380,12 @@ export class MessageStore {
     this.subscribed.delete(sessionId);
     this.messagesBySession.delete(sessionId);
     this.hasMoreBySession.delete(sessionId);
-    this.olderTurnBufferBySession.delete(sessionId);
-    this.olderSourceHasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
     this.loadFailedBySession.delete(sessionId);
     this.streamingBySession.delete(sessionId);
     this.runningBySession.delete(sessionId);
+    // 页面离开只撤销订阅，不是产品 turn 的终态。保留本轮起点，重进后由
+    // session 探针继续同一只时钟；真正 completed/error/done 时再清理。
     this.makerTurnRunningBySession.delete(sessionId);
     this.taskUpdatesBySession.delete(sessionId);
     this.parkedTaskUpdatesBySession.delete(sessionId);
@@ -665,6 +660,16 @@ export class MessageStore {
       if (toolUseId.length === 0) {
         return;
       }
+      const active = this.streamingBySession.get(sessionId);
+      const updatesCurrentTool = active !== undefined
+        && active.tools.some((tool: StreamingToolRow) => tool.toolUseId === toolUseId);
+      if (active !== undefined && active.text.length > 0 && !updatesCurrentTool) {
+        // Mobile 会在新工具开始前先固化已经出现的进度正文。Harmony 若继续把二者
+        // 塞进同一个 StreamingMessage，临时投影会固定输出“工具→正文”，渲染层便
+        // 把最新工具误判为正文前的已完成工作组，实时步骤和计时都会消失。
+        this.materializeStreamingProjection(sessionId, active);
+        this.streamingBySession.delete(sessionId);
+      }
       const s = this.ensureStreaming(sessionId, persistId);
       // 同 toolUseId 原地更新（不重复建行）。
       let row = s.tools.find((t: StreamingToolRow) => t.toolUseId === toolUseId);
@@ -885,14 +890,18 @@ export class MessageStore {
   private markSessionRunning(sessionId: string, running: boolean): void {
     if (running) {
       this.runningBySession.set(sessionId, true);
+      if (!this.runStartedAtBySession.has(sessionId)) {
+        this.runStartedAtBySession.set(sessionId, Date.now());
+      }
     } else {
       this.runningBySession.delete(sessionId);
+      this.runStartedAtBySession.delete(sessionId);
     }
   }
 
   /** 终态收口：保留临时正文用于最终渲染，但去掉所有运行标记。 */
   private finalizeSessionStreaming(sessionId: string): void {
-    this.runningBySession.delete(sessionId);
+    this.markSessionRunning(sessionId, false);
     this.finishStreamingProjection(sessionId);
   }
 
@@ -1161,7 +1170,6 @@ export class MessageStore {
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.consideredHistoryGaps.delete(sessionId);
     this.historyCoverageBySession.delete(sessionId);
-    this.clearOlderTurnState(sessionId);
     this.messagesBySession.delete(sessionId);
     return this.loadInitial(deviceId, sessionId);
   }
@@ -1172,7 +1180,6 @@ export class MessageStore {
     this.historyHealGenerations.set(sessionId, generation);
     this.consideredHistoryGaps.delete(sessionId);
     this.historyCoverageBySession.delete(sessionId);
-    this.clearOlderTurnState(sessionId);
     try {
       const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
@@ -1186,6 +1193,7 @@ export class MessageStore {
         sessionId, this.hasMoreAfterPage(sessionId, page, page.items));
       this.streamingBySession.delete(sessionId);
       this.runningBySession.delete(sessionId);
+      this.runStartedAtBySession.delete(sessionId);
       this.makerTurnRunningBySession.delete(sessionId);
       this.loadFailedBySession.delete(sessionId);
       this.notify();
@@ -1196,141 +1204,67 @@ export class MessageStore {
   }
 
   /**
-   * 向上翻页：一次用户触发只揭示上一轮完整的「user + 回复/工作过程」。
-   * relay 把大页裁成一行时会在内部继续向前请求，命中顶层 user 前不改可见列表，
-   * 从而避免一条 tool/thinking 被临时并进现有 work_group。
+   * 向上翻页：与 Mobile/iOS 一样，一次请求合并一整页持久化消息行。
+   * 渲染层会在 prepend 后重新聚合被页边界切开的 work group；数据层不能再把
+   * 一页人为拆成“一次只露出一轮”，否则长工具轮次会让用户反复撞顶。
    */
-  async loadOlder(deviceId: string, sessionId: string): Promise<void> {
+  async loadOlder(deviceId: string, sessionId: string): Promise<number> {
     const client = this.client;
-    if (!client) return;
-    if (!this.hasMore(sessionId)) return;
+    if (!client) return 0;
+    if (!this.hasMore(sessionId)) return 0;
     const generation = this.historyHealGenerations.get(sessionId) ?? 0;
-    let current = this.messagesBySession.get(sessionId) ?? [];
-    let buffered = (this.olderTurnBufferBySession.get(sessionId) ?? []).slice();
-    let sourceHasMore = this.olderSourceHasMoreBySession.get(sessionId)
-      ?? this.hasMore(sessionId);
-    let reveal = revealNearestCompleteHistoryTurn(buffered, sourceHasMore);
-    let requests = 0;
-    let fetchedRows = 0;
-    let lastCursor = '';
-    let requestLimit = HISTORY_PAGE_LIMIT;
+    const current = this.messagesBySession.get(sessionId) ?? [];
+    const before = oldestMessageCursor(current);
+    if (before.length === 0) return 0;
     try {
-      while (reveal.needsOlderPage
-        && requests < HISTORY_TURN_MAX_REQUESTS
-        && fetchedRows < HISTORY_TURN_MAX_ROWS) {
-        const cursorRows = buffered.length > 0 ? buffered : current;
-        const before = oldestMessageCursor(cursorRows);
-        if (before.length === 0 || before === lastCursor) {
-          // 无可用游标或游标没有前移，不等同于权威历史耗尽。保留半轮和入口，
-          // 禁止把尚未命中 user 边界的行作为孤儿内容提前揭示。
-          break;
-        }
-        lastCursor = before;
-        const page = await this.requestMessagesList(
-          deviceId, sessionId, requestLimit, before);
-        if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
-          || this.subscribed.get(sessionId) !== deviceId) return;
-        requests += 1;
-        fetchedRows += page.items.length;
-        page.items.sort(sortMessagesAsc);
-
-        // before 理论上排除当前游标；仍按 identity 过滤，兼容旧 host 的包含式分页。
-        const previousSize = buffered.length;
-        const allFetched = this.mergeWithoutDuplicates(page.items, buffered.concat(current));
-        const currentIds = new Set<string>();
-        for (let i = 0; i < current.length; i++) currentIds.add(messageIdentity(current[i]));
-        buffered = [];
-        for (let i = 0; i < allFetched.length; i++) {
-          if (!currentIds.has(messageIdentity(allFetched[i]))) buffered.push(allFetched[i]);
-        }
-        buffered.sort(sortMessagesAsc);
-        const progressed = buffered.length > previousSize;
-        const fetchedWindow = this.mergeWithoutDuplicates(buffered, current);
-        sourceHasMore = this.hasMoreAfterPage(sessionId, page, fetchedWindow);
-        reveal = revealNearestCompleteHistoryTurn(buffered, sourceHasMore);
-        if (page.items.length === 0) break;
-        if (!progressed) {
-          // 旧 host 的包含式 before 加上 relay 裁页，可能只返当前游标本身。
-          // 缩小页大小可降低响应裁剪概率；仍不前进时保留 hasMore 给下次重试。
-          if (sourceHasMore && requestLimit > 1) {
-            requestLimit = Math.max(1, Math.floor(requestLimit / 2));
-            lastCursor = '';
-            continue;
-          }
-          break;
-        }
-        requestLimit = HISTORY_PAGE_LIMIT;
-      }
-
-      // 请求预算只负责防止异常 host 死循环；未命中 user 时继续保留 buffer，
-      // 不把半轮内容塞进现有工作组。下一次触发会从 buffer 最早游标续取。
-      this.olderTurnBufferBySession.set(sessionId, reveal.buffered);
-      this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
-      if (reveal.reveal.length === 0) {
-        this.hasMoreBySession.set(sessionId, reveal.buffered.length > 0 || sourceHasMore);
-        hilog.info(DOMAIN, TAG,
-          'history turn buffered session=%{public}s rows=%{public}d requests=%{public}d',
-          sessionId.slice(0, 8), reveal.buffered.length, requests);
-        this.notify();
-        return;
-      }
-
-      // 收集期间可能有实时尾部 push；最终 merge 使用最新窗口，且只 notify 一次。
+      const page = await this.requestMessagesList(
+        deviceId, sessionId, HISTORY_PAGE_LIMIT, before);
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
-        || this.subscribed.get(sessionId) !== deviceId) return;
-      current = this.messagesBySession.get(sessionId) ?? current;
-      const merged = this.mergeWithoutDuplicates(reveal.reveal, current);
+        || this.subscribed.get(sessionId) !== deviceId) return 0;
+      page.items.sort(sortMessagesAsc);
+
+      // 请求期间可能有实时尾部 push；最终 merge 使用最新窗口且只 notify 一次。
+      const latestCurrent = this.messagesBySession.get(sessionId) ?? current;
+      const merged = this.mergeWithoutDuplicates(page.items, latestCurrent);
       merged.sort(sortMessagesAsc);
       this.messagesBySession.set(sessionId, merged);
       const coverage = extendCoverageEarlier(
         this.historyCoverageBySession.get(sessionId) ?? null,
-        reveal.reveal,
-        current.length > 0 ? current[0] : null);
+        page.items,
+        latestCurrent.length > 0 ? latestCurrent[0] : null);
       if (coverage !== null) this.historyCoverageBySession.set(sessionId, coverage);
-      this.hasMoreBySession.set(sessionId,
-        reveal.buffered.length > 0 || sourceHasMore);
+      this.setOlderAvailability(
+        sessionId, this.hasMoreAfterPage(sessionId, page, merged));
+      const added = Math.max(0, merged.length - latestCurrent.length);
       hilog.info(DOMAIN, TAG,
-        'history turn revealed requests=%{public}d fetched=%{public}d added=%{public}d hasMore=%{public}s',
-        requests, fetchedRows, Math.max(0, merged.length - current.length),
+        'history page merged fetched=%{public}d added=%{public}d hasMore=%{public}s',
+        page.items.length, added,
         this.hasMore(sessionId) ? 'true' : 'false');
       this.notify();
+      return added;
     } catch (e) {
-      // 一轮内部可能已经跨过多个 relay 裁页；后续页断线时保留已取回的半轮，
-      // 下次手势从 buffer 最早游标续取，既不逐条闪入 UI，也不重复请求这些行。
-      if ((this.historyHealGenerations.get(sessionId) ?? 0) === generation
-        && this.subscribed.get(sessionId) === deviceId) {
-        this.olderTurnBufferBySession.set(sessionId, buffered);
-        this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
-        this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
-      }
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
       hilog.warn(DOMAIN, TAG, 'history older failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), msg);
+      throw (e instanceof Error ? e : new Error(msg));
     }
   }
 
-  private clearOlderTurnState(sessionId: string): void {
-    this.olderTurnBufferBySession.delete(sessionId);
-    this.olderSourceHasMoreBySession.delete(sessionId);
-  }
-
   private setOlderAvailability(sessionId: string, sourceHasMore: boolean): void {
-    this.olderSourceHasMoreBySession.set(sessionId, sourceHasMore);
-    const buffered = this.olderTurnBufferBySession.get(sessionId) ?? [];
-    this.hasMoreBySession.set(sessionId, buffered.length > 0 || sourceHasMore);
+    this.hasMoreBySession.set(sessionId, sourceHasMore);
   }
 
   /**
    * Mobile 同源判定：满页 / remoteRowsTrimmed / 服务端总数均说明上沿还有历史。
-   * 若旧桌面端没有透出总数或裁页标记，非空短首屏也保留一次上翻机会；空页返回后
-   * hasMore 会被置 false，避免持续重试。
+   * 无总数且没有裁页标记的短页按 iOS 语义视为历史到底，避免在最早消息处
+   * 永久保留入口并对同一 before 游标反复空转。
    */
   private hasMoreAfterPage(sessionId: string, page: HistoryPage, merged: RemoteMessage[]): boolean {
     if (page.items.length === 0) return false;
     if (page.hasMore) return true;
     const total = this.messageCountBySession.get(sessionId) ?? 0;
     if (total > countRealMessages(merged)) return true;
-    return merged.length > 0 && total === 0;
+    return false;
   }
 
   /**
@@ -1789,8 +1723,7 @@ export class MessageStore {
   }
 
   private applyLatestWindow(sessionId: string, page: HistoryPage): RemoteMessage[] {
-    // 最新窗重拉会重新裁定连续区间；旧 buffer 不能跨权威窗口复用。
-    this.clearOlderTurnState(sessionId);
+    // 最新窗重拉会重新裁定连续区间；已上翻的连续旧窗由 reconcile 保留。
     if (page.items.length === 0) {
       const streaming = this.streamingBySession.get(sessionId);
       if (streaming !== undefined && !streaming.finished
@@ -1880,8 +1813,9 @@ export function buildPersistedUserContent(text: string, images: RemoteImageRef[]
 /** 返回可以交给 Desktop local-db 游标的最早真实消息 id。 */
 function oldestMessageCursor(messages: RemoteMessage[]): string {
   for (let i = 0; i < messages.length; i++) {
-    const id = messages[i].id;
-    if (id.length === 0 || isSyntheticMessageId(id)) {
+    const message = messages[i];
+    const id = message.id;
+    if (message.localOnly || id.length === 0 || isSyntheticMessageId(id)) {
       continue;
     }
     return id;

@@ -45,6 +45,7 @@ export struct ConversationComposer {
   @Prop atoms: ComposerAtomPresentation[] = [];
   @Prop sending: boolean = false;
   @Prop streaming: boolean = false;
+  @Prop streamingElapsedText: string = '0s';
   @Prop hasContent: boolean = false;
   @Prop canSend: boolean = false;
   @Prop composerEnabled: boolean = true;
@@ -287,12 +288,18 @@ export struct ConversationComposer {
             .width(12)
             .height(12)
             .color($r('app.color.chat_status_accent'))
-          Text('正在工作…')
+          Text('思考中…')
             .fontSize(uiFontSize(12))
             .lineHeight(uiLineHeight(18))
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.chat_status_accent'))
+          Row().layoutWeight(1)
+          Text(this.streamingElapsedText)
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(18))
+            .fontColor($r('app.color.text_tertiary'))
         }
+        .width('100%')
         .height(20)
         .padding({ left: 12, right: 12 })
         .transition(uiRevealTransition())

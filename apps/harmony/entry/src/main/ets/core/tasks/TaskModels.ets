@@ -337,13 +337,20 @@ function messageUserText(content: Object | undefined): string {
   return '';
 }
 
-/** 按 createdAt 升序排序（稳定排序 + rowid 兜底）。 */
+/**
+ * 按 createdAt 升序排序；只有两边都有真实 DB rowid 时才用 rowid 破同毫秒平局。
+ * messages:created 实时 push 可能不带 rowid（解析后为 0），此时必须像 Mobile
+ * 一样返回 0 保留到达顺序，不能把新正文错误插到旧工作步骤前面。
+ */
 export function sortMessagesAsc(a: RemoteMessage, b: RemoteMessage): number {
   if (a.createdAt !== b.createdAt) {
     if (a.createdAt < b.createdAt) return -1;
     if (a.createdAt > b.createdAt) return 1;
   }
-  return a.rowid - b.rowid;
+  if (a.rowid > 0 && b.rowid > 0 && a.rowid !== b.rowid) {
+    return a.rowid - b.rowid;
+  }
+  return 0;
 }
 
 export function sortSessionsByUpdatedAt(a: RemoteSession, b: RemoteSession): number {

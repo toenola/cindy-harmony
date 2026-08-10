@@ -8,8 +8,10 @@ import {
   readObj,
   readStr,
   recordOrEmpty,
+  DeviceView,
   RemoteMessage,
   RemoteSession,
+  sortMessagesAsc,
 } from '../main/ets/core/tasks/TaskModels';
 import {
   RemoteImageRef,
@@ -59,6 +61,10 @@ import {
   preferIncomingCreatedMessage,
 } from '../main/ets/core/messages/MessageStore';
 import {
+  formatSessionActivityElapsed,
+  sessionActivityElapsedMs,
+} from '../main/ets/core/messages/SessionActivityPresentation';
+import {
   compareTaskListLabels,
   compareTaskSessionsForList,
   taskActivityAt,
@@ -107,7 +113,6 @@ import {
   MessageWindowCoverage,
   reconcileLatestMessageWindow,
 } from '../main/ets/core/messages/HistoryWindowCoverage';
-import { revealNearestCompleteHistoryTurn } from '../main/ets/core/messages/HistoryTurnPaging';
 import {
   historyRetryLimits,
   isPayloadTooLargeError,
@@ -119,6 +124,19 @@ import {
 } from '../main/ets/core/device-link/DlProtocol';
 import { DlError } from '../main/ets/core/device-link/DlClient';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
+import {
+  CachedTaskListDevice,
+  parseTaskListSnapshot,
+  serializeTaskListSnapshot,
+} from '../main/ets/core/tasks/TaskListSnapshotStore';
+import {
+  firstVisibleMessageRenderIndex,
+  FOLLOW_LATEST_RETRY_DELAYS,
+  INITIAL_HISTORY_AUTOFILL_PAGES,
+  messageListBottomIndex,
+  messageListRenderNodeKey,
+  shouldAutoLoadEarlier,
+} from '../main/ets/pages/TaskScrollState';
 import {
   decideNewSessionRecoveryAction,
   exactNewSessionRecord,
@@ -684,56 +702,6 @@ export default function localUnitTest() {
       expect(bubbles[0].errorText).assertEqual('relay unavailable');
     });
 
-    it('revealsHistoryOnlyAfterACompleteTopLevelTurnBoundary', 0, () => {
-      const row = (id: string, role: string, second: number): RemoteMessage => {
-        const message = new RemoteMessage();
-        message.id = id;
-        message.role = role;
-        message.createdAt = `2026-08-01T00:00:${second < 10 ? '0' : ''}${second}.000Z`;
-        return message;
-      };
-      const replyTail = row('reply-tail', 'tool_result', 4);
-      const firstTrimmed = revealNearestCompleteHistoryTurn([replyTail], true);
-      expect(firstTrimmed.reveal.length).assertEqual(0);
-      expect(firstTrimmed.needsOlderPage).assertEqual(true);
-
-      const nestedUser = row('nested-user', 'user', 3);
-      nestedUser.agentMeta['parentUuid'] = 'agent-parent';
-      const nestedOnly = revealNearestCompleteHistoryTurn([nestedUser, replyTail], true);
-      expect(nestedOnly.reveal.length).assertEqual(0);
-      expect(nestedOnly.needsOlderPage).assertEqual(true);
-
-      const user = row('top-user', 'user', 1);
-      const work = row('work', 'tool_use', 2);
-      const complete = revealNearestCompleteHistoryTurn(
-        [user, work, nestedUser, replyTail], true);
-      expect(complete.needsOlderPage).assertEqual(false);
-      expect(complete.reveal.length).assertEqual(4);
-      expect(complete.reveal[0].id).assertEqual('top-user');
-    });
-
-    it('buffersEarlierTurnsAndRevealsOneTurnPerTrigger', 0, () => {
-      const row = (id: string, role: string, second: number): RemoteMessage => {
-        const message = new RemoteMessage();
-        message.id = id;
-        message.role = role;
-        message.createdAt = `2026-08-01T00:00:0${second}.000Z`;
-        return message;
-      };
-      const buffer = [
-        row('user-1', 'user', 1), row('answer-1', 'assistant', 2),
-        row('user-2', 'user', 3), row('answer-2', 'assistant', 4),
-      ];
-      const first = revealNearestCompleteHistoryTurn(buffer, false);
-      expect(first.reveal.length).assertEqual(2);
-      expect(first.reveal[0].id).assertEqual('user-2');
-      expect(first.buffered.length).assertEqual(2);
-      const second = revealNearestCompleteHistoryTurn(first.buffered, false);
-      expect(second.reveal.length).assertEqual(2);
-      expect(second.reveal[0].id).assertEqual('user-1');
-      expect(second.buffered.length).assertEqual(0);
-    });
-
     it('keepsTodoCardAndStepKeysStableAcrossPlanStatusUpdates', 0, () => {
       const user = new RemoteMessage();
       user.id = 'plan-user-row';
@@ -1059,6 +1027,160 @@ export default function localUnitTest() {
 
       const legacy = projectToolUseActions('Bash', JSON.stringify(JSON.stringify(input)), '');
       expect(legacy[0].label).assertEqual('读取鸿蒙消息实现');
+    });
+
+    it('closesEarlierWorkImmediatelyWhenSameMillisecondProgressPushArrives', 0, () => {
+      const sessionId = 'same-ms-live-session';
+      const createdAt = '2026-08-10T00:00:00.000Z';
+      const store = new MessageStore();
+
+      const thinkingMessage: Record<string, Object> = {};
+      thinkingMessage['id'] = 'thinking-before-progress';
+      thinkingMessage['clientId'] = 'thinking-before-progress';
+      thinkingMessage['sessionId'] = sessionId;
+      thinkingMessage['role'] = 'thinking';
+      thinkingMessage['content'] = '检查现有实现';
+      thinkingMessage['createdAt'] = createdAt;
+      thinkingMessage['rowid'] = 41;
+      const thinkingPush: Record<string, Object> = {};
+      thinkingPush['sessionId'] = sessionId;
+      thinkingPush['message'] = thinkingMessage;
+      store.handleSessionPush('device-1', 'local-db:messages:created', thinkingPush);
+
+      const progressData: Record<string, Object> = {};
+      progressData['text'] = '已经找到同步问题，继续修复。';
+      const progressEvent: Record<string, Object> = {};
+      progressEvent['type'] = 'text';
+      progressEvent['data'] = progressData;
+      store.handleMakerEvent(sessionId, progressEvent, 'progress-answer');
+
+      // Desktop messages:created 实时帧不保证携带 DB rowid；与前一行同毫秒时
+      // 必须保留到达顺序，不能把正文排到工作步骤前面。
+      const answerMessage: Record<string, Object> = {};
+      answerMessage['id'] = 'progress-answer';
+      answerMessage['clientId'] = 'progress-answer';
+      answerMessage['sessionId'] = sessionId;
+      answerMessage['role'] = 'assistant';
+      answerMessage['content'] = '已经找到同步问题，继续修复。';
+      answerMessage['createdAt'] = createdAt;
+      const answerPush: Record<string, Object> = {};
+      answerPush['sessionId'] = sessionId;
+      answerPush['message'] = answerMessage;
+      store.handleSessionPush('device-1', 'local-db:messages:created', answerPush);
+
+      const nextToolInput: Record<string, Object> = {};
+      nextToolInput['description'] = '修改实时收口逻辑';
+      const nextToolData: Record<string, Object> = {};
+      nextToolData['toolUseId'] = 'tool-after-progress';
+      nextToolData['toolName'] = 'Bash';
+      nextToolData['input'] = nextToolInput;
+      const nextToolEvent: Record<string, Object> = {};
+      nextToolEvent['type'] = 'tool_use';
+      nextToolEvent['data'] = nextToolData;
+      store.handleMakerEvent(sessionId, nextToolEvent, 'next-tool-block');
+
+      const messages = store.getMessagesWithStreaming(sessionId);
+      expect(messages.length).assertEqual(3);
+      expect(messages[0].id).assertEqual('thinking-before-progress');
+      expect(messages[1].id).assertEqual('progress-answer');
+      expect(messages[2].role).assertEqual('tool_use');
+      expect(store.isSessionStreaming(sessionId)).assertEqual(true);
+
+      const items = buildRenderItems(messages, true);
+      expect(items.length).assertEqual(3);
+      expect(items[0].type).assertEqual('work_group');
+      expect((items[0] as RenderWorkGroupItem).isStreaming).assertEqual(false);
+      expect(items[1].type).assertEqual('message');
+      expect(items[2].type).assertEqual('work_group');
+      expect((items[2] as RenderWorkGroupItem).isStreaming).assertEqual(true);
+
+      const historyRow = new RemoteMessage();
+      historyRow.createdAt = createdAt;
+      historyRow.rowid = 41;
+      const liveRow = new RemoteMessage();
+      liveRow.createdAt = createdAt;
+      expect(sortMessagesAsc(liveRow, historyRow)).assertEqual(0);
+    });
+
+    it('rebuildsOnlyWorkGroupNodesWhenLiveStateCloses', 0, () => {
+      expect(messageListRenderNodeKey('work-a', 'work_group', true))
+        .assertEqual('render:10:work_group:6:work-a:work:live');
+      expect(messageListRenderNodeKey('work-a', 'work_group', false))
+        .assertEqual('render:10:work_group:6:work-a:work:done');
+      expect(messageListRenderNodeKey('work-a', 'work_group', true))
+        .assertEqual('render:10:work_group:6:work-a:work:live');
+      expect(messageListRenderNodeKey('message-a', 'message', true))
+        .assertEqual('render:7:message:9:message-a');
+      expect(messageListRenderNodeKey(
+        'subagent-a', 'subagent_group', false, 's:7:running:0:w1'))
+        .assertEqual('render:14:subagent_group:10:subagent-a:state:16:s:7:running:0:w1');
+      expect(messageListRenderNodeKey(
+        'subagent-a', 'subagent_group', false, 's:9:completed:0:w0'))
+        .assertEqual('render:14:subagent_group:10:subagent-a:state:18:s:9:completed:0:w0');
+    });
+
+    it('keepsToolsAfterProgressTextInTheLiveWorkGroupAndPreservesTurnClock', 0, () => {
+      const store = new MessageStore();
+      const textData: Record<string, Object> = {};
+      textData['text'] = '先汇报当前进度';
+      const textEvent: Record<string, Object> = {};
+      textEvent['type'] = 'text';
+      textEvent['data'] = textData;
+      store.handleMakerEvent('interleaved-live', textEvent, 'progress-1');
+      const startedAt = store.getSessionRunStartedAt('interleaved-live');
+      expect(startedAt > 0).assertEqual(true);
+
+      const input: Record<string, Object> = {};
+      input['description'] = '搜索后续实现';
+      const toolData: Record<string, Object> = {};
+      toolData['toolUseId'] = 'post-progress-tool';
+      toolData['toolName'] = 'Bash';
+      toolData['input'] = input;
+      const toolEvent: Record<string, Object> = {};
+      toolEvent['type'] = 'tool_use';
+      toolEvent['data'] = toolData;
+      store.handleMakerEvent('interleaved-live', toolEvent, 'tool-1');
+
+      expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
+      void store.closeSession('interleaved-live');
+      expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
+      // 重进后的运行探针不得把仍在进行的同一产品 turn 从 0 秒重新计时。
+      store.handleMakerEvent('interleaved-live', textEvent, 'progress-2');
+      expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
+
+      const messages = store.getMessagesWithStreaming('interleaved-live');
+      expect(messages.length).assertEqual(1);
+      expect(messages[0].role).assertEqual('assistant');
+      store.handleMakerEvent('interleaved-live', toolEvent, 'tool-1');
+      const messagesAfterReentry = store.getMessagesWithStreaming('interleaved-live');
+      expect(messagesAfterReentry.length).assertEqual(2);
+      expect(messagesAfterReentry[0].role).assertEqual('assistant');
+      expect(messagesAfterReentry[1].role).assertEqual('tool_use');
+      const items = buildRenderItems(messagesAfterReentry, store.isSessionStreaming('interleaved-live'));
+      const work = items[items.length - 1] as RenderWorkGroupItem;
+      expect(work.type).assertEqual('work_group');
+      expect(work.isStreaming).assertEqual(true);
+      const tools = work.children[0] as RenderToolGroupItem;
+      expect(tools.tools[0].toolUseId).assertEqual('post-progress-tool');
+
+      const done: Record<string, Object> = {};
+      done['type'] = 'done';
+      store.handleMakerEvent('interleaved-live', done);
+      expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(0);
+      const completed = buildRenderItems(
+        store.getMessagesWithStreaming('interleaved-live'),
+        store.isSessionStreaming('interleaved-live'),
+      );
+      const completedWork = completed[completed.length - 1] as RenderWorkGroupItem;
+      expect(completedWork.isStreaming).assertEqual(false);
+    });
+
+    it('formatsTheComposerActivityClockLikeIos', 0, () => {
+      expect(sessionActivityElapsedMs(10_999, 10_000)).assertEqual(999);
+      expect(sessionActivityElapsedMs(9_000, 10_000)).assertEqual(0);
+      expect(formatSessionActivityElapsed(999)).assertEqual('0s');
+      expect(formatSessionActivityElapsed(1_000)).assertEqual('1s');
+      expect(formatSessionActivityElapsed(62_900)).assertEqual('1m 2s');
     });
 
     it('keepsNewPersistedStreamingBlockWhenOlderPushArrives', 0, () => {
@@ -1503,6 +1625,112 @@ export default function localUnitTest() {
       const updated = store.getSessions('device-1')[0];
       expect(updated.title).assertEqual('Authoritative title');
       expect(updated.pendingLocalCreation).assertEqual(true);
+    });
+
+    it('roundTripsAWhitelistedTaskListStartupSnapshot', 0, () => {
+      const device = new CachedTaskListDevice();
+      device.deviceId = 'desktop-1';
+      device.deviceName = 'Office Mac';
+      const session = new RemoteSession();
+      session.id = 'session-1';
+      session.title = 'A'.repeat(300);
+      session.workingDir = '/workspace/cindy';
+      session.status = 'active';
+      session.agentKind = 'codex';
+      session.createdAt = '2026-08-10T01:00:00.000Z';
+      session.updatedAt = '2026-08-10T02:00:00.000Z';
+      session.preview = 'cached preview';
+      device.sessions = [session];
+
+      const serialized = serializeTaskListSnapshot('account-1', [device]);
+      expect(serialized !== null && serialized.length > 0).assertEqual(true);
+      const restored = parseTaskListSnapshot(serialized ?? '', 'account-1');
+      expect(restored.length).assertEqual(1);
+      expect(restored[0].deviceId).assertEqual('desktop-1');
+      expect(restored[0].sessions.length).assertEqual(1);
+      expect(restored[0].sessions[0].title.length).assertEqual(240);
+      expect(restored[0].sessions[0].workingDir).assertEqual('/workspace/cindy');
+      expect(restored[0].sessions[0].preview).assertEqual('cached preview');
+      expect(parseTaskListSnapshot(serialized ?? '', 'account-2').length).assertEqual(0);
+    });
+
+    it('showsCachedTasksImmediatelyButLetsTheServerRemoveGhostDevices', 0, () => {
+      const cached = new CachedTaskListDevice();
+      cached.deviceId = 'desktop-stale';
+      cached.deviceName = 'Last known desktop';
+      const session = new RemoteSession();
+      session.id = 'cached-session';
+      session.status = 'active';
+      session.createdAt = '2026-08-10T01:00:00.000Z';
+      cached.sessions = [session];
+      const store = new TaskStore();
+
+      store.hydrateTaskListSnapshot([cached]);
+      expect(store.deviceList.length).assertEqual(1);
+      expect(store.deviceList[0].online).assertEqual(false);
+      expect(store.getSessions('desktop-stale').length).assertEqual(1);
+
+      store.mergeServerDevices([]);
+      expect(store.deviceList.length).assertEqual(0);
+      expect(store.getSessions('desktop-stale').length).assertEqual(0);
+    });
+
+    it('keepsCachedSessionsVisibleWhileAKnownDeviceIsBeingRevalidated', 0, () => {
+      const cached = new CachedTaskListDevice();
+      cached.deviceId = 'desktop-1';
+      const session = new RemoteSession();
+      session.id = 'cached-session';
+      session.status = 'active';
+      session.createdAt = '2026-08-10T01:00:00.000Z';
+      cached.sessions = [session];
+      const store = new TaskStore();
+      store.hydrateTaskListSnapshot([cached]);
+
+      const live = new DeviceView();
+      live.deviceId = 'desktop-1';
+      live.name = 'Live desktop';
+      live.platform = 'darwin';
+      live.online = true;
+      live.remoteControlEnabled = true;
+      store.mergeServerDevices([live]);
+
+      expect(store.deviceList[0].online).assertEqual(true);
+      expect(store.getSessions('desktop-1')[0].id).assertEqual('cached-session');
+    });
+
+    it('anchorsStreamingFollowToTheRealListTailAndRetriesAfterLayout', 0, () => {
+      expect(messageListBottomIndex(true, 3, true, true, 2)).assertEqual(8);
+      expect(messageListBottomIndex(false, 3, false, false, 0)).assertEqual(3);
+      expect(firstVisibleMessageRenderIndex(true, 0, 12)).assertEqual(0);
+      expect(firstVisibleMessageRenderIndex(true, 8, 12)).assertEqual(7);
+      expect(firstVisibleMessageRenderIndex(false, 8, 12)).assertEqual(8);
+      expect(firstVisibleMessageRenderIndex(true, 20, 12)).assertEqual(11);
+      expect(firstVisibleMessageRenderIndex(true, 0, 0)).assertEqual(-1);
+      expect(FOLLOW_LATEST_RETRY_DELAYS.length).assertEqual(3);
+      expect(FOLLOW_LATEST_RETRY_DELAYS[0] < FOLLOW_LATEST_RETRY_DELAYS[1]).assertEqual(true);
+      expect(FOLLOW_LATEST_RETRY_DELAYS[1] < FOLLOW_LATEST_RETRY_DELAYS[2]).assertEqual(true);
+    });
+
+    it('autofillsShortHistoryThenKeepsPrefetchingForRealUserReview', 0, () => {
+      expect(INITIAL_HISTORY_AUTOFILL_PAGES).assertEqual(3);
+      expect(shouldAutoLoadEarlier(
+        false, 3, true, true, false, false, true, true, 2, 'first-1', '',
+      )).assertEqual(true);
+      expect(shouldAutoLoadEarlier(
+        false, 0, true, true, false, false, true, true, 2, 'first-1', '',
+      )).assertEqual(false);
+      expect(shouldAutoLoadEarlier(
+        false, 3, false, true, false, false, true, true, 2, 'first-1', '',
+      )).assertEqual(false);
+      expect(shouldAutoLoadEarlier(
+        true, 0, false, true, false, false, true, true, 2, 'first-2', '',
+      )).assertEqual(true);
+      expect(shouldAutoLoadEarlier(
+        true, 0, false, true, false, false, true, true, 2, 'first-2', 'first-2',
+      )).assertEqual(false);
+      expect(shouldAutoLoadEarlier(
+        true, 0, false, true, false, true, true, true, 2, 'first-3', '',
+      )).assertEqual(false);
     });
 
     it('rejectsUnknownImageSchemesAndNormalizesSupportedCase', 0, () => {

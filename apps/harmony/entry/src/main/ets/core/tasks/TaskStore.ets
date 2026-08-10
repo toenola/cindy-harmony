@@ -15,6 +15,7 @@ import {
   RemoteSession, DeviceView, parseDeviceView, parseSession, sortSessionsByUpdatedAt,
   readStr, readObj,
 } from './TaskModels';
+import { CachedTaskListDevice } from './TaskListSnapshotStore';
 
 export class SessionMetaPatch {
   title: string | undefined = undefined;
@@ -39,8 +40,15 @@ export class TaskStore {
   private liveActivityBySession: Map<string, SessionLiveActivity> = new Map();
   /** 同一任务的元数据写使用字段级代次；旧响应/旧失败不能覆盖新操作。 */
   private metaWriteGenerations: Map<string, number> = new Map();
+  /**
+   * 整个任务投影的单调代次。登出/换号只递增、不复用；所有异步响应写回前
+   * 都必须校验，避免旧账号与新账号恰好使用相同 deviceId/sessionId 时串数据。
+   */
+  private stateGeneration: number = 0;
   /** 本机 deviceId（hello-ack 返回）；presence / REST 里的自己一律不进列表。 */
   private selfDeviceId: string = '';
+  /** 冷启动快照种入、尚未被 REST / presence 权威设备状态对账的设备。 */
+  private cachedDeviceIds: Set<string> = new Set();
 
   attach(client: DlClient): void {
     this.client = client;
@@ -94,6 +102,17 @@ export class TaskStore {
    * 用「presence 已见过的设备不降级」策略避免把刚上线的设备打回离线。
    */
   mergeServerDevices(views: DeviceView[]): void {
+    const serverDeviceIds: Set<string> = new Set();
+    for (let i = 0; i < views.length; i++) serverDeviceIds.add(views[i].deviceId);
+    const staleCachedDeviceIds: string[] = [];
+    this.cachedDeviceIds.forEach((deviceId: string) => {
+      if (!serverDeviceIds.has(deviceId)) staleCachedDeviceIds.push(deviceId);
+    });
+    for (let i = 0; i < staleCachedDeviceIds.length; i++) {
+      this.devices.delete(staleCachedDeviceIds[i]);
+      this.invalidateSessions(staleCachedDeviceIds[i]);
+    }
+    this.cachedDeviceIds.clear();
     for (let i = 0; i < views.length; i++) {
       const v = views[i];
       // 自己、非桌面平台（iOS/Android/Harmony 控制端）不进列表：
@@ -150,6 +169,44 @@ export class TaskStore {
     return this.sessionsByDevice.get(deviceId) ?? [];
   }
 
+  /**
+   * 冷启动先种入 last-known 列表；设备一律标离线，避免缓存伪造实时可用性。
+   * REST / presence 到达后 mergeServerDevices / handlePresence 会完成权威对账。
+   */
+  hydrateTaskListSnapshot(snapshot: CachedTaskListDevice[]): void {
+    if (this.devices.size > 0 || this.sessionsByDevice.size > 0) return;
+    for (let i = 0; i < snapshot.length; i++) {
+      const cached = snapshot[i];
+      if (cached.deviceId.length === 0 || cached.sessions.length === 0) continue;
+      const device = new PresenceSnapshot();
+      device.deviceId = cached.deviceId;
+      device.deviceName = cached.deviceName.length > 0 ? cached.deviceName : cached.deviceId;
+      device.online = false;
+      device.remoteControlEnabled = true;
+      const latestAt = cached.sessions[0].updatedAt.length > 0
+        ? cached.sessions[0].updatedAt : cached.sessions[0].createdAt;
+      const parsedAt = Date.parse(latestAt);
+      device.lastSeenAt = Number.isNaN(parsedAt) ? 0 : parsedAt;
+      this.devices.set(device.deviceId, device);
+      this.sessionsByDevice.set(device.deviceId, cached.sessions.slice());
+      this.cachedDeviceIds.add(device.deviceId);
+    }
+    if (this.cachedDeviceIds.size > 0) this.notify();
+  }
+
+  /** 显式登出时同时清掉内存镜像，防止下一账号看到上一账号的 last-known 列表。 */
+  clearAll(): void {
+    this.stateGeneration += 1;
+    this.devices.clear();
+    this.sessionsByDevice.clear();
+    this.sessionLoadRevisions.clear();
+    this.pendingActivityByDevice.clear();
+    this.liveActivityBySession.clear();
+    this.metaWriteGenerations.clear();
+    this.cachedDeviceIds.clear();
+    this.notify();
+  }
+
   getLiveActivity(sessionId: string): SessionLiveActivity | null {
     return this.liveActivityBySession.get(sessionId) ?? null;
   }
@@ -176,6 +233,7 @@ export class TaskStore {
   async loadSessions(deviceId: string): Promise<boolean> {
     const client = this.client;
     if (!client) return false;
+    const stateGeneration = this.stateGeneration;
     const revision = (this.sessionLoadRevisions.get(deviceId) ?? 0) + 1;
     this.sessionLoadRevisions.set(deviceId, revision);
     try {
@@ -185,7 +243,8 @@ export class TaskStore {
       includePinned['includePinned'] = true;
       opts.args = [200, 'all', includePinned];
       const env = await client.invoke(deviceId, opts);
-      if (this.sessionLoadRevisions.get(deviceId) !== revision) return false;
+      if (stateGeneration !== this.stateGeneration
+        || this.sessionLoadRevisions.get(deviceId) !== revision) return false;
       const device = this.devices.get(deviceId);
       if (device !== undefined && !device.remoteControlEnabled) return false;
       const result = unwrapInvokeResult(env);
@@ -221,11 +280,13 @@ export class TaskStore {
   async refreshActiveSessions(deviceId: string): Promise<void> {
     const client = this.client;
     if (!client) return;
+    const stateGeneration = this.stateGeneration;
     try {
       const opts = new DlInvokeOptions();
       opts.channel = 'maker:list-active';
       opts.args = [];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (stateGeneration !== this.stateGeneration) return;
       if (!Array.isArray(result)) return;
       const rows = result as Object[];
       let changed = false;
@@ -260,6 +321,7 @@ export class TaskStore {
   async patchSession(deviceId: string, sessionId: string, patch: SessionMetaPatch): Promise<boolean> {
     const client = this.client;
     if (!client || sessionId.length === 0) return false;
+    const stateGeneration = this.stateGeneration;
     const list = this.sessionsByDevice.get(deviceId) ?? [];
     let before: RemoteSession | undefined = undefined;
     for (let i = 0; i < list.length; i++) {
@@ -277,6 +339,7 @@ export class TaskStore {
       opts.channel = 'local-db:sessions:patch-meta';
       opts.args = [sessionId, patch];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (stateGeneration !== this.stateGeneration) return false;
       if (this.metaWriteGenerations.get(sessionId) !== generation) return true;
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
         const session = parseSession(result as Record<string, Object>);
@@ -287,7 +350,8 @@ export class TaskStore {
       }
       return true;
     } catch (e) {
-      if (this.metaWriteGenerations.get(sessionId) === generation) {
+      if (stateGeneration === this.stateGeneration
+        && this.metaWriteGenerations.get(sessionId) === generation) {
         this.upsertSession(deviceId, before);
         void this.loadSessions(deviceId);
       }
@@ -298,6 +362,7 @@ export class TaskStore {
   async regenerateTitle(deviceId: string, sessionId: string): Promise<string> {
     const client = this.client;
     if (!client || sessionId.length === 0) return '';
+    const stateGeneration = this.stateGeneration;
     try {
       const request: Record<string, Object> = {};
       request['sessionId'] = sessionId;
@@ -305,6 +370,7 @@ export class TaskStore {
       opts.channel = 'maker:regenerate-title';
       opts.args = [request];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (stateGeneration !== this.stateGeneration) return '';
       if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) return '';
       return readStr(result as Record<string, Object>, 'title');
     } catch (e) {

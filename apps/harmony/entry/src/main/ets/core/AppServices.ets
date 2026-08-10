@@ -22,6 +22,7 @@ import {
   CONTROLLER_CAPABILITIES, MAKER_EVENT_BATCH_CHANNEL, expandMakerEventBatchPayload,
 } from './device-link/DlProtocol';
 import { TaskStore } from './tasks/TaskStore';
+import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
 import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
@@ -51,6 +52,7 @@ export class AppServices {
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
+  readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
@@ -81,6 +83,14 @@ export class AppServices {
     this.tasks.attach(this.client);
     this.tasks.onChanged(() => {
       this.syncSessionSubscriptions();
+      this.taskListSnapshot.save(() => snapshotDevices(
+        this.tasks.deviceList,
+        (deviceId: string) => this.tasks.getSessions(deviceId),
+      ));
+    });
+    this.auth.setLogoutCleanup(async (): Promise<void> => {
+      await this.taskListSnapshot.clear();
+      this.tasks.clearAll();
     });
     this.messages.attach(this.client);
     this.inputQueue.attach(this.client);
@@ -158,7 +168,14 @@ export class AppServices {
       this.auth.init(context),
       this.composerDrafts.init(context),
       this.taskListPreferences.init(context),
+      this.taskListSnapshot.init(context),
     ]);
+  }
+
+  /** 登录态确认后、网络握手前恢复可丢弃的任务列表首屏快照。 */
+  restoreTaskListSnapshot(): void {
+    this.taskListSnapshot.setAccountScope(this.auth.cacheAccountId);
+    this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
   }
 
   /** 连接状态订阅（登录后调用 start）；返回退订函数。 */
@@ -274,9 +291,13 @@ export class AppServices {
       }
     };
     events.onHelloAck = (ack: HelloAckPayload) => {
-      // 握手成功：记录本机 deviceId，并拉一次 REST 设备快照作为列表基础。
+      // setStatus('online') 已在同一 hello-ack 处理链中触发 loadDevices；这里只记录
+      // 本机身份，避免冷启动对设备 REST 发出两份完全相同的并发请求。
       this.tasks.setSelfDeviceId(ack.deviceId);
-      void this.loadDevices();
+      const previousAccountId = this.auth.cacheAccountId;
+      if (this.auth.rememberRelayUserId(ack.userId)) {
+        void this.switchTaskListAccountScope(previousAccountId, ack.userId);
+      }
     };
     events.onAuthFailed = () => {
       // 握手被 401 拒：强制刷新 token 后立即重连。
@@ -308,6 +329,7 @@ export class AppServices {
 
   /** 拉取全量设备快照（REST 管理面），presence 补丁保留在线状态不回退。 */
   async loadDevices(): Promise<void> {
+    const authEpoch = this.auth.sessionEpoch;
     let retried = false;
     try {
       for (;;) {
@@ -361,6 +383,7 @@ export class AppServices {
           views.push(parseDeviceView(raw as Record<string, Object>));
         }
       }
+      if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return;
       hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
       this.tasks.mergeServerDevices(views);
       const seenDeviceIds = new Set<string>();
@@ -384,6 +407,15 @@ export class AppServices {
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'load devices failed: %{public}s', JSON.stringify(e));
     }
+  }
+
+  private async switchTaskListAccountScope(previousAccountId: string, accountId: string): Promise<void> {
+    if (previousAccountId.length > 0 && previousAccountId !== accountId) {
+      await this.taskListSnapshot.clear();
+      this.tasks.clearAll();
+    }
+    this.taskListSnapshot.setAccountScope(accountId);
+    void this.loadDevices();
   }
 
   private dispatchPush(deviceId: string, channel: string, payload: Object | undefined): void {

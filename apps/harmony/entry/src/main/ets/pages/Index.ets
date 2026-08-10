@@ -20,7 +20,8 @@ struct Index {
       await AppServices.instance.init(getContext(this));
       const restored = await AppServices.instance.auth.restoreSession();
       if (restored) {
-        // 已有本地会话：直接连 relay（token 自动刷新）。
+        // 先画 last-known 列表，再连 relay 用远端权威快照对账。
+        AppServices.instance.restoreTaskListSnapshot();
         AppServices.instance.client.start();
         router.replaceUrl({ url: 'pages/TaskListPage' });
       } else {
