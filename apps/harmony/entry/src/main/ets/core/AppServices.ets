@@ -89,6 +89,7 @@ export class AppServices {
       ));
     });
     this.auth.setLogoutCleanup(async (): Promise<void> => {
+      await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
       this.tasks.clearAll();
     });
@@ -169,12 +170,15 @@ export class AppServices {
       this.composerDrafts.init(context),
       this.taskListPreferences.init(context),
       this.taskListSnapshot.init(context),
+      this.messages.initCache(context),
     ]);
   }
 
   /** 登录态确认后、网络握手前恢复可丢弃的任务列表首屏快照。 */
   restoreTaskListSnapshot(): void {
-    this.taskListSnapshot.setAccountScope(this.auth.cacheAccountId);
+    const accountId = this.auth.cacheAccountId;
+    this.taskListSnapshot.setAccountScope(accountId);
+    this.messages.setCacheAccountScope(accountId);
     this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
   }
 
@@ -411,10 +415,12 @@ export class AppServices {
 
   private async switchTaskListAccountScope(previousAccountId: string, accountId: string): Promise<void> {
     if (previousAccountId.length > 0 && previousAccountId !== accountId) {
+      await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
       this.tasks.clearAll();
     }
     this.taskListSnapshot.setAccountScope(accountId);
+    this.messages.setCacheAccountScope(accountId);
     void this.loadDevices();
   }
 

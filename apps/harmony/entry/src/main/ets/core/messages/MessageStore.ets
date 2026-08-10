@@ -13,6 +13,7 @@
  * 显式 new，避免字面量缺字段。
  */
 
+import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
@@ -54,6 +55,10 @@ import {
   shouldInferOlderMessagesFromCount,
   shouldKeepOlderMessagesAffordance,
 } from './MessagePaging';
+import {
+  MAX_CACHED_MESSAGE_SESSIONS,
+  SessionMessageCacheStore,
+} from './SessionMessageCacheStore';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -62,6 +67,8 @@ const TAG = 'CindyMsg';
 // 会按 80 → 40 → 20 → 10 → 5 → 1 自动降档。
 const HISTORY_PAGE_LIMIT = 80;
 const RECONNECT_MESSAGE_WINDOW_LIMIT = 80;
+/** 进程内保留更多已上翻历史；超限时按最近访问淘汰整个非活动会话。 */
+const MAX_MEMORY_CACHED_MESSAGE_ROWS = 1600;
 
 function hasTurnContinuation(event: Record<string, Object>): boolean {
   const value = event['turnContinuationId'];
@@ -80,6 +87,30 @@ export class StreamingToolRow {
   settled: boolean = false;
   /** tool_result 明确标记失败。 */
   hasError: boolean = false;
+}
+
+/** 空权威窗口与实时尾部交错时的延迟清窗状态。 */
+export class AuthoritativeEmptyDeferrals {
+  private sessions: Set<string> = new Set();
+
+  update(sessionId: string, shouldDefer: boolean): void {
+    if (shouldDefer) this.sessions.add(sessionId);
+    else this.sessions.delete(sessionId);
+  }
+
+  cancel(sessionId: string): void {
+    this.sessions.delete(sessionId);
+  }
+
+  consume(sessionId: string): boolean {
+    if (!this.sessions.has(sessionId)) return false;
+    this.sessions.delete(sessionId);
+    return true;
+  }
+
+  clear(): void {
+    this.sessions.clear();
+  }
 }
 
 /** 流式 assistant 消息（maker:event 增量累积，落库后清除）。 */
@@ -165,6 +196,86 @@ export class MessageStore {
   /** 已验证连续窗口；只有 subscribe ACK 后到达的实时尾部可推进 until。 */
   private historyCoverageBySession: Map<string, MessageWindowCoverage> = new Map();
   private subscriptionAckedSessions: Set<string> = new Set();
+  /** 最近消息持久快照；只保存稳定消息行，不保存临时 running / streaming 投影。 */
+  private readonly sessionMessageCache: SessionMessageCacheStore = new SessionMessageCacheStore();
+  /** 已知会话所属设备，供内存消息变更写回按设备隔离的持久缓存。 */
+  private cachedDeviceBySession: Map<string, string> = new Map();
+  /** 非活动会话进程内缓存的 LRU 顺序。 */
+  private cacheAccessBySession: Map<string, number> = new Map();
+  private cacheAccessSequence: number = 0;
+  /** 页面打开代次：关闭后的旧历史响应不得覆盖新 lease。 */
+  private sessionLeaseRevisions: Map<string, number> = new Map();
+  /** 同一会话的 subscribe / unsubscribe 串行，避免快速重进时旧退订撤销新订阅。 */
+  private subscriptionOperations: Map<string, Promise<void>> = new Map();
+  /** 空历史到达时若仍有 live 投影，先延迟清窗；终态探针收口后再应用该权威空窗。 */
+  private deferredAuthoritativeEmptySessions: AuthoritativeEmptyDeferrals =
+    new AuthoritativeEmptyDeferrals();
+  /** 在当前产品 turn 内已固化的临时行；权威空窗收口时不能连最终投影一起删掉。 */
+  private pendingStreamingProjectionKeysBySession: Map<string, Set<string>> = new Map();
+  /** 消息 push 代次；旧的空历史响应不能覆盖请求期间刚到的权威增量。 */
+  private authoritativeMessageRevisions: Map<string, number> = new Map();
+
+  async initCache(context: common.Context): Promise<void> {
+    await this.sessionMessageCache.init(context);
+  }
+
+  setCacheAccountScope(accountId: string): void {
+    this.sessionMessageCache.setAccountScope(accountId);
+  }
+
+  /** 登出/切换账号：本地消息、运行投影和落盘快照必须一起失效。 */
+  async clearAllCachedSessions(): Promise<void> {
+    const subscribedSessionIds: string[] = [];
+    const subscribedDeviceIds: string[] = [];
+    this.subscribed.forEach((deviceId: string, sessionId: string) => {
+      subscribedSessionIds.push(sessionId);
+      subscribedDeviceIds.push(deviceId);
+      this.nextSessionLease(sessionId);
+    });
+    this.subscribed.clear();
+    const client = this.client;
+    if (client !== undefined) {
+      const pendingUnsubscribes: Promise<void>[] = [];
+      for (let i = 0; i < subscribedSessionIds.length; i++) {
+        const sessionId = subscribedSessionIds[i];
+        const deviceId = subscribedDeviceIds[i];
+        pendingUnsubscribes.push(this.queueSubscriptionOperation(
+          sessionId, async (): Promise<void> => {
+            try {
+              await client.unsubscribe(deviceId, [sessionTopic(sessionId)]);
+            } catch (e) {
+              // 登出/切号仍继续清本地；断链后的订阅会由 relay 自身释放。
+            }
+          }));
+      }
+      await Promise.all(pendingUnsubscribes);
+    }
+    this.messagesBySession.clear();
+    this.hasMoreBySession.clear();
+    this.messageCountBySession.clear();
+    this.streamingBySession.clear();
+    this.runningBySession.clear();
+    this.runStartedAtBySession.clear();
+    this.makerTurnRunningBySession.clear();
+    this.taskUpdatesBySession.clear();
+    this.parkedTaskUpdatesBySession.clear();
+    this.loadFailedBySession.clear();
+    this.consideredHistoryGaps.clear();
+    this.historyCoverageBySession.clear();
+    this.subscriptionAckedSessions.clear();
+    this.cachedDeviceBySession.clear();
+    this.cacheAccessBySession.clear();
+    this.cacheAccessSequence = 0;
+    this.runningStateRevisions.clear();
+    this.historyHealGenerations.clear();
+    this.sessionLeaseRevisions.clear();
+    this.subscriptionOperations.clear();
+    this.deferredAuthoritativeEmptySessions.clear();
+    this.pendingStreamingProjectionKeysBySession.clear();
+    this.authoritativeMessageRevisions.clear();
+    await this.sessionMessageCache.clear();
+    this.notify();
+  }
 
   attach(client: DlClient): void {
     this.client = client;
@@ -192,7 +303,145 @@ export class MessageStore {
     }
   }
 
+  private touchSessionCache(sessionId: string): void {
+    if (sessionId.length === 0) return;
+    this.cacheAccessSequence += 1;
+    this.cacheAccessBySession.set(sessionId, this.cacheAccessSequence);
+  }
+
+  private rememberSessionDevice(sessionId: string, deviceId: string): void {
+    if (sessionId.length === 0 || deviceId.length === 0) return;
+    this.cachedDeviceBySession.set(sessionId, deviceId);
+    this.touchSessionCache(sessionId);
+  }
+
+  private persistSessionMessages(sessionId: string): void {
+    const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
+    if (deviceId.length === 0) return;
+    this.sessionMessageCache.save(deviceId, sessionId, this.messagesBySession.get(sessionId) ?? []);
+  }
+
+  private setSessionMessages(sessionId: string, messages: RemoteMessage[]): void {
+    this.messagesBySession.set(sessionId, messages);
+    this.touchSessionCache(sessionId);
+    this.persistSessionMessages(sessionId);
+  }
+
+  private removeSessionMessages(sessionId: string, removePersistent: boolean): void {
+    this.messagesBySession.delete(sessionId);
+    if (removePersistent) this.persistSessionMessages(sessionId);
+  }
+
+  /** 只在内存仍为空时种入冷启动快照，网络先返回时绝不让慢缓存反向覆盖。 */
+  private hydrateCachedMessagesIfEmpty(deviceId: string, sessionId: string): boolean {
+    if ((this.messagesBySession.get(sessionId)?.length ?? 0) > 0) return false;
+    const cached = this.sessionMessageCache.read(deviceId, sessionId);
+    if (cached.length === 0) return false;
+    this.messagesBySession.set(sessionId, cached);
+    this.touchSessionCache(sessionId);
+    this.notify();
+    return true;
+  }
+
+  private nextSessionLease(sessionId: string): number {
+    const next = (this.sessionLeaseRevisions.get(sessionId) ?? 0) + 1;
+    this.sessionLeaseRevisions.set(sessionId, next);
+    return next;
+  }
+
+  private sessionLeaseCurrent(sessionId: string, deviceId: string, lease: number): boolean {
+    return this.sessionLeaseRevisions.get(sessionId) === lease
+      && this.subscribed.get(sessionId) === deviceId;
+  }
+
+  private currentSessionLease(deviceId: string, sessionId: string): number {
+    const lease = this.sessionLeaseRevisions.get(sessionId) ?? -1;
+    return lease >= 0 && this.sessionLeaseCurrent(sessionId, deviceId, lease) ? lease : -1;
+  }
+
+  private queueSubscriptionOperation(sessionId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.subscriptionOperations.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => {
+    }).then(operation);
+    this.subscriptionOperations.set(sessionId, current);
+    void current.then(() => {
+      if (this.subscriptionOperations.get(sessionId) === current) {
+        this.subscriptionOperations.delete(sessionId);
+      }
+    }).catch(() => {
+      if (this.subscriptionOperations.get(sessionId) === current) {
+        this.subscriptionOperations.delete(sessionId);
+      }
+    });
+    return current;
+  }
+
+  private memoryCachedSessionIds(): string[] {
+    const ids = new Set<string>();
+    this.messagesBySession.forEach((_messages: RemoteMessage[], sessionId: string) => ids.add(sessionId));
+    this.streamingBySession.forEach((_streaming: StreamingMessage, sessionId: string) => ids.add(sessionId));
+    this.taskUpdatesBySession.forEach((_updates: Map<string, AgentTaskUpdate>, sessionId: string) => ids.add(sessionId));
+    const out: string[] = [];
+    ids.forEach((sessionId: string) => out.push(sessionId));
+    return out;
+  }
+
+  private memoryCachedMessageRows(): number {
+    let rows = 0;
+    this.messagesBySession.forEach((messages: RemoteMessage[]) => {
+      rows += messages.length;
+    });
+    return rows;
+  }
+
+  private evictMemorySession(sessionId: string): void {
+    this.messagesBySession.delete(sessionId);
+    this.hasMoreBySession.delete(sessionId);
+    this.messageCountBySession.delete(sessionId);
+    this.loadFailedBySession.delete(sessionId);
+    this.streamingBySession.delete(sessionId);
+    this.runningBySession.delete(sessionId);
+    this.runStartedAtBySession.delete(sessionId);
+    this.makerTurnRunningBySession.delete(sessionId);
+    this.taskUpdatesBySession.delete(sessionId);
+    this.parkedTaskUpdatesBySession.delete(sessionId);
+    this.runningStateRevisions.delete(sessionId);
+    this.historyHealGenerations.delete(sessionId);
+    this.consideredHistoryGaps.delete(sessionId);
+    this.historyCoverageBySession.delete(sessionId);
+    this.subscriptionAckedSessions.delete(sessionId);
+    this.deferredAuthoritativeEmptySessions.cancel(sessionId);
+    this.pendingStreamingProjectionKeysBySession.delete(sessionId);
+    this.authoritativeMessageRevisions.delete(sessionId);
+    this.cachedDeviceBySession.delete(sessionId);
+    this.cacheAccessBySession.delete(sessionId);
+  }
+
+  private evictInactiveSessionCaches(): void {
+    let ids = this.memoryCachedSessionIds();
+    while (ids.length > MAX_CACHED_MESSAGE_SESSIONS
+      || this.memoryCachedMessageRows() > MAX_MEMORY_CACHED_MESSAGE_ROWS) {
+      // 单个用户刚查看过的超长会话不整窗丢弃；行数上限是多会话缓存的软预算。
+      if (ids.length <= 1) return;
+      let victim = '';
+      let oldest = Number.MAX_SAFE_INTEGER;
+      for (let i = 0; i < ids.length; i++) {
+        const sessionId = ids[i];
+        if (this.subscribed.has(sessionId)) continue;
+        const access = this.cacheAccessBySession.get(sessionId) ?? 0;
+        if (access < oldest) {
+          oldest = access;
+          victim = sessionId;
+        }
+      }
+      if (victim.length === 0) return;
+      this.evictMemorySession(victim);
+      ids = this.memoryCachedSessionIds();
+    }
+  }
+
   getMessages(sessionId: string): RemoteMessage[] {
+    this.touchSessionCache(sessionId);
     return this.messagesBySession.get(sessionId) ?? [];
   }
 
@@ -221,7 +470,7 @@ export class MessageStore {
     const current = this.messagesBySession.get(sessionId) ?? [];
     const next = current.concat([message]);
     next.sort(sortMessagesAsc);
-    this.messagesBySession.set(sessionId, next);
+    this.setSessionMessages(sessionId, next);
     this.notify();
   }
 
@@ -255,7 +504,7 @@ export class MessageStore {
       const current = this.messagesBySession.get(sessionId) ?? [];
       const merged = this.mergeWithoutDuplicates(rows, current);
       merged.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, merged);
+      this.setSessionMessages(sessionId, merged);
       this.notify();
     }
     return this.hasMessageClientId(sessionId, clientId);
@@ -349,17 +598,34 @@ export class MessageStore {
   }
 
   async openSession(deviceId: string, sessionId: string): Promise<boolean> {
+    this.rememberSessionDevice(sessionId, deviceId);
+    this.hydrateCachedMessagesIfEmpty(deviceId, sessionId);
     const client = this.client;
     if (!client) {
       this.loadFailedBySession.set(sessionId, true);
       this.notify();
       return false;
     }
+    const lease = this.nextSessionLease(sessionId);
     if (this.subscribed.get(sessionId) === deviceId) {
+      if (!this.subscriptionAckedSessions.has(sessionId)) {
+        void this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+          if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+          try {
+            await client.subscribe(deviceId, [sessionTopic(sessionId)]);
+            if (this.sessionLeaseCurrent(sessionId, deviceId, lease)) {
+              this.subscriptionAckedSessions.add(sessionId);
+            }
+          } catch (e) {
+            // 历史仍可独立恢复，下一次重连/重进继续补订阅。
+          }
+        });
+      }
       // 已打开：重新拉一次历史（重进页面恢复用）。
-      const loaded = await this.loadInitial(deviceId, sessionId);
+      const loaded = await this.loadInitial(deviceId, sessionId, lease);
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return false;
       if (loaded) this.scheduleHistoryHeal(deviceId, sessionId, true);
-      void this.refreshSessionRunningState(deviceId, sessionId);
+      void this.refreshSessionRunningState(deviceId, sessionId, lease);
       return loaded;
     }
     // 先确保控制链路（link-open），否则 subscribe / history 会挂起或失败。
@@ -370,52 +636,61 @@ export class MessageStore {
         // link 失败不阻断历史加载尝试
       }
     }
+    if (this.sessionLeaseRevisions.get(sessionId) !== lease) return false;
     this.subscribed.set(sessionId, deviceId);
     this.subscriptionAckedSessions.delete(sessionId);
     const existingCoverage = this.historyCoverageBySession.get(sessionId);
     if (existingCoverage !== undefined) existingCoverage.liveTailTrusted = false;
-    // 订阅实时流（并行，失败不阻塞历史）。
-    client.subscribe(deviceId, [sessionTopic(sessionId)]).then(() => {
-      if (this.subscribed.get(sessionId) === deviceId) this.subscriptionAckedSessions.add(sessionId);
-    }).catch(() => {
+    // 订阅实时流（并行，失败不阻塞历史）；与旧 unsubscribe 串行，快速重进不会丢订阅。
+    void this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+      try {
+        await client.subscribe(deviceId, [sessionTopic(sessionId)]);
+        if (this.sessionLeaseCurrent(sessionId, deviceId, lease)) {
+          this.subscriptionAckedSessions.add(sessionId);
+        }
+      } catch (e) {
+        // 订阅失败不阻塞历史窗口恢复。
+      }
     });
-    const loaded = await this.loadInitial(deviceId, sessionId);
+    const loaded = await this.loadInitial(deviceId, sessionId, lease);
+    if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return false;
     if (loaded) this.scheduleHistoryHeal(deviceId, sessionId, true);
-    void this.refreshSessionRunningState(deviceId, sessionId);
+    void this.refreshSessionRunningState(deviceId, sessionId, lease);
     return loaded;
   }
 
-  /** 关闭会话：注销订阅并清内存（页面退出时调用）。 */
+  /**
+   * 页面离开只停用实时订阅，保留历史、分页与当前运行投影用于快速重进。
+   * 真正内存回收由 LRU 负责；落盘只保留稳定消息的最近一页。
+   */
   async closeSession(sessionId: string): Promise<void> {
     const deviceId = this.subscribed.get(sessionId);
+    this.nextSessionLease(sessionId);
     this.subscribed.delete(sessionId);
-    this.messagesBySession.delete(sessionId);
-    this.hasMoreBySession.delete(sessionId);
-    this.messageCountBySession.delete(sessionId);
-    this.loadFailedBySession.delete(sessionId);
-    this.streamingBySession.delete(sessionId);
-    this.runningBySession.delete(sessionId);
-    // 页面离开只撤销订阅，不是产品 turn 的终态。保留本轮起点，重进后由
-    // session 探针继续同一只时钟；真正 completed/error/done 时再清理。
-    this.makerTurnRunningBySession.delete(sessionId);
-    this.taskUpdatesBySession.delete(sessionId);
-    this.parkedTaskUpdatesBySession.delete(sessionId);
-    this.runningStateRevisions.delete(sessionId);
+    this.touchSessionCache(sessionId);
+    this.persistSessionMessages(sessionId);
+    // 让关闭前发出的运行探针失效；缓存中的 running 状态留给重进后的新探针裁定。
+    this.bumpRunningStateRevision(sessionId);
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
-    this.consideredHistoryGaps.delete(sessionId);
-    this.historyCoverageBySession.delete(sessionId);
     this.subscriptionAckedSessions.delete(sessionId);
+    const coverage = this.historyCoverageBySession.get(sessionId);
+    if (coverage !== undefined) coverage.liveTailTrusted = false;
     if (deviceId !== undefined) {
       const client = this.client;
       if (client) {
-        try {
-          await client.unsubscribe(deviceId, [sessionTopic(sessionId)]);
-        } catch (e) {
-          // fire-and-forget
-        }
+        await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+          try {
+            await client.unsubscribe(deviceId, [sessionTopic(sessionId)]);
+          } catch (e) {
+            // 退订失败不影响本地停用；重连时 registry 会重建。
+          }
+        });
       }
     }
+    await this.sessionMessageCache.flush();
+    this.evictInactiveSessionCaches();
     this.notify();
   }
 
@@ -439,26 +714,43 @@ export class MessageStore {
     if (!client) {
       return;
     }
+    const lease = this.sessionLeaseRevisions.get(sessionId) ?? 0;
+    if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
     // relay 新连接后旧订阅失效，需重新 subscribe。
     this.subscriptionAckedSessions.delete(sessionId);
     const previousCoverage = this.historyCoverageBySession.get(sessionId);
     if (previousCoverage !== undefined) previousCoverage.liveTailTrusted = false;
     try {
-      await client.subscribe(deviceId, [sessionTopic(sessionId)]);
-      if (this.subscribed.get(sessionId) === deviceId) this.subscriptionAckedSessions.add(sessionId);
+      await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+        if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+        await client.subscribe(deviceId, [sessionTopic(sessionId)]);
+      });
+      if (this.sessionLeaseCurrent(sessionId, deviceId, lease)) {
+        this.subscriptionAckedSessions.add(sessionId);
+      }
     } catch (e) {
       // 订阅失败不阻断 healing
     }
+    const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     try {
       const page = await this.requestMessagesList(
         deviceId, sessionId, RECONNECT_MESSAGE_WINDOW_LIMIT, '');
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
       page.items.sort(sortMessagesAsc);
+      const streaming = this.streamingBySession.get(sessionId);
+      this.deferredAuthoritativeEmptySessions.update(sessionId,
+        shouldDeferAuthoritativeEmptyWindow(
+          page.items.length,
+          streaming !== undefined && !streaming.finished,
+          messageRevision,
+          this.authoritativeMessageRevisions.get(sessionId) ?? 0,
+        ));
       const merged = this.applyLatestWindow(sessionId, page);
       this.setOlderAvailability(
         sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.notify();
       this.scheduleHistoryHeal(deviceId, sessionId, true);
-      void this.refreshSessionRunningState(deviceId, sessionId);
+      void this.refreshSessionRunningState(deviceId, sessionId, lease);
     } catch (e) {
       // healing 失败：保持现有消息，等下一次重连恢复。
     }
@@ -487,7 +779,7 @@ export class MessageStore {
     const current = this.messagesBySession.get(sessionId) ?? [];
     const merged = this.mergeWithoutDuplicates(rows, current);
     merged.sort(sortMessagesAsc);
-    this.messagesBySession.set(sessionId, merged);
+    this.setSessionMessages(sessionId, merged);
   }
 
   private async healHistoryWindow(
@@ -854,6 +1146,7 @@ export class MessageStore {
         content['input'] = tool.input ?? emptyInput;
         use.content = content;
         list.push(use);
+        this.rememberPendingStreamingProjection(sessionId, use);
       }
       if (tool.settled && !list.some((message: RemoteMessage) => message.role === 'tool_result'
         && message.toolUseId === tool.toolUseId)) {
@@ -870,6 +1163,7 @@ export class MessageStore {
         resultContent['text'] = '';
         result.content = resultContent;
         list.push(result);
+        this.rememberPendingStreamingProjection(sessionId, result);
       }
     }
     if (streaming.text.length > 0) {
@@ -887,9 +1181,10 @@ export class MessageStore {
       assistant.isStreaming = false;
       if (index >= 0) list[index] = assistant;
       else list.push(assistant);
+      this.rememberPendingStreamingProjection(sessionId, assistant);
     }
     list.sort(sortMessagesAsc);
-    this.messagesBySession.set(sessionId, list);
+    this.setSessionMessages(sessionId, list);
   }
 
   private bumpRunningStateRevision(sessionId: string): number {
@@ -914,6 +1209,50 @@ export class MessageStore {
   private finalizeSessionStreaming(sessionId: string): void {
     this.markSessionRunning(sessionId, false);
     this.finishStreamingProjection(sessionId);
+    const protectedProjectionKeys = this.pendingStreamingProjectionKeysBySession.get(sessionId)
+      ?? new Set<string>();
+    this.pendingStreamingProjectionKeysBySession.delete(sessionId);
+    this.applyDeferredAuthoritativeEmpty(sessionId, protectedProjectionKeys);
+  }
+
+  private applyDeferredAuthoritativeEmpty(
+    sessionId: string,
+    protectedProjectionKeys: Set<string>,
+  ): void {
+    if (!this.deferredAuthoritativeEmptySessions.consume(sessionId)) return;
+    const merged = reconcileDeferredAuthoritativeEmptyMessages(
+      this.messagesBySession.get(sessionId) ?? [], protectedProjectionKeys);
+    this.setSessionMessages(sessionId, merged);
+    this.historyCoverageBySession.delete(sessionId);
+    this.setOlderAvailability(sessionId, false);
+  }
+
+  private rememberPendingStreamingProjection(sessionId: string, message: RemoteMessage): void {
+    let keys = this.pendingStreamingProjectionKeysBySession.get(sessionId);
+    if (keys === undefined) {
+      keys = new Set<string>();
+      this.pendingStreamingProjectionKeysBySession.set(sessionId, keys);
+    }
+    keys.add(messageIdentity(message));
+  }
+
+  private discardPendingStreamingProjection(sessionId: string, message: RemoteMessage): void {
+    const keys = this.pendingStreamingProjectionKeysBySession.get(sessionId);
+    if (keys === undefined) return;
+    keys.delete(messageIdentity(message));
+    if ((message.role === 'tool_use' || message.role === 'tool_result')
+      && message.toolUseId.length > 0) {
+      const prefix = message.role === 'tool_use' ? 'streaming-tool-' : 'streaming-result-';
+      keys.delete(`id:${prefix}${message.toolUseId}`);
+    } else if (message.role === 'assistant') {
+      const prefix = `id:streaming-text-${sessionId}`;
+      const syntheticKeys: string[] = [];
+      keys.forEach((key: string) => {
+        if (key.startsWith(prefix)) syntheticKeys.push(key);
+      });
+      for (let i = 0; i < syntheticKeys.length; i++) keys.delete(syntheticKeys[i]);
+    }
+    if (keys.size === 0) this.pendingStreamingProjectionKeysBySession.delete(sessionId);
   }
 
   /** 收口当前 provider 段的临时投影，但保留产品级 running 状态（交互/续跑）。 */
@@ -976,7 +1315,11 @@ export class MessageStore {
   }
 
   /** 打开/重连时向被控端核实 live session，避免历史 isStreaming 标记永久卡住。 */
-  private async refreshSessionRunningState(deviceId: string, sessionId: string): Promise<void> {
+  private async refreshSessionRunningState(
+    deviceId: string,
+    sessionId: string,
+    expectedLease: number,
+  ): Promise<void> {
     const client = this.client;
     if (!client) return;
     const revision = this.runningStateRevisions.get(sessionId) ?? 0;
@@ -985,6 +1328,7 @@ export class MessageStore {
     opts.args = [sessionId];
     try {
       const env = await client.invoke(deviceId, opts);
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) return;
       if ((this.runningStateRevisions.get(sessionId) ?? 0) !== revision) return;
       const result = unwrapInvokeResult(env);
       if (typeof result !== 'boolean') return;
@@ -1036,7 +1380,7 @@ export class MessageStore {
     boundary.systemCardData = data;
     existing.push(boundary);
     existing.sort(sortMessagesAsc);
-    this.messagesBySession.set(sessionId, existing);
+    this.setSessionMessages(sessionId, existing);
     this.notify();
   }
 
@@ -1052,6 +1396,7 @@ export class MessageStore {
    * work_group 聚合规则收进折叠面板。
    */
   getMessagesWithStreaming(sessionId: string): RemoteMessage[] {
+    this.touchSessionCache(sessionId);
     const base = this.messagesBySession.get(sessionId) ?? [];
     const s = this.streamingBySession.get(sessionId);
     if (s === undefined || (s.text.length === 0 && s.tools.length === 0)) {
@@ -1139,13 +1484,29 @@ export class MessageStore {
     }
   }
 
-  private async loadInitial(deviceId: string, sessionId: string): Promise<boolean> {
+  private async loadInitial(
+    deviceId: string,
+    sessionId: string,
+    expectedLease: number,
+  ): Promise<boolean> {
     const client = this.client;
     if (!client) return false;
+    const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     try {
       // 对齐 iOS：历史走 local-db:messages:list（返回完整行含 clientId，最新在前）。
       const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) {
+        return false;
+      }
       page.items.sort(sortMessagesAsc);
+      const streaming = this.streamingBySession.get(sessionId);
+      this.deferredAuthoritativeEmptySessions.update(sessionId,
+        shouldDeferAuthoritativeEmptyWindow(
+          page.items.length,
+          streaming !== undefined && !streaming.finished,
+          messageRevision,
+          this.authoritativeMessageRevisions.get(sessionId) ?? 0,
+        ));
       const merged = this.applyLatestWindow(sessionId, page);
       this.setOlderAvailability(
         sessionId, this.hasMoreAfterPage(sessionId, page, merged));
@@ -1165,6 +1526,9 @@ export class MessageStore {
       this.notify();
       return true;
     } catch (e) {
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) {
+        return false;
+      }
       // 加载失败：标记失败（页面提供重试），不保持空列表假装成功。
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
       hilog.warn(DOMAIN, TAG, 'loadInitial failed session=%{public}s err=%{public}s',
@@ -1177,12 +1541,19 @@ export class MessageStore {
 
   /** 破坏性消息操作完成后重拉当前整窗，避免旧分页与服务端截断结果混合。 */
   async reloadSession(deviceId: string, sessionId: string): Promise<boolean> {
+    const lease = this.currentSessionLease(deviceId, sessionId);
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.consideredHistoryGaps.delete(sessionId);
     this.historyCoverageBySession.delete(sessionId);
-    this.messagesBySession.delete(sessionId);
-    return this.loadInitial(deviceId, sessionId);
+    this.removeSessionMessages(sessionId, true);
+    this.deferredAuthoritativeEmptySessions.cancel(sessionId);
+    this.pendingStreamingProjectionKeysBySession.delete(sessionId);
+    if (lease < 0) {
+      this.notify();
+      return false;
+    }
+    return this.loadInitial(deviceId, sessionId, lease);
   }
 
   /** Pi 分支切换后的权威替换；旧分支消息不能与新窗口 merge。 */
@@ -1198,11 +1569,13 @@ export class MessageStore {
       page.items.sort(sortMessagesAsc);
       const reconciled = reconcileLatestMessageWindow(
         [], page.items, page.hasMore, null, this.subscriptionAckedSessions.has(sessionId));
-      this.messagesBySession.set(sessionId, reconciled.items);
+      this.setSessionMessages(sessionId, reconciled.items);
       if (reconciled.coverage !== null) this.historyCoverageBySession.set(sessionId, reconciled.coverage);
       this.setOlderAvailability(
         sessionId, this.hasMoreAfterPage(sessionId, page, page.items));
       this.streamingBySession.delete(sessionId);
+      this.deferredAuthoritativeEmptySessions.cancel(sessionId);
+      this.pendingStreamingProjectionKeysBySession.delete(sessionId);
       this.runningBySession.delete(sessionId);
       this.runStartedAtBySession.delete(sessionId);
       this.makerTurnRunningBySession.delete(sessionId);
@@ -1238,7 +1611,7 @@ export class MessageStore {
       const latestCurrent = this.messagesBySession.get(sessionId) ?? current;
       const merged = this.mergeWithoutDuplicates(page.items, latestCurrent);
       merged.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, merged);
+      this.setSessionMessages(sessionId, merged);
       const coverage = extendCoverageEarlier(
         this.historyCoverageBySession.get(sessionId) ?? null,
         page.items,
@@ -1374,6 +1747,10 @@ export class MessageStore {
   // ─── push 增量 ──────────────────────────────────────────────────────────────
 
   handleSessionPush(deviceId: string, channel: string, payload: Object | undefined): void {
+    if (payload !== undefined && typeof payload === 'object' && !Array.isArray(payload)) {
+      const sessionId = readStr(payload as Record<string, Object>, 'sessionId');
+      if (sessionId.length > 0) this.rememberSessionDevice(sessionId, deviceId);
+    }
     switch (channel) {
       case 'local-db:messages:created':
         this.appendCreated(payload);
@@ -1387,7 +1764,7 @@ export class MessageStore {
         if (sessionId.length > 0 && this.subscribed.has(sessionId)) {
           // 会话尾部落 error 行：重载一次让错误消息可见。
           this.historyCoverageBySession.delete(sessionId);
-          void this.loadInitial(deviceId, sessionId);
+          void this.loadInitial(deviceId, sessionId, this.currentSessionLease(deviceId, sessionId));
         }
         break;
       }
@@ -1407,13 +1784,17 @@ export class MessageStore {
     if (sessionId.length === 0 || Object.keys(rawMessage).length === 0) return;
     const message = parseMessage(rawMessage);
     if (message.id.length === 0) return;
+    this.authoritativeMessageRevisions.set(sessionId,
+      (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
+    this.deferredAuthoritativeEmptySessions.cancel(sessionId);
+    this.discardPendingStreamingProjection(sessionId, message);
     let list = this.messagesBySession.get(sessionId);
     if (!list) {
       // push 可能早于首次历史加载到达：先建列表，loadInitial 会合并去重。
       const fresh: RemoteMessage[] = [];
       fresh.push(message);
       fresh.sort(sortMessagesAsc);
-      this.messagesBySession.set(sessionId, fresh);
+      this.setSessionMessages(sessionId, fresh);
       this.clearStreamingIfAssistant(sessionId, message);
       this.notify();
       return;
@@ -1424,7 +1805,7 @@ export class MessageStore {
       const syntheticPrefix = message.role === 'tool_use' ? 'streaming-tool-' : 'streaming-result-';
       list = list.filter((existing: RemoteMessage) => !(existing.toolUseId === message.toolUseId
         && existing.role === message.role && existing.id.startsWith(syntheticPrefix)));
-      this.messagesBySession.set(sessionId, list);
+      this.setSessionMessages(sessionId, list);
     }
     const existingIndex = list.findIndex((m: RemoteMessage) =>
       m.id === message.id || (message.clientId.length > 0 && m.clientId === message.clientId));
@@ -1432,7 +1813,7 @@ export class MessageStore {
       if (preferIncomingCreatedMessage(list[existingIndex], message)) {
         list[existingIndex] = message;
         list.sort(sortMessagesAsc);
-        this.messagesBySession.set(sessionId, list);
+        this.setSessionMessages(sessionId, list);
         this.notify();
       }
       this.clearStreamingIfAssistant(sessionId, message);
@@ -1440,6 +1821,7 @@ export class MessageStore {
     }
     list.push(message);
     list.sort(sortMessagesAsc);
+    this.setSessionMessages(sessionId, list);
     if (this.subscriptionAckedSessions.has(sessionId)) {
       extendCoverageLiveTail(this.historyCoverageBySession.get(sessionId) ?? null, message);
     }
@@ -1465,12 +1847,15 @@ export class MessageStore {
       if (single.length > 0) clientIds.push(single);
     }
     if (sessionId.length === 0 || clientIds.length === 0) return;
+    this.authoritativeMessageRevisions.set(sessionId,
+      (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
+    this.deferredAuthoritativeEmptySessions.cancel(sessionId);
     this.historyCoverageBySession.delete(sessionId);
     const list = this.messagesBySession.get(sessionId);
     if (!list) return;
     const filtered = list.filter((m: RemoteMessage) => !clientIds.includes(m.clientId));
     if (filtered.length !== list.length) {
-      this.messagesBySession.set(sessionId, filtered);
+      this.setSessionMessages(sessionId, filtered);
       this.notify();
     }
   }
@@ -1577,7 +1962,8 @@ export class MessageStore {
     }
     // accepted 的 onAccepted 已先写入 Desktop DB；主动重拉一次兜住 topic push
     // 丢失或订阅建立竞态，保证当前 Harmony 页面立即看到自己的消息。
-    await this.loadInitial(deviceId, session.id);
+    const lease = this.currentSessionLease(deviceId, session.id);
+    if (lease >= 0) await this.loadInitial(deviceId, session.id, lease);
   }
 
   /** 停止当前执行。 */
@@ -1608,7 +1994,7 @@ export class MessageStore {
       messages[i].content = content;
       break;
     }
-    this.messagesBySession.set(sessionId, messages);
+    this.setSessionMessages(sessionId, messages);
     this.notify();
     if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
     const opts = new DlInvokeOptions();
@@ -1710,7 +2096,7 @@ export class MessageStore {
       for (let i = 0; i < current.length; i++) {
         if (deleted.indexOf(current[i].clientId) < 0) next.push(current[i]);
       }
-      this.messagesBySession.set(sessionId, next);
+      this.setSessionMessages(sessionId, next);
       this.historyCoverageBySession.delete(sessionId);
       this.notify();
     }
@@ -1742,7 +2128,8 @@ export class MessageStore {
     // 最新窗重拉会重新裁定连续区间；已上翻的连续旧窗由 reconcile 保留。
     if (page.items.length === 0) {
       const streaming = this.streamingBySession.get(sessionId);
-      if (streaming !== undefined && !streaming.finished
+      if (streaming !== undefined && shouldPreserveCachedMessagesForAuthoritativeEmpty(
+        page.items.length, !streaming.finished)
         && (streaming.text.length > 0 || streaming.tools.length > 0)) {
         return this.messagesBySession.get(sessionId) ?? [];
       }
@@ -1758,7 +2145,7 @@ export class MessageStore {
     );
     reconciled.items = this.mergeWithoutDuplicates(localOnly, reconciled.items);
     reconciled.items.sort(sortMessagesAsc);
-    this.messagesBySession.set(sessionId, reconciled.items);
+    this.setSessionMessages(sessionId, reconciled.items);
     if (reconciled.coverage !== null) {
       this.historyCoverageBySession.set(sessionId, reconciled.coverage);
     } else {
@@ -1874,6 +2261,51 @@ function messageIdentity(message: RemoteMessage): string {
   if (message.id.length > 0) return `id:${message.id}`;
   if (message.clientId.length > 0) return `client:${message.clientId}`;
   return `fallback:${message.role}:${message.createdAt}:${message.rowid}`;
+}
+
+/** 请求期间若有新 push，返回的旧空窗口不能进入延迟清窗。 */
+export function shouldDeferAuthoritativeEmptyWindow(
+  authoritativeRows: number,
+  hasLiveProjection: boolean,
+  requestMessageRevision: number,
+  currentMessageRevision: number,
+): boolean {
+  return shouldPreserveCachedMessagesForAuthoritativeEmpty(
+    authoritativeRows, hasLiveProjection)
+    && requestMessageRevision === currentMessageRevision;
+}
+
+export function shouldPreserveCachedMessagesForAuthoritativeEmpty(
+  authoritativeRows: number,
+  hasLiveProjection: boolean,
+): boolean {
+  return authoritativeRows === 0 && hasLiveProjection;
+}
+
+/**
+ * live turn 终态后应用此前延迟的权威空窗：清理旧服务端行，同时保留本地卡片与
+ * 本轮尚未等到 DB push 的最终临时投影。
+ */
+export function reconcileDeferredAuthoritativeEmptyMessages(
+  current: RemoteMessage[],
+  protectedProjectionKeys: Set<string>,
+): RemoteMessage[] {
+  const reconciled = reconcileLatestMessageWindow(current, [], false, null, false);
+  const byKey = new Map<string, RemoteMessage>();
+  for (let i = 0; i < reconciled.items.length; i++) {
+    byKey.set(messageIdentity(reconciled.items[i]), reconciled.items[i]);
+  }
+  for (let i = 0; i < current.length; i++) {
+    const message = current[i];
+    const key = messageIdentity(message);
+    if ((message.localOnly || protectedProjectionKeys.has(key)) && !byKey.has(key)) {
+      byKey.set(key, message);
+    }
+  }
+  const out: RemoteMessage[] = [];
+  byKey.forEach((message: RemoteMessage) => out.push(message));
+  out.sort(sortMessagesAsc);
+  return out;
 }
 
 /** 兼容没有 boundaryId 的旧 compact_boundary 事件，生成可重放的稳定身份。 */

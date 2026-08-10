@@ -55,11 +55,23 @@ import {
 } from '../main/ets/core/messages/MessageSearch';
 import { projectToolUseActions } from '../main/ets/core/messages/ToolUsePresentation';
 import {
+  AuthoritativeEmptyDeferrals,
   buildAgentUserContent,
   buildPersistedUserContent,
   MessageStore,
   preferIncomingCreatedMessage,
+  reconcileDeferredAuthoritativeEmptyMessages,
+  shouldDeferAuthoritativeEmptyWindow,
+  shouldPreserveCachedMessagesForAuthoritativeEmpty,
 } from '../main/ets/core/messages/MessageStore';
+import {
+  CachedSessionMessages,
+  MAX_CACHED_MESSAGE_SESSIONS,
+  MAX_CACHED_SESSION_MESSAGES,
+  normalizeSessionCacheMessages,
+  parseSessionMessageSnapshot,
+  serializeSessionMessageSnapshot,
+} from '../main/ets/core/messages/SessionMessageCacheStore';
 import {
   formatSessionActivityElapsed,
   sessionActivityElapsedMs,
@@ -1155,19 +1167,13 @@ export default function localUnitTest() {
       expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
       void store.closeSession('interleaved-live');
       expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
-      // 重进后的运行探针不得把仍在进行的同一产品 turn 从 0 秒重新计时。
-      store.handleMakerEvent('interleaved-live', textEvent, 'progress-2');
+      // 离开页面只停订阅：重进首帧应仍看到进度正文和当前工具，且计时不归零。
       expect(store.getSessionRunStartedAt('interleaved-live')).assertEqual(startedAt);
-
-      const messages = store.getMessagesWithStreaming('interleaved-live');
-      expect(messages.length).assertEqual(1);
-      expect(messages[0].role).assertEqual('assistant');
-      store.handleMakerEvent('interleaved-live', toolEvent, 'tool-1');
-      const messagesAfterReentry = store.getMessagesWithStreaming('interleaved-live');
-      expect(messagesAfterReentry.length).assertEqual(2);
-      expect(messagesAfterReentry[0].role).assertEqual('assistant');
-      expect(messagesAfterReentry[1].role).assertEqual('tool_use');
-      const items = buildRenderItems(messagesAfterReentry, store.isSessionStreaming('interleaved-live'));
+      const cachedMessages = store.getMessagesWithStreaming('interleaved-live');
+      expect(cachedMessages.length).assertEqual(2);
+      expect(cachedMessages[0].role).assertEqual('assistant');
+      expect(cachedMessages[1].role).assertEqual('tool_use');
+      const items = buildRenderItems(cachedMessages, store.isSessionStreaming('interleaved-live'));
       const work = items[items.length - 1] as RenderWorkGroupItem;
       expect(work.type).assertEqual('work_group');
       expect(work.isStreaming).assertEqual(true);
@@ -1184,6 +1190,102 @@ export default function localUnitTest() {
       );
       const completedWork = completed[completed.length - 1] as RenderWorkGroupItem;
       expect(completedWork.isStreaming).assertEqual(false);
+    });
+
+    it('evictsLeastRecentlyUsedInactiveMessageSessions', 0, async () => {
+      const store = new MessageStore();
+      for (let i = 0; i <= MAX_CACHED_MESSAGE_SESSIONS; i++) {
+        const data: Record<string, Object> = {};
+        data['index'] = i;
+        const sessionId = `cached-session-${i}`;
+        store.appendLocalSystemCard(sessionId, 'learn', data);
+        await store.closeSession(sessionId);
+      }
+      expect(store.getMessages('cached-session-0').length).assertEqual(0);
+      expect(store.getMessages(`cached-session-${MAX_CACHED_MESSAGE_SESSIONS}`).length).assertEqual(1);
+    });
+
+    it('roundTripsStructuredRecentMessageCacheAndStripsHeavyMediaBytes', 0, () => {
+      const messages: RemoteMessage[] = [];
+      for (let i = 0; i < MAX_CACHED_SESSION_MESSAGES + 2; i++) {
+        const message = new RemoteMessage();
+        message.id = `message-${i}`;
+        message.clientId = message.id;
+        message.sessionId = 'cache-session';
+        message.role = 'user';
+        message.createdAt = new Date(1_700_000_000_000 + i).toISOString();
+        const image: Record<string, Object> = {};
+        image['url'] = 'https://example.invalid/image.png';
+        image['base64'] = 'very-heavy-binary';
+        const content: Record<string, Object> = {};
+        content['text'] = `正文 ${i}`;
+        content['images'] = [image];
+        message.content = content;
+        messages.push(message);
+      }
+      const normalized = normalizeSessionCacheMessages(messages);
+      expect(normalized.length).assertEqual(MAX_CACHED_SESSION_MESSAGES);
+      expect(normalized[0].id).assertEqual('message-2');
+      const normalizedContent = normalized[0].content as Record<string, Object>;
+      const images = normalizedContent['images'] as Object[];
+      const cachedImage = images[0] as Record<string, Object>;
+      expect(cachedImage['url']).assertEqual('https://example.invalid/image.png');
+      expect(cachedImage['base64'] === undefined).assertEqual(true);
+
+      const entry = new CachedSessionMessages();
+      entry.deviceId = 'device-1';
+      entry.sessionId = 'cache-session';
+      entry.updatedAt = 123;
+      entry.messages = normalized;
+      const serialized = serializeSessionMessageSnapshot('account-a', [entry]) ?? '';
+      expect(parseSessionMessageSnapshot(serialized, 'account-b').length).assertEqual(0);
+      const restored = parseSessionMessageSnapshot(serialized, 'account-a');
+      expect(restored.length).assertEqual(1);
+      expect(restored[0].messages.length).assertEqual(MAX_CACHED_SESSION_MESSAGES);
+      expect(restored[0].messages[0].id).assertEqual('message-2');
+    });
+
+    it('keepsLiveCacheOnAuthoritativeEmptyAndCancelsDeferredClearForNewPush', 0, () => {
+      expect(shouldPreserveCachedMessagesForAuthoritativeEmpty(0, true)).assertEqual(true);
+      expect(shouldPreserveCachedMessagesForAuthoritativeEmpty(1, true)).assertEqual(false);
+      expect(shouldDeferAuthoritativeEmptyWindow(0, true, 4, 4)).assertEqual(true);
+      // messages:list 请求期间已有新权威 push：旧空响应不能重新挂起清窗。
+      expect(shouldDeferAuthoritativeEmptyWindow(0, true, 4, 5)).assertEqual(false);
+
+      const deferrals = new AuthoritativeEmptyDeferrals();
+      deferrals.update('cache-live', true);
+      // 空响应先到、push 后到：push 必须取消已挂起的清窗。
+      deferrals.cancel('cache-live');
+      expect(deferrals.consume('cache-live')).assertEqual(false);
+      deferrals.update('cache-live', true);
+      expect(deferrals.consume('cache-live')).assertEqual(true);
+      expect(deferrals.consume('cache-live')).assertEqual(false);
+    });
+
+    it('clearsStaleCachedRowsAfterLiveTurnButKeepsLocalAndFinalProjection', 0, () => {
+      const stale = new RemoteMessage();
+      stale.id = 'stale-server-row';
+      stale.role = 'assistant';
+      stale.createdAt = '2026-08-01T00:00:01.000Z';
+      const local = new RemoteMessage();
+      local.id = 'custom-local-card';
+      local.role = 'system';
+      local.localOnly = true;
+      local.createdAt = '2026-08-01T00:00:02.000Z';
+      const finalProjection = new RemoteMessage();
+      finalProjection.id = 'final-projection';
+      finalProjection.role = 'assistant';
+      finalProjection.content = '刚完成但尚未收到 DB push 的回答';
+      finalProjection.createdAt = '2026-08-01T00:00:03.000Z';
+      finalProjection.isStreaming = false;
+      const protectedKeys = new Set<string>();
+      protectedKeys.add('id:final-projection');
+      const reconciled = reconcileDeferredAuthoritativeEmptyMessages(
+        [stale, local, finalProjection], protectedKeys);
+      expect(reconciled.length).assertEqual(2);
+      expect(reconciled[0].id).assertEqual(local.id);
+      expect(reconciled[1].id).assertEqual(finalProjection.id);
+      expect(reconciled[1].isStreaming).assertEqual(false);
     });
 
     it('formatsTheComposerActivityClockLikeIos', 0, () => {
