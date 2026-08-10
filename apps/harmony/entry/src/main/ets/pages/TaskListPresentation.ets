@@ -15,6 +15,29 @@ const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
 
+export type TaskListCategory = 'projects' | 'dialogues' | 'automations';
+export type TaskListSortMode = 'default' | 'recency' | 'alphabetic';
+
+/**
+ * 沿用 Harmony 原状态筛选口径：优先识别调度器来源，旧数据再用标题前缀识别。
+ */
+export function taskIsAutomation(session: RemoteSession): boolean {
+  return session.source === 'scheduler' || session.title.startsWith('[Schedule]');
+}
+
+/** 自动化优先于工作区类型，确保三个首页分类互斥。 */
+export function taskListCategory(session: RemoteSession): TaskListCategory {
+  if (taskIsAutomation(session)) return 'automations';
+  if (session.workspaceKind === 'dialogue' || session.workingDir.length === 0) return 'dialogues';
+  return 'projects';
+}
+
+/** 去掉状态筛选后的可见性：默认只看活跃任务，搜索时可找回归档任务。 */
+export function taskVisibleInTaskList(session: RemoteSession, searchActive: boolean): boolean {
+  if (session.status === 'deleted' || session.orcaRole === 'worker') return false;
+  return searchActive || session.status === 'active';
+}
+
 export function taskDisplayTitle(session: RemoteSession): string {
   const title = session.title.trim();
   if (title.length > 0 && title !== DEFAULT_DRAFT_TITLE) {
@@ -90,6 +113,38 @@ export function taskActivityAt(session: RemoteSession): string {
   if (session.userSendAt.length > 0) return session.userSendAt;
   if (session.updatedAt.length > 0) return session.updatedAt;
   return session.createdAt;
+}
+
+/** 字母排序忽略大小写；原文和 id 只承担稳定兜底，不改变主要语义。 */
+export function compareTaskListLabels(left: string, right: string): number {
+  const normalizedLeft = left.trim().toLocaleLowerCase();
+  const normalizedRight = right.trim().toLocaleLowerCase();
+  const normalizedResult = normalizedLeft.localeCompare(normalizedRight);
+  if (normalizedResult !== 0) return normalizedResult;
+  return left.localeCompare(right);
+}
+
+/**
+ * 会话排序口径：
+ * - 最近优先沿用 Mobile / Desktop 的 userSendAt → updatedAt → createdAt；
+ * - 字母排序按用户可见标题；
+ * - 默认排序保留被控端提供的稳定顺序，因此比较器返回相等。
+ */
+export function compareTaskSessionsForList(
+  left: RemoteSession,
+  right: RemoteSession,
+  mode: TaskListSortMode,
+): number {
+  if (mode === 'default') return 0;
+  if (mode === 'recency') {
+    const leftActivity = taskActivityAt(left);
+    const rightActivity = taskActivityAt(right);
+    if (leftActivity !== rightActivity) return leftActivity > rightActivity ? -1 : 1;
+  } else {
+    const titleResult = compareTaskListLabels(taskDisplayTitle(left), taskDisplayTitle(right));
+    if (titleResult !== 0) return titleResult;
+  }
+  return left.id.localeCompare(right.id);
 }
 
 /** 与 Mobile 共享口径：刚刚、分钟、小时、天、周、月、年。 */

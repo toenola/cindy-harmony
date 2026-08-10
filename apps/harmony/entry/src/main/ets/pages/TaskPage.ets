@@ -13,6 +13,7 @@
 
 import { router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
@@ -54,6 +55,7 @@ import {
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_FAST,
+  UI_MOTION_SPINNER_CYCLE,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
@@ -184,6 +186,55 @@ import {
   ToolActionPresentation,
   projectToolUseActions,
 } from '../core/messages/ToolUsePresentation';
+
+const TODO_STATUS_ICON_SIZE = 16;
+const TODO_STATUS_STROKE_WIDTH = 1.5;
+const TODO_STATUS_SPINNER_DASH: number[] = [30, 20];
+const TODO_STATUS_FRAME_RATE: ExpectedFrameRateRange = {
+  min: 60,
+  max: 120,
+  expected: 120,
+};
+
+/** 与其它步骤状态共用 16vp 可见外径；只旋转外层，圆弧几何保持静态。 */
+@Component
+struct TodoRunningStatusIcon {
+  @State rotation: number = 0;
+  private reduceMotion: boolean = false;
+
+  aboutToAppear(): void {
+    try {
+      this.reduceMotion = accessibility.isAnimationReduceEnabledSync();
+    } catch (_err) {
+      this.reduceMotion = false;
+    }
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      Circle()
+        .width(TODO_STATUS_ICON_SIZE)
+        .height(TODO_STATUS_ICON_SIZE)
+        .fill(Color.Transparent)
+        .stroke($r('app.color.text_secondary'))
+        .strokeWidth(TODO_STATUS_STROKE_WIDTH)
+        .strokeDashArray(TODO_STATUS_SPINNER_DASH)
+        .strokeLineCap(LineCapStyle.Round)
+    }
+    .width(TODO_STATUS_ICON_SIZE)
+    .height(TODO_STATUS_ICON_SIZE)
+    .rotate({ angle: this.rotation })
+    .animation({
+      duration: UI_MOTION_SPINNER_CYCLE,
+      curve: Curve.Linear,
+      iterations: -1,
+      expectedFrameRateRange: TODO_STATUS_FRAME_RATE,
+    })
+    .onAppear(() => {
+      if (!this.reduceMotion) this.rotation = 360;
+    })
+  }
+}
 
 /** 活动 work_group 收起态的实时步骤预览行（对齐 Mobile collapsedBody）。 */
 class WorkPreviewRow {
@@ -432,6 +483,8 @@ export struct TaskPageContent {
   @State previewImageUrl: string = '';
   /** 挂起的交互请求（Permission / Ask User / Plan Review）。 */
   @State pendingInteractions: PendingInteraction[] = [];
+  /** Ask User 草稿的页面级响应式快照；Store 的普通 Map 本身不会触发 ArkUI 局部重绘。 */
+  @State askDraftSnapshots: Map<string, AskUserDraft> = new Map();
   /** 多卡时只展示一个 active request；新快照优先保留用户正在处理的卡。 */
   @State activeInteractionRequestId: string = '';
   /** 高风险 Permission 首击只进入确认态；同一 request 的第二击才真正提交。 */
@@ -609,6 +662,13 @@ export struct TaskPageContent {
     const sorted = sortPendingInteractions(
       AppServices.instance.interactions.getPending(this.sessionId));
     this.pendingInteractions = sorted;
+    const askDraftSnapshots: Map<string, AskUserDraft> = new Map();
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i].kind !== 'ask_user_question') continue;
+      const draft = AppServices.instance.interactions.readAskDraft(sorted[i].requestId);
+      if (draft !== null) askDraftSnapshots.set(sorted[i].requestId, draft);
+    }
+    this.askDraftSnapshots = askDraftSnapshots;
     let activeExists = false;
     for (let i = 0; i < sorted.length; i++) {
       if (sorted[i].requestId === this.activeInteractionRequestId) {
@@ -3948,6 +4008,12 @@ export struct TaskPageContent {
       },
       onSend: (): void => this.send(),
       onAbort: (): void => this.abort(),
+      onPreviewImage: (image: ComposerImage): void => {
+        if (image.status !== 'ready' || image.uri.length === 0) return;
+        uiAnimateFastState(this.getUIContext(), () => {
+          this.previewImageUrl = image.uri;
+        });
+      },
       onRemoveImage: (image: ComposerImage): void => this.imageQueue.remove(image),
       onRetryImage: (image: ComposerImage): void => this.imageQueue.retry(image),
       onRemoveFile: (file: ComposerFile): void => this.fileQueue.remove(file),
@@ -6759,35 +6825,32 @@ export struct TaskPageContent {
     Stack({ alignContent: Alignment.Center }) {
       if (status === 'completed') {
         Circle()
-          .width(18)
-          .height(18)
+          .width(TODO_STATUS_ICON_SIZE)
+          .height(TODO_STATUS_ICON_SIZE)
           .fill($r('app.color.text_primary'))
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(uiFontSize(11))
           .fontColor([$r('app.color.bg_card')])
       } else if (status === 'in_progress' && streaming) {
-        LoadingProgress()
-          .width(18)
-          .height(18)
-          .color($r('app.color.text_secondary'))
+        TodoRunningStatusIcon()
       } else if (status === 'in_progress') {
         Circle()
-          .width(16)
-          .height(16)
+          .width(TODO_STATUS_ICON_SIZE)
+          .height(TODO_STATUS_ICON_SIZE)
           .fill(Color.Transparent)
           .stroke($r('app.color.text_secondary'))
-          .strokeWidth(1.5)
+          .strokeWidth(TODO_STATUS_STROKE_WIDTH)
         Circle()
           .width(5)
           .height(5)
           .fill($r('app.color.text_secondary'))
       } else {
         Circle()
-          .width(16)
-          .height(16)
+          .width(TODO_STATUS_ICON_SIZE)
+          .height(TODO_STATUS_ICON_SIZE)
           .fill(Color.Transparent)
           .stroke($r('app.color.text_tertiary'))
-          .strokeWidth(1.5)
+          .strokeWidth(TODO_STATUS_STROKE_WIDTH)
       }
     }
     .width(20)
@@ -8027,7 +8090,22 @@ export struct TaskPageContent {
   }
 
   private askDraft(item: PendingInteraction): AskUserDraft {
+    return this.askDraftSnapshots.get(item.requestId) ?? new AskUserDraft();
+  }
+
+  /** 点击处理使用 Store 返回的副本，避免原地修改 @State Map 中的快照对象。 */
+  private mutableAskDraft(item: PendingInteraction): AskUserDraft {
     return AppServices.instance.interactions.readAskDraft(item.requestId) ?? new AskUserDraft();
+  }
+
+  private saveAskDraft(item: PendingInteraction, draft: AskUserDraft): void {
+    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+    // Store notify 会同步所有 TaskPage；这里再显式换 Map 引用，保证本次点击当帧可见。
+    const snapshot = AppServices.instance.interactions.readAskDraft(item.requestId);
+    const next = new Map(this.askDraftSnapshots);
+    if (snapshot === null) next.delete(item.requestId);
+    else next.set(item.requestId, snapshot);
+    this.askDraftSnapshots = next;
   }
 
   private askCurrentIndex(item: PendingInteraction): number {
@@ -8072,7 +8150,7 @@ export struct TaskPageContent {
   }
 
   private toggleAskSelection(item: PendingInteraction, label: string): void {
-    const draft = this.askDraft(item);
+    const draft = this.mutableAskDraft(item);
     if (!this.askMultiSelect(item)) {
       draft.selectedLabels = [label];
       draft.customInput = '';
@@ -8086,16 +8164,16 @@ export struct TaskPageContent {
       }
     }
     this.recordCurrentAskAnswer(item, draft);
-    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+    this.saveAskDraft(item, draft);
   }
 
   private updateAskCustomInput(item: PendingInteraction, value: string): void {
-    const draft = this.askDraft(item);
+    const draft = this.mutableAskDraft(item);
     draft.customInput = value;
     draft.showCustomInput = value.length > 0;
     if (!this.askMultiSelect(item) && value.length > 0) draft.selectedLabels = [];
     this.recordCurrentAskAnswer(item, draft);
-    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+    this.saveAskDraft(item, draft);
   }
 
   private askCurrentAnswer(item: PendingInteraction): string {
@@ -8181,12 +8259,12 @@ export struct TaskPageContent {
   }
 
   private moveAskQuestion(item: PendingInteraction, delta: number): void {
-    const draft = this.askDraft(item);
+    const draft = this.mutableAskDraft(item);
     this.recordCurrentAskAnswer(item, draft);
     const max = Math.max(0, this.askQuestionCount(item) - 1);
     draft.currentIndex = Math.min(Math.max(draft.currentIndex + delta, 0), max);
     this.restoreAskControls(item, draft);
-    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+    this.saveAskDraft(item, draft);
   }
 
   private askIsLast(item: PendingInteraction): boolean {
@@ -8194,26 +8272,26 @@ export struct TaskPageContent {
   }
 
   private submitAskQuestion(item: PendingInteraction): void {
-    const draft = this.askDraft(item);
+    const draft = this.mutableAskDraft(item);
     const answer = this.answerFromAskDraft(item, draft);
     if (answer.trim().length === 0) return;
     this.recordCurrentAskAnswer(item, draft);
     if (!this.askIsLast(item)) {
       draft.currentIndex += 1;
       this.restoreAskControls(item, draft);
-      AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+      this.saveAskDraft(item, draft);
       return;
     }
     this.resolveInteraction(item, this.askDecisionFromDraft(draft));
   }
 
   private skipAskQuestion(item: PendingInteraction): void {
-    const draft = this.askDraft(item);
+    const draft = this.mutableAskDraft(item);
     draft.answers.set(this.askQuestion(item), '');
     if (!this.askIsLast(item)) {
       draft.currentIndex += 1;
       this.restoreAskControls(item, draft);
-      AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+      this.saveAskDraft(item, draft);
       return;
     }
     this.resolveInteraction(item, this.askDecisionFromDraft(draft));

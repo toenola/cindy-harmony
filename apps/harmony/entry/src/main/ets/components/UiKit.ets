@@ -30,6 +30,8 @@ export const UI_MOTION_INSTANT = 80;
 export const UI_MOTION_FAST = 150;
 export const UI_MOTION_BASE = 200;
 export const UI_MOTION_ENTER = 250;
+/** 功能性加载圆环完整旋转一周的语义周期（DESIGN.md §14.4）。 */
+export const UI_MOTION_SPINNER_CYCLE = 1000;
 
 /** 进入/展开使用的 ease-out 曲线；收起用 EaseIn，位移/尺寸用 EaseInOut。 */
 export const UI_CURVE_ENTER: Curve = Curve.EaseOut;

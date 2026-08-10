@@ -267,7 +267,8 @@ export class InteractionStore {
           const opts = new DlInvokeOptions();
           opts.channel = 'maker:resolve-interaction';
           opts.args = [requestId, decision];
-          await client.invoke(deviceId, opts);
+          const envelope = await client.invoke(deviceId, opts);
+          unwrapInvokeResult(envelope);
           resolved = true;
           break;
         } catch (e) {

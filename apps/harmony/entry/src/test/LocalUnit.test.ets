@@ -11,7 +11,10 @@ import {
   RemoteMessage,
   RemoteSession,
 } from '../main/ets/core/tasks/TaskModels';
-import { RemoteImageRef } from '../main/ets/core/attachments/AttachmentModels';
+import {
+  RemoteImageRef,
+  composerAttachmentRenderKey,
+} from '../main/ets/core/attachments/AttachmentModels';
 import {
   isRetryablePresignStatus,
   isUploadRevisionCurrent,
@@ -56,14 +59,24 @@ import {
   preferIncomingCreatedMessage,
 } from '../main/ets/core/messages/MessageStore';
 import {
+  compareTaskListLabels,
+  compareTaskSessionsForList,
   taskActivityAt,
   taskDisplayTitle,
+  taskIsAutomation,
+  taskListCategory,
   taskPreviewText,
   taskProjectKey,
   taskProjectName,
   taskRelativeTime,
+  taskVisibleInTaskList,
   taskVisibleOnHome,
 } from '../main/ets/pages/TaskListPresentation';
+import {
+  parseTaskListPreferences,
+  serializeTaskListPreferences,
+  TaskListPreferences,
+} from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
   isWideTaskLayout,
   TASK_FOLD_STATUS_FOLDED,
@@ -123,7 +136,11 @@ import {
   sessionScopedPermissionSuggestions,
   sortPendingInteractions,
 } from '../main/ets/core/interactions/InteractionPresentation';
-import { PendingInteraction } from '../main/ets/core/interactions/InteractionStore';
+import {
+  AskUserDraft,
+  InteractionStore,
+  PendingInteraction,
+} from '../main/ets/core/interactions/InteractionStore';
 
 function planToolMessage(
   id: string,
@@ -260,6 +277,26 @@ export default function localUnitTest() {
       expect(evidence.outlineItems[1].title).assertEqual('实现');
     });
 
+    it('publishesAskDraftSelectionsAsClonedSnapshots', 0, () => {
+      const store = new InteractionStore();
+      let changed = 0;
+      const unsubscribe = store.onChanged(() => {
+        changed += 1;
+      });
+      const draft = new AskUserDraft();
+      draft.selectedLabels = ['最近优先'];
+      draft.answers.set('请选择排序方式', '最近优先');
+      store.saveAskDraft('ask-1', draft);
+
+      expect(changed).assertEqual(1);
+      const snapshot = store.readAskDraft('ask-1');
+      expect(snapshot !== null).assertEqual(true);
+      expect(snapshot?.selectedLabels[0]).assertEqual('最近优先');
+      snapshot?.selectedLabels.push('字母排序');
+      expect(store.readAskDraft('ask-1')?.selectedLabels.length).assertEqual(1);
+      unsubscribe();
+    });
+
     it('blocksComposerOnlyForLocallyResolvablePendingInteractions', 0, () => {
       const plugin = new PendingInteraction();
       plugin.requestId = 'plugin';
@@ -303,6 +340,11 @@ export default function localUnitTest() {
       expect(isUploadRevisionCurrent(3, 2, false, true)).assertEqual(false);
       expect(isUploadRevisionCurrent(2, 2, true, true)).assertEqual(false);
       expect(isUploadRevisionCurrent(2, 2, false, false)).assertEqual(false);
+
+      const uploadingKey = composerAttachmentRenderKey('photo://1', 'uploading', 1);
+      expect(composerAttachmentRenderKey('photo://1', 'ready', 1) === uploadingKey).assertEqual(false);
+      expect(composerAttachmentRenderKey('photo://1', 'failed', 1) === uploadingKey).assertEqual(false);
+      expect(composerAttachmentRenderKey('photo://1', 'uploading', 2) === uploadingKey).assertEqual(false);
     });
 
     it('recognizesSchedulerAutomationOrigin', 0, () => {
@@ -1689,6 +1731,105 @@ export default function localUnitTest() {
       expect(taskVisibleOnHome(session)).assertEqual(true);
       session.orcaRole = 'worker';
       expect(taskVisibleOnHome(session)).assertEqual(false);
+    });
+
+    it('classifiesTaskListCategoriesWithAutomationPriority', 0, () => {
+      const project = new RemoteSession();
+      project.title = 'Build Harmony';
+      project.workspaceKind = 'project';
+      project.workingDir = '/work/cindy-harmony';
+      expect(taskListCategory(project)).assertEqual('projects');
+
+      const dialogue = new RemoteSession();
+      dialogue.title = 'Quick question';
+      dialogue.workspaceKind = 'dialogue';
+      dialogue.workingDir = '/tmp/assigned';
+      expect(taskListCategory(dialogue)).assertEqual('dialogues');
+
+      const emptyWorkspace = new RemoteSession();
+      emptyWorkspace.title = 'No workspace';
+      emptyWorkspace.workspaceKind = 'project';
+      emptyWorkspace.workingDir = '';
+      expect(taskListCategory(emptyWorkspace)).assertEqual('dialogues');
+
+      const scheduler = new RemoteSession();
+      scheduler.title = 'Daily check';
+      scheduler.source = 'scheduler';
+      scheduler.workspaceKind = 'project';
+      scheduler.workingDir = '/work/cindy-harmony';
+      expect(taskIsAutomation(scheduler)).assertEqual(true);
+      expect(taskListCategory(scheduler)).assertEqual('automations');
+
+      const legacySchedule = new RemoteSession();
+      legacySchedule.title = '[Schedule] Weekly report';
+      legacySchedule.workspaceKind = 'dialogue';
+      legacySchedule.workingDir = '';
+      expect(taskIsAutomation(legacySchedule)).assertEqual(true);
+      expect(taskListCategory(legacySchedule)).assertEqual('automations');
+
+      const archived = new RemoteSession();
+      archived.status = 'archived';
+      expect(taskVisibleInTaskList(archived, false)).assertEqual(false);
+      expect(taskVisibleInTaskList(archived, true)).assertEqual(true);
+      archived.status = 'deleted';
+      expect(taskVisibleInTaskList(archived, true)).assertEqual(false);
+    });
+
+    it('sortsTaskListByRecencyAlphabetAndSourceDefault', 0, () => {
+      const alpha = new RemoteSession();
+      alpha.id = 'alpha';
+      alpha.title = 'alpha 任务';
+      alpha.userSendAt = '2026-08-01T10:00:00.000Z';
+      const bravo = new RemoteSession();
+      bravo.id = 'bravo';
+      bravo.title = 'Bravo 任务';
+      bravo.userSendAt = '2026-08-01T11:00:00.000Z';
+
+      const recent = [alpha, bravo];
+      recent.sort((left: RemoteSession, right: RemoteSession) =>
+        compareTaskSessionsForList(left, right, 'recency'));
+      expect(recent[0].id).assertEqual('bravo');
+      expect(recent[1].id).assertEqual('alpha');
+
+      const alphabetic = [bravo, alpha];
+      alphabetic.sort((left: RemoteSession, right: RemoteSession) =>
+        compareTaskSessionsForList(left, right, 'alphabetic'));
+      expect(alphabetic[0].id).assertEqual('alpha');
+      expect(alphabetic[1].id).assertEqual('bravo');
+      expect(compareTaskListLabels('alpha', 'Bravo') < 0).assertEqual(true);
+
+      // 默认排序不施加客户端比较，调用方可保留被控端提供的原始稳定顺序。
+      expect(compareTaskSessionsForList(bravo, alpha, 'default')).assertEqual(0);
+    });
+
+    it('persistsAutomationCategoryAndDropsLegacyFilters', 0, () => {
+      const preferences = new TaskListPreferences();
+      preferences.activeListTab = 'automations';
+      preferences.sortMode = 'alphabetic';
+      preferences.searchQuery = '巡检';
+      const serialized = serializeTaskListPreferences(preferences);
+      const roundTrip = parseTaskListPreferences(serialized);
+      expect(roundTrip.activeListTab).assertEqual('automations');
+      expect(roundTrip.sortMode).assertEqual('alphabetic');
+      expect(roundTrip.searchQuery).assertEqual('巡检');
+
+      const invalidSort = parseTaskListPreferences(JSON.stringify({ sortMode: 'unknown' }));
+      expect(invalidSort.sortMode).assertEqual('recency');
+      expect(serializeTaskListPreferences(new TaskListPreferences()).indexOf('sortMode')).assertEqual(-1);
+
+      const legacy = parseTaskListPreferences(JSON.stringify({
+        activeListTab: 'dialogues',
+        statusFilter: 'automation',
+        projectFilterKeys: ['device:/work/app'],
+        agentFilter: 'codex',
+        activityFilter: '7d',
+      }));
+      expect(legacy.activeListTab).assertEqual('automations');
+      const migrated = serializeTaskListPreferences(legacy);
+      expect(migrated.indexOf('statusFilter')).assertEqual(-1);
+      expect(migrated.indexOf('projectFilterKeys')).assertEqual(-1);
+      expect(migrated.indexOf('agentFilter')).assertEqual(-1);
+      expect(migrated.indexOf('activityFilter')).assertEqual(-1);
     });
   });
 }

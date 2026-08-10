@@ -9,11 +9,8 @@ export class TaskListPreferences {
   selectedDeviceId: string = '';
   selectedDeviceName: string = '';
   activeListTab: string = 'projects';
-  statusFilter: string = 'active';
+  sortMode: string = 'recency';
   searchQuery: string = '';
-  projectFilterKeys: string[] = [];
-  agentFilter: string = 'all';
-  activityFilter: string = 'all';
   openProjectKeys: string[] = [];
   fullyExpandedProjectKeys: string[] = [];
   pinnedCollapsed: boolean = true;
@@ -49,18 +46,14 @@ export function parseTaskListPreferences(raw: string): TaskListPreferences {
     out.selectedDeviceId = safeString(record, 'selectedDeviceId', 512);
     out.selectedDeviceName = safeString(record, 'selectedDeviceName', 256);
     const tab = safeString(record, 'activeListTab', 20);
-    if (tab === 'projects' || tab === 'dialogues') out.activeListTab = tab;
-    const status = safeString(record, 'statusFilter', 20);
-    if (status === 'active' || status === 'waiting' || status === 'automation'
-      || status === 'archived' || status === 'all') out.statusFilter = status;
-    out.searchQuery = safeString(record, 'searchQuery', 256);
-    out.projectFilterKeys = safeKeys(record['projectFilterKeys']);
-    const agent = safeString(record, 'agentFilter', 20);
-    if (agent === 'all' || agent === 'cc' || agent === 'codex' || agent === 'pi') out.agentFilter = agent;
-    const activity = safeString(record, 'activityFilter', 20);
-    if (activity === 'all' || activity === '1d' || activity === '7d' || activity === '30d') {
-      out.activityFilter = activity;
+    if (tab === 'projects' || tab === 'dialogues' || tab === 'automations') out.activeListTab = tab;
+    const sortMode = safeString(record, 'sortMode', 20);
+    if (sortMode === 'default' || sortMode === 'recency' || sortMode === 'alphabetic') {
+      out.sortMode = sortMode;
     }
+    // 旧版把自动化放在状态筛选中；升级后迁移到新的一级分类。
+    if (safeString(record, 'statusFilter', 20) === 'automation') out.activeListTab = 'automations';
+    out.searchQuery = safeString(record, 'searchQuery', 256);
     out.openProjectKeys = safeKeys(record['openProjectKeys']);
     out.fullyExpandedProjectKeys = safeKeys(record['fullyExpandedProjectKeys']);
     if (typeof record['pinnedCollapsed'] === 'boolean') out.pinnedCollapsed = record['pinnedCollapsed'] as boolean;
@@ -75,11 +68,8 @@ export function serializeTaskListPreferences(value: TaskListPreferences): string
   if (value.selectedDeviceId.length > 0) out['selectedDeviceId'] = value.selectedDeviceId;
   if (value.selectedDeviceName.length > 0) out['selectedDeviceName'] = value.selectedDeviceName;
   if (value.activeListTab !== 'projects') out['activeListTab'] = value.activeListTab;
-  if (value.statusFilter !== 'active') out['statusFilter'] = value.statusFilter;
+  if (value.sortMode !== 'recency') out['sortMode'] = value.sortMode;
   if (value.searchQuery.length > 0) out['searchQuery'] = value.searchQuery;
-  if (value.projectFilterKeys.length > 0) out['projectFilterKeys'] = value.projectFilterKeys;
-  if (value.agentFilter !== 'all') out['agentFilter'] = value.agentFilter;
-  if (value.activityFilter !== 'all') out['activityFilter'] = value.activityFilter;
   if (value.openProjectKeys.length > 0) out['openProjectKeys'] = value.openProjectKeys;
   if (value.fullyExpandedProjectKeys.length > 0) out['fullyExpandedProjectKeys'] = value.fullyExpandedProjectKeys;
   if (!value.pinnedCollapsed) out['pinnedCollapsed'] = false;

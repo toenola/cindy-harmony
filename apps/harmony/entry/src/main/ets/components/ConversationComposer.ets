@@ -1,5 +1,8 @@
 import { promptAction } from '@kit.ArkUI';
-import { RemoteImageRef } from '../core/attachments/AttachmentModels';
+import {
+  RemoteImageRef,
+  composerAttachmentRenderKey,
+} from '../core/attachments/AttachmentModels';
 import { ComposerFile } from '../core/attachments/ComposerFileQueue';
 import { ComposerAtomPresentation } from '../core/messages/ComposerDocument';
 import {
@@ -66,6 +69,7 @@ export struct ConversationComposer {
   onPlanToggle: () => void = () => {};
   onSend: () => void = () => {};
   onAbort: () => void = () => {};
+  onPreviewImage: (image: ComposerImage) => void = () => {};
   onRemoveImage: (image: ComposerImage) => void = () => {};
   onRetryImage: (image: ComposerImage) => void = () => {};
   onRemoveFile: (file: ComposerFile) => void = () => {};
@@ -126,6 +130,9 @@ export struct ConversationComposer {
           .height(56)
           .borderRadius(UI_RADIUS_CONTROL)
           .objectFit(ImageFit.Cover)
+          .onClick(() => {
+            if (image.status === 'ready') this.onPreviewImage(image);
+          })
         Stack({ alignContent: Alignment.Center }) {
           SymbolGlyph($r('sys.symbol.xmark'))
             .fontSize(10)
@@ -312,7 +319,8 @@ export struct ConversationComposer {
               ListItem() {
                 this.composerImageItem(image)
               }
-            }, (image: ComposerImage) => image.uri)
+            }, (image: ComposerImage) => composerAttachmentRenderKey(
+              image.uri, image.status, image.uploadRevision))
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
@@ -324,7 +332,8 @@ export struct ConversationComposer {
           List({ space: 0 }) {
             ForEach(this.files, (file: ComposerFile) => {
               ListItem() { this.composerFileItem(file) }
-            }, (file: ComposerFile) => file.uri)
+            }, (file: ComposerFile) => composerAttachmentRenderKey(
+              file.uri, file.status, file.uploadRevision))
           }
           .listDirection(Axis.Horizontal)
           .width('100%')

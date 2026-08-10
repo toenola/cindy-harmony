@@ -65,6 +65,18 @@ export class ImageAttachmentCandidate {
 /** 最大附件字节数（对齐 MOBILE_MAX_ATTACHMENT_BYTES，30MB）。 */
 export const MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 
+/**
+ * Composer 附件使用稳定 uri 标识同一条目，同时把上传状态纳入渲染身份。
+ * ArkUI ForEach 只有 key 变化时才会可靠重建原地更新过的附件节点。
+ */
+export function composerAttachmentRenderKey(
+  uri: string,
+  status: string,
+  uploadRevision: number,
+): string {
+  return `${uri}#${uploadRevision}#${status}`;
+}
+
 export function isImageCategory(category: string): boolean {
   return category === 'image';
 }

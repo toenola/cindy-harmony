@@ -8,6 +8,7 @@
  * 胶囊交互元素；行点击使用系统 clickEffect 弹性反馈，菜单淡入淡出。
  */
 
+import { accessibility } from '@kit.AccessibilityKit';
 import { display, promptAction, router } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
@@ -22,18 +23,24 @@ import {
   taskSplitRatioForDrag,
 } from './TaskSplitLayout';
 import {
+  compareTaskListLabels,
+  compareTaskSessionsForList,
   taskActivityAt,
   taskDisplayTitle,
+  taskListCategory,
+  TaskListCategory,
+  TaskListSortMode,
   taskPreviewText,
   taskProjectKey,
   taskProjectName,
   taskRelativeTime,
+  taskVisibleInTaskList,
 } from './TaskListPresentation';
 import {
-  UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
+  UI_MOTION_BASE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
@@ -45,14 +52,14 @@ import {
 } from '../components/UiKit';
 
 const LIST_INSET = 16;
-const TASK_DAY_MS = 24 * 60 * 60 * 1000;
+const LIST_TAB_SWIPER_ID = 'task-list-tab-swiper';
+const LIST_TAB_FRAME_RATE: ExpectedFrameRateRange = {
+  min: 60,
+  max: 120,
+  expected: 120,
+};
 /** 项目组内联展示的任务数上限，超出后由「查看全部」展开。 */
 const PROJECT_INLINE_LIMIT = 5;
-
-type TaskAgentFilter = 'all' | 'cc' | 'codex' | 'pi';
-type TaskActivityFilter = 'all' | '1d' | '7d' | '30d';
-type TaskListTab = 'projects' | 'dialogues';
-type TaskStatusFilter = 'active' | 'waiting' | 'automation' | 'archived' | 'all';
 
 class TaskListEntry {
   key: string = '';
@@ -78,12 +85,9 @@ struct TaskListPage {
   @State selectedSessionId: string = '';
   @State selectedMessageClientId: string = '';
   @State scopeMenuOpen: boolean = false;
-  @State filterMenuOpen: boolean = false;
-  @State projectFilterKeys: string[] = [];
-  @State agentFilter: TaskAgentFilter = 'all';
-  @State activityFilter: TaskActivityFilter = 'all';
-  @State activeListTab: TaskListTab = 'projects';
-  @State statusFilter: TaskStatusFilter = 'active';
+  @State sortMenuOpen: boolean = false;
+  @State activeListTab: TaskListCategory = 'projects';
+  @State sortMode: TaskListSortMode = 'recency';
   @State searchOpen: boolean = false;
   @State searchQuery: string = '';
   @State refreshing: boolean = false;
@@ -114,6 +118,9 @@ struct TaskListPage {
   private dividerTouchStartX: number = 0;
   private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   private foldStatusListening: boolean = false;
+  private listTabSwiperController: SwiperController = new SwiperController();
+  private listTabSwiperAppeared: boolean = false;
+  private initialListTabIndex: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
     this.foldStatus = status;
     this.ensureWideSelection();
@@ -128,6 +135,7 @@ struct TaskListPage {
       this.routeParamsInitialized = true;
     }
     this.hydratePreferences();
+    this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
     this.observeFoldStatus();
 
@@ -161,9 +169,10 @@ struct TaskListPage {
       this.clockTimer = -1;
     }
     this.stopFoldStatusObservation();
+    this.listTabSwiperAppeared = false;
     void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
-    this.filterMenuOpen = false;
+    this.sortMenuOpen = false;
   }
 
   private hydratePreferences(): void {
@@ -172,13 +181,10 @@ struct TaskListPage {
     const prefs = AppServices.instance.taskListPreferences.read();
     if (this.selectedDeviceId.length === 0) this.selectedDeviceId = prefs.selectedDeviceId;
     this.selectedDeviceNameHint = prefs.selectedDeviceName;
-    this.activeListTab = prefs.activeListTab as TaskListTab;
-    this.statusFilter = prefs.statusFilter as TaskStatusFilter;
+    this.activeListTab = prefs.activeListTab as TaskListCategory;
+    this.sortMode = prefs.sortMode as TaskListSortMode;
     this.searchQuery = prefs.searchQuery;
     this.searchOpen = prefs.searchQuery.length > 0;
-    this.projectFilterKeys = prefs.projectFilterKeys.slice();
-    this.agentFilter = prefs.agentFilter as TaskAgentFilter;
-    this.activityFilter = prefs.activityFilter as TaskActivityFilter;
     this.savedOpenProjectKeys = prefs.openProjectKeys.slice();
     this.expandedProjectKeys = prefs.fullyExpandedProjectKeys.slice();
     this.pinnedCollapsed = prefs.pinnedCollapsed;
@@ -190,11 +196,8 @@ struct TaskListPage {
     prefs.selectedDeviceId = this.selectedDeviceId;
     prefs.selectedDeviceName = this.selectedDeviceLabel();
     prefs.activeListTab = this.activeListTab;
-    prefs.statusFilter = this.statusFilter;
+    prefs.sortMode = this.sortMode;
     prefs.searchQuery = this.searchQuery.slice(0, 256);
-    prefs.projectFilterKeys = this.projectFilterKeys.slice();
-    prefs.agentFilter = this.agentFilter;
-    prefs.activityFilter = this.activityFilter;
     const groups = this.projectGroups();
     for (let i = 0; i < groups.length; i++) {
       if (!this.projectCollapsed(groups[i].key)) prefs.openProjectKeys.push(groups[i].key);
@@ -246,12 +249,13 @@ struct TaskListPage {
         next.push(entry);
       }
     }
-    next.sort((a: TaskListEntry, b: TaskListEntry) => {
-      const aTime = taskActivityAt(a.session);
-      const bTime = taskActivityAt(b.session);
-      if (aTime === bTime) return a.key < b.key ? -1 : 1;
-      return aTime > bTime ? -1 : 1;
-    });
+    if (this.sortMode !== 'default') {
+      next.sort((a: TaskListEntry, b: TaskListEntry) => {
+        const result = compareTaskSessionsForList(a.session, b.session, this.sortMode);
+        if (result !== 0) return result;
+        return a.key.localeCompare(b.key);
+      });
+    }
     this.devices = devices;
     this.entries = next;
     this.collapseProjectGroupsOnce();
@@ -283,10 +287,12 @@ struct TaskListPage {
     if (scoped.length === 0) {
       this.selectedSessionDeviceId = '';
       this.selectedSessionId = '';
+      this.selectedMessageClientId = '';
       return;
     }
     this.selectedSessionDeviceId = scoped[0].deviceId;
     this.selectedSessionId = scoped[0].session.id;
+    this.selectedMessageClientId = '';
   }
 
   private handleAreaChange(_oldArea: Area, newArea: Area): void {
@@ -333,18 +339,25 @@ struct TaskListPage {
     if (intent === null) return;
     const devices = AppServices.instance.tasks.deviceList;
     let deviceId = '';
+    let targetSession: RemoteSession | null = null;
     for (let i = 0; i < devices.length && deviceId.length === 0; i++) {
       const sessions = AppServices.instance.tasks.getSessions(devices[i].deviceId);
-      if (sessions.some((session: RemoteSession) => session.id === intent.sessionId)) {
+      for (let sessionIndex = 0; sessionIndex < sessions.length; sessionIndex++) {
+        if (sessions[sessionIndex].id !== intent.sessionId) continue;
         deviceId = devices[i].deviceId;
+        targetSession = sessions[sessionIndex];
+        break;
       }
     }
-    if (deviceId.length === 0) return;
+    if (deviceId.length === 0 || targetSession === null) return;
     AppServices.instance.consumePendingDeepLink();
     if (this.splitLayoutEnabled()) {
+      this.setActiveListTab(taskListCategory(targetSession), false);
+      if (this.selectedDeviceId.length > 0) this.selectedDeviceId = deviceId;
       this.selectedSessionDeviceId = deviceId;
       this.selectedSessionId = intent.sessionId;
       this.selectedMessageClientId = intent.messageClientId;
+      this.persistPreferences();
       return;
     }
     router.pushUrl({
@@ -357,14 +370,57 @@ struct TaskListPage {
     });
   }
 
-  private selectListTab(tab: TaskListTab): void {
+  private selectListTab(tab: TaskListCategory): void {
     if (this.activeListTab === tab) return;
-    uiAnimateState(this.getUIContext(), () => {
-      this.activeListTab = tab;
-    });
+    this.setActiveListTab(tab, true);
     this.ensureWideSelection();
     this.persistPreferences();
-    this.persistPreferences();
+  }
+
+  private setActiveListTab(tab: TaskListCategory, animate: boolean): void {
+    const index = this.listTabIndex(tab);
+    this.activeListTab = tab;
+    if (!this.listTabSwiperAppeared) {
+      this.initialListTabIndex = index;
+      return;
+    }
+    this.listTabSwiperController.changeIndex(
+      index,
+      animate && this.listTabIndicatorDuration() > 0,
+    );
+  }
+
+  private listTabIndex(tab: TaskListCategory): number {
+    if (tab === 'dialogues') return 1;
+    if (tab === 'automations') return 2;
+    return 0;
+  }
+
+  private listTabIndicatorTranslateX(): string {
+    if (this.activeListTab === 'dialogues') return '100%';
+    if (this.activeListTab === 'automations') return '200%';
+    return '0%';
+  }
+
+  private listTabIndicatorDuration(): number {
+    try {
+      return accessibility.isAnimationReduceEnabledSync() ? 0 : UI_MOTION_BASE;
+    } catch (_err) {
+      return UI_MOTION_BASE;
+    }
+  }
+
+  private handleListTabSwiperAppear(): void {
+    this.listTabSwiperAppeared = true;
+    this.listTabSwiperController.changeIndex(this.listTabIndex(this.activeListTab), false);
+    try {
+      const scenes = this.getUIContext().requireDynamicSyncScene(LIST_TAB_SWIPER_ID);
+      for (let i = 0; i < scenes.length; i++) {
+        scenes[i].setFrameRateRange(LIST_TAB_FRAME_RATE);
+      }
+    } catch (_err) {
+      // 不支持动态帧率场景的设备仍使用系统原生 Swiper 动画。
+    }
   }
 
   private handleDividerTouch(event: TouchEvent): void {
@@ -429,15 +485,8 @@ struct TaskListPage {
 
   private openDeviceScopeMenu(): void {
     this.animateMenu(() => {
-      this.filterMenuOpen = false;
+      this.sortMenuOpen = false;
       this.scopeMenuOpen = true;
-    });
-  }
-
-  private openFilterMenu(): void {
-    this.animateMenu(() => {
-      this.scopeMenuOpen = false;
-      this.filterMenuOpen = !this.filterMenuOpen;
     });
   }
 
@@ -447,18 +496,36 @@ struct TaskListPage {
     });
   }
 
-  private closeFilterMenu(): void {
+  private openSortMenu(): void {
     this.animateMenu(() => {
-      this.filterMenuOpen = false;
+      this.scopeMenuOpen = false;
+      this.sortMenuOpen = true;
     });
+  }
+
+  private closeSortMenu(): void {
+    this.animateMenu(() => {
+      this.sortMenuOpen = false;
+    });
+  }
+
+  private selectSortMode(mode: TaskListSortMode): void {
+    this.animateMenu(() => {
+      this.sortMode = mode;
+      this.sortMenuOpen = false;
+    });
+    this.refreshProjection();
+    this.persistPreferences();
+  }
+
+  private sortMenuTop(): number {
+    return 60 + (this.connectionStatus === 'online' ? 0 : 36) + 52;
   }
 
   private selectDevice(deviceId: string): void {
     this.animateMenu(() => {
       this.selectedDeviceId = deviceId;
-      this.projectFilterKeys = [];
       this.scopeMenuOpen = false;
-      this.filterMenuOpen = false;
     });
     this.ensureWideSelection();
     this.persistPreferences();
@@ -487,39 +554,17 @@ struct TaskListPage {
   private scopedEntries(): TaskListEntry[] {
     const source = this.deviceScopedEntries();
     const out: TaskListEntry[] = [];
-    const activityDays = this.activityFilterDays();
     for (let i = 0; i < source.length; i++) {
       const entry = source[i];
-      const session = entry.session;
-      if (!this.entryMatchesStatus(entry) || !this.entryMatchesSearch(entry)) continue;
-      const isDialogue = session.workspaceKind === 'dialogue' || session.workingDir.length === 0;
-      if (this.projectFilterKeys.length > 0) {
-        if (isDialogue || this.projectFilterKeys.indexOf(taskProjectKey(entry.deviceId, session.workingDir)) < 0) {
-          continue;
-        }
-      }
-      if (this.agentFilter !== 'all' && session.agentKind !== this.agentFilter) continue;
-      if (activityDays > 0) {
-        const activityAt = Date.parse(taskActivityAt(session));
-        if (Number.isFinite(activityAt) && this.now - activityAt > activityDays * TASK_DAY_MS) continue;
-      }
+      if (!this.entryVisibleInList(entry) || !this.entryMatchesSearch(entry)) continue;
       out.push(entry);
     }
     return out;
   }
 
-  private entryMatchesStatus(entry: TaskListEntry): boolean {
-    const session = entry.session;
-    if (this.statusFilter === 'all') return session.status !== 'deleted';
-    if (this.statusFilter === 'archived') return session.status === 'archived';
-    if (session.status !== 'active') return false;
-    if (this.statusFilter === 'automation') {
-      return session.source === 'scheduler' || session.title.startsWith('[Schedule]');
-    }
-    if (this.statusFilter === 'waiting') {
-      return AppServices.instance.interactions.getPending(session.id).length > 0;
-    }
-    return true;
+  private entryVisibleInList(entry: TaskListEntry): boolean {
+    // 状态筛选移除后，归档任务默认不混入列表，但仍可通过当前分类的搜索找到。
+    return taskVisibleInTaskList(entry.session, this.searchQuery.trim().length > 0);
   }
 
   private entryMatchesSearch(entry: TaskListEntry): boolean {
@@ -540,30 +585,8 @@ struct TaskListPage {
     return haystack.indexOf(query) >= 0;
   }
 
-  private activityFilterDays(): number {
-    if (this.activityFilter === '1d') return 1;
-    if (this.activityFilter === '7d') return 7;
-    if (this.activityFilter === '30d') return 30;
-    return 0;
-  }
-
-  private taskFilterActive(): boolean {
-    return this.projectFilterKeys.length > 0
-      || this.agentFilter !== 'all'
-      || this.activityFilter !== 'all'
-      || this.statusFilter !== 'active'
-      || this.searchQuery.trim().length > 0;
-  }
-
-  private selectStatusFilter(filter: TaskStatusFilter): void {
-    if (this.statusFilter === filter) return;
-    uiAnimateState(this.getUIContext(), () => {
-      this.statusFilter = filter;
-      this.selectedEntryKeys = [];
-      this.bulkMode = false;
-    });
-    this.ensureWideSelection();
-    this.persistPreferences();
+  private taskSearchActive(): boolean {
+    return this.searchQuery.trim().length > 0;
   }
 
   private toggleSearch(): void {
@@ -704,6 +727,7 @@ struct TaskListPage {
       if (entry.key === this.selectedTaskKey()) {
         this.selectedSessionDeviceId = '';
         this.selectedSessionId = '';
+        this.selectedMessageClientId = '';
       }
       this.closeSessionActions();
     }
@@ -812,77 +836,14 @@ struct TaskListPage {
     }
   }
 
-  private projectFilterGroups(): TaskProjectGroup[] {
-    return this.projectGroupsFrom(this.deviceScopedEntries());
-  }
-
-  private setProjectFilterAll(): void {
-    this.projectFilterKeys = [];
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private toggleProjectFilter(key: string): void {
-    if (this.projectFilterKeys.length === 0) {
-      this.projectFilterKeys = [key];
-    } else if (this.projectFilterKeys.indexOf(key) >= 0) {
-      this.projectFilterKeys = this.projectFilterKeys.filter((value: string) => value !== key);
-    } else {
-      this.projectFilterKeys = this.projectFilterKeys.concat([key]);
-    }
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private setAgentFilter(filter: TaskAgentFilter): void {
-    this.agentFilter = filter;
-    this.closeFilterMenu();
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private setActivityFilter(filter: TaskActivityFilter): void {
-    this.activityFilter = filter;
-    this.closeFilterMenu();
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private clearTaskFilters(): void {
-    this.projectFilterKeys = [];
-    this.agentFilter = 'all';
-    this.activityFilter = 'all';
-    this.statusFilter = 'active';
-    this.searchQuery = '';
-    this.closeFilterMenu();
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private projectFilterLabel(): string {
-    if (this.projectFilterKeys.length === 0) return '全部项目';
-    return `${this.projectFilterKeys.length} 个项目`;
-  }
-
-  private agentFilterLabel(): string {
-    if (this.agentFilter === 'cc') return 'Claude Code';
-    if (this.agentFilter === 'codex') return 'Codex';
-    if (this.agentFilter === 'pi') return 'Pi';
-    return '全部代理';
-  }
-
-  private activityFilterLabel(): string {
-    if (this.activityFilter === '1d') return '最近一天';
-    if (this.activityFilter === '7d') return '最近七天';
-    if (this.activityFilter === '30d') return '最近三十天';
-    return '全部时间';
-  }
-
-  private pinnedEntries(): TaskListEntry[] {
+  private pinnedEntries(category: TaskListCategory): TaskListEntry[] {
     const out: TaskListEntry[] = [];
     const scoped = this.scopedEntries();
     for (let i = 0; i < scoped.length; i++) {
-      if (scoped[i].session.pinnedAt.length > 0) out.push(scoped[i]);
+      if (scoped[i].session.pinnedAt.length > 0
+        && taskListCategory(scoped[i].session) === category) {
+        out.push(scoped[i]);
+      }
     }
     return out;
   }
@@ -905,8 +866,7 @@ struct TaskListPage {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       const session = entry.session;
-      // dialogue 会话即使有自动分配的 workingDir，也必须留在「对话」区。
-      if (session.workspaceKind === 'dialogue' || session.workingDir.length === 0) continue;
+      if (taskListCategory(session) !== 'projects') continue;
       const key = taskProjectKey(entry.deviceId, session.workingDir);
       let group = groups.get(key);
       if (group === undefined) {
@@ -922,10 +882,17 @@ struct TaskListPage {
     }
     const out: TaskProjectGroup[] = [];
     groups.forEach((group: TaskProjectGroup) => out.push(group));
-    out.sort((a: TaskProjectGroup, b: TaskProjectGroup) => {
-      if (a.latestActivityAt === b.latestActivityAt) return a.key < b.key ? -1 : 1;
-      return a.latestActivityAt > b.latestActivityAt ? -1 : 1;
-    });
+    if (this.sortMode !== 'default') {
+      out.sort((a: TaskProjectGroup, b: TaskProjectGroup) => {
+        if (this.sortMode === 'alphabetic') {
+          const titleResult = compareTaskListLabels(a.title, b.title);
+          if (titleResult !== 0) return titleResult;
+        } else if (a.latestActivityAt !== b.latestActivityAt) {
+          return a.latestActivityAt > b.latestActivityAt ? -1 : 1;
+        }
+        return a.key.localeCompare(b.key);
+      });
+    }
     return out;
   }
 
@@ -933,22 +900,34 @@ struct TaskListPage {
     const out: TaskListEntry[] = [];
     const entries = this.regularEntries();
     for (let i = 0; i < entries.length; i++) {
-      const session = entries[i].session;
-      if (session.workspaceKind === 'dialogue' || session.workingDir.length === 0) {
-        out.push(entries[i]);
-      }
+      if (taskListCategory(entries[i].session) === 'dialogues') out.push(entries[i]);
     }
     return out;
   }
 
-  /** 当前 Tab 可见的任务；置顶任务独立展示，因此在两个 Tab 中都保持可达。 */
+  private automationEntries(): TaskListEntry[] {
+    const out: TaskListEntry[] = [];
+    const entries = this.regularEntries();
+    for (let i = 0; i < entries.length; i++) {
+      if (taskListCategory(entries[i].session) === 'automations') out.push(entries[i]);
+    }
+    return out;
+  }
+
+  private flatCategoryEntries(category: TaskListCategory): TaskListEntry[] {
+    if (category === 'dialogues') return this.dialogueEntries();
+    if (category === 'automations') return this.automationEntries();
+    return [];
+  }
+
+  /** 当前分类可见的任务；置顶任务只出现在自身所属分类。 */
   private activeListEntries(): TaskListEntry[] {
     const out: TaskListEntry[] = [];
-    const pinned = this.pinnedEntries();
+    const pinned = this.pinnedEntries(this.activeListTab);
     for (let i = 0; i < pinned.length; i++) out.push(pinned[i]);
-    if (this.activeListTab === 'dialogues') {
-      const dialogues = this.dialogueEntries();
-      for (let i = 0; i < dialogues.length; i++) out.push(dialogues[i]);
+    if (this.activeListTab !== 'projects') {
+      const flatEntries = this.flatCategoryEntries(this.activeListTab);
+      for (let i = 0; i < flatEntries.length; i++) out.push(flatEntries[i]);
       return out;
     }
     const groups = this.projectGroups();
@@ -985,6 +964,11 @@ struct TaskListPage {
       this.collapsedProjectKeys = keys;
     });
     this.persistPreferences();
+  }
+
+  private toggleAllProjectsFromMenu(): void {
+    this.closeSortMenu();
+    this.toggleAllProjects();
   }
 
   private projectCollapsed(key: string): boolean {
@@ -1035,7 +1019,7 @@ struct TaskListPage {
 
   private emptyTitle(): string {
     if (this.connectionStatus === 'connecting') return '正在连接电脑';
-    if (this.taskFilterActive()) return '没有符合条件的任务';
+    if (this.taskSearchActive()) return '没有找到相关任务';
     if (this.devices.length === 0) return '还没有可控制的电脑';
     if (this.availableDeviceCount() === 0) return '电脑当前不可用';
     return '暂无任务';
@@ -1043,27 +1027,28 @@ struct TaskListPage {
 
   private emptyCopy(): string {
     if (this.connectionStatus === 'connecting') return '连接后将自动同步任务';
-    if (this.taskFilterActive()) return '可以调整项目、代理或最近活动筛选';
+    if (this.taskSearchActive()) return '换个关键词试试';
     if (this.devices.length === 0) return '请确认电脑端 Cindy 已登录并开启远程控制';
     if (this.availableDeviceCount() === 0) return '请将电脑上线并开启远程控制';
     if (this.selectedDeviceId.length > 0) return '这台电脑当前没有任务';
     return '新任务会显示在这里';
   }
 
-  private activeTabEmptyTitle(): string {
-    if (this.taskFilterActive()) {
-      return this.activeListTab === 'projects' ? '没有符合条件的项目任务' : '没有符合条件的对话任务';
+  private activeTabEmptyTitle(category: TaskListCategory): string {
+    if (category === 'projects') {
+      return this.taskSearchActive() ? '没有找到相关项目任务' : '暂无项目任务';
     }
-    return this.activeListTab === 'projects' ? '暂无项目任务' : '暂无对话任务';
+    if (category === 'dialogues') {
+      return this.taskSearchActive() ? '没有找到相关对话任务' : '暂无对话任务';
+    }
+    return this.taskSearchActive() ? '没有找到相关自动化' : '暂无自动化';
   }
 
-  private activeTabEmptyCopy(): string {
-    if (this.taskFilterActive()) {
-      return this.activeListTab === 'projects'
-        ? '可以调整项目、代理或最近活动筛选'
-        : '项目筛选不适用于对话，可以清除筛选后查看';
-    }
-    return this.activeListTab === 'projects' ? '新建项目任务后会显示在这里' : '新建对话任务后会显示在这里';
+  private activeTabEmptyCopy(category: TaskListCategory): string {
+    if (this.taskSearchActive()) return '换个关键词试试';
+    if (category === 'projects') return '新建项目任务后会显示在这里';
+    if (category === 'dialogues') return '新建对话任务后会显示在这里';
+    return '自动化运行后会显示在这里';
   }
 
   build() {
@@ -1085,8 +1070,8 @@ struct TaskListPage {
       if (this.scopeMenuOpen) {
         this.scopeMenuLayer()
       }
-      if (this.filterMenuOpen) {
-        this.filterMenuLayer()
+      if (this.sortMenuOpen) {
+        this.sortMenuLayer()
       }
       if (this.actionEntryKey.length > 0) {
         this.sessionActionLayer()
@@ -1115,25 +1100,42 @@ struct TaskListPage {
       if (this.searchOpen) {
         this.taskSearchField()
       }
-      this.taskStatusFilters()
-      // 不再外加 Stack/Box 等套层。原来的
-      // `Stack(...) { this.taskList() }.layoutWeight(1)` 即使改用默认
-      // TopStart 也会在折叠屏窄列里让首条 ListItem 漂到中段，原因是
-      // Stack 子项的 layoutWeight 在该 viewport 下与外层 Column 的
-      // flex 接力出现对齐残留。把"有/无数据"两条分支各做成自包含
-      // .layoutWeight(1) 的子节点直接挂到外层 Column，依靠 Column
-      // 的 flex 自然按剩余空间撑开，ListItem 从顶部 padding(top: 8)
-      // 处开始排列，不再被强制居中。
-      if (this.scopedEntries().length === 0) {
-        this.buildTaskListEmpty()
-      } else {
-        this.buildTaskListEntries()
+      Swiper(this.listTabSwiperController) {
+        this.taskListTabPage('projects')
+        this.taskListTabPage('dialogues')
+        this.taskListTabPage('automations')
       }
+      .id(LIST_TAB_SWIPER_ID)
+      .index(this.initialListTabIndex)
+      .indicator(false)
+      .loop(false)
+      .disableSwipe(true)
+      .cachedCount(2)
+      .duration(this.listTabIndicatorDuration())
+      .curve(UI_CURVE_MOVE)
+      .layoutWeight(1)
+      .width('100%')
+      .backgroundColor($r('app.color.bg_page'))
+      .onAppear(() => this.handleListTabSwiperAppear())
     }
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+  }
+
+  @Builder
+  taskListTabPage(category: TaskListCategory) {
+    Column() {
+      if (this.scopedEntries().length === 0) {
+        this.buildTaskListEmpty()
+      } else {
+        this.buildTaskListEntries(category)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.bg_page'))
   }
 
   @Builder
@@ -1279,24 +1281,28 @@ struct TaskListPage {
   @Builder
   taskListTabs() {
     Row({ space: 8 }) {
-      Button() {
-        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(15)
-          .fontColor([this.taskFilterActive()
-            ? $r('app.color.accent')
-            : $r('app.color.text_secondary')])
-      }
-      .type(ButtonType.Circle)
-      .width(36)
-      .height(36)
-      .padding(0)
-      .backgroundColor($r('app.color.bg_chip'))
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .onClick(() => this.openFilterMenu())
+      Stack({ alignContent: Alignment.Start }) {
+        Row()
+          .width('33.3333%')
+          .height(34)
+          .backgroundColor($r('app.color.task_list_group_surface'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_PILL)
+          .translate({ x: this.listTabIndicatorTranslateX() })
+          .animation({
+            duration: this.listTabIndicatorDuration(),
+            curve: UI_CURVE_MOVE,
+            expectedFrameRateRange: LIST_TAB_FRAME_RATE,
+          })
+          .hitTestBehavior(HitTestMode.None)
 
-      Row({ space: 2 }) {
-        this.listTabButton('项目', 'projects')
-        this.listTabButton('对话', 'dialogues')
+        Row() {
+          this.listTabButton('项目', 'projects')
+          this.listTabButton('对话', 'dialogues')
+          this.listTabButton('自动化', 'automations')
+        }
+        .width('100%')
+        .height('100%')
       }
       .layoutWeight(1)
       .height(40)
@@ -1305,18 +1311,9 @@ struct TaskListPage {
       .borderRadius(UI_RADIUS_PILL)
 
       Button() {
-        Stack({ alignContent: Alignment.Center }) {
-          SymbolGlyph($r('sys.symbol.chevron_up'))
-            .fontSize(9)
-            .fontColor([$r('app.color.text_secondary')])
-            .translate({ y: -3.5 })
-          SymbolGlyph($r('sys.symbol.chevron_down'))
-            .fontSize(9)
-            .fontColor([$r('app.color.text_secondary')])
-            .translate({ y: 3.5 })
-        }
-        .width(16)
-        .height(18)
+        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
+          .fontSize(17)
+          .fontColor([$r('app.color.text_secondary')])
       }
       .type(ButtonType.Circle)
       .width(36)
@@ -1324,9 +1321,8 @@ struct TaskListPage {
       .padding(0)
       .backgroundColor($r('app.color.bg_chip'))
       .clickEffect(UI_ICON_CLICK_EFFECT)
-      .enabled(this.activeListTab === 'projects' && this.projectGroups().length > 0)
-      .opacity(this.activeListTab === 'projects' ? 1 : 0)
-      .onClick(() => this.toggleAllProjects())
+      .accessibilityText('排序')
+      .onClick(() => this.openSortMenu())
     }
     .width('100%')
     .height(56)
@@ -1335,7 +1331,7 @@ struct TaskListPage {
   }
 
   @Builder
-  listTabButton(label: string, tab: TaskListTab) {
+  listTabButton(label: string, tab: TaskListCategory) {
     Button() {
       Text(label)
         .fontSize(14)
@@ -1348,15 +1344,9 @@ struct TaskListPage {
     .layoutWeight(1)
     .height(34)
     .padding(0)
-    .backgroundColor(this.activeListTab === tab
-      ? $r('app.color.task_list_group_surface')
-      : Color.Transparent)
-    .border({
-      width: this.activeListTab === tab ? 1 : 0,
-      color: $r('app.color.border'),
-    })
+    .backgroundColor(Color.Transparent)
     .borderRadius(UI_RADIUS_PILL)
-    .clickEffect(UI_CLICK_EFFECT)
+    .stateEffect(false)
     .onClick(() => this.selectListTab(tab))
   }
 
@@ -1408,39 +1398,6 @@ struct TaskListPage {
   }
 
   @Builder
-  taskStatusFilters() {
-    Row({ space: 4 }) {
-      this.statusFilterButton('活跃', 'active')
-      this.statusFilterButton('待处理', 'waiting')
-      this.statusFilterButton('自动化', 'automation')
-      this.statusFilterButton('归档', 'archived')
-      this.statusFilterButton('全部', 'all')
-    }
-    .width('100%')
-    .height(44)
-    .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 8 })
-    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
-  }
-
-  @Builder
-  statusFilterButton(label: string, filter: TaskStatusFilter) {
-    Button(label)
-      .type(ButtonType.Normal)
-      .layoutWeight(1)
-      .height(32)
-      .padding({ left: 2, right: 2 })
-      .fontSize(12)
-      .fontWeight(this.statusFilter === filter ? FontWeight.Medium : FontWeight.Normal)
-      .fontColor(this.statusFilter === filter
-        ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
-      .backgroundColor(this.statusFilter === filter
-        ? $r('app.color.chat_cta') : Color.Transparent)
-      .borderRadius(UI_RADIUS_PILL)
-      .clickEffect(UI_CLICK_EFFECT)
-      .onClick(() => this.selectStatusFilter(filter))
-  }
-
-  @Builder
   buildTaskListEmpty() {
     Column({ space: 8 }) {
       Text(this.emptyTitle())
@@ -1452,21 +1409,6 @@ struct TaskListPage {
         .lineHeight(19)
         .fontColor($r('app.color.text_secondary'))
         .textAlign(TextAlign.Center)
-      if (this.taskFilterActive()) {
-        Button() {
-          Text('清除筛选')
-            .fontSize(13)
-            .fontColor($r('app.color.text_primary'))
-        }
-        .type(ButtonType.Normal)
-        .height(34)
-        .padding({ left: 16, right: 16 })
-        .backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_PILL)
-        .clickEffect(UI_CLICK_EFFECT)
-        .margin({ top: 4 })
-        .onClick(() => this.clearTaskFilters())
-      }
     }
     .width('100%')
     .layoutWeight(1)
@@ -1475,14 +1417,14 @@ struct TaskListPage {
   }
 
   @Builder
-  buildTaskListEntries() {
+  buildTaskListEntries(category: TaskListCategory) {
     List() {
-      if (this.pinnedEntries().length > 0) {
+      if (this.pinnedEntries(category).length > 0) {
         ListItem() {
           this.sectionHeader(
             this.pinnedCollapsed,
             '置顶',
-            `${this.pinnedEntries().length}`,
+            `${this.pinnedEntries(category).length}`,
             $r('sys.symbol.pin'),
             () => {
               uiAnimateState(this.getUIContext(), () => {
@@ -1492,7 +1434,7 @@ struct TaskListPage {
             })
         }
         if (!this.pinnedCollapsed) {
-          ForEach(this.pinnedEntries(), (entry: TaskListEntry) => {
+          ForEach(this.pinnedEntries(category), (entry: TaskListEntry) => {
             ListItem() {
               this.sessionRow(entry, false)
             }
@@ -1521,22 +1463,21 @@ struct TaskListPage {
         }
       }
 
-      if (this.activeListTab === 'projects') {
+      if (category === 'projects') {
         if (this.projectGroups().length > 0) {
           ForEach(this.projectGroups(), (group: TaskProjectGroup) => {
             ListItem() {
               this.projectGroup(group)
             }
-            .transition(uiRevealTransition())
           }, (group: TaskProjectGroup) => `project:${group.key}`)
         } else {
           ListItem() {
-            this.activeTabEmptyState()
+            this.activeTabEmptyState(category)
           }
         }
       } else {
-        if (this.dialogueEntries().length > 0) {
-          ForEach(this.dialogueEntries(), (entry: TaskListEntry) => {
+        if (this.flatCategoryEntries(category).length > 0) {
+          ForEach(this.flatCategoryEntries(category), (entry: TaskListEntry) => {
             ListItem() {
               this.sessionRow(entry, false)
             }
@@ -1561,11 +1502,10 @@ struct TaskListPage {
               },
               edgeEffect: SwipeEdgeEffect.Spring,
             })
-            .transition(uiRevealTransition())
-          }, (entry: TaskListEntry) => `dialogue:${entry.key}`)
+          }, (entry: TaskListEntry) => `${category}:${entry.key}`)
         } else {
           ListItem() {
-            this.activeTabEmptyState()
+            this.activeTabEmptyState(category)
           }
         }
       }
@@ -1580,34 +1520,22 @@ struct TaskListPage {
   }
 
   @Builder
-  activeTabEmptyState() {
+  activeTabEmptyState(category: TaskListCategory) {
     Column({ space: 8 }) {
-      Text(this.activeTabEmptyTitle())
+      Text(this.activeTabEmptyTitle(category))
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
-      Text(this.activeTabEmptyCopy())
+      Text(this.activeTabEmptyCopy(category))
         .fontSize(13)
         .lineHeight(19)
         .fontColor($r('app.color.text_secondary'))
         .textAlign(TextAlign.Center)
-      if (this.taskFilterActive()) {
-        Button('清除筛选')
-          .height(34)
-          .fontSize(13)
-          .fontColor($r('app.color.text_primary'))
-          .padding({ left: 16, right: 16 })
-          .backgroundColor($r('app.color.bg_chip'))
-          .borderRadius(UI_RADIUS_PILL)
-          .clickEffect(UI_CLICK_EFFECT)
-          .onClick(() => this.clearTaskFilters())
-      }
     }
     .width('100%')
     .constraintSize({ minHeight: 180 })
     .justifyContent(FlexAlign.Center)
     .padding({ left: 24, right: 24 })
-    .transition(uiRevealTransition())
   }
 
   /**
@@ -2097,7 +2025,7 @@ struct TaskListPage {
   }
 
   @Builder
-  filterMenuLayer() {
+  sortMenuLayer() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column()
         .width('100%')
@@ -2105,151 +2033,87 @@ struct TaskListPage {
         .backgroundColor($r('app.color.task_list_overlay'))
         .transition(uiRevealTransition())
         .onClick(() => {
-          this.closeFilterMenu();
+          this.closeSortMenu();
         })
 
-      Column() {
-        Scroll() {
-          Column() {
-            Text('筛选任务')
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
-              .width('100%')
-              .padding({ left: 10, right: 10, top: 8, bottom: 6 })
-
-            this.filterGroupLabel('项目', this.projectFilterLabel())
-            this.menuOption('全部项目', this.projectFilterKeys.length === 0, () => {
-              this.setProjectFilterAll();
-            })
-            ForEach(this.projectFilterGroups(), (group: TaskProjectGroup) => {
-              this.filterProjectOption(group)
-            }, (group: TaskProjectGroup) => `filter-project:${group.key}`)
-
+      Row() {
+        Column() {
+          this.sortMenuOption('最近优先', 'recency')
+          this.sortMenuOption('字母排序', 'alphabetic')
+          this.sortMenuOption('默认排序', 'default')
+          if (this.activeListTab === 'projects') {
             Divider()
-              .strokeWidth(0.5)
+              .strokeWidth(1)
               .color($r('app.color.border'))
-              .margin({ top: 6, bottom: 6 })
-
-            this.filterGroupLabel('代理', this.agentFilterLabel())
-            this.menuOption('全部代理', this.agentFilter === 'all', () => {
-              this.setAgentFilter('all');
-            })
-            this.menuOption('Claude Code', this.agentFilter === 'cc', () => {
-              this.setAgentFilter('cc');
-            })
-            this.menuOption('Codex', this.agentFilter === 'codex', () => {
-              this.setAgentFilter('codex');
-            })
-            this.menuOption('Pi', this.agentFilter === 'pi', () => {
-              this.setAgentFilter('pi');
-            })
-
-            Divider()
-              .strokeWidth(0.5)
-              .color($r('app.color.border'))
-              .margin({ top: 6, bottom: 6 })
-
-            this.filterGroupLabel('最近活动', this.activityFilterLabel())
-            this.menuOption('全部时间', this.activityFilter === 'all', () => {
-              this.setActivityFilter('all');
-            })
-            this.menuOption('最近一天', this.activityFilter === '1d', () => {
-              this.setActivityFilter('1d');
-            })
-            this.menuOption('最近七天', this.activityFilter === '7d', () => {
-              this.setActivityFilter('7d');
-            })
-            this.menuOption('最近三十天', this.activityFilter === '30d', () => {
-              this.setActivityFilter('30d');
-            })
+              .margin({ top: 4, bottom: 4 })
+            this.projectExpandMenuOption()
           }
-          .width('100%')
         }
-        .width('100%')
-        .constraintSize({ maxHeight: 520 })
-        .scrollBar(BarState.Off)
+        .width(184)
+        .padding(8)
+        .backgroundColor($r('app.color.task_list_menu_surface'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .borderRadius(UI_RADIUS_CONTAINER)
+        .transition(uiOverlayTransition())
+        .onClick(() => {
+          // 截住面板区域点击，避免穿透到遮罩。
+        })
       }
-      .width(280)
-      .padding(8)
-      .margin({
-        left: LIST_INSET,
-        top: this.connectionStatus === 'online' ? 116 : 152,
-      })
-      .backgroundColor($r('app.color.task_list_menu_surface'))
-      .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayTransition())
-      .onClick(() => {
-        // 截住面板区域点击，避免穿透到遮罩。
-      })
+      .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
+      .padding({ right: LIST_INSET })
+      .margin({ top: this.sortMenuTop() })
+      .justifyContent(FlexAlign.End)
     }
     .width('100%')
     .height('100%')
   }
 
   @Builder
-  filterGroupLabel(title: string, value: string) {
-    Row({ space: 8 }) {
-      Text(title)
-        .fontSize(12)
-        .fontColor($r('app.color.text_tertiary'))
-        .layoutWeight(1)
-      Text(value)
-        .fontSize(12)
-        .fontColor($r('app.color.text_tertiary'))
-    }
-    .width('100%')
-    .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-  }
-
-  @Builder
-  menuOption(label: string, selected: boolean, action: () => void) {
+  sortMenuOption(label: string, mode: TaskListSortMode) {
     Row({ space: 10 }) {
-      this.menuCheck(selected)
+      this.menuCheck(this.sortMode === mode)
       Text(label)
         .fontSize(15)
+        .fontWeight(this.sortMode === mode ? FontWeight.Medium : FontWeight.Regular)
         .fontColor($r('app.color.text_primary'))
         .layoutWeight(1)
     }
     .width('100%')
     .height(44)
     .padding({ left: 10, right: 12 })
-    .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
+    .backgroundColor(this.sortMode === mode ? $r('app.color.bg_chip') : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
     .clickEffect(UI_LIST_CLICK_EFFECT)
-    .onClick(action)
+    .onClick(() => this.selectSortMode(mode))
   }
 
   @Builder
-  filterProjectOption(group: TaskProjectGroup) {
+  projectExpandMenuOption() {
     Row({ space: 10 }) {
-      this.menuCheck(this.projectFilterKeys.length === 0
-        || this.projectFilterKeys.indexOf(group.key) >= 0)
-      SymbolGlyph($r('sys.symbol.folder'))
-        .fontSize(16)
-        .fontColor([$r('app.color.text_secondary')])
-        .width(22)
-      Text(group.title)
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph(this.allProjectsCollapsed()
+          ? $r('sys.symbol.chevron_down')
+          : $r('sys.symbol.chevron_up'))
+          .fontSize(14)
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .width(18)
+      .height(18)
+      Text(this.allProjectsCollapsed() ? '展开项目' : '收起项目')
         .fontSize(15)
-        .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .fontColor(this.projectGroups().length > 0
+          ? $r('app.color.text_primary')
+          : $r('app.color.text_tertiary'))
         .layoutWeight(1)
-      Text(`${group.entries.length}`)
-        .fontSize(12)
-        .fontColor($r('app.color.text_tertiary'))
     }
     .width('100%')
     .height(44)
     .padding({ left: 10, right: 12 })
-    .backgroundColor(this.projectFilterKeys.length === 0
-      || this.projectFilterKeys.indexOf(group.key) >= 0
-      ? $r('app.color.bg_chip')
-      : Color.Transparent)
+    .backgroundColor(Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
+    .enabled(this.projectGroups().length > 0)
     .clickEffect(UI_LIST_CLICK_EFFECT)
-    .onClick(() => this.toggleProjectFilter(group.key))
+    .onClick(() => this.toggleAllProjectsFromMenu())
   }
 
   @Builder
