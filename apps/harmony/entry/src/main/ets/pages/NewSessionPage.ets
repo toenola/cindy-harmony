@@ -30,6 +30,12 @@ import {
 } from '../core/tasks/NewSessionCreationStore';
 import { normalizeAutoTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import {
+  UI_ICON_CLICK_EFFECT,
+  uiAnimateFastState,
+  uiFontSize,
+  uiOverlayTransition,
+} from '../components/UiKit';
 
 type NewAgentKind = 'claude-code' | 'codex' | 'pi';
 type WorkspaceKind = 'dialogue' | 'project';
@@ -138,6 +144,8 @@ struct NewSessionPage {
   @State composerImages: ComposerImage[] = [];
   @State composerFiles: ComposerFile[] = [];
   @State pickingImages: boolean = false;
+  /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
+  @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
   @State contextSelectedUris: string[] = [];
@@ -1278,6 +1286,12 @@ struct NewSessionPage {
     });
   }
 
+  private closeImagePreview(): void {
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.previewImageUrl = '';
+    });
+  }
+
   build() {
     Column() {
       this.topBar()
@@ -1298,6 +1312,36 @@ struct NewSessionPage {
       }
       .width('100%')
       .layoutWeight(1)
+
+      // 与任务详情 Composer 共用同一交互：ready 图片点击后进入全屏预览。
+      if (this.previewImageUrl.length > 0) {
+        Stack() {
+          Image(this.previewImageUrl)
+            .width('100%')
+            .height('100%')
+            .objectFit(ImageFit.Contain)
+          Button() {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(uiFontSize(16))
+              .fontColor([$r('app.color.chat_overlay_text')])
+          }
+          .type(ButtonType.Circle)
+          .width(40)
+          .height(40)
+          .padding(0)
+          .backgroundColor($r('app.color.overlay'))
+          .clickEffect(UI_ICON_CLICK_EFFECT)
+          .position({ x: 16, y: 48 })
+          .onClick(() => this.closeImagePreview())
+        }
+        .width('100%')
+        .height('100%')
+        .position({ x: 0, y: 0 })
+        .zIndex(99)
+        .backgroundColor($r('app.color.chat_overlay_surface'))
+        .transition(uiOverlayTransition())
+        .onClick(() => this.closeImagePreview())
+      }
     }
       .width('100%')
     .height('100%')
@@ -2113,6 +2157,11 @@ struct NewSessionPage {
         onPlanToggle: (): void => this.togglePlanMode(),
         onSend: (): void => {
           void this.send();
+        },
+        onPreviewImage: (image: ComposerImage): void => {
+          if (image.status === 'ready' && image.uri.length > 0) {
+            this.previewImageUrl = image.uri;
+          }
         },
         onRemoveImage: (image: ComposerImage): void => this.removeComposerImage(image),
         onRetryImage: (image: ComposerImage): void => this.retryComposerImage(image),

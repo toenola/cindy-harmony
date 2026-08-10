@@ -165,7 +165,6 @@ import {
   ComposerAtomPresentation,
   ComposerNode,
   SerializedComposerDocument,
-  appendComposerNode,
   composerDocumentHasContent,
   composerDocumentFromPersistedContent,
   composerDocumentProjectedText,
@@ -174,7 +173,6 @@ import {
   isLongComposerPaste,
   pastedTextNode,
   mentionNode,
-  quoteNode,
   reconcileComposerProjectedText,
   removeComposerNode,
   replaceComposerTextRange,
@@ -462,6 +460,8 @@ export struct TaskPageContent {
   @State sessionTreeError: string = '';
   @State sessionTree: PiSessionTreeSnapshot | null = null;
   private sessionTreeGeneration: number = 0;
+  /** iOS 风格消息操作层：空 key 表示关闭。 */
+  @State messageActionItemKey: string = '';
   @State messageActionBusyId: string = '';
   @State composerPaletteMode: string = '';
   @State composerPaletteItems: ComposerPaletteItem[] = [];
@@ -3253,6 +3253,9 @@ export struct TaskPageContent {
         .onClick(() => this.closeImagePreview())
       }
 
+      if (this.messageActionItemKey.length > 0) {
+        this.messageActionLayer()
+      }
       if (this.sessionActionOpen) {
         this.sessionActionLayer()
       }
@@ -7713,11 +7716,26 @@ export struct TaskPageContent {
     promptAction.showToast({ message: '已添加到输入框' });
   }
 
-  private quoteMessageInComposer(item: RenderMessageItem): void {
-    const body = item.body.trim();
-    if (body.length === 0) return;
-    this.setComposerDocument(appendComposerNode(this.composerDocument, quoteNode(body)));
-    promptAction.showToast({ message: '已引用到输入框' });
+  private messageActionItem(): RenderMessageItem | null {
+    for (let i = 0; i < this.items.length; i++) {
+      const candidate = this.items[i];
+      if (candidate.type === 'message' && candidate.key === this.messageActionItemKey) {
+        return candidate as RenderMessageItem;
+      }
+    }
+    return null;
+  }
+
+  private closeMessageActions(): void {
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.messageActionItemKey = '';
+    });
+  }
+
+  private selectMessageAction(action: () => void): void {
+    this.closeMessageActions();
+    // 与 iOS 一致先完成 Sheet 退场，再执行 toast / 二次确认，避免两层弹窗叠在一起。
+    setTimeout(action, UI_MOTION_FAST);
   }
 
   private copyMessageLink(item: RenderMessageItem): void {
@@ -7761,53 +7779,105 @@ export struct TaskPageContent {
   }
 
   private showMessageActions(item: RenderMessageItem): void {
-    const messageId = item.message?.clientId || item.message?.id || item.key;
-    if (this.canRewind(item)) {
-      this.getUIContext().showActionSheet({
-        title: '消息操作',
-        message: this.timeLabel(item.message?.createdAt ?? '') || '选择操作',
-        sheets: [{
-          title: '添加到输入框',
-          action: () => this.addMessageToComposer(item),
-        }, {
-          title: '引用消息',
-          action: () => this.quoteMessageInComposer(item),
-        }, {
-          title: '复制消息链接',
-          action: () => this.copyMessageLink(item),
-        }, {
-          title: '复制消息 ID',
-          action: () => this.copyPlainText(messageId, '已复制消息 ID'),
-        }, {
-          title: '回退到这里',
-          action: () => this.confirmRewind(item),
-        }, {
-          title: this.sessionStreaming ? '生成中不可删除' : '删除消息',
-          action: () => this.confirmDeleteMessage(item),
-        }],
-      });
-      return;
-    }
-    this.getUIContext().showActionSheet({
-      title: '消息操作',
-      message: this.timeLabel(item.message?.createdAt ?? '') || '选择操作',
-      sheets: [{
-        title: '添加到输入框',
-        action: () => this.addMessageToComposer(item),
-      }, {
-        title: '引用消息',
-        action: () => this.quoteMessageInComposer(item),
-      }, {
-        title: '复制消息链接',
-        action: () => this.copyMessageLink(item),
-      }, {
-        title: '复制消息 ID',
-        action: () => this.copyPlainText(messageId, '已复制消息 ID'),
-      }, {
-        title: this.sessionStreaming ? '生成中不可删除' : '删除消息',
-        action: () => this.confirmDeleteMessage(item),
-      }],
+    uiAnimateState(this.getUIContext(), () => {
+      this.messageActionItemKey = item.key;
     });
+  }
+
+  @Builder
+  messageActionLayer() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.task_list_overlay'))
+        .onClick(() => this.closeMessageActions())
+
+      Column({ space: 8 }) {
+        Column() {
+          this.messageActionOption('添加到对话', $r('sys.symbol.ellipsis_message'), false, () => {
+            const item = this.messageActionItem();
+            if (item !== null) this.selectMessageAction(() => this.addMessageToComposer(item));
+          })
+          this.messageActionOption('复制当前消息链接', $r('sys.symbol.link'), false, () => {
+            const item = this.messageActionItem();
+            if (item !== null) this.selectMessageAction(() => this.copyMessageLink(item));
+          })
+          if (this.messageActionItem() !== null && this.canRewind(this.messageActionItem() as RenderMessageItem)) {
+            this.messageActionOption('回到此处', $r('sys.symbol.arrow_clockwise'), false, () => {
+              const item = this.messageActionItem();
+              if (item !== null) this.selectMessageAction(() => this.confirmRewind(item));
+            })
+          }
+          if (!this.sessionStreaming) {
+            Divider()
+              .strokeWidth(0.5)
+              .color($r('app.color.message_action_border'))
+            this.messageActionOption('删除本条消息', $r('sys.symbol.trash'), true, () => {
+              const item = this.messageActionItem();
+              if (item !== null) this.selectMessageAction(() => this.confirmDeleteMessage(item));
+            })
+          }
+        }
+        .width('100%')
+        .backgroundColor($r('app.color.message_action_surface'))
+        .backgroundBlurStyle(BlurStyle.Thin)
+        .border({ width: 0.5, color: $r('app.color.message_action_border') })
+        .borderRadius(UI_RADIUS_CONTAINER)
+
+        Button('取消')
+          .type(ButtonType.Normal)
+          .width('100%')
+          .height(54)
+          .fontSize(uiFontSize(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.message_action_text'))
+          .backgroundColor($r('app.color.message_action_surface'))
+          .backgroundBlurStyle(BlurStyle.Thin)
+          .border({ width: 0.5, color: $r('app.color.message_action_border') })
+          .borderRadius(UI_RADIUS_CONTAINER)
+          .clickEffect(UI_LIST_CLICK_EFFECT)
+          .onClick(() => this.closeMessageActions())
+      }
+      .width('calc(100% - 24vp)')
+      .constraintSize({ maxWidth: 620 })
+      .margin({ left: 12, right: 12, bottom: 12 })
+      .transition(uiOverlayTransition())
+    }
+    .width('100%')
+    .height('100%')
+    .position({ x: 0, y: 0 })
+    .zIndex(98)
+  }
+
+  @Builder
+  messageActionOption(label: string, symbol: Resource, danger: boolean, action: () => void) {
+    Button() {
+      Row({ space: 12 }) {
+        SymbolGlyph(symbol)
+          .fontSize(uiFontSize(22))
+          .fontColor([danger ? $r('app.color.danger') : $r('app.color.message_action_text')])
+          .width(24)
+        Text(label)
+          .fontSize(uiFontSize(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(danger ? $r('app.color.danger') : $r('app.color.message_action_text'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+    }
+    .type(ButtonType.Normal)
+    .width('100%')
+    .height(54)
+    .padding({ left: 16, right: 16 })
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .enabled(this.messageActionBusyId.length === 0)
+    .opacity(this.messageActionBusyId.length === 0 ? 1 : 0.42)
+    .onClick(action)
   }
 
   private copyMessage(item: RenderMessageItem): void {

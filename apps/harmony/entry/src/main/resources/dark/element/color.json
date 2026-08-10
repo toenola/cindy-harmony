@@ -77,6 +77,18 @@
       "value": "#73000000"
     },
     {
+      "name": "message_action_surface",
+      "value": "#803B3B3B"
+    },
+    {
+      "name": "message_action_border",
+      "value": "#505050"
+    },
+    {
+      "name": "message_action_text",
+      "value": "#C1C1C1"
+    },
+    {
       "name": "chat_header_surface",
       "value": "#CC1F1F1E"
     },
