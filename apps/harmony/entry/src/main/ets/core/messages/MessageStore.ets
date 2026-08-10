@@ -48,7 +48,12 @@ import {
   extendCoverageEarlier,
   extendCoverageLiveTail,
 } from './HistoryWindowCoverage';
-import { historyRetryLimits, isPayloadTooLargeError } from './MessagePaging';
+import {
+  historyRetryLimits,
+  isPayloadTooLargeError,
+  shouldInferOlderMessagesFromCount,
+  shouldKeepOlderMessagesAffordance,
+} from './MessagePaging';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -313,7 +318,10 @@ export class MessageStore {
     return this.hasMoreBySession.get(sessionId) ?? false;
   }
 
-  /** 写入任务列表的服务端消息总数，并立即校正当前分页状态。 */
+  /**
+   * 写入任务列表的服务端消息总数。只在分页尚未给出结论时用于乐观推断；
+   * 真实分页已经返回后不能再覆盖它，否则尾部新增会被误判为顶部还有历史。
+   */
   setMessageCount(sessionId: string, count: number): void {
     if (count <= 0) {
       this.messageCountBySession.delete(sessionId);
@@ -322,7 +330,10 @@ export class MessageStore {
     this.messageCountBySession.set(sessionId, count);
     const current = this.messagesBySession.get(sessionId) ?? [];
     if (current.length === 0) return;
-    this.hasMoreBySession.set(sessionId, count > countRealMessages(current));
+    if (shouldInferOlderMessagesFromCount(
+      this.hasMoreBySession.has(sessionId), count, countRealMessages(current))) {
+      this.hasMoreBySession.set(sessionId, true);
+    }
   }
 
   /** 该会话历史是否加载失败（页面据此显示重试）。 */
@@ -1234,7 +1245,7 @@ export class MessageStore {
         latestCurrent.length > 0 ? latestCurrent[0] : null);
       if (coverage !== null) this.historyCoverageBySession.set(sessionId, coverage);
       this.setOlderAvailability(
-        sessionId, this.hasMoreAfterPage(sessionId, page, merged));
+        sessionId, this.hasMoreAfterPage(sessionId, page, merged, false));
       const added = Math.max(0, merged.length - latestCurrent.length);
       hilog.info(DOMAIN, TAG,
         'history page merged fetched=%{public}d added=%{public}d hasMore=%{public}s',
@@ -1256,12 +1267,17 @@ export class MessageStore {
 
   /**
    * Mobile 同源判定：满页 / remoteRowsTrimmed / 服务端总数均说明上沿还有历史。
-   * 无总数且没有裁页标记的短页按 iOS 语义视为历史到底，避免在最早消息处
-   * 永久保留入口并对同一 before 游标反复空转。
+   * 首次最新窗口允许用已知总数辅助推断；真实向前分页的短页按 iOS 语义视为
+   * 历史到底，避免尾部新消息增长把顶部入口重新点亮。
    */
-  private hasMoreAfterPage(sessionId: string, page: HistoryPage, merged: RemoteMessage[]): boolean {
-    if (page.items.length === 0) return false;
-    if (page.hasMore) return true;
+  private hasMoreAfterPage(
+    sessionId: string,
+    page: HistoryPage,
+    merged: RemoteMessage[],
+    allowMessageCountInference: boolean = true,
+  ): boolean {
+    if (shouldKeepOlderMessagesAffordance(page.items.length, page.hasMore)) return true;
+    if (!allowMessageCountInference || page.items.length === 0) return false;
     const total = this.messageCountBySession.get(sessionId) ?? 0;
     if (total > countRealMessages(merged)) return true;
     return false;

@@ -415,6 +415,16 @@ export class TaskStore {
     }
   }
 
+  /**
+   * 新建任务成功收口：解除本地创建锁，并立即启动一轮更高代次的权威列表对账。
+   * sessions:created 触发的旧请求可能早于 create-session 落库；这里的新请求会让
+   * 旧响应失效，避免它在返回任务列表前把刚创建的行覆盖掉。
+   */
+  completeLocalCreation(deviceId: string, sessionId: string): void {
+    this.setPendingLocalCreation(deviceId, sessionId, false);
+    void this.loadSessions(deviceId);
+  }
+
   removeLocalSession(deviceId: string, sessionId: string): void {
     this.removeSession(deviceId, sessionId);
   }

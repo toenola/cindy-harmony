@@ -21,3 +21,23 @@ export function historyRetryLimits(initial: number): number[] {
   }
   return out;
 }
+
+/**
+ * 一次真实分页请求已经返回后，入口只服从这一页的连续性信号。短页 / 空页代表
+ * 已到历史起点；任务总数随后增长可能只是尾部新增，不能反向点亮顶部入口。
+ */
+export function shouldKeepOlderMessagesAffordance(
+  pageItemCount: number,
+  pageHasMore: boolean,
+): boolean {
+  return pageItemCount > 0 && pageHasMore;
+}
+
+/** 总数只用于真实分页尚未落地的缓存窗口，不能覆盖已经收口的分页结论。 */
+export function shouldInferOlderMessagesFromCount(
+  pagingAvailabilityResolved: boolean,
+  totalCount: number,
+  loadedRealCount: number,
+): boolean {
+  return !pagingAvailabilityResolved && totalCount > loadedRealCount;
+}

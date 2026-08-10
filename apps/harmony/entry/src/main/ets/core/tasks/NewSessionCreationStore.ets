@@ -417,7 +417,7 @@ export class NewSessionCreationStore {
       // 在其 subscribe 之后晚到，误退掉仍在使用的同名 topic。
       task.temporaryTopicHandedOff = true;
       task.session.pendingLocalCreation = false;
-      this.tasksStore?.setPendingLocalCreation(task.deviceId, task.sessionId, false);
+      this.tasksStore?.completeLocalCreation(task.deviceId, task.sessionId);
       this.tasks.delete(task.sessionId);
       this.notify();
       this.finishTemporaryTopicHandoff(task);

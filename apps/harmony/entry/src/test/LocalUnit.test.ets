@@ -116,6 +116,8 @@ import {
 import {
   historyRetryLimits,
   isPayloadTooLargeError,
+  shouldInferOlderMessagesFromCount,
+  shouldKeepOlderMessagesAffordance,
 } from '../main/ets/core/messages/MessagePaging';
 import {
   computeReconnectDelayMs,
@@ -891,6 +893,15 @@ export default function localUnitTest() {
       expect(isPayloadTooLargeError(new Error('network disconnected'))).assertEqual(false);
     });
 
+    it('letsASettledHistoryPageOwnTheLoadEarlierAffordance', 0, () => {
+      expect(shouldKeepOlderMessagesAffordance(80, true)).assertEqual(true);
+      expect(shouldKeepOlderMessagesAffordance(5, true)).assertEqual(true);
+      expect(shouldKeepOlderMessagesAffordance(52, false)).assertEqual(false);
+      expect(shouldKeepOlderMessagesAffordance(0, true)).assertEqual(false);
+      expect(shouldInferOlderMessagesFromCount(false, 213, 212)).assertEqual(true);
+      expect(shouldInferOlderMessagesFromCount(true, 213, 212)).assertEqual(false);
+    });
+
     it('projectsFriendlyToolLabelsAndKeepsCommandsInDetails', 0, () => {
       const bashInput: Record<string, Object> = {};
       bashInput['description'] = '搜索 DlClient 的定义';
@@ -1625,6 +1636,24 @@ export default function localUnitTest() {
       const updated = store.getSessions('device-1')[0];
       expect(updated.title).assertEqual('Authoritative title');
       expect(updated.pendingLocalCreation).assertEqual(true);
+    });
+
+    it('keepsCreatedSessionInTheListWhenStartingPostCreateReconciliation', 0, () => {
+      const store = new TaskStore();
+      const session = new RemoteSession();
+      session.id = 'new-project-session';
+      session.workspaceKind = 'project';
+      session.workingDir = '/workspace/cindy';
+      session.pendingLocalCreation = true;
+      store.upsertSession('device-1', session);
+
+      // 未 attach client 时列表刷新会安全失败；成功收口仍必须保留本地行并解除创建锁。
+      store.completeLocalCreation('device-1', session.id);
+
+      const sessions = store.getSessions('device-1');
+      expect(sessions.length).assertEqual(1);
+      expect(sessions[0].id).assertEqual(session.id);
+      expect(sessions[0].pendingLocalCreation).assertEqual(false);
     });
 
     it('roundTripsAWhitelistedTaskListStartupSnapshot', 0, () => {

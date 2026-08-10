@@ -417,6 +417,8 @@ export struct TaskPageContent {
   private leavingForCreationEdit: boolean = false;
   /** 加载更早消息进行中（防重复触发，并驱动列表头入口）。 */
   @State loadingOlder: boolean = false;
+  /** Store 的分页结论镜像为响应式状态，确保短页落地后顶部入口立即消失。 */
+  @State hasOlderMessages: boolean = false;
   /** List 当前可见的首尾渲染项，用于贴底意图和历史分页。 */
   private visibleStartIndex: number = 0;
   private visibleEndIndex: number = -1;
@@ -584,6 +586,7 @@ export struct TaskPageContent {
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
+    this.hasOlderMessages = false;
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
     this.historyLastAttemptFirstKey = '';
@@ -857,12 +860,13 @@ export struct TaskPageContent {
     return undefined;
   }
 
-  /** 把任务列表的服务端消息总数交给分页 Store，覆盖 device-link 短页场景。 */
+  /** 把任务列表的服务端消息总数交给分页 Store，供首窗落地前乐观推断。 */
   private syncMessageCount(): void {
     const session = this.session();
     if (session !== undefined && session.messageCount > 0) {
       AppServices.instance.messages.setMessageCount(this.sessionId, session.messageCount);
     }
+    this.hasOlderMessages = AppServices.instance.messages.hasMore(this.sessionId);
   }
 
   /** sessions:patched 回流计划模式后，保持 Sheet 与桌面端真相一致。 */
@@ -1954,6 +1958,7 @@ export struct TaskPageContent {
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
     this.listTouchLoadTriggered = false;
+    this.hasOlderMessages = false;
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
     this.historyLastAttemptFirstKey = '';
@@ -2053,7 +2058,7 @@ export struct TaskPageContent {
 
   /** List 顶部的“加载更早消息”也是一个 ListItem，所有渲染项索引都要补这个偏移。 */
   private renderListIndex(renderIndex: number): number {
-    return renderIndex + (AppServices.instance.messages.hasMore(this.sessionId) ? 1 : 0);
+    return renderIndex + (this.hasOlderMessages ? 1 : 0);
   }
 
   private renderItemContainsClientId(item: RenderItem, clientId: string): boolean {
@@ -2135,7 +2140,7 @@ export struct TaskPageContent {
   /** 固定的尾部 sentinel 索引；必须覆盖消息后的状态卡、尾部卡和排队气泡。 */
   private bottomSentinelListIndex(): number {
     return messageListBottomIndex(
-      AppServices.instance.messages.hasMore(this.sessionId),
+      this.hasOlderMessages,
       this.items.length,
       this.hasQueueStateBanner(),
       this.tailPresentation() !== null,
@@ -2393,7 +2398,7 @@ export struct TaskPageContent {
     if (this.loadingOlder) {
       return;
     }
-    const hadOlderMessages = AppServices.instance.messages.hasMore(this.sessionId);
+    const hadOlderMessages = this.hasOlderMessages;
     if (!hadOlderMessages) {
       return;
     }
@@ -2438,8 +2443,7 @@ export struct TaskPageContent {
     const anchorRestoreGeneration = ++this.historyAnchorRestoreGeneration;
     this.loadingOlder = true;
     AppServices.instance.messages.loadOlder(this.deviceId, this.sessionId).then((added: number) => {
-      const historyHeaderChanged = hadOlderMessages
-        !== AppServices.instance.messages.hasMore(this.sessionId);
+      const historyHeaderChanged = hadOlderMessages !== this.hasOlderMessages;
       if (added > 0 || historyHeaderChanged) {
         const stillFollowingLatest = keepFollowingLatest
           && !this.historyReviewIntent && this.followingLatest && !this.listTouchActive;
@@ -2517,7 +2521,7 @@ export struct TaskPageContent {
       this.initialScrollSettling,
       this.loadingOlder,
       this.nearHistoryStart(),
-      AppServices.instance.messages.hasMore(this.sessionId),
+      this.hasOlderMessages,
       this.items.length,
       firstKey,
       this.historyLastAttemptFirstKey,
@@ -2960,7 +2964,7 @@ export struct TaskPageContent {
   private searchPaging(): MessageSearchPagingPresentation {
     return messageSearchPagingPresentation(
       this.searchQuery,
-      AppServices.instance.messages.hasMore(this.sessionId),
+      this.hasOlderMessages,
       this.loadingOlder,
       this.searchHits().length,
     );
@@ -4025,7 +4029,7 @@ export struct TaskPageContent {
         .alignItems(HorizontalAlign.Center)
       } else {
         List({ space: 16, scroller: this.listScroller }) {
-          if (AppServices.instance.messages.hasMore(this.sessionId)) {
+          if (this.hasOlderMessages) {
             ListItem() {
               Button(this.loadingOlder ? '加载中' : '加载更早消息')
                 .fontSize(uiFontSize(12))
