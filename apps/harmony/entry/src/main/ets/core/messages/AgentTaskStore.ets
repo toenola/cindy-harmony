@@ -101,6 +101,54 @@ export function isAgentTaskToolName(toolName: string): boolean {
     || toolName.startsWith('collab:');
 }
 
+export function subagentSpawnReceiptName(
+  toolName: string,
+  inputRaw: string,
+  resultText: string,
+): string {
+  if (toolName !== 'collab:spawn' || resultText.trim().length === 0) return '';
+  try {
+    const parsed = JSON.parse(inputRaw) as Object;
+    const input = recordOf(parsed);
+    if (input === null) return '';
+    const name = stringOf(input, 'name');
+    return name.length > 0 && resultText.trim() === name ? name : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+export function subagentSpawnResultIndicatesRunning(toolName: string, resultText: string): boolean {
+  const trimmed = resultText.trim().replace(/\r\n/g, '\n');
+  if ((toolName === 'Agent' || toolName === 'Task')
+    && (trimmed === 'Async agent launched successfully.'
+      || (trimmed.startsWith('Async agent launched successfully.\nagentId: ')
+        && trimmed.indexOf('\nThe agent is working in the background.') >= 0))) return true;
+  if (toolName !== 'collab:spawnAgent') return false;
+  const lines = trimmed.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (/^[^:\n]+:\s*(?:running|in[_-]?progress|started|active)\s*$/i.test(lines[i].trim())) return true;
+  }
+  return false;
+}
+
+/** 真实结果可收敛陈旧 running；明确失败/停止与纯启动回执始终优先。 */
+export function deriveAgentTaskStatus(
+  updateStatus: string,
+  toolName: string,
+  inputRaw: string,
+  resultText: string,
+): string {
+  if (updateStatus === 'failed' || updateStatus === 'stopped' || updateStatus === 'completed') {
+    return updateStatus;
+  }
+  const hasResult = resultText.trim().length > 0;
+  const launchReceipt = subagentSpawnReceiptName(toolName, inputRaw, resultText).length > 0
+    || subagentSpawnResultIndicatesRunning(toolName, resultText);
+  if (hasResult && !launchReceipt) return 'completed';
+  return 'running';
+}
+
 export function normalizeWorkflowProgress(value: Object | undefined): WorkflowProgressEntry[] | null {
   if (!Array.isArray(value)) return null;
   const list = value as Object[];

@@ -42,11 +42,18 @@ import {
   todoCardIndexAtRankFromTail,
   todoCardRankFromTail,
   findTodoPlanInsertions,
+  applyCodexPlanSnapshotOnDone,
+  markCodexPlanTurnFailed,
+  planRowSealed,
+  planRowTurnFailed,
   parseThinkingPresentation,
   shouldSplitToolGroup,
   turnFinalAssistantIds,
 } from '../main/ets/core/messages/MessageRender';
-import { AgentTaskUpdate } from '../main/ets/core/messages/AgentTaskStore';
+import {
+  AgentTaskUpdate,
+  deriveAgentTaskStatus,
+} from '../main/ets/core/messages/AgentTaskStore';
 import {
   findMessageSearchHits,
   messageSearchPagingPresentation,
@@ -134,10 +141,20 @@ import {
 import {
   computeReconnectDelayMs,
   DlChannels,
+  Envelope,
   expandMakerEventBatchPayload,
 } from '../main/ets/core/device-link/DlProtocol';
-import { DlError } from '../main/ets/core/device-link/DlClient';
+import {
+  assertInvokeSucceeded,
+  DlError,
+  isSafeUnsentDlError,
+} from '../main/ets/core/device-link/DlClient';
+import { parseChoiceOptions } from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
+import {
+  TASK_LIST_RECONCILE_INTERVAL_MS,
+  TaskListReconcileBackoff,
+} from '../main/ets/core/tasks/TaskListReconcilePolicy';
 import {
   CachedTaskListDevice,
   parseTaskListSnapshot,
@@ -2189,6 +2206,145 @@ export default function localUnitTest() {
       expect(migrated.indexOf('projectFilterKeys')).assertEqual(-1);
       expect(migrated.indexOf('agentFilter')).assertEqual(-1);
       expect(migrated.indexOf('activityFilter')).assertEqual(-1);
+    });
+
+    it('rejectsFailedInvokeResultsBeforeMarkingTopicSubscribed', 0, () => {
+      const okEnvelope = new Envelope();
+      const okPayload: Record<string, Object> = {};
+      okPayload['ok'] = true;
+      okEnvelope.payload = okPayload;
+      assertInvokeSucceeded(okEnvelope);
+
+      const failedEnvelope = new Envelope();
+      const failedPayload: Record<string, Object> = {};
+      failedPayload['ok'] = false;
+      const error: Record<string, Object> = {};
+      error['code'] = 'REMOTE_DISABLED';
+      error['message'] = 'remote control disabled';
+      failedPayload['error'] = error;
+      failedEnvelope.payload = failedPayload;
+      let rejected = false;
+      try {
+        assertInvokeSucceeded(failedEnvelope);
+      } catch (caught) {
+        rejected = caught instanceof DlError
+          && caught.code === 'REMOTE_DISABLED'
+          && caught.message === 'remote control disabled';
+      }
+      expect(rejected).assertEqual(true);
+    });
+
+    it('onlyAutoRetriesConnectionErrorsThatWereNotSent', 0, () => {
+      expect(isSafeUnsentDlError(new DlError('NOT_CONNECTED', 'offline'))).assertEqual(true);
+      expect(isSafeUnsentDlError(new DlError('BACKPRESSURE', 'busy'))).assertEqual(true);
+      expect(isSafeUnsentDlError(new DlError('NOT_CONNECTED', 'ack lost', true))).assertEqual(false);
+      expect(isSafeUnsentDlError(new DlError('INVOKE_TIMEOUT', 'timeout', true))).assertEqual(false);
+    });
+
+    it('keepsCancelledCodexPlansAliveAndSealsSuccessfulOnes', 0, () => {
+      const step: Record<string, Object> = {};
+      step['step'] = '同步鸿蒙';
+      step['status'] = 'in_progress';
+      const input: Record<string, Object> = {};
+      input['plan'] = [step];
+      const cancelled = planToolMessage('cancelled-plan', 'update_plan', input, 'plan:turn-cancelled');
+      applyCodexPlanSnapshotOnDone(
+        [cancelled], [step], 'turn-cancelled', 'completed', 100, true);
+      expect(planRowSealed(cancelled)).assertEqual(false);
+      expect(planRowTurnFailed(cancelled)).assertEqual(true);
+
+      const successful = planToolMessage('successful-plan', 'update_plan', input, 'plan:turn-success');
+      applyCodexPlanSnapshotOnDone(
+        [successful], [step], 'turn-success', 'completed', 200, false);
+      expect(planRowSealed(successful)).assertEqual(true);
+      expect(successful.terminalPlanAtMs).assertEqual(200);
+    });
+
+    it('keepsExplicitFailedPlanStampAheadOfLegacyTurnUsageSeal', 0, () => {
+      const raw: Record<string, Object> = {};
+      raw['role'] = 'tool_use';
+      const content: Record<string, Object> = {};
+      content['turnCompleted'] = false;
+      raw['content'] = content;
+      const agentMeta: Record<string, Object> = {};
+      const usage: Record<string, Object> = {};
+      usage['inputTokens'] = 1;
+      agentMeta['turnUsageDetails'] = usage;
+      raw['agentMeta'] = agentMeta;
+      const parsed = parseMessage(raw);
+      expect(parsed.hasTurnCompleted).assertEqual(true);
+      expect(parsed.turnCompleted).assertEqual(false);
+      expect(planRowTurnFailed(parsed)).assertEqual(true);
+    });
+
+    it('stampsOnlyTheCurrentCodexPlanAcrossSteerRows', 0, () => {
+      const step: Record<string, Object> = {};
+      step['step'] = '继续排查';
+      step['status'] = 'in_progress';
+      const input: Record<string, Object> = {};
+      input['plan'] = [step];
+      const oldPlan = planToolMessage('old-plan', 'update_plan', input, 'plan:old');
+      const boundary = userBoundary('new-turn');
+      const currentPlan = planToolMessage('current-plan', 'update_plan', input, 'plan:current');
+      const steer = userBoundary('steer');
+      steer.agentMeta['delivery'] = 'steer';
+      const messages = [oldPlan, boundary, currentPlan, steer];
+      expect(markCodexPlanTurnFailed(messages)).assertEqual(true);
+      expect(planRowTurnFailed(currentPlan)).assertEqual(true);
+      expect(planRowTurnFailed(oldPlan)).assertEqual(false);
+    });
+
+    it('usesTerminalPlanSealsAsHardPlanSessionBoundaries', 0, () => {
+      const step: Record<string, Object> = {};
+      step['step'] = '未勾完但本轮成功';
+      step['status'] = 'pending';
+      const input: Record<string, Object> = {};
+      input['plan'] = [step];
+      const first = planToolMessage('sealed-plan', 'update_plan', input, 'plan:first');
+      first.terminalPlanSnapshot = true;
+      const second = planToolMessage('next-plan', 'update_plan', input, 'plan:second');
+      expect(findTodoPlanInsertions([first, second]).size).assertEqual(2);
+    });
+
+    it('distinguishesSubagentLaunchReceiptsFromRealTerminalResults', 0, () => {
+      const spawnInput: Record<string, Object> = {};
+      spawnInput['name'] = 'reviewer';
+      expect(deriveAgentTaskStatus(
+        'running', 'collab:spawn', JSON.stringify(spawnInput), 'reviewer')).assertEqual('running');
+      expect(deriveAgentTaskStatus(
+        'running', 'Agent', '{}', 'Async agent launched successfully.')).assertEqual('running');
+      expect(deriveAgentTaskStatus(
+        'running', 'collab:spawnAgent', '{}', 'reviewer: active')).assertEqual('running');
+      expect(deriveAgentTaskStatus(
+        'running', 'collab:spawnAgent', '{}', 'reviewer: completed')).assertEqual('completed');
+      expect(deriveAgentTaskStatus(
+        'failed', 'collab:spawnAgent', '{}', 'reviewer: completed')).assertEqual('failed');
+    });
+
+    it('deduplicatesLegacyDefaultAndAskPermissionModes', 0, () => {
+      const rows: Object[] = ['default', 'ask', 'ask', 'plan', 'acceptEdits'];
+      const options = parseChoiceOptions(rows, true);
+      expect(options.length).assertEqual(2);
+      expect(options[0].id).assertEqual('ask');
+      expect(options[1].id).assertEqual('acceptEdits');
+    });
+
+    it('backsOffTaskListAntiEntropyPerDeviceAndResetsAfterSuccess', 0, () => {
+      const backoff = new TaskListReconcileBackoff();
+      const start = 1_000;
+      backoff.report('desktop-a', false, start, 0.5);
+      expect(backoff.shouldAttempt('desktop-a', start + TASK_LIST_RECONCILE_INTERVAL_MS - 1))
+        .assertEqual(false);
+      expect(backoff.shouldAttempt('desktop-b', start)).assertEqual(true);
+      expect(backoff.shouldAttempt('desktop-a', start + TASK_LIST_RECONCILE_INTERVAL_MS))
+        .assertEqual(true);
+
+      backoff.report('desktop-a', false, start + TASK_LIST_RECONCILE_INTERVAL_MS, 0.5);
+      expect(backoff.shouldAttempt('desktop-a', start + TASK_LIST_RECONCILE_INTERVAL_MS * 3 - 1))
+        .assertEqual(false);
+      backoff.report('desktop-a', true, start + TASK_LIST_RECONCILE_INTERVAL_MS * 3, 0.5);
+      expect(backoff.shouldAttempt('desktop-a', start + TASK_LIST_RECONCILE_INTERVAL_MS * 3))
+        .assertEqual(true);
     });
   });
 }

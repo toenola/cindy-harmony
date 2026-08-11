@@ -25,12 +25,66 @@ const TAG = 'CindyDl';
 
 export class DlError extends Error {
   readonly code: string;
+  /** true 表示请求帧可能已经交给 WebSocket，ACK 丢失时禁止调用方盲重。 */
+  readonly inFlight: boolean;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, inFlight: boolean = false) {
     super(message);
     this.name = 'DlError';
     this.code = code;
+    this.inFlight = inFlight;
   }
+}
+
+/** 只有能证明请求尚未发出的连接错误，才允许进入本地 outbox 自动续发。 */
+export function isSafeUnsentDlError(value: Object | undefined): boolean {
+  if (value instanceof DlError) {
+    if (value.inFlight) return false;
+    return value.code === 'NOT_CONNECTED'
+      || value.code === 'BACKPRESSURE'
+      || value.code === 'LINK_NOT_OPEN'
+      || value.code === 'DEVICE_OFFLINE'
+      || value.code === 'DEVICE_UNRESPONSIVE';
+  }
+  const message = value instanceof Error ? value.message : '';
+  return message.indexOf('[NOT_CONNECTED]') >= 0
+    || message.indexOf('[DEVICE_LINK_NOT_CONNECTED]') >= 0
+    || message.indexOf('[BACKPRESSURE]') >= 0
+    || message.indexOf('[LINK_NOT_OPEN]') >= 0
+    || message.indexOf('[DEVICE_OFFLINE]') >= 0
+    || message.indexOf('[DEVICE_UNRESPONSIVE]') >= 0;
+}
+
+/**
+ * invoke-result 只有 `ok=true` 才算业务调用成功。
+ *
+ * request id 能配对只说明收到了响应；订阅被桌面端拒绝时也会返回 invoke-result。
+ * 若把这种响应当成功，调用方会永久记成“已订阅”，之后不再重试 sessions topic。
+ */
+export function assertInvokeSucceeded(env: Envelope): void {
+  if (env.payload === undefined || env.payload === null
+    || typeof env.payload !== 'object' || Array.isArray(env.payload)) {
+    throw new DlError('INVALID_RESPONSE', 'invoke result payload is invalid');
+  }
+  const payload = env.payload as Record<string, Object>;
+  if (payload['ok'] === true) return;
+
+  let code = 'IPC_ERROR';
+  let message = 'invoke failed';
+  const error = payload['error'];
+  if (error !== undefined && error !== null && typeof error === 'object' && !Array.isArray(error)) {
+    const record = error as Record<string, Object>;
+    if (typeof record['code'] === 'string' && record['code'].length > 0) code = record['code'];
+    if (typeof record['message'] === 'string' && record['message'].length > 0) message = record['message'];
+  } else {
+    if (typeof payload['errorCode'] === 'string' && payload['errorCode'].length > 0) {
+      code = payload['errorCode'];
+    }
+    if (typeof payload['errorMessage'] === 'string' && payload['errorMessage'].length > 0) {
+      message = payload['errorMessage'];
+    }
+  }
+  throw new DlError(code, message);
 }
 
 /** 简单延时。 */
@@ -96,6 +150,7 @@ class PendingRequest {
   };
   timer: number = 0;
   label: string = '';
+  inFlight: boolean = false;
 }
 
 export class DlClient {
@@ -440,7 +495,7 @@ export class DlClient {
   }
 
   /** 订阅推送 topic（device-link:subscribe 控制帧）。 */
-  subscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
+  async subscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
     const arg = new SubscribeArgs();
     arg.topics = topics;
     arg.controllerName = this.opts.getHello().deviceName;
@@ -450,11 +505,13 @@ export class DlClient {
     opts.channel = 'device-link:subscribe';
     opts.args = args;
     opts.timeoutMs = timeoutMs;
-    return this.invoke(deviceId, opts);
+    const env = await this.invoke(deviceId, opts);
+    assertInvokeSucceeded(env);
+    return env;
   }
 
   /** 注销推送 topic。 */
-  unsubscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
+  async unsubscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
     const arg = new SubscribeArgs();
     arg.topics = topics;
     const args: Object[] = [arg];
@@ -462,7 +519,9 @@ export class DlClient {
     opts.channel = 'device-link:unsubscribe';
     opts.args = args;
     opts.timeoutMs = timeoutMs;
-    return this.invoke(deviceId, opts);
+    const env = await this.invoke(deviceId, opts);
+    assertInvokeSucceeded(env);
+    return env;
   }
 
   /** 更新自身 presence（fire-and-forget）。 */
@@ -509,10 +568,29 @@ export class DlClient {
         req.label = `${kind}:${channel}`;
         req.timer = setTimeout(() => {
           this.pending.delete(id);
-          reject(new DlError('INVOKE_TIMEOUT', `${kind} ${channel} timeout after ${timeoutMs}ms`));
+          reject(new DlError('INVOKE_TIMEOUT',
+            `${kind} ${channel} timeout after ${timeoutMs}ms`, req.inFlight));
         }, timeoutMs);
         this.pending.set(id, req);
-        this.sendEnvelope(env);
+        // 在进入 send 前先按“可能已发出”处理；即使适配器同步触发 close，
+        // failAllPending 也不能把这次写请求误判为可自动重放。
+        req.inFlight = true;
+        let sent = false;
+        try {
+          sent = this.sendEnvelope(env);
+        } catch (e) {
+          this.pending.delete(id);
+          this.clearTimer(req.timer);
+          const message = e instanceof Error ? e.message : JSON.stringify(e);
+          reject(new DlError('SEND_FAILED', message, true));
+          return;
+        }
+        if (!sent) {
+          req.inFlight = false;
+          this.pending.delete(id);
+          this.clearTimer(req.timer);
+          reject(new DlError('NOT_CONNECTED', 'socket unavailable before send'));
+        }
       });
     };
     if (this.status === 'online') {
@@ -527,10 +605,10 @@ export class DlClient {
     });
   }
 
-  private sendEnvelope(env: Envelope): void {
+  private sendEnvelope(env: Envelope): boolean {
     const ws = this.ws;
-    if (!ws) return;
-    ws.send(encodeEnvelope(env));
+    if (!ws) return false;
+    return ws.send(encodeEnvelope(env));
   }
 
   private takePending(id: string): PendingRequest | undefined {
@@ -543,7 +621,7 @@ export class DlClient {
   private failAllPending(err: DlError): void {
     this.pending.forEach((req: PendingRequest, id: string) => {
       this.clearTimer(req.timer);
-      req.reject(err);
+      req.reject(new DlError(err.code, err.message, err.inFlight || req.inFlight));
     });
     this.pending.clear();
   }

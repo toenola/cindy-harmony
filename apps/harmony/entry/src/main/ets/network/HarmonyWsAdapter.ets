@@ -96,13 +96,14 @@ export class HarmonyWsAdapter implements WsAdapter {
     ws.connect(url, { header: headers });
   }
 
-  send(data: string): void {
+  send(data: string): boolean {
     const ws = this.ws;
     if (!ws || this.closed) {
       hilog.warn(DOMAIN, TAG, 'send on closed ws, drop');
-      return;
+      return false;
     }
     ws.send(data);
+    return true;
   }
 
   close(code?: number, reason?: string): void {

@@ -22,7 +22,11 @@ import {
   readStr, readObj, readBool, readNum,
 } from '../tasks/TaskModels';
 import { RemoteImageRef, RemoteMediaFetchResult } from '../attachments/AttachmentModels';
-import { summarizeText } from './MessageRender';
+import {
+  applyCodexPlanSnapshotOnDone,
+  markCodexPlanTurnFailed,
+  summarizeText,
+} from './MessageRender';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import {
   AgentTaskUpdate,
@@ -924,10 +928,11 @@ export class MessageStore {
     const ev = event as Record<string, Object>;
     const type = readStr(ev, 'type');
     const data = readObj(ev, 'data');
+    const eventSource = readStr(ev, 'source');
     this.bumpRunningStateRevision(sessionId);
 
     if (type === 'agent_task_update') {
-      const rawSource = readStr(ev, 'source');
+      const rawSource = eventSource;
       const source = rawSource === 'codex' || rawSource === 'pi' || rawSource === 'claude-code'
         ? rawSource : '';
       const previous = this.recallParkedTaskUpdates(
@@ -1046,6 +1051,21 @@ export class MessageStore {
           t.settled = true;
         });
       }
+      if (eventSource === 'codex' && !hasTurnContinuation(ev)) {
+        if (s !== undefined) {
+          this.materializeStreamingProjection(sessionId, s);
+          this.streamingBySession.delete(sessionId);
+        }
+        const raw = readObj(data, 'raw');
+        applyCodexPlanSnapshotOnDone(
+          this.messagesBySession.get(sessionId) ?? [],
+          data['plan'],
+          readStr(raw, 'id'),
+          readStr(raw, 'status'),
+          readNum(data, 'planUpdatedAtMs', 0),
+          readBool(data, 'cancelled', false),
+        );
+      }
       if (hasTurnContinuation(ev)) {
         // SDK segment 结束但产品 turn 仍会继续，不能把 Composer 切回停止态。
         this.markSessionRunning(sessionId, true);
@@ -1059,6 +1079,14 @@ export class MessageStore {
     if (type === 'error') {
       const terminal = readBool(data, 'isTerminal', !readBool(data, 'willRetry', false));
       if (terminal) {
+        if (eventSource === 'codex') {
+          const active = this.streamingBySession.get(sessionId);
+          if (active !== undefined) {
+            this.materializeStreamingProjection(sessionId, active);
+            this.streamingBySession.delete(sessionId);
+          }
+          markCodexPlanTurnFailed(this.messagesBySession.get(sessionId) ?? []);
+        }
         this.makerTurnRunningBySession.delete(sessionId);
         this.finalizeSessionStreaming(sessionId);
       } else {

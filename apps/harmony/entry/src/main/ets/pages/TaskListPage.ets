@@ -15,6 +15,10 @@ import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
 import { SessionLiveActivity, SessionMetaPatch } from '../core/tasks/TaskStore';
 import { TaskListPreferences } from '../core/tasks/TaskListPreferenceStore';
+import {
+  TASK_LIST_RECONCILE_INTERVAL_MS,
+  TaskListReconcileBackoff,
+} from '../core/tasks/TaskListReconcilePolicy';
 import { TaskPageContent } from './TaskPage';
 import {
   isWideTaskLayout,
@@ -116,6 +120,10 @@ struct TaskListPage {
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
   private clockTimer: number = -1;
+  private taskListReconcileTimer: number = -1;
+  private taskListLoadInFlight: Map<string, Promise<boolean>> = new Map();
+  private taskListReconcileBackoff: TaskListReconcileBackoff = new TaskListReconcileBackoff();
+  private taskListReconcileGeneration: number = 0;
   private dividerTouchStartX: number = 0;
   private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   private foldStatusListening: boolean = false;
@@ -131,6 +139,7 @@ struct TaskListPage {
   };
 
   aboutToAppear(): void {
+    this.taskListReconcileGeneration += 1;
     if (!this.routeParamsInitialized) {
       const params = (router.getParams() ?? {}) as Record<string, Object>;
       this.selectedDeviceId = readStr(params, 'deviceId');
@@ -158,12 +167,19 @@ struct TaskListPage {
 
     this.refreshProjection();
     AppServices.instance.syncSessionSubscriptions();
+    // Mobile 同源语义：进入列表先做一轮权威对账；push 仍是实时主路径。
+    void this.refreshTaskList(false);
     this.clockTimer = setInterval(() => {
       this.now = Date.now();
     }, 60_000);
+    // best-effort push 可能在弱网/订阅恢复窗口丢失；前台可见时低频补拉最终收敛。
+    this.taskListReconcileTimer = setInterval(() => {
+      this.reconcileTaskLists();
+    }, TASK_LIST_RECONCILE_INTERVAL_MS);
   }
 
   aboutToDisappear(): void {
+    this.taskListReconcileGeneration += 1;
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
     }
@@ -172,6 +188,12 @@ struct TaskListPage {
       clearInterval(this.clockTimer);
       this.clockTimer = -1;
     }
+    if (this.taskListReconcileTimer >= 0) {
+      clearInterval(this.taskListReconcileTimer);
+      this.taskListReconcileTimer = -1;
+    }
+    this.taskListLoadInFlight.clear();
+    this.taskListReconcileBackoff.clear();
     this.stopFoldStatusObservation();
     this.listTabSwiperAppeared = false;
     void AppServices.instance.taskListPreferences.flush();
@@ -638,16 +660,85 @@ struct TaskListPage {
     this.persistPreferences();
   }
 
-  private async refreshAllDevices(): Promise<void> {
-    if (this.refreshing) return;
-    this.refreshing = true;
-    const devices = this.devices.slice();
-    for (let i = 0; i < devices.length; i++) {
-      if (devices[i].online && devices[i].remoteControlEnabled) {
-        await AppServices.instance.tasks.loadSessions(devices[i].deviceId);
+  private async refreshTaskList(visible: boolean): Promise<boolean> {
+    if (this.refreshing) return false;
+    if (visible) this.refreshing = true;
+    let deviceSnapshotLoaded = false;
+    let eligibleCount = 0;
+    let loadedCount = 0;
+    try {
+      if (AppServices.instance.client.getStatus() !== 'online') {
+        AppServices.instance.client.connectNow('task-list-refresh', true);
+        try {
+          await AppServices.instance.client.waitUntilOnline(5000);
+        } catch (_err) {
+          if (visible) promptAction.showToast({ message: '连接电脑后才能刷新任务' });
+          return false;
+        }
       }
+      // 与 Mobile 手动刷新同源：先刷新设备管理面，再按最新设备快照拉任务列表。
+      deviceSnapshotLoaded = await AppServices.instance.loadDevices();
+      AppServices.instance.syncSessionSubscriptions();
+      const devices = AppServices.instance.tasks.deviceList;
+      const loads: Array<Promise<boolean>> = [];
+      for (let i = 0; i < devices.length; i++) {
+        if (!devices[i].online || !devices[i].remoteControlEnabled) continue;
+        eligibleCount += 1;
+        // 用户主动刷新必须发起新的权威拉取；已有的订阅初拉或周期对账不能冒充本次刷新。
+        // TaskStore 的 per-device revision 会让更早请求的迟到响应自动失权。
+        loads.push(this.loadTaskListSingleFlight(devices[i].deviceId, visible));
+      }
+      const outcomes = await Promise.all(loads);
+      for (let i = 0; i < outcomes.length; i++) {
+        if (outcomes[i]) loadedCount += 1;
+      }
+      const success = deviceSnapshotLoaded && (eligibleCount === 0 || loadedCount === eligibleCount);
+      if (visible && !success) promptAction.showToast({ message: '部分任务刷新失败，请重试' });
+      return success;
+    } finally {
+      if (visible) this.refreshing = false;
     }
-    this.refreshing = false;
+  }
+
+  /** 页面内所有列表补拉按设备合并，避免手动刷新与周期对账互相判旧。 */
+  private loadTaskListSingleFlight(deviceId: string, forceFresh: boolean = false): Promise<boolean> {
+    const existing = this.taskListLoadInFlight.get(deviceId);
+    if (!forceFresh && existing !== undefined) return existing;
+    const request = AppServices.instance.tasks.loadSessions(deviceId);
+    this.taskListLoadInFlight.set(deviceId, request);
+    void request.finally(() => {
+      if (this.taskListLoadInFlight.get(deviceId) === request) {
+        this.taskListLoadInFlight.delete(deviceId);
+      }
+    });
+    return request;
+  }
+
+  /** 10 秒 anti-entropy：每设备 single-flight，失败指数退避到最多 2 分钟。 */
+  private reconcileTaskLists(): void {
+    if (this.connectionStatus !== 'online') return;
+    const devices = AppServices.instance.tasks.deviceList;
+    const eligibleDeviceIds: Set<string> = new Set();
+    for (let i = 0; i < devices.length; i++) {
+      const device = devices[i];
+      if (!device.online || !device.remoteControlEnabled) continue;
+      eligibleDeviceIds.add(device.deviceId);
+      if (this.taskListLoadInFlight.has(device.deviceId)
+        || !this.taskListReconcileBackoff.shouldAttempt(device.deviceId)) {
+        continue;
+      }
+      const generation = this.taskListReconcileGeneration;
+      void this.loadTaskListSingleFlight(device.deviceId)
+        .then((loaded: boolean) => {
+          if (generation !== this.taskListReconcileGeneration) return;
+          this.taskListReconcileBackoff.report(device.deviceId, loaded);
+        })
+        .catch((_err: Error) => {
+          if (generation !== this.taskListReconcileGeneration) return;
+          this.taskListReconcileBackoff.report(device.deviceId, false);
+        });
+    }
+    this.taskListReconcileBackoff.retainOnly(eligibleDeviceIds);
   }
 
   private entryForKey(key: string): TaskListEntry | null {
@@ -1006,18 +1097,17 @@ struct TaskListPage {
     return [];
   }
 
-  /** 行内操作条会改变 ListItem 实高；key 带展开态，促使 ArkUI 重新测量当前行。 */
   private sessionEntryRenderKey(prefix: string, entry: TaskListEntry): string {
-    return `${prefix}:${entry.key}:${this.actionEntryKey === entry.key ? 'actions' : 'row'}`;
+    return `${prefix}:${entry.key}`;
   }
 
   private projectGroupRenderKey(group: TaskProjectGroup): string {
+    // ForEach 会按 key 复用已有项目节点；成员签名确保跨端新建任务进入已有项目时真正重建。
+    let key = `project:${group.key}`;
     for (let i = 0; i < group.entries.length; i++) {
-      if (group.entries[i].key === this.actionEntryKey) {
-        return `project:${group.key}:actions:${this.actionEntryKey}`;
-      }
+      key += `:${group.entries[i].key}`;
     }
-    return `project:${group.key}:row`;
+    return key;
   }
 
   /** 当前分类可见的任务；置顶任务只出现在自身所属分类。 */
@@ -1333,9 +1423,7 @@ struct TaskListPage {
 
       this.headerSymbolButton($r('sys.symbol.gearshape'), () => this.openSettings())
       this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch())
-      this.headerSymbolButton($r('sys.symbol.arrow_clockwise'), () => {
-        void this.refreshAllDevices();
-      })
+      this.refreshHeaderButton()
       this.headerSymbolButton($r('sys.symbol.plus'), () => this.openNewSession())
     }
     .width('100%')
@@ -1358,6 +1446,33 @@ struct TaskListPage {
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
     .onClick(action)
+  }
+
+  @Builder
+  refreshHeaderButton() {
+    Button() {
+      if (this.refreshing) {
+        LoadingProgress()
+          .width(18)
+          .height(18)
+          .color($r('app.color.text_secondary'))
+      } else {
+        SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+          .fontSize(18)
+          .fontColor([$r('app.color.text_primary')])
+      }
+    }
+    .type(ButtonType.Circle)
+    .width(40)
+    .height(40)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .enabled(!this.refreshing)
+    .accessibilityText(this.refreshing ? '正在刷新任务' : '刷新任务')
+    .onClick(() => {
+      void this.refreshTaskList(true);
+    })
   }
 
   @Builder
@@ -1572,8 +1687,46 @@ struct TaskListPage {
       if (category === 'projects') {
         if (this.projectGroups().length > 0) {
           ForEach(this.projectGroups(), (group: TaskProjectGroup) => {
-            ListItem() {
-              this.projectGroup(group)
+            ListItemGroup() {
+              ListItem() {
+                this.projectGroupHeader(group)
+              }
+              if (!this.projectCollapsed(group.key)) {
+                ForEach(this.visibleProjectEntries(group), (entry: TaskListEntry) => {
+                  ListItem() {
+                    this.sessionEntry(entry, true)
+                  }
+                  .swipeAction({
+                    start: {
+                      builder: () => {
+                        this.swipePinAction(entry)
+                      },
+                      actionAreaDistance: 56,
+                      onAction: () => {
+                        void this.togglePinned(entry);
+                      },
+                    },
+                    end: {
+                      builder: () => {
+                        this.swipeArchiveAction(entry)
+                      },
+                      actionAreaDistance: 56,
+                      onAction: () => {
+                        void this.archiveOrRestore(entry);
+                      },
+                    },
+                    edgeEffect: SwipeEdgeEffect.Spring,
+                  })
+                }, (entry: TaskListEntry) => this.sessionEntryRenderKey('project', entry))
+                if (group.entries.length > PROJECT_INLINE_LIMIT) {
+                  ListItem() {
+                    this.projectViewAllRow(group)
+                  }
+                }
+              }
+              ListItem() {
+                this.projectGroupDivider()
+              }
             }
           }, (group: TaskProjectGroup) => this.projectGroupRenderKey(group))
         } else {
@@ -1686,13 +1839,7 @@ struct TaskListPage {
    */
   @Builder
   sessionEntry(entry: TaskListEntry, inGroup: boolean) {
-    Column() {
-      this.sessionRow(entry, inGroup)
-      if (this.actionEntryKey === entry.key) {
-        this.sessionInlineActions(entry, inGroup)
-      }
-    }
-    .width('100%')
+    this.sessionRow(entry, inGroup)
   }
 
   @Builder
@@ -1729,20 +1876,6 @@ struct TaskListPage {
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
-      if (!this.bulkMode) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-            .fontSize(15)
-            .fontColor([$r('app.color.text_secondary')])
-        }
-        .type(ButtonType.Circle)
-        .width(34)
-        .height(34)
-        .padding(0)
-        .backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .onClick(() => this.openSessionActions(entry))
-      }
     }
     .width('auto')
     .constraintSize({
@@ -1751,7 +1884,7 @@ struct TaskListPage {
     .padding({ left: 14, right: 14, top: 9, bottom: 9 })
     .margin(inGroup
       ? { left: 6, right: 6, bottom: 2 }
-      : { left: LIST_INSET, right: LIST_INSET, bottom: this.actionEntryKey === entry.key ? 2 : 8 })
+      : { left: LIST_INSET, right: LIST_INSET, bottom: 8 })
     .backgroundColor(this.entrySelected(entry) || this.selectedEntryKeys.indexOf(entry.key) >= 0
       ? $r('app.color.bg_chip')
       : Color.Transparent)
@@ -1870,45 +2003,36 @@ struct TaskListPage {
   }
 
   @Builder
-  projectGroup(group: TaskProjectGroup) {
-    Column() {
-      Row({ space: 8 }) {
-        SymbolGlyph($r('sys.symbol.folder'))
-          .fontSize(17)
-          .fontColor([$r('app.color.text_secondary')])
-        Text(group.title)
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-        Text(`${group.entries.length}`)
-          .fontSize(12)
-          .fontColor($r('app.color.text_tertiary'))
-        this.collapseChevron(this.projectCollapsed(group.key))
-      }
-      .width('100%')
-      .height(52)
-      .padding({ left: LIST_INSET, right: LIST_INSET })
-      .clickEffect(UI_LIST_CLICK_EFFECT)
-      .onClick(() => this.toggleProject(group.key))
-
-      if (!this.projectCollapsed(group.key)) {
-        ForEach(this.visibleProjectEntries(group), (entry: TaskListEntry) => {
-          this.sessionEntry(entry, true)
-        }, (entry: TaskListEntry) => `project-session:${entry.key}`)
-        if (group.entries.length > PROJECT_INLINE_LIMIT) {
-          this.projectViewAllRow(group)
-        }
-      }
-
-      Divider()
-        .strokeWidth(0.5)
-        .color($r('app.color.border'))
-        .margin({ left: LIST_INSET, right: LIST_INSET })
+  projectGroupHeader(group: TaskProjectGroup) {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.folder'))
+        .fontSize(17)
+        .fontColor([$r('app.color.text_secondary')])
+      Text(group.title)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      Text(`${group.entries.length}`)
+        .fontSize(12)
+        .fontColor($r('app.color.text_tertiary'))
+      this.collapseChevron(this.projectCollapsed(group.key))
     }
     .width('100%')
+    .height(52)
+    .padding({ left: LIST_INSET, right: LIST_INSET })
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => this.toggleProject(group.key))
+  }
+
+  @Builder
+  projectGroupDivider() {
+    Divider()
+      .strokeWidth(0.5)
+      .color($r('app.color.border'))
+      .margin({ left: LIST_INSET, right: LIST_INSET })
   }
 
   @Builder

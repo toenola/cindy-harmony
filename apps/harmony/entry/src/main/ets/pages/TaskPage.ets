@@ -126,6 +126,7 @@ import {
   QueuedInputItem,
 } from '../core/messages/InputQueueStore';
 import { RewindPreview } from '../core/messages/MessageStore';
+import { deriveAgentTaskStatus } from '../core/messages/AgentTaskStore';
 import {
   AutoResumePresentation,
   appendAutoResumePendingMessage,
@@ -2041,8 +2042,7 @@ export struct TaskPageContent {
     }
     if (item.type === 'agent_task') {
       const task = item as RenderAgentTaskItem;
-      const status = task.update !== null
-        ? task.update.status : (task.tool !== null && task.tool.hasResult ? 'completed' : 'running');
+      const status = this.agentTaskStatus(task);
       const progress = task.update !== null ? task.update.workflowProgress.length : 0;
       return `${item.key}:agent:${status}:${progress}`;
     }
@@ -3716,6 +3716,7 @@ export struct TaskPageContent {
     }
     if (item.phase === 'sending') return '正在发送…';
     if (item.phase === 'waiting') return '等待任务创建后发送…';
+    if (item.phase === 'connection-waiting') return '等待连接恢复后发送…';
     if (item.phase === 'settling') return '已发送，正在同步…';
     if (item.phase === 'editing') return '正在编辑';
     if (item.phase === 'paused') return `队列 ${item.queueIndex} · 已暂停`;
@@ -5030,8 +5031,12 @@ export struct TaskPageContent {
   }
 
   private agentTaskStatus(item: RenderAgentTaskItem): string {
-    if (item.update !== null) return item.update.status;
-    return item.tool !== null && item.tool.hasResult ? 'completed' : 'running';
+    return deriveAgentTaskStatus(
+      item.update?.status ?? '',
+      item.tool?.toolName ?? '',
+      item.tool?.inputRaw ?? '',
+      item.tool?.resultText ?? '',
+    );
   }
 
   private agentTaskProvider(item: RenderAgentTaskItem): string {

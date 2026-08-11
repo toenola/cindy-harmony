@@ -5,7 +5,7 @@
  * `maker:input:projection` push；页面只消费归一化投影。所有操作复用 Mobile
  * 已使用的 `maker:input:*` 通道，不创建 Harmony 专用协议。
  */
-import { DlClient, DlError, DlInvokeOptions } from '../device-link/DlClient';
+import { DlClient, DlError, DlInvokeOptions, isSafeUnsentDlError } from '../device-link/DlClient';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
 import { RemoteSession, readBool, readObj, readStr } from '../tasks/TaskModels';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
@@ -48,6 +48,11 @@ class ActiveInputTarget {
 }
 
 class DeferredDispatchTarget {
+  deviceId: string = '';
+  session: RemoteSession = new RemoteSession();
+}
+
+class ConnectionDispatchTarget {
   deviceId: string = '';
   session: RemoteSession = new RemoteSession();
 }
@@ -230,6 +235,10 @@ export class InputQueueStore {
   private deferredPumps: Set<string> = new Set();
   /** 已从 deferred 移入本地 projection、但尚未被 Desktop 确认接收的条目。 */
   private deferredDispatchClientIds: Set<string> = new Set();
+  /** 能证明尚未发出的断线消息；恢复投影成功后才按 FIFO 自动续发。 */
+  private connectionWaitingBySession: Map<string, QueuedInputItem[]> = new Map();
+  private connectionDispatchTargets: Map<string, ConnectionDispatchTarget> = new Map();
+  private connectionPumps: Set<string> = new Set();
   /** 用户主动删除的条目不能被队列 diff 误判为“派发中”。 */
   private locallyRemovedClientIds: Set<string> = new Set();
   /** 删除回包与补拉都失败时，等待下一份权威投影裁决是否真的删除。 */
@@ -299,6 +308,18 @@ export class InputQueueStore {
     if (this.enqueueingClientIds.delete(clientId)) changed = true;
     if (this.locallyRemovedClientIds.delete(clientId)) changed = true;
     if (this.deferredDispatchClientIds.delete(clientId)) changed = true;
+    const waiting = this.connectionWaitingBySession.get(sessionId);
+    if (waiting !== undefined) {
+      const next = waiting.filter((item: QueuedInputItem) => item.clientId !== clientId);
+      if (next.length !== waiting.length) {
+        if (next.length > 0) this.connectionWaitingBySession.set(sessionId, next);
+        else {
+          this.connectionWaitingBySession.delete(sessionId);
+          this.connectionDispatchTargets.delete(sessionId);
+        }
+        changed = true;
+      }
+    }
     if (changed) this.notify();
   }
 
@@ -435,6 +456,19 @@ export class InputQueueStore {
       bubble.phase = 'waiting';
       bubbles.push(bubble);
     }
+    const connectionWaiting = this.connectionWaitingBySession.get(sessionId) ?? [];
+    for (let i = 0; i < connectionWaiting.length; i++) {
+      const item = connectionWaiting[i];
+      const bubble = new PendingQueueBubble();
+      bubble.clientId = item.clientId;
+      bubble.text = item.text;
+      bubble.queueIndex = projection.pendingQueue.length + deferred.length + i + 1;
+      bubble.images = item.images;
+      bubble.files = item.files;
+      bubble.phase = this.enqueueingClientIds.has(item.clientId)
+        ? 'sending' : 'connection-waiting';
+      bubbles.push(bubble);
+    }
     return bubbles;
   }
 
@@ -465,6 +499,7 @@ export class InputQueueStore {
     if (changed) {
       this.notify();
       void this.pumpDeferred(sessionId);
+      void this.pumpConnectionWaiting(sessionId);
     }
   }
 
@@ -571,6 +606,8 @@ export class InputQueueStore {
     // 保留 per-session tombstone；clear 前启动的旧请求不得在同 id 重建后复活。
     this.bumpAuthorityEpoch(sessionId);
     this.dropProjection(sessionId);
+    this.connectionWaitingBySession.delete(sessionId);
+    this.connectionDispatchTargets.delete(sessionId);
     this.sessionDevices.delete(sessionId);
     this.notify();
   }
@@ -601,19 +638,26 @@ export class InputQueueStore {
 
   /** Relay 重连后补拉当前打开任务的输入投影。 */
   async resyncActiveSessions(): Promise<void> {
-    const pending: Promise<boolean>[] = [];
+    const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInputTarget, sessionId: string) => {
-      pending.push(this.refresh(target.deviceId, sessionId));
+      pending.push(this.refreshThenPumpConnection(target.deviceId, sessionId));
     });
     await Promise.all(pending);
   }
 
   async resyncDevice(deviceId: string): Promise<void> {
-    const pending: Promise<boolean>[] = [];
+    const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInputTarget, sessionId: string) => {
-      if (target.deviceId === deviceId) pending.push(this.refresh(deviceId, sessionId));
+      if (target.deviceId === deviceId) {
+        pending.push(this.refreshThenPumpConnection(deviceId, sessionId));
+      }
     });
     await Promise.all(pending);
+  }
+
+  private async refreshThenPumpConnection(deviceId: string, sessionId: string): Promise<void> {
+    const refreshed = await this.refresh(deviceId, sessionId);
+    if (refreshed) await this.pumpConnectionWaiting(sessionId);
   }
 
   /** 目标桌面离线、撤权或从权威设备快照移除：旧投影立即删除并 fence 在途 RPC。 */
@@ -683,6 +727,9 @@ export class InputQueueStore {
     this.deferredDispatchTargets.clear();
     this.deferredPumps.clear();
     this.deferredDispatchClientIds.clear();
+    this.connectionWaitingBySession.clear();
+    this.connectionDispatchTargets.clear();
+    this.connectionPumps.clear();
     this.enqueueingClientIds.clear();
     this.failedByClientId.clear();
     this.locallyRemovedClientIds.clear();
@@ -725,6 +772,12 @@ export class InputQueueStore {
     }
     const item = this.buildQueuedMessage(
       session, serialized, images, files, stableClientId, planModeOverride);
+    if (this.client?.getStatus() !== 'online'
+      || (this.connectionWaitingBySession.get(session.id)?.length ?? 0) > 0
+      || this.connectionPumps.has(session.id)) {
+      this.parkForConnection(deviceId, session, item);
+      return item.clientId;
+    }
     const projection = this.getProjection(session.id);
     projection.sessionId = session.id;
     projection.pendingQueue = projection.pendingQueue.concat([item]);
@@ -745,6 +798,11 @@ export class InputQueueStore {
       this.notify();
       return item.clientId;
     } catch (e) {
+      if (isSafeUnsentDlError(e)) {
+        this.removeLocalProjectionItem(session.id, item.clientId);
+        this.parkForConnection(deviceId, session, item);
+        return item.clientId;
+      }
       // NOT_CONNECTED 可能发生在 host 已接收之后；先权威对账再决定是否标失败。
       const applied = await this.refresh(deviceId, session.id);
       if (applied && this.findItem(session.id, item.clientId) !== null) {
@@ -778,6 +836,7 @@ export class InputQueueStore {
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
+      void this.pumpConnectionWaiting(sessionId);
     } catch (e) {
       if (deferredDispatch && !this.deferredDispatchClientIds.has(clientId)) {
         this.enqueueingClientIds.delete(clientId);
@@ -793,6 +852,18 @@ export class InputQueueStore {
   }
 
   async remove(deviceId: string, sessionId: string, clientId: string): Promise<void> {
+    const connectionWaiting = this.connectionWaitingBySession.get(sessionId) ?? [];
+    if (connectionWaiting.some((item: QueuedInputItem) => item.clientId === clientId)) {
+      const next = connectionWaiting.filter((item: QueuedInputItem) => item.clientId !== clientId);
+      if (next.length > 0) this.connectionWaitingBySession.set(sessionId, next);
+      else {
+        this.connectionWaitingBySession.delete(sessionId);
+        this.connectionDispatchTargets.delete(sessionId);
+      }
+      this.clearTransientClient(clientId);
+      this.notify();
+      return;
+    }
     const deferred = this.deferredBySession.get(sessionId) ?? [];
     const deferredIndex = deferred.findIndex(
       (item: QueuedInputItem) => item.clientId === clientId);
@@ -1014,6 +1085,115 @@ export class InputQueueStore {
     }
     this.deferredBySession.delete(sessionId);
     this.deferredDispatchTargets.delete(sessionId);
+  }
+
+  private removeLocalProjectionItem(sessionId: string, clientId: string): void {
+    const projection = this.projections.get(sessionId);
+    if (projection !== undefined) {
+      projection.pendingQueue = projection.pendingQueue.filter(
+        (item: QueuedInputItem) => item.clientId !== clientId);
+      this.bumpAuthorityEpoch(sessionId);
+      this.projections.set(sessionId, projection);
+    }
+    const settling = this.settlingBySession.get(sessionId);
+    if (settling !== undefined) {
+      const next = settling.filter((item: QueuedInputItem) => item.clientId !== clientId);
+      if (next.length > 0) this.settlingBySession.set(sessionId, next);
+      else this.settlingBySession.delete(sessionId);
+      this.clearSettlingClock(clientId);
+    }
+    this.enqueueingClientIds.delete(clientId);
+    this.failedByClientId.delete(clientId);
+  }
+
+  private parkForConnection(
+    deviceId: string,
+    session: RemoteSession,
+    item: QueuedInputItem,
+  ): void {
+    const target = new ConnectionDispatchTarget();
+    target.deviceId = deviceId;
+    target.session = session;
+    this.connectionDispatchTargets.set(session.id, target);
+    const waiting = this.connectionWaitingBySession.get(session.id) ?? [];
+    if (!waiting.some((queued: QueuedInputItem) => queued.clientId === item.clientId)) {
+      this.connectionWaitingBySession.set(session.id, waiting.concat([item]));
+    }
+    this.enqueueingClientIds.delete(item.clientId);
+    this.failedByClientId.delete(item.clientId);
+    this.notify();
+  }
+
+  /**
+   * await enqueue 期间仍允许新消息追加到同一 outbox。出队必须重新读取最新队列，
+   * 不能用 await 前的数组回写，否则会覆盖并丢掉刚追加的尾项。
+   */
+  private consumeConnectionWaitingHead(sessionId: string, clientId: string): boolean {
+    const latest = this.connectionWaitingBySession.get(sessionId) ?? [];
+    if (latest.length === 0 || latest[0].clientId !== clientId) return false;
+    const next = latest.slice(1);
+    if (next.length > 0) {
+      this.connectionWaitingBySession.set(sessionId, next);
+    } else {
+      this.connectionWaitingBySession.delete(sessionId);
+      this.connectionDispatchTargets.delete(sessionId);
+    }
+    return true;
+  }
+
+  /** 仅在权威投影同步成功后调用；队首未安全送达时阻塞后续，避免消息超车。 */
+  private async pumpConnectionWaiting(sessionId: string): Promise<void> {
+    if (this.connectionPumps.has(sessionId)) return;
+    const active = this.activeTargets.get(sessionId);
+    const target = this.connectionDispatchTargets.get(sessionId);
+    if (active === undefined || target === undefined || active.deviceId !== target.deviceId) return;
+    this.connectionPumps.add(sessionId);
+    try {
+      for (;;) {
+        const waiting = this.connectionWaitingBySession.get(sessionId) ?? [];
+        const currentTarget = this.connectionDispatchTargets.get(sessionId);
+        if (waiting.length === 0 || currentTarget === undefined) {
+          this.connectionWaitingBySession.delete(sessionId);
+          this.connectionDispatchTargets.delete(sessionId);
+          return;
+        }
+        const item = waiting[0];
+        this.applySessionContextToQueuedItem(item, currentTarget.session);
+        this.enqueueingClientIds.add(item.clientId);
+        this.notify();
+        const sendOptions: Record<string, Object> = {};
+        sendOptions['sendAtMs'] = Date.now();
+        try {
+          const expectedEpoch = this.captureAuthorityEpoch(sessionId);
+          const result = await this.invoke(currentTarget.deviceId,
+            'maker:input:enqueue', [sessionId, item.raw, sendOptions]);
+          this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+          this.consumeConnectionWaitingHead(sessionId, item.clientId);
+          this.enqueueingClientIds.delete(item.clientId);
+          this.failedByClientId.delete(item.clientId);
+          this.notify();
+        } catch (e) {
+          this.enqueueingClientIds.delete(item.clientId);
+          if (isSafeUnsentDlError(e)) {
+            this.notify();
+            return;
+          }
+          // 已发出但 ACK 不确定：只做一次权威对账；无法确认时转人工失败，绝不自动重放。
+          const applied = await this.refresh(currentTarget.deviceId, sessionId);
+          if (applied && this.findItem(sessionId, item.clientId) !== null) {
+            this.consumeConnectionWaitingHead(sessionId, item.clientId);
+            this.notify();
+            continue;
+          }
+          if (!this.consumeConnectionWaitingHead(sessionId, item.clientId)) return;
+          const message = e instanceof Error ? e.message : JSON.stringify(e);
+          this.restoreFailedQueueItem(sessionId, item.clientId, message, item);
+          return;
+        }
+      }
+    } finally {
+      this.connectionPumps.delete(sessionId);
+    }
   }
 
   /** 队首失败会留在正常 pendingQueue 并阻断后续；用户重试成功后 retry() 会再次唤醒。 */
@@ -1333,7 +1513,16 @@ export class InputQueueStore {
   ): Promise<Object | undefined> {
     const client = this.client;
     if (!client) throw new Error('Device Link 未连接');
-    if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    if (this.linkOpener !== undefined) {
+      try {
+        await this.linkOpener(deviceId);
+      } catch (e) {
+        // link-open 自身即使 ACK 不确定，本次 maker:input 调用也还没有开始发送。
+        if (e instanceof DlError) throw new DlError(e.code, e.message, false);
+        const message = e instanceof Error ? e.message : JSON.stringify(e);
+        throw new DlError('LINK_NOT_OPEN', message, false);
+      }
+    }
     const options = new DlInvokeOptions();
     options.channel = channel;
     options.args = args;

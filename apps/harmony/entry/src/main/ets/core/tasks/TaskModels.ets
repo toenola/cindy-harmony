@@ -197,6 +197,10 @@ export class RemoteMessage {
   systemCardData: Record<string, Object> = {};
   /** agentMeta 中的 turn seal；用于区分过程正文与最终答复。 */
   turnCompleted: boolean = false;
+  /** 区分协议缺失与显式 false；Codex 失败印记依赖该三态。 */
+  hasTurnCompleted: boolean = false;
+  terminalPlanSnapshot: boolean = false;
+  terminalPlanAtMs: number = 0;
   /** 流式投影标记；历史正文不应被当作最终答复展示。 */
   isStreaming: boolean = false;
   /** 保留少量 agentMeta 语义，避免渲染层只能靠消息顺序猜测 turn。 */
@@ -285,13 +289,32 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
     }
   }
   m.localOnly = readBool(raw, 'localOnly', false);
+  const contentRecord = recordOrEmpty(m.content);
   const turnUsageDetails = readObj(agentMeta, 'turnUsageDetails');
   const turnCost = readObj(agentMeta, 'turnCost');
-  m.turnCompleted = readBool(raw, 'turnCompleted', false)
-    || readBool(agentMeta, 'turnCompleted', false)
-    || Object.keys(turnUsageDetails).length > 0
-    || Object.keys(turnCost).length > 0
-    || readNum(agentMeta, 'turnCostUsd', 0) > 0;
+  const rawTurnCompleted = raw['turnCompleted'];
+  const metaTurnCompleted = agentMeta['turnCompleted'];
+  const contentTurnCompleted = contentRecord['turnCompleted'];
+  m.hasTurnCompleted = typeof rawTurnCompleted === 'boolean'
+    || typeof metaTurnCompleted === 'boolean'
+    || typeof contentTurnCompleted === 'boolean';
+  if (typeof rawTurnCompleted === 'boolean') {
+    m.turnCompleted = rawTurnCompleted as boolean;
+  } else if (typeof metaTurnCompleted === 'boolean') {
+    m.turnCompleted = metaTurnCompleted as boolean;
+  } else if (typeof contentTurnCompleted === 'boolean') {
+    m.turnCompleted = contentTurnCompleted as boolean;
+  } else {
+    m.turnCompleted = Object.keys(turnUsageDetails).length > 0
+      || Object.keys(turnCost).length > 0
+      || readNum(agentMeta, 'turnCostUsd', 0) > 0;
+  }
+  m.terminalPlanSnapshot = readBool(raw, 'terminalPlanSnapshot', false)
+    || readBool(agentMeta, 'terminalPlanSnapshot', false)
+    || readBool(contentRecord, 'terminalPlanSnapshot', false);
+  m.terminalPlanAtMs = readNum(raw, 'terminalPlanAtMs', 0);
+  if (m.terminalPlanAtMs <= 0) m.terminalPlanAtMs = readNum(agentMeta, 'terminalPlanAtMs', 0);
+  if (m.terminalPlanAtMs <= 0) m.terminalPlanAtMs = readNum(contentRecord, 'terminalPlanAtMs', 0);
   m.isStreaming = readBool(raw, 'isStreaming', false)
     || readBool(agentMeta, 'isStreaming', false)
     || readBool(agentMeta, 'streaming', false);

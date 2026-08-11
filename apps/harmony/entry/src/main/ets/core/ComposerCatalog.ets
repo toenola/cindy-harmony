@@ -85,6 +85,16 @@ export function parseChoiceOptions(value: Object | undefined, permission: boolea
   const out: ComposerChoiceOption[] = [];
   if (!Array.isArray(value)) return out;
   const rows = value as Object[];
+  let hasAsk = false;
+  if (permission) {
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      if (raw === 'ask') hasAsk = true;
+      else if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+        && readStr(raw as Record<string, Object>, 'id') === 'ask') hasAsk = true;
+    }
+  }
+  const seenIds = new Set<string>();
   for (let i = 0; i < rows.length; i++) {
     const raw = rows[i];
     let id = '';
@@ -98,7 +108,9 @@ export function parseChoiceOptions(value: Object | undefined, permission: boolea
       displayName = readStr(record, 'displayName') || readStr(record, 'name');
       description = readStr(record, 'description');
     }
-    if (id.length === 0 || (permission && id === 'plan')) continue;
+    if (id.length === 0 || (permission && (id === 'plan' || (id === 'default' && hasAsk)))) continue;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
     const option = new ComposerChoiceOption();
     option.id = id;
     option.label = permission

@@ -30,8 +30,8 @@ export interface WsAdapter {
   /** 建立连接。headers 用于握手阶段的 HTTP Header（如 Authorization: Bearer）。 */
   connect(url: string, headers: Record<string, string>): void;
 
-  /** 发送文本帧。 */
-  send(data: string): void;
+  /** 发送文本帧；false 表示适配器在进入平台 send 前已确认连接关闭。 */
+  send(data: string): boolean;
 
   /** 正常关闭（发 close 帧）。 */
   close(code?: number, reason?: string): void;

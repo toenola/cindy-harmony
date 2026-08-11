@@ -104,7 +104,10 @@ function messageRecord(message: RemoteMessage): Record<string, Object> {
   if (agentMeta !== undefined && Object.keys(agentMeta as Record<string, Object>).length > 0) {
     out['agentMeta'] = agentMeta;
   }
-  if (message.turnCompleted) out['turnCompleted'] = true;
+  if (message.hasTurnCompleted) out['turnCompleted'] = message.turnCompleted;
+  else if (message.turnCompleted) out['turnCompleted'] = true;
+  if (message.terminalPlanSnapshot) out['terminalPlanSnapshot'] = true;
+  if (message.terminalPlanAtMs > 0) out['terminalPlanAtMs'] = message.terminalPlanAtMs;
   if (message.isStreaming) out['isStreaming'] = true;
   if (message.localOnly) out['localOnly'] = true;
   return out;

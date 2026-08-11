@@ -332,14 +332,14 @@ export class AppServices {
   }
 
   /** 拉取全量设备快照（REST 管理面），presence 补丁保留在线状态不回退。 */
-  async loadDevices(): Promise<void> {
+  async loadDevices(): Promise<boolean> {
     const authEpoch = this.auth.sessionEpoch;
     let retried = false;
     try {
       for (;;) {
       const token = await this.auth.getAccessToken();
       if (token === null || token.length === 0) {
-        return;
+        return false;
       }
       const headers: Record<string, string> = {};
       headers['Authorization'] = `Bearer ${token}`;
@@ -356,11 +356,11 @@ export class AppServices {
         if (refreshed !== null && refreshed.length > 0) {
           continue;
         }
-        return;
+        return false;
       }
       if (res.statusCode >= 300) {
         hilog.warn(DOMAIN, TAG, 'load devices status=%{public}d', res.statusCode);
-        return;
+        return false;
       }
       const views: DeviceView[] = [];
       let parsed: Object;
@@ -368,7 +368,7 @@ export class AppServices {
         parsed = JSON.parse(res.body) as Object;
       } catch (e) {
         hilog.warn(DOMAIN, TAG, 'load devices: response is not json');
-        return;
+        return false;
       }
       // 兼容两种响应形态：直接数组，或 { devices: [...] }。
       let rawList: Object[] = [];
@@ -387,7 +387,7 @@ export class AppServices {
           views.push(parseDeviceView(raw as Record<string, Object>));
         }
       }
-      if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return;
+      if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
       hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
       this.tasks.mergeServerDevices(views);
       const seenDeviceIds = new Set<string>();
@@ -406,10 +406,11 @@ export class AppServices {
           void this.messages.hydrateActiveSessions(views[i].deviceId);
         }
       }
-      return;
+      return true;
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'load devices failed: %{public}s', JSON.stringify(e));
+      return false;
     }
   }
 

@@ -26,6 +26,7 @@ import {
 } from './MessagePayload';
 import {
   AgentTaskUpdate,
+  deriveAgentTaskStatus,
   findAgentTaskUpdate,
   isAgentTaskToolName,
 } from './AgentTaskStore';
@@ -661,6 +662,89 @@ function planMessageKey(message: RemoteMessage, index: number): string {
   return `${message.createdAt}-${index}`;
 }
 
+export function planRowSealed(message: RemoteMessage | undefined): boolean {
+  if (message === undefined) return false;
+  if (message.terminalPlanSnapshot) return true;
+  let content: Record<string, Object> = {};
+  if (message.content !== undefined && typeof message.content === 'object'
+    && !Array.isArray(message.content)) content = message.content as Record<string, Object>;
+  return content['terminalPlanSnapshot'] === true;
+}
+
+export function planRowTurnFailed(message: RemoteMessage | undefined): boolean {
+  if (message === undefined) return false;
+  if (message.hasTurnCompleted && !message.turnCompleted) return true;
+  let content: Record<string, Object> = {};
+  if (message.content !== undefined && typeof message.content === 'object'
+    && !Array.isArray(message.content)) content = message.content as Record<string, Object>;
+  return content['turnCompleted'] === false;
+}
+
+/** Codex done 的权威计划快照与终态印记；取消优先于 completed。 */
+export function applyCodexPlanSnapshotOnDone(
+  messages: RemoteMessage[],
+  snapshot: Object | undefined,
+  turnId: string,
+  terminalStatus: string,
+  planUpdatedAtMs: number,
+  cancelled: boolean,
+): boolean {
+  const authoritative = Array.isArray(snapshot) ? snapshot as Object[] : null;
+  const success = terminalStatus === 'completed' && !cancelled;
+  const expectedUseId = turnId.length > 0 ? `plan:${turnId}` : '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'tool_use') continue;
+    const tool = parseToolUse(message);
+    if (tool.toolName !== 'update_plan') continue;
+    if (expectedUseId.length > 0 && tool.toolUseId !== expectedUseId) continue;
+    if (message.content === undefined || typeof message.content !== 'object'
+      || Array.isArray(message.content)) continue;
+    const content = message.content as Record<string, Object>;
+    const input = readObj(content, 'input');
+    if (!Array.isArray(input['plan'])) continue;
+    if (authoritative !== null) input['plan'] = authoritative;
+    content['input'] = input;
+    if (turnId.length > 0 && success) {
+      message.terminalPlanSnapshot = true;
+      content['terminalPlanSnapshot'] = true;
+      if (planUpdatedAtMs > 0) {
+        message.terminalPlanAtMs = planUpdatedAtMs;
+        content['terminalPlanAtMs'] = planUpdatedAtMs;
+      }
+    } else if (turnId.length > 0) {
+      message.hasTurnCompleted = true;
+      message.turnCompleted = false;
+      content['turnCompleted'] = false;
+    }
+    message.content = content;
+    return true;
+  }
+  return false;
+}
+
+/** terminal error 无 done 时，只给当前 turn 内最近的 Codex 计划写失败印记。 */
+export function markCodexPlanTurnFailed(messages: RemoteMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === 'user' && readStr(message.agentMeta, 'delivery') !== 'steer') return false;
+    if (message.role !== 'tool_use') continue;
+    const tool = parseToolUse(message);
+    if (tool.toolName !== 'update_plan') continue;
+    if (planRowSealed(message) || planRowTurnFailed(message)) return false;
+    message.hasTurnCompleted = true;
+    message.turnCompleted = false;
+    if (message.content !== undefined && typeof message.content === 'object'
+      && !Array.isArray(message.content)) {
+      const content = message.content as Record<string, Object>;
+      content['turnCompleted'] = false;
+      message.content = content;
+    }
+    return true;
+  }
+  return false;
+}
+
 function taskRecord(value: Object | undefined): Record<string, Object> | null {
   if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as Record<string, Object>;
@@ -902,7 +986,9 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
     }
     const continuesCompletedTask = source === 'task' && previousAllDone
       && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState);
-    const startsNew = previous === undefined || (previousAllDone && !continuesCompletedTask);
+    const previousSealed = previous !== undefined && planRowSealed(messages[previous.lastIndex]);
+    const startsNew = previous === undefined || previousSealed
+      || (previousAllDone && !continuesCompletedTask);
     if (source === 'task' && startsNew) taskState.clear();
     const parsed = extractTodos(tool.toolName, tool.inputRaw)
       ?? (source === 'task'
@@ -1687,13 +1773,14 @@ function buildSubagentGroup(
   }
   const result = id.length > 0 ? resultMeta.get(id) : undefined;
   if (result !== undefined) group.summary = result.summary;
-  group.status = result !== undefined ? 'completed' : (streaming ? 'running' : 'completed');
+  group.update = findAgentTaskUpdate(
+    taskUpdates, id, message.clientId.length > 0 ? message.clientId : message.id) ?? null;
+  group.status = deriveAgentTaskStatus(
+    group.update?.status ?? '', tool.toolName, tool.inputRaw, result?.summary ?? '');
   const start = Date.parse(message.createdAt);
   if (result !== undefined && Number.isFinite(start) && result.createdAtMs >= start) {
     group.durationMs = result.createdAtMs - start;
   }
-  group.update = findAgentTaskUpdate(
-    taskUpdates, id, message.clientId.length > 0 ? message.clientId : message.id) ?? null;
   return group;
 }
 
@@ -1994,9 +2081,13 @@ function isCompactBoundaryItem(item: RenderItem): boolean {
 function isWorkActivityItem(item: RenderItem): boolean {
   if (item.type === 'agent_task') {
     const task = item as RenderAgentTaskItem;
-    return task.update !== null
-      ? task.update.status !== 'running'
-      : task.tool !== null && task.tool.hasResult;
+    const tool = task.tool;
+    return deriveAgentTaskStatus(
+      task.update?.status ?? '',
+      tool?.toolName ?? '',
+      tool?.inputRaw ?? '',
+      tool?.resultText ?? '',
+    ) !== 'running';
   }
   return item.type === 'thinking' || item.type === 'tool_group';
 }
