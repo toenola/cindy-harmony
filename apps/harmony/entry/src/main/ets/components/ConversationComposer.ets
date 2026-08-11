@@ -101,7 +101,7 @@ export struct ConversationComposer {
   }
 
   private hasModelChip(): boolean {
-    return this.hasModelOptions && (this.focused || this.images.length > 0);
+    return this.hasModelOptions && this.expanded();
   }
 
   private expanded(): boolean {
@@ -280,6 +280,73 @@ export struct ConversationComposer {
     .onClick(action)
   }
 
+  /** 展开态工具栏里的模型胶囊；窄屏只压缩文字，不挤占上方输入区域。 */
+  @Builder
+  composerModelButton() {
+    Button() {
+      Row({ space: 4 }) {
+        Text(this.effortLabel.length > 0
+          ? `${this.modelLabel} · ${this.effortLabel}`
+          : this.modelLabel)
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(11)
+          .fontColor([$r('app.color.text_tertiary')])
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .type(ButtonType.Normal)
+    .height(30)
+    .constraintSize({ minWidth: 72, maxWidth: this.planModeEnabled ? 88 : 136 })
+    .padding({ left: 12, right: 10 })
+    .borderRadius(UI_RADIUS_PILL)
+    .backgroundColor($r('app.color.bg_chip'))
+    .clickEffect(UI_CLICK_EFFECT)
+    .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
+    .onClick(() => this.onModel())
+  }
+
+  @Builder
+  composerPrimaryButton() {
+    Button() {
+      if (this.sending) {
+        LoadingProgress()
+          .width(15)
+          .height(15)
+          .color($r('app.color.chat_cta_text'))
+      } else if (this.streaming && !this.hasContent) {
+        SymbolGlyph($r('sys.symbol.square'))
+          .fontSize(11)
+          .fontColor([$r('app.color.chat_cta_text')])
+      } else if (this.canSend) {
+        SymbolGlyph($r('sys.symbol.arrow_up'))
+          .fontSize(17)
+          .fontColor([$r('app.color.chat_cta_text')])
+      } else {
+        SymbolGlyph($r('sys.symbol.mic'))
+          .fontSize(18)
+          .fontColor([$r('app.color.chat_text_secondary')])
+      }
+    }
+    .type(ButtonType.Circle)
+    .width(40)
+    .height(40)
+    .padding(0)
+    .borderRadius(UI_RADIUS_PILL)
+    .backgroundColor((this.streaming && !this.hasContent) || this.canSend
+      ? $r('app.color.chat_cta')
+      : Color.Transparent)
+    .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .enabled(this.composerEnabled && !this.sending)
+    .onClick(() => this.tapPrimaryAction())
+  }
+
   build() {
     Column({ space: 6 }) {
       if (this.showStreamingStatus && this.streaming) {
@@ -361,8 +428,43 @@ export struct ConversationComposer {
           .transition(uiRevealTransition())
         }
 
+        // 输入节点始终留在同一行内，聚焦切换布局时不会因重挂载而丢焦点。
         Row({ space: 6 }) {
-          if (this.expanded()) {
+          Column() {
+            TextArea({ placeholder: this.placeholder, text: this.input })
+              .id(this.inputId)
+              .enabled(this.composerEnabled)
+              .fontSize(uiFontSize(15))
+              .placeholderFont({ size: uiFontSize(15) })
+              .lineHeight(uiLineHeight(22))
+              .fontColor($r('app.color.text_primary'))
+              .placeholderColor($r('app.color.text_placeholder'))
+              .caretColor($r('app.color.chat_input_caret'))
+              .backgroundColor(Color.Transparent)
+              .align(Alignment.Center)
+              .textAlign(TextAlign.Start)
+              .padding({ left: 4, right: 4 })
+              .width('100%')
+              .constraintSize({
+                minHeight: 40,
+                maxHeight: this.expanded() ? this.inputMaxHeight : 40,
+              })
+              .onFocus(() => this.onFocusChange(true))
+              .onBlur(() => this.onFocusChange(false))
+              .onChange((value: string) => this.onInputChange(value))
+          }
+          .layoutWeight(1)
+
+          if (!this.expanded()) {
+            this.composerPrimaryButton()
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        if (this.expanded()) {
+          // Mobile 同源卡片态：上方输入独占整行，所有控制固定在底部工具栏。
+          Row({ space: 6 }) {
             if (this.showAddButton) {
               this.composerIconButton(
                 $r('sys.symbol.plus'),
@@ -395,100 +497,19 @@ export struct ConversationComposer {
                 .enabled(this.composerEnabled && !this.contextBusy)
                 .onClick(() => this.onPlanToggle())
             }
-          }
 
-          TextArea({ placeholder: this.placeholder, text: this.input })
-            .id(this.inputId)
-            .enabled(this.composerEnabled)
-            .fontSize(uiFontSize(15))
-            .placeholderFont({ size: uiFontSize(15) })
-            .lineHeight(uiLineHeight(22))
-            .fontColor($r('app.color.text_primary'))
-            .placeholderColor($r('app.color.text_placeholder'))
-            .caretColor($r('app.color.chat_input_caret'))
-            .backgroundColor(Color.Transparent)
-            .align(Alignment.Center)
-            .textAlign(TextAlign.Start)
-            .padding({ left: 4, right: 4 })
-            .constraintSize({
-              minHeight: 40,
-              maxHeight: this.expanded() ? this.inputMaxHeight : 40,
-            })
-            .layoutWeight(1)
-            .onFocus(() => this.onFocusChange(true))
-            .onBlur(() => this.onFocusChange(false))
-            .onChange((value: string) => this.onInputChange(value))
+            Row().layoutWeight(1)
 
-          if (this.hasModelChip()) {
-            Button() {
-              Row({ space: 4 }) {
-                Text(this.modelLabel)
-                  .fontSize(uiFontSize(12))
-                  .fontColor($r('app.color.text_secondary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                if (this.effortLabel.length > 0) {
-                  Text('·')
-                    .fontSize(uiFontSize(12))
-                    .fontColor($r('app.color.text_tertiary'))
-                  Text(this.effortLabel)
-                    .fontSize(uiFontSize(12))
-                    .fontColor($r('app.color.text_secondary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                }
-                SymbolGlyph($r('sys.symbol.chevron_down'))
-                  .fontSize(11)
-                  .fontColor([$r('app.color.text_tertiary')])
-              }
-              .alignItems(VerticalAlign.Center)
+            if (this.hasModelChip()) {
+              this.composerModelButton()
             }
-            .type(ButtonType.Normal)
-            .height(30)
-            .constraintSize({ minWidth: 88, maxWidth: 170 })
-            .padding({ left: 12, right: 10 })
-            .borderRadius(UI_RADIUS_PILL)
-            .backgroundColor($r('app.color.bg_chip'))
-            .clickEffect(UI_CLICK_EFFECT)
-            .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
-            .onClick(() => this.onModel())
-          }
 
-          Button() {
-            if (this.sending) {
-              LoadingProgress()
-                .width(15)
-                .height(15)
-                .color($r('app.color.chat_cta_text'))
-            } else if (this.streaming && !this.hasContent) {
-              SymbolGlyph($r('sys.symbol.square'))
-                .fontSize(11)
-                .fontColor([$r('app.color.chat_cta_text')])
-            } else if (this.canSend) {
-              SymbolGlyph($r('sys.symbol.arrow_up'))
-                .fontSize(17)
-                .fontColor([$r('app.color.chat_cta_text')])
-            } else {
-              SymbolGlyph($r('sys.symbol.mic'))
-                .fontSize(18)
-                .fontColor([$r('app.color.chat_text_secondary')])
-            }
+            this.composerPrimaryButton()
           }
-          .type(ButtonType.Circle)
-          .width(40)
-          .height(40)
-          .padding(0)
-          .borderRadius(UI_RADIUS_PILL)
-          .backgroundColor((this.streaming && !this.hasContent) || this.canSend
-            ? $r('app.color.chat_cta')
-            : Color.Transparent)
-          .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .enabled(this.composerEnabled && !this.sending)
-          .onClick(() => this.tapPrimaryAction())
+          .width('100%')
+          .constraintSize({ minHeight: 40 })
+          .alignItems(VerticalAlign.Center)
         }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
       }
       .width('100%')
       .constraintSize({ minHeight: 36 })

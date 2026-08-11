@@ -10,6 +10,22 @@ import {
 const KEY_PREFIX = 'composer.document.v1.';
 const PERSIST_DEBOUNCE_MS = 400;
 
+/** 异步草稿回读只能填充读取开始后从未被用户修改过的同一 Composer。 */
+export function shouldApplyComposerDraftRead(
+  expectedSessionId: string,
+  currentSessionId: string,
+  expectedGeneration: number,
+  currentGeneration: number,
+  expectedInputRevision: number,
+  currentInputRevision: number,
+  creationDraftHandoffDone: boolean,
+): boolean {
+  return expectedSessionId === currentSessionId
+    && expectedGeneration === currentGeneration
+    && expectedInputRevision === currentInputRevision
+    && !creationDraftHandoffDone;
+}
+
 export class ComposerDraftStore {
   private store: SecureStore = new SecureStore();
   private memory: Map<string, ComposerDocument> = new Map();

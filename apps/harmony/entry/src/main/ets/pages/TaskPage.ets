@@ -124,7 +124,9 @@ import {
 import {
   PendingQueueBubble,
   QueuedInputItem,
+  pendingQueueBubbleRenderKey,
 } from '../core/messages/InputQueueStore';
+import { shouldApplyComposerDraftRead } from '../core/messages/ComposerDraftStore';
 import { RewindPreview } from '../core/messages/MessageStore';
 import { deriveAgentTaskStatus } from '../core/messages/AgentTaskStore';
 import {
@@ -208,6 +210,9 @@ const TODO_STATUS_STROKE_WIDTH = 1.25;
 const TODO_STATUS_CHECKMARK_SIZE = 9;
 const TODO_STATUS_ACTIVE_DOT_SIZE = 4;
 const TODO_STATUS_SPINNER_DASH: number[] = [24, 16];
+const MESSAGE_LIST_HORIZONTAL_PADDING = 16;
+const USER_MESSAGE_BUBBLE_MAX_RATIO = 0.86;
+const USER_MESSAGE_BUBBLE_FALLBACK_AREA_WIDTH = 360;
 const TODO_STATUS_FRAME_RATE: ExpectedFrameRateRange = {
   min: 60,
   max: 120,
@@ -430,6 +435,8 @@ export struct TaskPageContent {
   private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 发送开始后的输入变更不会被旧请求的成功回调清空。 */
   private composerInputRevision: number = 0;
+  /** 正式消息回流对账会同步触发 queue notify；避免同一栈内递归刷新受控输入框。 */
+  private reconcilingDeliveredClientIds: boolean = false;
   /** Composer 加号的原生上下文 Sheet。 */
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
@@ -593,7 +600,7 @@ export struct TaskPageContent {
     // 输入队列由应用级 Store 持有；页面仅镜像展示并触发操作。
     this.unsubs.push(AppServices.instance.inputQueue.onChanged(() => {
       this.refreshQueueState();
-      this.refreshItems();
+      if (!this.reconcilingDeliveredClientIds) this.refreshItems();
     }));
     this.refreshQueueState();
 
@@ -1966,7 +1973,12 @@ export struct TaskPageContent {
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].clientId.length > 0) deliveredClientIds.add(messages[i].clientId);
     }
-    AppServices.instance.inputQueue.setDeliveredClientIds(this.sessionId, deliveredClientIds);
+    this.reconcilingDeliveredClientIds = true;
+    try {
+      AppServices.instance.inputQueue.setDeliveredClientIds(this.sessionId, deliveredClientIds);
+    } finally {
+      this.reconcilingDeliveredClientIds = false;
+    }
     const streaming = AppServices.instance.messages.isSessionStreaming(this.sessionId);
     const nextItems = buildRenderItems(
       messages,
@@ -2908,9 +2920,17 @@ export struct TaskPageContent {
   private restoreComposerDraft(): void {
     const sessionId = this.sessionId;
     const generation = ++this.composerDraftGeneration;
+    const inputRevision = this.composerInputRevision;
     void AppServices.instance.composerDrafts.read(sessionId).then((document: ComposerDocument | null) => {
-      if (generation !== this.composerDraftGeneration || sessionId !== this.sessionId
-        || document === null || this.creationDraftHandoffDone) return;
+      if (document === null || !shouldApplyComposerDraftRead(
+        sessionId,
+        this.sessionId,
+        generation,
+        this.composerDraftGeneration,
+        inputRevision,
+        this.composerInputRevision,
+        this.creationDraftHandoffDone,
+      )) return;
       this.setComposerDocument(document, false);
     });
   }
@@ -3667,18 +3687,61 @@ export struct TaskPageContent {
   }
 
   @Builder
-  queueInlineAction(label: string, danger: boolean, enabled: boolean, action: () => void) {
+  queueInlineAction(
+    label: string,
+    symbol: Resource,
+    cta: boolean,
+    enabled: boolean,
+    action: () => void,
+  ) {
+    Button() {
+      Row({ space: 6 }) {
+        SymbolGlyph(symbol)
+          .fontSize(uiFontSize(14))
+          .fontColor([cta
+            ? $r('app.color.chat_cta_text')
+            : $r('app.color.text_secondary')])
+        Text(label)
+          .fontSize(uiFontSize(12))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(cta
+            ? $r('app.color.chat_cta_text')
+            : $r('app.color.text_primary'))
+      }
+      .alignItems(VerticalAlign.Center)
+    }
+      .type(ButtonType.Normal)
+      .height(36)
+      .padding({ left: 12, right: 12 })
+      .backgroundColor(cta
+        ? $r('app.color.chat_cta')
+        : $r('app.color.bg_chip'))
+      .border({
+        width: 1,
+        color: cta ? $r('app.color.chat_cta') : $r('app.color.border'),
+      })
+      .borderRadius(UI_RADIUS_PILL)
+      .enabled(enabled)
+      .opacity(enabled ? 1 : 0.42)
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(action)
+      .margin({ right: 6, bottom: 6 })
+  }
+
+  /** 队列级横幅动作保持安静的纯文字形态，不与逐条消息操作争夺层级。 */
+  @Builder
+  queueBannerAction(label: string, enabled: boolean, action: () => void) {
     Button(label)
       .type(ButtonType.Normal)
       .height(30)
       .padding({ left: 12, right: 12 })
       .fontSize(uiFontSize(12))
       .fontWeight(FontWeight.Medium)
-      .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+      .fontColor($r('app.color.text_primary'))
       .backgroundColor($r('app.color.bg_chip'))
       .borderRadius(UI_RADIUS_PILL)
       .enabled(enabled)
-      .opacity(enabled ? 1 : 0.45)
+      .opacity(enabled ? 1 : 0.42)
       .clickEffect(UI_CLICK_EFFECT)
       .onClick(action)
   }
@@ -3732,30 +3795,31 @@ export struct TaskPageContent {
       if (this.isCreateFailureBubble(item)
         || (!this.isCreationBlockingRemoteOps()
           && (this.selectedQueueClientId === item.clientId || item.phase === 'failed'))) {
-        Row({ space: 6 }) {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End }) {
           if (this.isCreateFailureBubble(item)) {
-            this.queueInlineAction('重试创建', false, !this.queueBusy,
+            this.queueInlineAction('重试创建', $r('sys.symbol.arrow_clockwise'), true, !this.queueBusy,
               () => this.retryNewSessionCreation())
-            this.queueInlineAction('返回编辑', false, !this.queueBusy,
+            this.queueInlineAction('返回编辑', $r('sys.symbol.square_and_pencil'), false, !this.queueBusy,
               () => void this.returnNewSessionToEdit())
           } else if (item.phase === 'failed') {
-            this.queueInlineAction('重试发送', false, !this.queueBusy,
+            this.queueInlineAction('重试发送', $r('sys.symbol.arrow_clockwise'), true, !this.queueBusy,
               () => this.retryQueueItem(item.clientId))
           } else if (item.phase === 'queued' || item.phase === 'paused') {
-            this.queueInlineAction('上移', false, item.queueIndex > 1 && !this.queueBusy,
+            this.queueInlineAction('上移', $r('sys.symbol.chevron_up'), false,
+              item.queueIndex > 1 && !this.queueBusy,
               () => this.moveQueueItem(item.clientId, -1))
-            this.queueInlineAction('下移', false,
+            this.queueInlineAction('下移', $r('sys.symbol.chevron_down'), false,
               item.queueIndex < AppServices.instance.inputQueue
                 .getProjection(this.sessionId).pendingQueue.length && !this.queueBusy,
               () => this.moveQueueItem(item.clientId, 1))
-            this.queueInlineAction('编辑', false, !this.queueBusy,
+            this.queueInlineAction('编辑', $r('sys.symbol.square_and_pencil'), false, !this.queueBusy,
               () => this.beginQueueEdit(item.clientId))
-            this.queueInlineAction('插话', false, this.sessionStreaming && !this.queueBusy,
+            this.queueInlineAction('插话', $r('sys.symbol.arrow_up'), true,
+              this.sessionStreaming && !this.queueBusy,
               () => this.steerQueueItem(item.clientId))
           }
-          Row().layoutWeight(1)
           if (!this.isCreateFailureBubble(item)) {
-            this.queueInlineAction('删除消息', true, !this.queueBusy,
+            this.queueInlineAction('删除消息', $r('sys.symbol.trash'), false, !this.queueBusy,
               () => this.removeQueueItem(item.clientId))
           }
         }
@@ -3790,10 +3854,10 @@ export struct TaskPageContent {
           .fontColor($r('app.color.danger'))
           .width('100%')
         Row({ space: 8 }) {
-          this.queueInlineAction('重试发送', false,
+          this.queueBannerAction('重试发送',
             this.queueErrorRetryText.length > 0 && !this.queueActionBlocked(),
             () => this.retryQueueError())
-          this.queueInlineAction('忽略错误', false, !this.queueActionBlocked(),
+          this.queueBannerAction('忽略错误', !this.queueActionBlocked(),
             () => this.clearQueueError())
         }
         .width('100%')
@@ -3832,7 +3896,7 @@ export struct TaskPageContent {
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_secondary'))
             .layoutWeight(1)
-          this.queueInlineAction('继续发送', false, !this.queueActionBlocked(),
+          this.queueBannerAction('继续发送', !this.queueActionBlocked(),
             () => this.resumeQueue())
         }
         .width('100%')
@@ -3858,11 +3922,11 @@ export struct TaskPageContent {
         Row({ space: 8 }) {
           if (this.tailPresentation()?.retryable === true
             || this.tailPresentation()?.interrupted === true) {
-            this.queueInlineAction(this.tailPresentation()?.interrupted === true ? '继续任务' : '重试',
-              false, !this.tailBannerBusy && !this.deviceDisabled,
+            this.queueBannerAction(this.tailPresentation()?.interrupted === true ? '继续任务' : '重试',
+              !this.tailBannerBusy && !this.deviceDisabled,
               () => this.continueSessionTail())
           }
-          this.queueInlineAction('忽略', false, !this.tailBannerBusy && !this.deviceDisabled,
+          this.queueBannerAction('忽略', !this.tailBannerBusy && !this.deviceDisabled,
             () => this.dismissSessionTail())
         }
         .width('100%')
@@ -3972,7 +4036,7 @@ export struct TaskPageContent {
             ListItem() {
               this.pendingQueueBubble(item)
             }
-          }, (item: PendingQueueBubble) => `message-${item.clientId}`)
+          }, (item: PendingQueueBubble) => pendingQueueBubbleRenderKey(item))
           // 稳定尾锚不能复用正在流式增高的消息节点，否则 ArkUI 重测同一项时会
           // 把 scrollToIndex 的旧几何解释成历史位置，造成每次新内容都反向跳动。
           ListItem() {
@@ -6294,6 +6358,18 @@ export struct TaskPageContent {
     return item.body.length > 140 || item.body.includes('\n') ? 12 : 8;
   }
 
+  /**
+   * 使用明确数值打断“气泡百分比 maxWidth + 内部文字 100%”的循环测量。
+   * ArkUI 动态插入消息时可能先按外层宽度排文字、再收窄气泡，导致文字越界；
+   * 重新进入会话后的完整测量才会恢复。短消息仍由内容决定实际宽度。
+   */
+  private userMessageBubbleMaxWidth(): number {
+    const areaWidth = this.messageAreaWidth > 0
+      ? this.messageAreaWidth : USER_MESSAGE_BUBBLE_FALLBACK_AREA_WIDTH;
+    const contentWidth = Math.max(1, areaWidth - MESSAGE_LIST_HORIZONTAL_PADDING * 2);
+    return Math.max(1, Math.floor(contentWidth * USER_MESSAGE_BUBBLE_MAX_RATIO));
+  }
+
   private hasMessageActions(item: RenderMessageItem): boolean {
     return item.kind === 'user'
       || (item.kind === 'assistant' && item.isTurnFinalAssistant);
@@ -6476,7 +6552,9 @@ export struct TaskPageContent {
               .opacity(0.72)
           }
         }
-        .constraintSize({ maxWidth: item.kind === 'user' ? '86%' : '100%' })
+        .constraintSize({
+          maxWidth: item.kind === 'user' ? this.userMessageBubbleMaxWidth() : '100%',
+        })
         .alignItems(HorizontalAlign.Start)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
         .backgroundColor(item.kind === 'user' ? $r('app.color.bg_card') : Color.Transparent)

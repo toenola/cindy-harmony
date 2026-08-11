@@ -110,7 +110,9 @@ import {
 } from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
   isWideTaskLayout,
+  TASK_FOLD_STATUS_EXPANDED,
   TASK_FOLD_STATUS_FOLDED,
+  TASK_FOLD_STATUS_HALF_FOLDED,
   taskDetailKeyboardInset,
   taskListPaneWidth,
   taskSplitRatioForDrag,
@@ -130,9 +132,11 @@ import {
 } from '../main/ets/core/messages/AutoResumePresentation';
 import {
   InputQueueStore,
+  pendingQueueBubbleRenderKey,
   parseInputProjection,
   parseQueuedInputItem,
 } from '../main/ets/core/messages/InputQueueStore';
+import { shouldApplyComposerDraftRead } from '../main/ets/core/messages/ComposerDraftStore';
 import { SerializedComposerDocument } from '../main/ets/core/messages/ComposerDocument';
 import {
   extendCoverageEarlier,
@@ -668,6 +672,56 @@ export default function localUnitTest() {
       const queue = store.getProjection(session.id).pendingQueue;
       expect(queue.length).assertEqual(1);
       expect(queue[0].clientId).assertEqual('stable-client');
+    });
+
+    it('rebuildsQueueBubblePresentationAfterAckAndRenumbersAfterDrain', 0, () => {
+      const store = new InputQueueStore();
+      const session = new RemoteSession();
+      session.id = 'queue-render-session';
+      session.model = 'model';
+      session.permissionMode = 'ask';
+      store.seedOptimisticText('device-1', session, 'one', [], 'queue-1');
+      store.seedOptimisticText('device-1', session, 'two', [], 'queue-2');
+      store.seedOptimisticText('device-1', session, 'three', [], 'queue-3');
+      const rawQueue = store.getProjection(session.id).pendingQueue
+        .map((item) => item.raw as Object);
+
+      const sendingProjection: Record<string, Object> = {};
+      sendingProjection['sessionId'] = session.id;
+      sendingProjection['pendingQueue'] = rawQueue;
+      sendingProjection['steeringQueueClientIds'] = ['queue-1'];
+      store.handleProjectionPush(sendingProjection);
+      const sendingBubble = store.getBubbles(session.id)[0];
+      const sendingKey = pendingQueueBubbleRenderKey(sendingBubble);
+      expect(sendingBubble.phase).assertEqual('sending');
+
+      const acknowledgedProjection: Record<string, Object> = {};
+      acknowledgedProjection['sessionId'] = session.id;
+      acknowledgedProjection['pendingQueue'] = rawQueue;
+      acknowledgedProjection['steeringQueueClientIds'] = [];
+      store.handleProjectionPush(acknowledgedProjection);
+      const queuedBubble = store.getBubbles(session.id)[0];
+      expect(queuedBubble.phase).assertEqual('queued');
+      expect(pendingQueueBubbleRenderKey(queuedBubble) === sendingKey).assertEqual(false);
+
+      const drainedProjection: Record<string, Object> = {};
+      drainedProjection['sessionId'] = session.id;
+      drainedProjection['pendingQueue'] = [rawQueue[1], rawQueue[2]];
+      store.handleProjectionPush(drainedProjection);
+      const afterDrain = store.getBubbles(session.id);
+      const second = afterDrain.find((item) => item.clientId === 'queue-2');
+      const third = afterDrain.find((item) => item.clientId === 'queue-3');
+      expect(second?.queueIndex).assertEqual(1);
+      expect(third?.queueIndex).assertEqual(2);
+    });
+
+    it('doesNotApplyAsyncComposerDraftAfterUserStartsTyping', 0, () => {
+      expect(shouldApplyComposerDraftRead('session-1', 'session-1', 3, 3, 7, 7, false))
+        .assertEqual(true);
+      expect(shouldApplyComposerDraftRead('session-1', 'session-1', 3, 3, 7, 8, false))
+        .assertEqual(false);
+      expect(shouldApplyComposerDraftRead('session-1', 'session-2', 3, 3, 7, 7, false))
+        .assertEqual(false);
     });
 
     it('keepsCreationFollowUpsInLocalFifoUntilExplicitHandoff', 0, () => {
@@ -2135,15 +2189,20 @@ export default function localUnitTest() {
     });
 
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {
-      expect(isWideTaskLayout(599)).assertEqual(false);
-      expect(isWideTaskLayout(600)).assertEqual(true);
-      expect(isWideTaskLayout(900, TASK_FOLD_STATUS_FOLDED)).assertEqual(false);
+      expect(isWideTaskLayout(599, 400)).assertEqual(false);
+      expect(isWideTaskLayout(600, 400)).assertEqual(true);
+      expect(isWideTaskLayout(900, 1200, TASK_FOLD_STATUS_EXPANDED)).assertEqual(false);
+      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_EXPANDED)).assertEqual(true);
+      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_FOLDED)).assertEqual(false);
+      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_HALF_FOLDED)).assertEqual(false);
+      expect(isWideTaskLayout(1200, 900, 0)).assertEqual(false);
       expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(293);
       expect(taskListPaneWidth(600, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(220);
-      expect(taskDetailKeyboardInset(599, -1, 320)).assertEqual(0);
-      expect(taskDetailKeyboardInset(900, -1, 320)).assertEqual(320);
-      expect(taskDetailKeyboardInset(900, TASK_FOLD_STATUS_FOLDED, 320)).assertEqual(0);
-      expect(taskDetailKeyboardInset(900, -1, -1)).assertEqual(0);
+      expect(taskDetailKeyboardInset(599, 400, -1, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, 600, -1, 320)).assertEqual(320);
+      expect(taskDetailKeyboardInset(600, 900, -1, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, 600, TASK_FOLD_STATUS_FOLDED, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, 600, -1, -1)).assertEqual(0);
 
       const dragged = taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, 200);
       expect(dragged > 0.55 && dragged <= 0.6).assertEqual(true);

@@ -111,6 +111,7 @@ struct TaskListPage {
   @State connectionStatus: string = 'connecting';
   @State now: number = Date.now();
   @State viewportWidth: number = 0;
+  @State viewportHeight: number = 0;
   @State foldStatus: number = -1;
   @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   @State dividerActive: boolean = false;
@@ -126,6 +127,7 @@ struct TaskListPage {
   private dividerTouchStartX: number = 0;
   private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   private foldStatusListening: boolean = false;
+  private singlePaneNavigationPending: boolean = false;
   private pageActive: boolean = false;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
@@ -136,13 +138,14 @@ struct TaskListPage {
   private listTabSwiperAppeared: boolean = false;
   private initialListTabIndex: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
+    const wasSplit = this.splitLayoutEnabled();
     this.foldStatus = status;
-    this.ensureWideSelection();
-    this.updateKeyboardAvoidance();
+    this.handleSplitLayoutChange(wasSplit);
   };
 
   aboutToAppear(): void {
     this.pageActive = true;
+    this.singlePaneNavigationPending = false;
     this.taskListReconcileGeneration += 1;
     if (!this.routeParamsInitialized) {
       const params = (router.getParams() ?? {}) as Record<string, Object>;
@@ -326,7 +329,7 @@ struct TaskListPage {
   }
 
   private ensureWideSelection(): void {
-    if (!isWideTaskLayout(this.viewportWidth, this.foldStatus)) return;
+    if (!this.splitLayoutEnabled()) return;
     const scoped = this.activeListEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].deviceId === this.selectedSessionDeviceId
@@ -347,15 +350,60 @@ struct TaskListPage {
 
   private handleAreaChange(_oldArea: Area, newArea: Area): void {
     const widthValue = newArea.width;
+    const heightValue = newArea.height;
     const width = typeof widthValue === 'number' ? widthValue : 0;
-    if (!Number.isFinite(width) || width <= 0 || width === this.viewportWidth) return;
+    const height = typeof heightValue === 'number' ? heightValue : 0;
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
+    if (width === this.viewportWidth && height === this.viewportHeight) return;
+    const wasSplit = this.splitLayoutEnabled();
     this.viewportWidth = width;
-    this.ensureWideSelection();
+    this.viewportHeight = height;
+    this.handleSplitLayoutChange(wasSplit);
+  }
+
+  private handleSplitLayoutChange(wasSplit: boolean): void {
+    const splitEnabled = this.splitLayoutEnabled();
+    if (splitEnabled) this.ensureWideSelection();
+    if (wasSplit && !splitEnabled) {
+      void this.openSelectedTaskAfterSplitExit();
+    }
     this.updateKeyboardAvoidance();
   }
 
+  /** 折叠或横转竖退出双栏时，保持用户正在查看的任务详情，而不是退回列表。 */
+  private async openSelectedTaskAfterSplitExit(): Promise<void> {
+    if (this.singlePaneNavigationPending
+      || this.selectedSessionDeviceId.length === 0
+      || this.selectedSessionId.length === 0) {
+      return;
+    }
+    this.singlePaneNavigationPending = true;
+    try {
+      if (this.selectedMessageClientId.length > 0) {
+        await router.pushUrl({
+          url: 'pages/TaskPage',
+          params: {
+            deviceId: this.selectedSessionDeviceId,
+            sessionId: this.selectedSessionId,
+            message: this.selectedMessageClientId,
+          },
+        });
+      } else {
+        await router.pushUrl({
+          url: 'pages/TaskPage',
+          params: {
+            deviceId: this.selectedSessionDeviceId,
+            sessionId: this.selectedSessionId,
+          },
+        });
+      }
+    } finally {
+      this.singlePaneNavigationPending = false;
+    }
+  }
+
   private splitLayoutEnabled(): boolean {
-    return isWideTaskLayout(this.viewportWidth, this.foldStatus);
+    return isWideTaskLayout(this.viewportWidth, this.viewportHeight, this.foldStatus);
   }
 
   private updateKeyboardAvoidance(): void {
@@ -398,7 +446,12 @@ struct TaskListPage {
   }
 
   private detailKeyboardInset(): number {
-    return taskDetailKeyboardInset(this.viewportWidth, this.foldStatus, this.keyboardHeight);
+    return taskDetailKeyboardInset(
+      this.viewportWidth,
+      this.viewportHeight,
+      this.foldStatus,
+      this.keyboardHeight,
+    );
   }
 
   private listPaneWidth(): number {

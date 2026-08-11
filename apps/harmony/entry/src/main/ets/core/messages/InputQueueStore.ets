@@ -67,6 +67,21 @@ export class PendingQueueBubble {
   files: RemoteSerializedAttachment[] = [];
 }
 
+/**
+ * ArkUI 的 ForEach 会按 key 复用节点；队列气泡的 clientId 在整个发送生命周期不变，
+ * 因此 key 还必须包含会改变展示的投影字段，才能让“发送中 → 队列 N”和出队后的
+ * 序号递补立即重建对应行。
+ */
+export function pendingQueueBubbleRenderKey(item: PendingQueueBubble): string {
+  let contentHash = 0;
+  const content = `${item.text}\n${item.errorText}`;
+  for (let i = 0; i < content.length; i++) {
+    contentHash = ((contentHash * 31) + content.charCodeAt(i)) >>> 0;
+  }
+  return `message-${item.clientId}-${item.phase}-${item.queueIndex}-${contentHash}`
+    + `-${item.images.length}-${item.files.length}`;
+}
+
 function readStringArray(value: Object | undefined): string[] {
   const out: string[] = [];
   if (!Array.isArray(value)) return out;

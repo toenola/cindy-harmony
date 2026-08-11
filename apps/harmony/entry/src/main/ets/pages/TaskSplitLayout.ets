@@ -1,9 +1,9 @@
 /**
  * 任务页宽屏双栏布局的纯计算。
  *
- * 600vp 对齐 Mobile 的 medium 窗口档位，覆盖折叠屏展开内屏和大屏横向窗口；
- * 盒盖态/直板机保持单页列表导航。比例只约束列表宽度，分隔条和详情最小宽度
- * 固定留出触控与阅读空间。
+ * 600vp 对齐 Mobile 的 medium 窗口档位；只有展开态横屏才使用主从双栏，
+ * 竖屏、盒盖态和半折叠态都回到单页导航。比例只约束列表宽度，分隔条和详情
+ * 最小宽度固定留出触控与阅读空间。
  */
 
 export const WIDE_TASK_LAYOUT_MIN_WIDTH = 600;
@@ -13,14 +13,24 @@ export const TASK_SPLIT_MIN_DETAIL_WIDTH = 320;
 export const TASK_SPLIT_DEFAULT_RATIO = 1 / 3;
 export const TASK_SPLIT_MIN_RATIO = 0.25;
 export const TASK_SPLIT_MAX_RATIO = 0.6;
+export const TASK_FOLD_STATUS_EXPANDED = 1;
 export const TASK_FOLD_STATUS_FOLDED = 2;
 export const TASK_FOLD_STATUS_HALF_FOLDED = 3;
 
-export function isWideTaskLayout(viewportWidth: number, foldStatus: number = -1): boolean {
-  if (foldStatus === TASK_FOLD_STATUS_FOLDED || foldStatus === TASK_FOLD_STATUS_HALF_FOLDED) {
+export function isWideTaskLayout(
+  viewportWidth: number,
+  viewportHeight: number,
+  foldStatus: number = -1,
+): boolean {
+  const postureSupportsSplit = foldStatus === -1 || foldStatus === TASK_FOLD_STATUS_EXPANDED;
+  if (!postureSupportsSplit) {
     return false;
   }
-  return Number.isFinite(viewportWidth) && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH;
+  return Number.isFinite(viewportWidth)
+    && Number.isFinite(viewportHeight)
+    && viewportHeight > 0
+    && viewportWidth > viewportHeight
+    && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH;
 }
 
 export function clampTaskSplitRatio(ratio: number): number {
@@ -56,10 +66,11 @@ export function taskSplitRatioForDrag(
  */
 export function taskDetailKeyboardInset(
   viewportWidth: number,
+  viewportHeight: number,
   foldStatus: number,
   keyboardHeight: number,
 ): number {
-  if (!isWideTaskLayout(viewportWidth, foldStatus)) return 0;
+  if (!isWideTaskLayout(viewportWidth, viewportHeight, foldStatus)) return 0;
   if (!Number.isFinite(keyboardHeight) || keyboardHeight <= 0) return 0;
   return keyboardHeight;
 }
