@@ -9,7 +9,7 @@
  */
 
 import { accessibility } from '@kit.AccessibilityKit';
-import { display, promptAction, router } from '@kit.ArkUI';
+import { display, KeyboardAvoidMode, promptAction, router, window } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
@@ -23,12 +23,14 @@ import { TaskPageContent } from './TaskPage';
 import {
   isWideTaskLayout,
   TASK_SPLIT_DEFAULT_RATIO,
+  taskDetailKeyboardInset,
   taskListPaneWidth,
   taskSplitRatioForDrag,
 } from './TaskSplitLayout';
 import {
   compareTaskListLabels,
   compareTaskSessionsForList,
+  resolveTaskRightStatus,
   taskActivityAt,
   taskDisplayTitle,
   taskListCategory,
@@ -112,6 +114,7 @@ struct TaskListPage {
   @State foldStatus: number = -1;
   @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   @State dividerActive: boolean = false;
+  @State keyboardHeight: number = 0;
 
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
@@ -123,15 +126,23 @@ struct TaskListPage {
   private dividerTouchStartX: number = 0;
   private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   private foldStatusListening: boolean = false;
+  private pageActive: boolean = false;
+  private keyboardWindow: window.Window | null = null;
+  private keyboardHeightListening: boolean = false;
+  private keyboardHeightListener: (height: number) => void = (height: number): void => {
+    this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
+  };
   private listTabSwiperController: SwiperController = new SwiperController();
   private listTabSwiperAppeared: boolean = false;
   private initialListTabIndex: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
     this.foldStatus = status;
     this.ensureWideSelection();
+    this.updateKeyboardAvoidance();
   };
 
   aboutToAppear(): void {
+    this.pageActive = true;
     this.taskListReconcileGeneration += 1;
     if (!this.routeParamsInitialized) {
       const params = (router.getParams() ?? {}) as Record<string, Object>;
@@ -144,11 +155,15 @@ struct TaskListPage {
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
     this.observeFoldStatus();
+    void this.observeKeyboardHeight();
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
     }));
     this.unsubs.push(AppServices.instance.interactions.onChanged(() => {
+      this.refreshProjection();
+    }));
+    this.unsubs.push(AppServices.instance.messages.onRunningStateChanged(() => {
       this.refreshProjection();
     }));
     this.unsubs.push(AppServices.instance.onStatus((status: string) => {
@@ -172,6 +187,7 @@ struct TaskListPage {
   }
 
   aboutToDisappear(): void {
+    this.pageActive = false;
     this.taskListReconcileGeneration += 1;
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
@@ -188,6 +204,9 @@ struct TaskListPage {
     this.taskListLoadInFlight.clear();
     this.taskListReconcileBackoff.clear();
     this.stopFoldStatusObservation();
+    this.stopKeyboardHeightObservation();
+    this.keyboardHeight = 0;
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     this.listTabSwiperAppeared = false;
     void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
@@ -332,10 +351,54 @@ struct TaskListPage {
     if (!Number.isFinite(width) || width <= 0 || width === this.viewportWidth) return;
     this.viewportWidth = width;
     this.ensureWideSelection();
+    this.updateKeyboardAvoidance();
   }
 
   private splitLayoutEnabled(): boolean {
     return isWideTaskLayout(this.viewportWidth, this.foldStatus);
+  }
+
+  private updateKeyboardAvoidance(): void {
+    if (this.splitLayoutEnabled()) {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+      void this.observeKeyboardHeight();
+      return;
+    }
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+    this.keyboardHeight = 0;
+  }
+
+  private async observeKeyboardHeight(): Promise<void> {
+    if (this.keyboardHeightListening) return;
+    const hostContext = this.getUIContext().getHostContext();
+    if (hostContext === undefined) return;
+    try {
+      const hostWindow = await window.getLastWindow(hostContext);
+      if (!this.pageActive || this.keyboardHeightListening) return;
+      this.keyboardWindow = hostWindow;
+      hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
+      this.keyboardHeightListening = true;
+    } catch (_err) {
+      // 监听不可用时宁可回退为全页避让，也不能让输入框被键盘遮住。
+      if (this.pageActive && this.splitLayoutEnabled()) {
+        this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+      }
+    }
+  }
+
+  private stopKeyboardHeightObservation(): void {
+    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    try {
+      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+    } catch (_err) {
+      // 页面退出时监听已被系统清理，不影响后续路由恢复默认避让。
+    }
+    this.keyboardWindow = null;
+    this.keyboardHeightListening = false;
+  }
+
+  private detailKeyboardInset(): number {
+    return taskDetailKeyboardInset(this.viewportWidth, this.foldStatus, this.keyboardHeight);
   }
 
   private listPaneWidth(): number {
@@ -1082,6 +1145,7 @@ struct TaskListPage {
           }
           .layoutWeight(1)
           .height('100%')
+          .padding({ bottom: this.detailKeyboardInset() })
         }
       }
       .width('100%')
@@ -1752,12 +1816,12 @@ struct TaskListPage {
 
   private taskRightStatusKind(entry: TaskListEntry): string {
     const activity = AppServices.instance.tasks.getLiveActivity(entry.session.id);
-    if (activity?.phase === 'error' && activity.attention) return 'error';
-    if (AppServices.instance.interactions.getPending(entry.session.id).length > 0
-      || activity?.phase === 'needs-interaction') return 'waiting';
-    if (activity?.phase === 'running') return 'running';
-    if (activity?.phase === 'completed' && activity.attention) return 'done';
-    return 'time';
+    return resolveTaskRightStatus(
+      activity?.phase ?? '',
+      activity?.attention === true,
+      AppServices.instance.interactions.getPending(entry.session.id).length,
+      AppServices.instance.messages.isSessionRunning(entry.session.id),
+    );
   }
 
   @Builder

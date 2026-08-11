@@ -91,6 +91,7 @@ import {
 import {
   compareTaskListLabels,
   compareTaskSessionsForList,
+  resolveTaskRightStatus,
   taskActivityAt,
   taskDisplayTitle,
   taskIsAutomation,
@@ -110,6 +111,7 @@ import {
 import {
   isWideTaskLayout,
   TASK_FOLD_STATUS_FOLDED,
+  taskDetailKeyboardInset,
   taskListPaneWidth,
   taskSplitRatioForDrag,
   TASK_SPLIT_DEFAULT_RATIO,
@@ -1969,6 +1971,10 @@ export default function localUnitTest() {
 
     it('closesRunningProjectionForActivityAndStatusBoundaries', 0, () => {
       const store = new MessageStore();
+      let runningTransitions = 0;
+      const unsubscribe = store.onRunningStateChanged(() => {
+        runningTransitions += 1;
+      });
       const textData: Record<string, Object> = {};
       textData['text'] = '正在运行';
       const textEvent: Record<string, Object> = {};
@@ -1976,6 +1982,11 @@ export default function localUnitTest() {
       textEvent['data'] = textData;
       store.handleMakerEvent('run-1', textEvent);
       expect(store.isSessionStreaming('run-1')).assertEqual(true);
+      expect(store.isSessionRunning('run-1')).assertEqual(true);
+      expect(runningTransitions).assertEqual(1);
+
+      store.handleMakerEvent('run-1', textEvent);
+      expect(runningTransitions).assertEqual(1);
 
       const completed: Record<string, Object> = {};
       completed['sessionId'] = 'run-1';
@@ -1983,6 +1994,8 @@ export default function localUnitTest() {
       completed['isRunning'] = true;
       store.handleSessionActivity(completed);
       expect(store.isSessionStreaming('run-1')).assertEqual(false);
+      expect(store.isSessionRunning('run-1')).assertEqual(false);
+      expect(runningTransitions).assertEqual(2);
 
       const continuedStatusData: Record<string, Object> = {};
       continuedStatusData['isRunning'] = false;
@@ -1992,6 +2005,7 @@ export default function localUnitTest() {
       continuedStatus['turnContinuationId'] = 1;
       store.handleMakerEvent('run-1', continuedStatus);
       expect(store.isSessionStreaming('run-1')).assertEqual(true);
+      expect(runningTransitions).assertEqual(3);
 
       const continuedDone: Record<string, Object> = {};
       continuedDone['type'] = 'done';
@@ -2003,6 +2017,7 @@ export default function localUnitTest() {
       finalDone['type'] = 'done';
       store.handleMakerEvent('run-1', finalDone);
       expect(store.isSessionStreaming('run-1')).assertEqual(false);
+      expect(runningTransitions).assertEqual(4);
 
       const reopenedData: Record<string, Object> = {};
       reopenedData['text'] = '再次运行';
@@ -2015,6 +2030,8 @@ export default function localUnitTest() {
       statusClosed['status'] = 'closed';
       store.handleMakerStatusChanged(statusClosed);
       expect(store.isSessionStreaming('run-1')).assertEqual(false);
+      expect(runningTransitions).assertEqual(6);
+      unsubscribe();
     });
 
     it('surfacesManagedToolResultImagesOutsideWorkGroup', 0, () => {
@@ -2123,6 +2140,10 @@ export default function localUnitTest() {
       expect(isWideTaskLayout(900, TASK_FOLD_STATUS_FOLDED)).assertEqual(false);
       expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(293);
       expect(taskListPaneWidth(600, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(220);
+      expect(taskDetailKeyboardInset(599, -1, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, -1, 320)).assertEqual(320);
+      expect(taskDetailKeyboardInset(900, TASK_FOLD_STATUS_FOLDED, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, -1, -1)).assertEqual(0);
 
       const dragged = taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, 200);
       expect(dragged > 0.55 && dragged <= 0.6).assertEqual(true);
@@ -2151,6 +2172,13 @@ export default function localUnitTest() {
       expect(taskVisibleOnHome(session)).assertEqual(true);
       session.orcaRole = 'worker';
       expect(taskVisibleOnHome(session)).assertEqual(false);
+    });
+
+    it('keepsTaskListRunningAheadOfStaleCompletedAttention', 0, () => {
+      expect(resolveTaskRightStatus('completed', true, 0, true)).assertEqual('running');
+      expect(resolveTaskRightStatus('completed', true, 0, false)).assertEqual('done');
+      expect(resolveTaskRightStatus('error', true, 0, true)).assertEqual('error');
+      expect(resolveTaskRightStatus('completed', true, 1, true)).assertEqual('waiting');
     });
 
     it('classifiesTaskListCategoriesWithAutomationPriority', 0, () => {

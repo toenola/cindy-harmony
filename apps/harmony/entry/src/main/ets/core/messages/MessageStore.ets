@@ -169,6 +169,8 @@ class CreateOptsArgs {
 export class MessageStore {
   private client: DlClient | undefined = undefined;
   private listeners: Array<() => void> = [];
+  /** 仅在运行 boolean 翻转时通知，避免任务列表随每个流式事件整页重绘。 */
+  private runningStateListeners: Array<() => void> = [];
   private messagesBySession: Map<string, RemoteMessage[]> = new Map();
   /** sessionId -> deviceId（当前订阅关系）。 */
   private subscribed: Map<string, string> = new Map();
@@ -258,6 +260,7 @@ export class MessageStore {
     this.hasMoreBySession.clear();
     this.messageCountBySession.clear();
     this.streamingBySession.clear();
+    const hadRunningSession = this.runningBySession.size > 0;
     this.runningBySession.clear();
     this.runStartedAtBySession.clear();
     this.makerTurnRunningBySession.clear();
@@ -278,6 +281,7 @@ export class MessageStore {
     this.pendingStreamingProjectionKeysBySession.clear();
     this.authoritativeMessageRevisions.clear();
     await this.sessionMessageCache.clear();
+    if (hadRunningSession) this.notifyRunningStateChanged();
     this.notify();
   }
 
@@ -301,10 +305,23 @@ export class MessageStore {
     };
   }
 
+  /** 列表只关心运行边界，不订阅正文、工具和 token 级消息更新。 */
+  onRunningStateChanged(listener: () => void): () => void {
+    this.runningStateListeners.push(listener);
+    return () => {
+      const idx = this.runningStateListeners.indexOf(listener);
+      if (idx >= 0) this.runningStateListeners.splice(idx, 1);
+    };
+  }
+
   private notify(): void {
     for (const l of this.listeners) {
       l();
     }
+  }
+
+  private notifyRunningStateChanged(): void {
+    for (const listener of this.runningStateListeners) listener();
   }
 
   private touchSessionCache(sessionId: string): void {
@@ -404,8 +421,7 @@ export class MessageStore {
     this.messageCountBySession.delete(sessionId);
     this.loadFailedBySession.delete(sessionId);
     this.streamingBySession.delete(sessionId);
-    this.runningBySession.delete(sessionId);
-    this.runStartedAtBySession.delete(sessionId);
+    this.markSessionRunning(sessionId, false);
     this.makerTurnRunningBySession.delete(sessionId);
     this.taskUpdatesBySession.delete(sessionId);
     this.parkedTaskUpdatesBySession.delete(sessionId);
@@ -544,6 +560,11 @@ export class MessageStore {
 
   isMakerTurnRunning(sessionId: string): boolean {
     return this.makerTurnRunningBySession.get(sessionId) === true;
+  }
+
+  /** 当前产品 turn 的运行事实，供列表状态覆盖可能迟到的 completed 未读态。 */
+  isSessionRunning(sessionId: string): boolean {
+    return this.runningBySession.get(sessionId) === true;
   }
 
   /** 底部活动条的独立计时起点；0 表示当前没有运行中的产品 turn。 */
@@ -1222,6 +1243,7 @@ export class MessageStore {
   }
 
   private markSessionRunning(sessionId: string, running: boolean): void {
+    const wasRunning = this.runningBySession.get(sessionId) === true;
     if (running) {
       this.runningBySession.set(sessionId, true);
       if (!this.runStartedAtBySession.has(sessionId)) {
@@ -1231,6 +1253,7 @@ export class MessageStore {
       this.runningBySession.delete(sessionId);
       this.runStartedAtBySession.delete(sessionId);
     }
+    if (wasRunning !== running) this.notifyRunningStateChanged();
   }
 
   /** 终态收口：保留临时正文用于最终渲染，但去掉所有运行标记。 */
@@ -1592,8 +1615,7 @@ export class MessageStore {
       this.streamingBySession.delete(sessionId);
       this.deferredAuthoritativeEmptySessions.cancel(sessionId);
       this.pendingStreamingProjectionKeysBySession.delete(sessionId);
-      this.runningBySession.delete(sessionId);
-      this.runStartedAtBySession.delete(sessionId);
+      this.markSessionRunning(sessionId, false);
       this.makerTurnRunningBySession.delete(sessionId);
       this.loadFailedBySession.delete(sessionId);
       this.notify();

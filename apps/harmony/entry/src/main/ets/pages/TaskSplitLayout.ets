@@ -49,3 +49,17 @@ export function taskSplitRatioForDrag(
   const nextWidth = taskListPaneWidth(viewportWidth, startRatio) + deltaX;
   return clampTaskSplitRatio(nextWidth / availableWidth);
 }
+
+/**
+ * 展开屏键盘只占用详情栏的可用高度；列表栏仍保持全高并由键盘覆盖。
+ * 窄屏继续交给系统的页面级键盘避让处理。
+ */
+export function taskDetailKeyboardInset(
+  viewportWidth: number,
+  foldStatus: number,
+  keyboardHeight: number,
+): number {
+  if (!isWideTaskLayout(viewportWidth, foldStatus)) return 0;
+  if (!Number.isFinite(keyboardHeight) || keyboardHeight <= 0) return 0;
+  return keyboardHeight;
+}

@@ -17,6 +17,24 @@ const YEAR_MS = 365 * DAY_MS;
 
 export type TaskListCategory = 'projects' | 'dialogues' | 'automations';
 export type TaskListSortMode = 'default' | 'recency' | 'alphabetic';
+export type TaskRightStatusKind = 'error' | 'waiting' | 'running' | 'done' | 'time';
+
+/**
+ * 与 Mobile 会话行同一优先级：运行事实必须压过旧的 completed 未读态，
+ * 避免 maker:event 已进入新一轮后，列表仍被迟到的完成活动标成「已完成」。
+ */
+export function resolveTaskRightStatus(
+  livePhase: string,
+  liveAttention: boolean,
+  pendingInteractionCount: number,
+  running: boolean,
+): TaskRightStatusKind {
+  if (livePhase === 'error' && liveAttention) return 'error';
+  if (pendingInteractionCount > 0 || livePhase === 'needs-interaction') return 'waiting';
+  if (running || livePhase === 'running') return 'running';
+  if (livePhase === 'completed' && liveAttention) return 'done';
+  return 'time';
+}
 
 /**
  * 沿用 Harmony 原状态筛选口径：优先识别调度器来源，旧数据再用标题前缀识别。
