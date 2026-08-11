@@ -9,6 +9,10 @@ import { image } from '@kit.ImageKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { ImageAttachmentCandidate } from './AttachmentModels';
 
+function pickerError(error: Object): Error {
+  return error instanceof Error ? error : new Error('image picker failed');
+}
+
 /** 从相册选图（多选），返回 photo uri 列表。 */
 export async function pickImageUris(maxCount: number): Promise<string[]> {
   if (maxCount <= 0) {
@@ -19,8 +23,12 @@ export async function pickImageUris(maxCount: number): Promise<string[]> {
     MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
     maxSelectNumber: maxCount,
   };
-  const result = await picker.select(options);
-  return result.photoUris;
+  try {
+    const result = await picker.select(options);
+    return result.photoUris;
+  } catch (e) {
+    throw pickerError(e);
+  }
 }
 
 /** 从系统截图目录选图；无法定位截图目录时显式失败，不退化为普通照片。 */
@@ -28,20 +36,24 @@ export async function pickScreenshotUris(context: common.Context, maxCount: numb
   if (maxCount <= 0) {
     return [];
   }
-  const helper = photoAccessHelper.getPhotoAccessHelper(context);
-  const albumId = await helper.getAlbumIdByLpath('/Pictures/Screenshots');
-  const filter = new photoAccessHelper.OperationItem();
-  filter.operationType = photoAccessHelper.OperationType.EQUAL_TO;
-  filter.field = photoAccessHelper.PhotoKeys.OWNER_ALBUM_ID;
-  filter.value = [albumId];
-  const picker = new photoAccessHelper.PhotoViewPicker();
-  const options: photoAccessHelper.PhotoSelectOptions = {
-    MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
-    maxSelectNumber: maxCount,
-    assetFilter: [filter],
-  };
-  const result = await picker.select(options);
-  return result.photoUris;
+  try {
+    const helper = photoAccessHelper.getPhotoAccessHelper(context);
+    const albumId = await helper.getAlbumIdByLpath('/Pictures/Screenshots');
+    const filter = new photoAccessHelper.OperationItem();
+    filter.operationType = photoAccessHelper.OperationType.EQUAL_TO;
+    filter.field = photoAccessHelper.PhotoKeys.OWNER_ALBUM_ID;
+    filter.value = [albumId];
+    const picker = new photoAccessHelper.PhotoViewPicker();
+    const options: photoAccessHelper.PhotoSelectOptions = {
+      MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
+      maxSelectNumber: maxCount,
+      assetFilter: [filter],
+    };
+    const result = await picker.select(options);
+    return result.photoUris;
+  } catch (e) {
+    throw pickerError(e);
+  }
 }
 
 /** 拉起系统相机 picker 拍照；取消或失败返回空串。 */
@@ -106,15 +118,23 @@ export async function buildImageCandidate(uri: string, index: number): Promise<I
     candidate.size = 0;
   }
   // 宽高
+  let source: image.ImageSource | null = null;
   try {
-    const source = image.createImageSource(uri);
+    source = image.createImageSource(uri);
     const info = await source.getImageInfo();
     candidate.width = info.size.width;
     candidate.height = info.size.height;
-    source.release();
   } catch (e) {
     candidate.width = 0;
     candidate.height = 0;
+  } finally {
+    if (source !== null) {
+      try {
+        await source.release();
+      } catch (e) {
+        // 候选构建已完成；释放失败不能阻断附件选择。
+      }
+    }
   }
   candidate.name = `image-${index + 1}.${extForMime(candidate.mimeType)}`;
   return candidate;

@@ -59,14 +59,19 @@ export function planImagePreprocess(
 
 /** 读取本地文件字节。 */
 export async function readFileBytes(uri: string): Promise<ArrayBuffer> {
-  const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
   try {
-    const stat = fileIo.statSync(file.fd);
-    const buf = new ArrayBuffer(stat.size);
-    fileIo.readSync(file.fd, buf);
-    return buf;
-  } finally {
-    fileIo.closeSync(file);
+    const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+    try {
+      const stat = fileIo.statSync(file.fd);
+      const buf = new ArrayBuffer(stat.size);
+      fileIo.readSync(file.fd, buf);
+      return buf;
+    } finally {
+      fileIo.closeSync(file);
+    }
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    throw new Error('read image bytes failed');
   }
 }
 
@@ -84,6 +89,34 @@ export function renameForImagePreprocess(name: string, format: string): string {
   const dot = name.lastIndexOf('.');
   const stem = dot > slash ? name.slice(0, dot) : name;
   return `${stem.length > 0 ? stem : 'image'}.${extension}`;
+}
+
+async function releaseImageResources(
+  packer: image.ImagePacker | null,
+  pixelMap: image.PixelMap | null,
+  source: image.ImageSource | null,
+): Promise<void> {
+  if (packer !== null) {
+    try {
+      await packer.release();
+    } catch (e) {
+      // 清理失败不改变已经完成的压缩结果，继续释放其它资源。
+    }
+  }
+  if (pixelMap !== null) {
+    try {
+      await pixelMap.release();
+    } catch (e) {
+      // 清理失败不改变已经完成的压缩结果，继续释放其它资源。
+    }
+  }
+  if (source !== null) {
+    try {
+      await source.release();
+    } catch (e) {
+      // 清理失败不改变已经完成的压缩结果。
+    }
+  }
 }
 
 async function originalImageResult(
@@ -116,37 +149,42 @@ export async function preprocessImage(
     return originalImageResult(uri, name, mimeType);
   }
   try {
-    const source = image.createImageSource(uri);
-    const info = await source.getImageInfo();
-    const pixelMap = await source.createPixelMap();
-    if (plan.resize) {
-      // 等比缩放（长边压到 2048）——PackingOption 无缩尺寸字段，走 PixelMap.scale。
-      const w = info.size.width;
-      const h = info.size.height;
-      const longEdge = Math.max(w, h);
-      if (longEdge > MAX_LONG_EDGE) {
-        const scale = MAX_LONG_EDGE / longEdge;
-        await pixelMap.scale(scale, scale);
+    let source: image.ImageSource | null = null;
+    let pixelMap: image.PixelMap | null = null;
+    let packer: image.ImagePacker | null = null;
+    try {
+      source = image.createImageSource(uri);
+      const info = await source.getImageInfo();
+      pixelMap = await source.createPixelMap();
+      if (plan.resize) {
+        // 等比缩放（长边压到 2048）——PackingOption 无缩尺寸字段，走 PixelMap.scale。
+        const w = info.size.width;
+        const h = info.size.height;
+        const longEdge = Math.max(w, h);
+        if (longEdge > MAX_LONG_EDGE) {
+          const scale = MAX_LONG_EDGE / longEdge;
+          await pixelMap.scale(scale, scale);
+        }
       }
+      packer = image.createImagePacker();
+      const packingOptions: image.PackingOption = {
+        format: plan.format === 'png' ? 'image/png' : 'image/jpeg',
+        quality: plan.quality,
+      };
+      const buffer = await packer.packToData(pixelMap, packingOptions);
+      // 产物没变小 → 白做，回退原图。
+      if (buffer.byteLength >= size) {
+        return originalImageResult(uri, name, mimeType);
+      }
+      const out = new PreprocessResult();
+      out.bytes = buffer;
+      out.name = renameForImagePreprocess(name, plan.format);
+      out.mimeType = plan.format === 'png' ? 'image/png' : 'image/jpeg';
+      out.size = buffer.byteLength;
+      return out;
+    } finally {
+      await releaseImageResources(packer, pixelMap, source);
     }
-    const packer = image.createImagePacker();
-    const packingOptions: image.PackingOption = {
-      format: plan.format === 'png' ? 'image/png' : 'image/jpeg',
-      quality: plan.quality,
-    };
-    const buffer = await packer.packing(pixelMap, packingOptions);
-    pixelMap.release();
-    source.release();
-    // 产物没变小 → 白做，回退原图。
-    if (buffer.byteLength >= size) {
-      return originalImageResult(uri, name, mimeType);
-    }
-    const out = new PreprocessResult();
-    out.bytes = buffer;
-    out.name = renameForImagePreprocess(name, plan.format);
-    out.mimeType = plan.format === 'png' ? 'image/png' : 'image/jpeg';
-    out.size = buffer.byteLength;
-    return out;
   } catch (e) {
     // 压缩失败不能挡发图，回退原图。
     return originalImageResult(uri, name, mimeType);

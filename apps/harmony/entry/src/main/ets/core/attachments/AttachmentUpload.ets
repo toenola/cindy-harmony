@@ -39,14 +39,19 @@ export function isUploadRevisionCurrent(
 
 /** SHA-256（小写 hex）。 */
 export async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
-  const md = cryptoFramework.createMd('SHA256');
-  await md.update({ data: new Uint8Array(bytes) });
-  const out = await md.digest();
-  let hex = '';
-  for (let i = 0; i < out.data.length; i++) {
-    hex += out.data[i].toString(16).padStart(2, '0');
+  try {
+    const md = cryptoFramework.createMd('SHA256');
+    await md.update({ data: new Uint8Array(bytes) });
+    const out = await md.digest();
+    let hex = '';
+    for (let i = 0; i < out.data.length; i++) {
+      hex += out.data[i].toString(16).padStart(2, '0');
+    }
+    return hex;
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    throw new AttachmentUploadError('sha256 failed');
   }
-  return hex;
 }
 
 /** presign：向 relay 申请 OSS 预签名上传。 */

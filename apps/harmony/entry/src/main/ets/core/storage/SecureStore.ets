@@ -17,6 +17,11 @@ const TAG = 'CindyStore';
 const STORE_NAME = 'cindy_secure';
 const KEY_DEVICE_ID_HINT = 'auth.deviceId';
 
+function secureStoreError(operation: string, error: Object): Error {
+  if (error instanceof Error) return error;
+  return new Error(`SecureStore ${operation} failed`);
+}
+
 export class SecureStore {
   private pref: preferences.Preferences | undefined = undefined;
 
@@ -28,7 +33,11 @@ export class SecureStore {
     const options: preferences.Options = {
       name: STORE_NAME,
     };
-    this.pref = await preferences.getPreferences(context, options);
+    try {
+      this.pref = await preferences.getPreferences(context, options);
+    } catch (e) {
+      throw secureStoreError('init', e);
+    }
     hilog.info(DOMAIN, TAG, 'secure store initialized');
   }
 
@@ -37,11 +46,15 @@ export class SecureStore {
     if (!pref) {
       return defaultValue;
     }
-    const value = await pref.get(key, defaultValue);
-    if (typeof value === 'string') {
-      return value;
+    try {
+      const value = await pref.get(key, defaultValue);
+      if (typeof value === 'string') {
+        return value;
+      }
+      return defaultValue;
+    } catch (e) {
+      throw secureStoreError('get', e);
     }
-    return defaultValue;
   }
 
   async set(key: string, value: string): Promise<void> {
@@ -49,8 +62,12 @@ export class SecureStore {
     if (!pref) {
       throw new Error('SecureStore not initialized');
     }
-    await pref.put(key, value);
-    await pref.flush();
+    try {
+      await pref.put(key, value);
+      await pref.flush();
+    } catch (e) {
+      throw secureStoreError('set', e);
+    }
   }
 
   async remove(key: string): Promise<void> {
@@ -58,8 +75,12 @@ export class SecureStore {
     if (!pref) {
       return;
     }
-    await pref.delete(key);
-    await pref.flush();
+    try {
+      await pref.delete(key);
+      await pref.flush();
+    } catch (e) {
+      throw secureStoreError('remove', e);
+    }
   }
 
   /** 清空敏感信息（token 等）。deviceId 由调用方单独保留/清除，避免误删设备身份。 */
@@ -68,15 +89,19 @@ export class SecureStore {
     if (!pref) {
       return;
     }
-    const raw = await pref.get(KEY_DEVICE_ID_HINT, '');
-    let deviceId = '';
-    if (typeof raw === 'string') {
-      deviceId = raw;
+    try {
+      const raw = await pref.get(KEY_DEVICE_ID_HINT, '');
+      let deviceId = '';
+      if (typeof raw === 'string') {
+        deviceId = raw;
+      }
+      await pref.clear();
+      if (deviceId.length > 0) {
+        await pref.put(KEY_DEVICE_ID_HINT, deviceId);
+      }
+      await pref.flush();
+    } catch (e) {
+      throw secureStoreError('clearSensitive', e);
     }
-    await pref.clear();
-    if (deviceId.length > 0) {
-      await pref.put(KEY_DEVICE_ID_HINT, deviceId);
-    }
-    await pref.flush();
   }
 }
