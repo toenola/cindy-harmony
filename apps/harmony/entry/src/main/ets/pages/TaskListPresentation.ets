@@ -57,14 +57,6 @@ export function normalizeAutoTitle(text: string): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, 40).trimEnd();
 }
 
-/**
- * 标题是否仍是建会话时的裸默认哨兵（尚未起名、也未改名）。精确比较，不做大小写归一：
- * 用户手动把标题改成 `new maker` 是合法自定义标题，不该被当成系统占位覆盖掉。
- */
-export function isDefaultDraftSessionTitle(title: string): boolean {
-  return title === DEFAULT_DRAFT_TITLE;
-}
-
 export function taskPreviewText(preview: string): string {
   return preview.replace(/\s+/g, ' ').trim();
 }

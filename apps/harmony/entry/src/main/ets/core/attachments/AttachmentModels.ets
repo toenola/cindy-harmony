@@ -76,7 +76,3 @@ export function composerAttachmentRenderKey(
 ): string {
   return `${uri}#${uploadRevision}#${status}`;
 }
-
-export function isImageCategory(category: string): boolean {
-  return category === 'image';
-}

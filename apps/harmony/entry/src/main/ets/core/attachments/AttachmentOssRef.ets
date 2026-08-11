@@ -47,11 +47,6 @@ export function buildAttachmentOssRef(ref: AttachmentOssRef): string {
   return `${PREFIX}${toBase64Url(JSON.stringify(payload))}`;
 }
 
-/** 判断字符串是否为附件 OSS 引用。 */
-export function isAttachmentOssRef(value: string): boolean {
-  return attachmentPrefix(value).length > 0;
-}
-
 /** 解析引用；半套完整性返回 null。 */
 export function parseAttachmentOssRef(value: string): AttachmentOssRef | null {
   const prefix = attachmentPrefix(value);

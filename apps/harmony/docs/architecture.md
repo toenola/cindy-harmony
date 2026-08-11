@@ -37,7 +37,8 @@ Harmony 端是远程控制壳，不运行桌面 Agent。
 ```text
 pages/
 ├── LoginPage
-├── HomePage
+├── TaskListPage
+├── NewSessionPage
 ├── TaskPage
 └── SettingsPage
 ```

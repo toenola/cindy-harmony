@@ -216,12 +216,6 @@ export function replaceComposerTextRange(document: ComposerDocument, from: numbe
   return normalizeComposerDocument(out);
 }
 
-export function appendComposerNode(document: ComposerDocument, node: ComposerNode): ComposerDocument {
-  const out = new ComposerDocument();
-  out.nodes = document.nodes.concat([node]);
-  return normalizeComposerDocument(out);
-}
-
 export function removeComposerNode(document: ComposerDocument, index: number): ComposerDocument {
   if (index < 0 || index >= document.nodes.length) return document;
   const out = new ComposerDocument();

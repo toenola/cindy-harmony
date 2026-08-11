@@ -1539,18 +1539,6 @@ export class MessageStore {
       this.setOlderAvailability(
         sessionId, this.hasMoreAfterPage(sessionId, page, merged));
       this.loadFailedBySession.delete(sessionId);
-      // 临时诊断：确认 user 消息是否在数据层（对比渲染层丢失）。
-      let userCount = 0;
-      let assistantCount = 0;
-      let otherCount = 0;
-      for (let i = 0; i < page.items.length; i++) {
-        const r = page.items[i].role;
-        if (r === 'user') userCount += 1;
-        else if (r === 'assistant') assistantCount += 1;
-        else otherCount += 1;
-      }
-      hilog.info(DOMAIN, TAG, 'history loaded total=%{public}d user=%{public}d assistant=%{public}d other=%{public}d hasMore=%{public}s',
-        page.items.length, userCount, assistantCount, otherCount, page.hasMore ? 'true' : 'false');
       this.notify();
       return true;
     } catch (e) {

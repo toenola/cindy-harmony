@@ -95,10 +95,6 @@ struct TaskListPage {
   @State searchOpen: boolean = false;
   @State searchQuery: string = '';
   @State refreshing: boolean = false;
-  @State actionEntryKey: string = '';
-  @State renameMode: boolean = false;
-  @State renameDraft: string = '';
-  @State renameGenerating: boolean = false;
   @State sessionActionBusy: boolean = false;
   @State bulkMode: boolean = false;
   @State selectedEntryKeys: string[] = [];
@@ -130,9 +126,6 @@ struct TaskListPage {
   private listTabSwiperController: SwiperController = new SwiperController();
   private listTabSwiperAppeared: boolean = false;
   private initialListTabIndex: number = 0;
-  private renameInitialDraft: string = '';
-  /** AI 起名轮次；取消、切换任务或手动编辑后，迟到结果不得覆盖当前输入。 */
-  private renameGeneration: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
     this.foldStatus = status;
     this.ensureWideSelection();
@@ -199,22 +192,9 @@ struct TaskListPage {
     void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
     this.sortMenuOpen = false;
-    this.actionEntryKey = '';
-    this.renameMode = false;
-    this.renameDraft = '';
-    this.renameGenerating = false;
-    this.renameGeneration += 1;
   }
 
   onBackPress(): boolean {
-    if (this.renameMode) {
-      this.closeRenameDialog();
-      return true;
-    }
-    if (this.actionEntryKey.length > 0) {
-      this.closeSessionActions();
-      return true;
-    }
     if (this.scopeMenuOpen) {
       this.closeScopeMenu();
       return true;
@@ -309,13 +289,6 @@ struct TaskListPage {
     }
     this.devices = devices;
     this.entries = next;
-    if (this.actionEntryKey.length > 0 && this.actionEntry() === null) {
-      this.actionEntryKey = '';
-      this.renameMode = false;
-      this.renameDraft = '';
-      this.renameGenerating = false;
-      this.renameGeneration += 1;
-    }
     this.collapseProjectGroupsOnce();
     this.ensureWideSelection();
     this.tryOpenPendingDeepLink();
@@ -436,7 +409,6 @@ struct TaskListPage {
   }
 
   private setActiveListTab(tab: TaskListCategory, animate: boolean): void {
-    this.prepareForProjectionChange();
     const index = this.listTabIndex(tab);
     this.activeListTab = tab;
     if (!this.listTabSwiperAppeared) {
@@ -569,7 +541,6 @@ struct TaskListPage {
   }
 
   private selectSortMode(mode: TaskListSortMode): void {
-    this.prepareForProjectionChange();
     this.animateMenu(() => {
       this.sortMode = mode;
       this.sortMenuOpen = false;
@@ -583,7 +554,6 @@ struct TaskListPage {
   }
 
   private selectDevice(deviceId: string): void {
-    this.prepareForProjectionChange();
     this.animateMenu(() => {
       this.selectedDeviceId = deviceId;
       this.scopeMenuOpen = false;
@@ -651,7 +621,6 @@ struct TaskListPage {
   }
 
   private toggleSearch(): void {
-    this.prepareForProjectionChange();
     uiAnimateFastState(this.getUIContext(), () => {
       this.searchOpen = !this.searchOpen;
       if (!this.searchOpen) this.searchQuery = '';
@@ -748,79 +717,6 @@ struct TaskListPage {
     return null;
   }
 
-  private actionEntry(): TaskListEntry | null {
-    return this.entryForKey(this.actionEntryKey);
-  }
-
-  private togglePinnedActionEntry(): void {
-    const entry = this.actionEntry();
-    if (entry !== null) void this.togglePinned(entry);
-  }
-
-  private archiveActionEntry(): void {
-    const entry = this.actionEntry();
-    if (entry !== null) void this.archiveOrRestore(entry);
-  }
-
-  private deleteActionEntry(): void {
-    const entry = this.actionEntry();
-    if (entry !== null) this.confirmDelete(entry);
-  }
-
-  private openSessionActions(entry: TaskListEntry): void {
-    if (this.sessionActionBusy) return;
-    this.renameGeneration += 1;
-    uiAnimateState(this.getUIContext(), () => {
-      if (this.actionEntryKey === entry.key) {
-        this.actionEntryKey = '';
-        this.renameDraft = '';
-      } else {
-        this.renameDraft = taskDisplayTitle(entry.session);
-        this.actionEntryKey = entry.key;
-      }
-      this.renameMode = false;
-      this.renameGenerating = false;
-    });
-  }
-
-  private closeSessionActions(): void {
-    if (this.sessionActionBusy) return;
-    this.renameGeneration += 1;
-    uiAnimateState(this.getUIContext(), () => {
-      this.actionEntryKey = '';
-      this.renameMode = false;
-      this.renameDraft = '';
-      this.renameGenerating = false;
-    });
-  }
-
-  /** 筛选、折叠或换 Tab 前同步清掉行内菜单，避免条目隐藏后残留不可见状态。 */
-  private prepareForProjectionChange(): void {
-    if (this.actionEntryKey.length === 0) return;
-    this.renameGeneration += 1;
-    this.actionEntryKey = '';
-    this.renameMode = false;
-    this.renameDraft = '';
-    this.renameGenerating = false;
-  }
-
-  private openRenameDialog(): void {
-    const entry = this.actionEntry();
-    if (entry === null || this.sessionActionBusy) return;
-    this.renameGeneration += 1;
-    this.renameInitialDraft = taskDisplayTitle(entry.session);
-    this.renameDraft = this.renameInitialDraft;
-    this.renameMode = true;
-    setTimeout(() => focusControl.requestFocus('task-list-rename-input'), 0);
-  }
-
-  private closeRenameDialog(): void {
-    if (this.sessionActionBusy) return;
-    this.renameGeneration += 1;
-    this.renameMode = false;
-    this.renameGenerating = false;
-  }
-
   private async applySessionPatch(entry: TaskListEntry, patch: SessionMetaPatch): Promise<boolean> {
     this.sessionActionBusy = true;
     const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
@@ -829,42 +725,10 @@ struct TaskListPage {
     return ok;
   }
 
-  private async saveRename(): Promise<void> {
-    const entry = this.actionEntry();
-    const title = this.renameDraft.trim();
-    if (entry === null || title.length === 0 || this.sessionActionBusy) return;
-    if (title === this.renameInitialDraft.trim()) {
-      this.closeRenameDialog();
-      return;
-    }
-    this.renameGeneration += 1;
-    this.renameGenerating = false;
-    const patch = new SessionMetaPatch();
-    patch.title = title;
-    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
-  }
-
-  private async generateRename(): Promise<void> {
-    const entry = this.actionEntry();
-    if (entry === null || this.sessionActionBusy || this.renameGenerating) return;
-    const generation = this.renameGeneration;
-    const entryKey = entry.key;
-    this.renameGenerating = true;
-    const title = await AppServices.instance.tasks.regenerateTitle(entry.deviceId, entry.session.id);
-    if (generation !== this.renameGeneration || !this.renameMode || this.actionEntryKey !== entryKey) return;
-    this.renameGenerating = false;
-    const generatedTitle = title.trim();
-    if (generatedTitle.length === 0) {
-      promptAction.showToast({ message: '暂时无法生成标题' });
-      return;
-    }
-    this.renameDraft = generatedTitle;
-  }
-
   private async togglePinned(entry: TaskListEntry): Promise<void> {
     const patch = new SessionMetaPatch();
     patch.pinnedAt = entry.session.pinnedAt.length > 0 ? null : new Date().toISOString();
-    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
+    await this.applySessionPatch(entry, patch);
   }
 
   private async archiveOrRestore(entry: TaskListEntry): Promise<void> {
@@ -875,39 +739,7 @@ struct TaskListPage {
       patch.status = 'archived';
       patch.pinnedAt = null;
     }
-    if (await this.applySessionPatch(entry, patch)) this.closeSessionActions();
-  }
-
-  private confirmDelete(entry: TaskListEntry): void {
-    this.getUIContext().showAlertDialog({
-      title: '删除任务？',
-      message: '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。',
-      primaryButton: {
-        value: '取消',
-        action: () => {
-        },
-      },
-      secondaryButton: {
-        value: '删除',
-        fontColor: $r('app.color.danger'),
-        action: () => {
-          void this.deleteSession(entry);
-        },
-      },
-    });
-  }
-
-  private async deleteSession(entry: TaskListEntry): Promise<void> {
-    const patch = new SessionMetaPatch();
-    patch.status = 'deleted';
-    if (await this.applySessionPatch(entry, patch)) {
-      if (entry.key === this.selectedTaskKey()) {
-        this.selectedSessionDeviceId = '';
-        this.selectedSessionId = '';
-        this.selectedMessageClientId = '';
-      }
-      this.closeSessionActions();
-    }
+    await this.applySessionPatch(entry, patch);
   }
 
   private beginBulkSelection(entry: TaskListEntry): void {
@@ -1141,7 +973,6 @@ struct TaskListPage {
   private toggleAllProjects(): void {
     const groups = this.projectGroups();
     if (groups.length === 0) return;
-    this.prepareForProjectionChange();
     if (this.allProjectsCollapsed()) {
       uiAnimateState(this.getUIContext(), () => {
         this.collapsedProjectKeys = [];
@@ -1167,7 +998,6 @@ struct TaskListPage {
   }
 
   private toggleProject(key: string): void {
-    this.prepareForProjectionChange();
     const index = this.collapsedProjectKeys.indexOf(key);
     uiAnimateState(this.getUIContext(), () => {
       if (index >= 0) {
@@ -1191,7 +1021,6 @@ struct TaskListPage {
   }
 
   private toggleProjectExpanded(key: string): void {
-    this.prepareForProjectionChange();
     uiAnimateState(this.getUIContext(), () => {
       if (this.projectFullyExpanded(key)) {
         this.expandedProjectKeys = this.expandedProjectKeys.filter((value: string) => value !== key);
@@ -1265,9 +1094,6 @@ struct TaskListPage {
       }
       if (this.sortMenuOpen) {
         this.sortMenuLayer()
-      }
-      if (this.renameMode && this.actionEntry() !== null) {
-        this.renameDialogLayer()
       }
       if (this.bulkMode) {
         this.bulkActionBar()
@@ -1584,7 +1410,6 @@ struct TaskListPage {
         .height(40)
         .padding(0)
         .onChange((value: string) => {
-          this.prepareForProjectionChange();
           this.searchQuery = value;
           this.ensureWideSelection();
           this.persistPreferences();
@@ -1601,7 +1426,6 @@ struct TaskListPage {
         .padding(0)
         .backgroundColor(Color.Transparent)
         .onClick(() => {
-          this.prepareForProjectionChange();
           this.searchQuery = '';
           this.ensureWideSelection();
           this.persistPreferences();
@@ -1647,7 +1471,6 @@ struct TaskListPage {
             `${this.pinnedEntries(category).length}`,
             $r('sys.symbol.pin'),
             () => {
-              this.prepareForProjectionChange();
               uiAnimateState(this.getUIContext(), () => {
                 this.pinnedCollapsed = !this.pinnedCollapsed;
               });
@@ -2076,176 +1899,6 @@ struct TaskListPage {
     if (agentKind === 'codex') return 'CX';
     if (agentKind === 'pi') return 'Pi';
     return 'AI';
-  }
-
-  @Builder
-  sessionInlineActions(entry: TaskListEntry, inGroup: boolean) {
-    Row() {
-      this.sessionInlineActionButton('重命名任务', $r('sys.symbol.doc_text'), false, () => {
-        this.openRenameDialog();
-      })
-      this.sessionInlineActionButton(entry.session.pinnedAt.length > 0 ? '取消置顶任务' : '置顶任务',
-        $r('sys.symbol.pin'), false, () => {
-          this.togglePinnedActionEntry();
-        })
-      this.sessionInlineActionButton(entry.session.status === 'archived' ? '恢复任务' : '归档任务',
-        $r('sys.symbol.archivebox'), false, () => {
-          this.archiveActionEntry();
-        })
-      this.sessionInlineActionButton('删除任务', $r('sys.symbol.trash'), true, () => {
-        this.deleteActionEntry();
-      })
-    }
-    .width('auto')
-    .constraintSize({
-      minHeight: taskPreviewText(entry.session.preview).length > 0 ? 72 : 56,
-    })
-    .padding({ left: 6, right: 6, top: 4, bottom: 4 })
-    .alignItems(VerticalAlign.Center)
-    .margin(inGroup
-      ? { left: 6, right: 6, bottom: 2 }
-      : { left: LIST_INSET, right: LIST_INSET, bottom: 8 })
-    .backgroundColor($r('app.color.task_list_menu_surface'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(UI_RADIUS_CONTAINER)
-    .transition(uiRevealTransition())
-  }
-
-  @Builder
-  sessionInlineActionButton(label: string, symbol: Resource, danger: boolean, action: () => void) {
-    Button() {
-      Column({ space: 3 }) {
-        SymbolGlyph(symbol)
-          .fontSize(17)
-          .fontColor([danger ? $r('app.color.danger') : $r('app.color.text_secondary')])
-        Text(label)
-          .fontSize(11)
-          .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .justifyContent(FlexAlign.Center)
-    }
-    .type(ButtonType.Normal)
-    .layoutWeight(1)
-    .height(48)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .borderRadius(UI_RADIUS_CONTROL)
-    .enabled(!this.sessionActionBusy)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .accessibilityText(label)
-    .onClick(action)
-  }
-
-  @Builder
-  renameDialogLayer() {
-    Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.overlay'))
-        .onClick(() => this.closeRenameDialog())
-
-      Column({ space: 16 }) {
-        Text('重命名任务')
-          .fontSize(17)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-
-        Row({ space: 4 }) {
-          TextInput({ placeholder: '任务名称', text: this.renameDraft })
-            .id('task-list-rename-input')
-            .fontSize(15)
-            .fontColor($r('app.color.text_primary'))
-            .placeholderColor($r('app.color.text_placeholder'))
-            .caretColor($r('app.color.accent'))
-            .layoutWeight(1)
-            .height(44)
-            .padding({ left: 14, right: 6 })
-            .backgroundColor(Color.Transparent)
-            .enabled(!this.sessionActionBusy)
-            .onChange((value: string) => {
-              if (this.renameGenerating) {
-                this.renameGeneration += 1;
-                this.renameGenerating = false;
-              }
-              this.renameDraft = value;
-            })
-
-          Button() {
-            if (this.renameGenerating) {
-              LoadingProgress()
-                .width(18)
-                .height(18)
-                .color($r('app.color.text_secondary'))
-            } else {
-              SymbolGlyph($r('sys.symbol.wand_and_stars'))
-                .fontSize(17)
-                .fontColor([$r('app.color.text_secondary')])
-            }
-          }
-          .type(ButtonType.Circle)
-          .width(38)
-          .height(38)
-          .padding(0)
-          .margin({ right: 3 })
-          .backgroundColor($r('app.color.bg_chip'))
-          .enabled(!this.sessionActionBusy && !this.renameGenerating)
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .accessibilityText(this.renameGenerating ? '正在 AI 起名' : 'AI 起名')
-          .onClick(() => {
-            void this.generateRename();
-          })
-        }
-        .width('100%')
-        .height(48)
-        .backgroundColor($r('app.color.bg_card'))
-        .border({ width: 1, color: $r('app.color.border') })
-        .borderRadius(UI_RADIUS_PILL)
-
-        Row({ space: 8 }) {
-          Button('取消')
-            .width(88)
-            .height(40)
-            .fontSize(14)
-            .fontColor($r('app.color.text_primary'))
-            .backgroundColor(Color.Transparent)
-            .border({ width: 1, color: $r('app.color.border') })
-            .borderRadius(UI_RADIUS_PILL)
-            .enabled(!this.sessionActionBusy)
-            .clickEffect(UI_LIST_CLICK_EFFECT)
-            .onClick(() => this.closeRenameDialog())
-          Button(this.sessionActionBusy && !this.renameGenerating ? '修改中…' : '修改任务名称')
-            .width(96)
-            .height(40)
-            .fontSize(14)
-            .fontColor($r('app.color.chat_cta_text'))
-            .backgroundColor($r('app.color.chat_cta'))
-            .borderRadius(UI_RADIUS_PILL)
-            .enabled(!this.sessionActionBusy && this.renameDraft.trim().length > 0)
-            .clickEffect(UI_LIST_CLICK_EFFECT)
-            .onClick(() => {
-              void this.saveRename();
-            })
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.End)
-      }
-      .width('calc(100% - 32vp)')
-      .constraintSize({ maxWidth: 420 })
-      .padding(16)
-      .backgroundColor($r('app.color.task_list_menu_surface'))
-      .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayTransition())
-      .onClick(() => {
-        // 截住弹窗内点击，避免触发遮罩关闭。
-      })
-    }
-    .width('100%')
-    .height('100%')
   }
 
   @Builder

@@ -120,10 +120,6 @@ export function parseMessageFiles(content: Object | undefined): RemoteSerialized
   return out;
 }
 
-export function isDesktopLocalMediaUrl(url: string): boolean {
-  return /^(?:xdt-image|xdt-video|xdt-audio|cindy-media|xdt-file):\/\//i.test(url);
-}
-
 export function isDirectPreviewableMediaUrl(url: string): boolean {
   return /^(?:https?:|data:)/i.test(url);
 }
@@ -273,11 +269,3 @@ export function buildToolDiff(toolName: string, inputRaw: string): RenderDiffPay
   }
   return out.segments.length > 0 ? out : null;
 }
-
-export function attachmentMediaKind(attachment: RemoteSerializedAttachment): string {
-  const mime = normalizedMime(attachment.mimeType);
-  if (mime.startsWith('video/')) return 'video';
-  if (mime.startsWith('audio/')) return 'audio';
-  return '';
-}
-

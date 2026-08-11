@@ -30,6 +30,7 @@ import {
   toolResultHasError,
   buildRenderItems,
   RenderToolGroupItem,
+  RenderToolItem,
   RenderToolMediaItem,
   RenderTodoCardItem,
   RenderTodoItem,
@@ -50,6 +51,10 @@ import {
   shouldSplitToolGroup,
   turnFinalAssistantIds,
 } from '../main/ets/core/messages/MessageRender';
+import {
+  workExplorationSummary,
+  workPreviewRows,
+} from '../main/ets/core/messages/WorkGroupPresentation';
 import {
   AgentTaskUpdate,
   deriveAgentTaskStatus,
@@ -149,7 +154,12 @@ import {
   DlError,
   isSafeUnsentDlError,
 } from '../main/ets/core/device-link/DlClient';
-import { parseChoiceOptions } from '../main/ets/core/ComposerCatalog';
+import {
+  parseChoiceOptions,
+  parseModelOptions,
+  parseModelVisibilityOverrides,
+  parseProviderModelOptions,
+} from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
 import {
   TASK_LIST_RECONCILE_INTERVAL_MS,
@@ -951,6 +961,40 @@ export default function localUnitTest() {
       const unknown = projectToolUseActions('exec', JSON.stringify(unknownInput), '');
       expect(unknown[0].label).assertEqual('运行命令');
       expect(unknown[0].detail.includes('/bin/zsh -lc')).assertEqual(true);
+    });
+
+    it('projectsAndDeduplicatesCollapsedWorkGroupRows', 0, () => {
+      const work = new RenderWorkGroupItem();
+      const thinking = new RenderThinkingItem();
+      thinking.type = 'thinking';
+      thinking.key = 'thinking-1';
+      thinking.body = '先检查消息存储，再继续分析。';
+
+      const tools = new RenderToolGroupItem();
+      tools.type = 'tool_group';
+      tools.key = 'tools-1';
+      for (let i = 0; i < 2; i++) {
+        const read = new RenderToolItem();
+        read.seq = i + 1;
+        read.toolName = 'Read';
+        read.inputRaw = '{"file_path":"/repo/MessageStore.ets"}';
+        read.hasResult = true;
+        tools.tools.push(read);
+      }
+      const search = new RenderToolItem();
+      search.seq = 3;
+      search.toolName = 'Grep';
+      search.inputRaw = '{"pattern":"loadInitial","path":"/repo"}';
+      tools.tools.push(search);
+      work.children = [thinking, tools];
+
+      const rows = workPreviewRows(work);
+      expect(rows.length).assertEqual(3);
+      expect(rows[0].kind).assertEqual('thinking');
+      expect(rows[1].text).assertEqual('读取 MessageStore.ets');
+      expect(rows[1].done).assertEqual(true);
+      expect(rows[2].explorationKind).assertEqual('search');
+      expect(workExplorationSummary(work)).assertEqual('读取 1 个文件 · 搜索 1 次');
     });
 
     it('splitsSafeCodexCommandActionsAndRejectsSideEffectingShellLabels', 0, () => {
@@ -2327,6 +2371,44 @@ export default function localUnitTest() {
       expect(options.length).assertEqual(2);
       expect(options[0].id).assertEqual('ask');
       expect(options[1].id).assertEqual('acceptEdits');
+    });
+
+    it('parsesSharedComposerModelsForNewAndExistingTasks', 0, () => {
+      const fallbackModel: Record<string, Object> = {};
+      fallbackModel['id'] = 'gpt-test';
+      fallbackModel['displayName'] = 'GPT Test';
+      fallbackModel['defaultEffort'] = 'high';
+      fallbackModel['supportsFastMode'] = true;
+      fallbackModel['efforts'] = ['medium', 'high'];
+      const fallback = parseModelOptions([fallbackModel]);
+      expect(fallback.length).assertEqual(1);
+      expect(fallback[0].label).assertEqual('GPT Test');
+      expect(fallback[0].defaultEffort).assertEqual('high');
+      expect(fallback[0].supportsFastMode).assertEqual(true);
+
+      const model: Record<string, Object> = {};
+      model['id'] = 'gpt-test';
+      model['name'] = 'Provider GPT';
+      model['defaultEnabled'] = false;
+      const models: Record<string, Object> = {};
+      models['codex'] = [model];
+      const provider: Record<string, Object> = {};
+      provider['id'] = 'provider-a';
+      provider['name'] = 'Provider A';
+      provider['connected'] = true;
+      provider['agents'] = ['codex'];
+      provider['models'] = models;
+      const overrides: Record<string, Object> = {};
+      overrides['codex:provider-a:gpt-test'] = false;
+      const response: Record<string, Object> = {};
+      response['providers'] = [provider];
+      response['modelVisibilityOverrides'] = overrides;
+      const visibility = parseModelVisibilityOverrides(response);
+      expect(parseProviderModelOptions(response, 'codex', visibility, undefined).length).assertEqual(0);
+      const selected = parseProviderModelOptions(response, 'codex', visibility,
+        { model: 'gpt-test', providerId: 'provider-a' });
+      expect(selected.length).assertEqual(1);
+      expect(selected[0].providerId).assertEqual('provider-a');
     });
 
     it('backsOffTaskListAntiEntropyPerDeviceAndResetsAfterSuccess', 0, () => {

@@ -13,6 +13,18 @@ import {
   SelectMode, PickerOrientation, SingleLineConfig, DataType,
 } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import {
+  ComposerChoiceOption as RuntimeChoiceOption,
+  ComposerModelOption as RuntimeModelOption,
+  ProviderListOptions,
+  composerModelKey,
+  effortLevelLabel,
+  parseModelOptions,
+  parseModelVisibilityOverrides,
+  parseProviderModelOptions as parseComposerProviderModelOptions,
+  permissionModeDescription,
+  permissionModeLabel,
+} from '../core/ComposerCatalog';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
 import {
   uploadImage, deleteUpload, presignGet, isUploadRevisionCurrent,
@@ -52,40 +64,8 @@ class RemoteDirectory {
   path: string = '';
 }
 
-class RuntimeChoiceOption {
-  id: string = '';
-  label: string = '';
-  description: string = '';
-}
-
-class RuntimeModelOption {
-  id: string = '';
-  label: string = '';
-  description: string = '';
-  efforts: string[] = [];
-  defaultEffort: string = '';
-  supportsFastMode: boolean = false;
-  effortDisplayNames: Record<string, string> = {};
-  providerId: string = '';
-  providerName: string = '';
-  providerLogoKind: string = '';
-  modelIcon: string = '';
-  subscription: boolean = false;
-}
-
-class ProviderListOptions {
-  capabilities: string[] = [];
-}
-
 const NEW_AGENT_OPTIONS: NewAgentKind[] = ['claude-code', 'codex', 'pi'];
 const MAX_COMPOSER_IMAGES = 20;
-const NEW_SESSION_FONT_SCALE = 0.84;
-const NEW_SESSION_MIN_FONT_SIZE = 8;
-
-function newSessionFontSize(base: number): number {
-  return Math.max(NEW_SESSION_MIN_FONT_SIZE, Math.round(base * NEW_SESSION_FONT_SCALE));
-}
-
 function createRecentPickerOptions(): PickerOptions {
   const options = new PickerOptions();
   options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
@@ -737,35 +717,6 @@ struct NewSessionPage {
     this.fastModeCapability = false;
   }
 
-  private permissionLabel(id: string, fallback: string): string {
-    if (id === 'default') return '默认';
-    if (id === 'ask') return '每次询问';
-    if (id === 'acceptEdits') return '自动接受编辑';
-    if (id === 'bypassPermissions') return '完全访问';
-    if (id === 'auto') return '自动';
-    return fallback.length > 0 ? fallback : id;
-  }
-
-  private permissionDescription(id: string, fallback: string): string {
-    if (id === 'default') return '使用当前 Agent 的默认权限策略。';
-    if (id === 'ask') return '只读工具直接运行；写文件、执行命令和 MCP 工具每次询问。';
-    if (id === 'acceptEdits') return '自动允许文件编辑；其它敏感操作仍会询问。';
-    if (id === 'auto') return '工作区内写入和安全命令自动运行；高风险操作仍会询问。';
-    if (id === 'bypassPermissions') return '所有工具无需询问即可运行。风险最高，仅用于可信任务。';
-    return fallback;
-  }
-
-  private effortLabel(id: string, fallback: string): string {
-    if (id === 'minimal') return '最小';
-    if (id === 'low') return '低';
-    if (id === 'medium') return '中';
-    if (id === 'high') return '高';
-    if (id === 'xhigh') return '超高';
-    if (id === 'max') return '最高';
-    if (id === 'ultra') return '极致';
-    return fallback.length > 0 ? fallback : id;
-  }
-
   private parseRuntimeChoices(value: Object | undefined, permission: boolean): RuntimeChoiceOption[] {
     const out: RuntimeChoiceOption[] = [];
     if (!Array.isArray(value)) return out;
@@ -786,46 +737,9 @@ struct NewSessionPage {
       if (id.length === 0 || (permission && id === 'plan')) continue;
       const option = new RuntimeChoiceOption();
       option.id = id;
-      option.label = permission ? this.permissionLabel(id, label) : this.effortLabel(id, label);
-      option.description = permission ? this.permissionDescription(id, description) : description;
+      option.label = permission ? permissionModeLabel(id, label) : effortLevelLabel(id, label);
+      option.description = permission ? permissionModeDescription(id, description) : description;
       out.push(option);
-    }
-    return out;
-  }
-
-  private parseRuntimeModels(value: Object | undefined): RuntimeModelOption[] {
-    const out: RuntimeModelOption[] = [];
-    if (!Array.isArray(value)) return out;
-    const rows = value as Object[];
-    for (let i = 0; i < rows.length; i++) {
-      const raw = rows[i];
-      const option = new RuntimeModelOption();
-      if (typeof raw === 'string') {
-        option.id = raw as string;
-        option.label = option.id;
-      } else if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
-        const record = raw as Record<string, Object>;
-        option.id = readStr(record, 'id');
-        option.label = readStr(record, 'displayName') || readStr(record, 'name') || option.id;
-        option.description = readStr(record, 'description');
-        option.defaultEffort = readStr(record, 'defaultEffort');
-        option.supportsFastMode = readBool(record, 'supportsFastMode', false);
-        const displayNames = readObj(record, 'effortDisplayNames');
-        const displayNameKeys = Object.keys(displayNames);
-        for (let j = 0; j < displayNameKeys.length; j++) {
-          const key = displayNameKeys[j];
-          const label = readStr(displayNames, key);
-          if (label.length > 0) option.effortDisplayNames[key] = label;
-        }
-        const rawEfforts = record['efforts'];
-        if (Array.isArray(rawEfforts)) {
-          const efforts = rawEfforts as Object[];
-          for (let j = 0; j < efforts.length; j++) {
-            if (typeof efforts[j] === 'string') option.efforts.push(efforts[j] as string);
-          }
-        }
-      }
-      if (option.id.length > 0) out.push(option);
     }
     return out;
   }
@@ -835,69 +749,9 @@ struct NewSessionPage {
    * 同名模型必须保留 providerId，否则新任务可能被路由到错误的凭证来源。
    */
   private parseProviderModelOptions(value: Object | undefined, agent: NewAgentKind): RuntimeModelOption[] {
-    if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return [];
-    const root = value as Record<string, Object>;
-    const rawProvidersValue = root['providers'];
-    if (!Array.isArray(rawProvidersValue)) return [];
-    const out: RuntimeModelOption[] = [];
     const selected = this.latestSessionForAgent(agent);
-    const rawProviders = rawProvidersValue as Object[];
-    for (let i = 0; i < rawProviders.length; i++) {
-      const rawProvider = rawProviders[i];
-      if (rawProvider === null || typeof rawProvider !== 'object' || Array.isArray(rawProvider)) continue;
-      const provider = rawProvider as Record<string, Object>;
-      if (!readBool(provider, 'connected', false) || readBool(provider, 'suspended', false)) continue;
-      const providerId = readStr(provider, 'id');
-      if (providerId.length === 0 || !this.stringArrayHas(provider['agents'], agent)) continue;
-      const modelsByAgent = readObj(provider, 'models');
-      const rawModelsValue = modelsByAgent[agent];
-      if (!Array.isArray(rawModelsValue)) continue;
-      const access = readObj(provider, 'access');
-      const subscription = readStr(access, 'kind') === 'subscription';
-      const providerName = readStr(provider, 'name') || providerId;
-      const providerLogoKind = readStr(provider, 'logoKind');
-      const rawModels = rawModelsValue as Object[];
-      for (let j = 0; j < rawModels.length; j++) {
-        const rawModel = rawModels[j];
-        if (rawModel === null || typeof rawModel !== 'object' || Array.isArray(rawModel)) continue;
-        const model = rawModel as Record<string, Object>;
-        const id = readStr(model, 'id');
-        if (id.length === 0 || readBool(model, 'disabled', false)) continue;
-        const visibilityKey = `${agent}:${providerId}:${id}`;
-        const visibility = this.modelVisibilityOverrides.get(visibilityKey);
-        const selectedCurrent = selected !== undefined
-          && selected.model === id && selected.providerId === providerId;
-        if (visibility === false && !selectedCurrent) continue;
-        if (visibility === undefined && !readBool(model, 'defaultEnabled', true) && !selectedCurrent) continue;
-        const option = new RuntimeModelOption();
-        option.id = id;
-        option.label = readStr(model, 'name') || readStr(model, 'displayName') || id;
-        option.description = readStr(model, 'description');
-        option.defaultEffort = readStr(model, 'defaultEffort');
-        option.supportsFastMode = readBool(model, 'supportsFastMode', false);
-        option.providerId = providerId;
-        option.providerName = providerName;
-        option.providerLogoKind = providerLogoKind;
-        option.modelIcon = readStr(model, 'icon');
-        option.subscription = subscription;
-        const displayNames = readObj(model, 'effortDisplayNames');
-        const displayNameKeys = Object.keys(displayNames);
-        for (let k = 0; k < displayNameKeys.length; k++) {
-          const key = displayNameKeys[k];
-          const label = readStr(displayNames, key);
-          if (label.length > 0) option.effortDisplayNames[key] = label;
-        }
-        const rawEfforts = model['efforts'];
-        if (Array.isArray(rawEfforts)) {
-          const efforts = rawEfforts as Object[];
-          for (let k = 0; k < efforts.length; k++) {
-            if (typeof efforts[k] === 'string') option.efforts.push(efforts[k] as string);
-          }
-        }
-        out.push(option);
-      }
-    }
-    return out;
+    return parseComposerProviderModelOptions(value, agent, this.modelVisibilityOverrides,
+      selected === undefined ? undefined : { model: selected.model, providerId: selected.providerId });
   }
 
   private latestSessionForAgent(agent: NewAgentKind): RemoteSession | undefined {
@@ -925,18 +779,7 @@ struct NewSessionPage {
       this.providerModelOptions = providerOptions;
       this.providerModelAgent = providerOptions.length > 0 ? agent : '';
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
-        const rawOverrides = (result as Record<string, Object>)['modelVisibilityOverrides'];
-        const nextOverrides = new Map<string, boolean>();
-        if (rawOverrides !== null && rawOverrides !== undefined
-          && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
-          const overrides = rawOverrides as Record<string, Object>;
-          const keys = Object.keys(overrides);
-          for (let i = 0; i < keys.length; i++) {
-            const key = keys[i];
-            if (typeof overrides[key] === 'boolean') nextOverrides.set(key, overrides[key] as boolean);
-          }
-        }
-        this.modelVisibilityOverrides = nextOverrides;
+        this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
         // Visibility overrides are part of the provider response. Reparse once so a
         // hidden model cannot remain in the list produced before the map was loaded.
         this.providerModelOptions = this.parseProviderModelOptions(result, agent);
@@ -986,16 +829,7 @@ struct NewSessionPage {
   }
 
   private modelOptionKey(option: RuntimeModelOption): string {
-    return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
-  }
-
-  private stringArrayHas(value: Object | undefined, expected: string): boolean {
-    if (!Array.isArray(value)) return false;
-    const values = value as Object[];
-    for (let i = 0; i < values.length; i++) {
-      if (values[i] === expected) return true;
-    }
-    return false;
+    return composerModelKey(option);
   }
 
   private choiceExists(options: RuntimeChoiceOption[], id: string): boolean {
@@ -1015,7 +849,7 @@ struct NewSessionPage {
 
   private modelEffortLabel(option: RuntimeModelOption, effort: string): string {
     const custom = option.effortDisplayNames[effort];
-    return custom !== undefined && custom.length > 0 ? custom : this.effortLabel(effort, effort);
+    return custom !== undefined && custom.length > 0 ? custom : effortLevelLabel(effort, effort);
   }
 
   private currentEffortOptions(): RuntimeChoiceOption[] {
@@ -1048,7 +882,7 @@ struct NewSessionPage {
   private currentEffortLabel(): string {
     const model = this.findModelOption(this.model, this.providerId);
     if (model !== undefined) return this.modelEffortLabel(model, this.effort);
-    return this.effort.length > 0 ? this.effortLabel(this.effort, this.effort) : '选择推理强度';
+    return this.effort.length > 0 ? effortLevelLabel(this.effort, this.effort) : '选择推理强度';
   }
 
   private currentModelSupportsFastMode(): boolean {
@@ -1070,7 +904,7 @@ struct NewSessionPage {
       if (generation !== this.runtimeLoadGeneration
         || result === undefined || typeof result !== 'object' || Array.isArray(result)) return;
       const capabilities = result as Record<string, Object>;
-      this.modelOptions = this.parseRuntimeModels(capabilities['availableModels']);
+      this.modelOptions = parseModelOptions(capabilities['availableModels']);
       this.effortOptions = this.parseRuntimeChoices(capabilities['effortLevels'], false);
       this.permissionOptions = this.parseRuntimeChoices(capabilities['permissionModes'], true);
       this.fastModeCapability = readBool(capabilities, 'hasFastMode', false);
@@ -1732,7 +1566,7 @@ struct NewSessionPage {
   contextRowIcon(symbol: Resource) {
     Stack({ alignContent: Alignment.Center }) {
       SymbolGlyph(symbol)
-        .fontSize(newSessionFontSize(22))
+        .fontSize(uiFontSize(22))
         .fontColor([$r('app.color.text_primary')])
     }
     .width(36)
@@ -1746,11 +1580,11 @@ struct NewSessionPage {
     Row({ space: 12 }) {
       this.contextRowIcon(symbol)
       Text(title)
-        .fontSize(newSessionFontSize(16))
+        .fontSize(uiFontSize(16))
         .fontColor($r('app.color.text_primary'))
         .layoutWeight(1)
       SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(newSessionFontSize(14))
+        .fontSize(uiFontSize(14))
         .fontColor([$r('app.color.text_tertiary')])
     }
     .width('100%')
@@ -1828,7 +1662,7 @@ struct NewSessionPage {
           Button(`加入对话 (${this.contextSelectedUris.length})`)
             .width('calc(100% - 32vp)')
             .height(42)
-            .fontSize(newSessionFontSize(15))
+            .fontSize(uiFontSize(15))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(8)
@@ -1843,10 +1677,10 @@ struct NewSessionPage {
             this.contextRowIcon($r('sys.symbol.list_bullet'))
             Column({ space: 2 }) {
               Text('计划模式')
-                .fontSize(newSessionFontSize(16))
+                .fontSize(uiFontSize(16))
                 .fontColor($r('app.color.text_primary'))
               Text('先生成计划，确认后再执行')
-                .fontSize(newSessionFontSize(12))
+                .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -1883,11 +1717,11 @@ struct NewSessionPage {
             this.contextRowIcon($r('sys.symbol.lock'))
             Column({ space: 2 }) {
               Text(option.label)
-                .fontSize(newSessionFontSize(16))
+                .fontSize(uiFontSize(16))
                 .fontColor($r('app.color.text_primary'))
               if (option.description.length > 0) {
                 Text(option.description)
-                  .fontSize(newSessionFontSize(12))
+                  .fontSize(uiFontSize(12))
                   .fontColor($r('app.color.text_tertiary'))
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1896,7 +1730,7 @@ struct NewSessionPage {
             .layoutWeight(1)
             if (option.id === this.permissionMode) {
               SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(newSessionFontSize(18))
+                .fontSize(uiFontSize(18))
                 .fontColor([$r('app.color.chat_cta')])
             }
           }
@@ -1921,13 +1755,13 @@ struct NewSessionPage {
       this.selectorIcon(agentMark(this.selectedAgentKind))
       Column({ space: 1 }) {
         Text(option.label)
-          .fontSize(newSessionFontSize(16))
+          .fontSize(uiFontSize(16))
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         if (option.providerName.length > 0 || option.description.length > 0) {
           Text(option.providerName.length > 0 ? option.providerName : option.description)
-            .fontSize(newSessionFontSize(12))
+            .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1936,13 +1770,13 @@ struct NewSessionPage {
       .layoutWeight(1)
       if (option.id === this.model && option.providerId === this.providerId) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(newSessionFontSize(18))
+          .fontSize(uiFontSize(18))
           .fontColor([$r('app.color.chat_cta')])
       }
       if (option.efforts.length > 0 || option.supportsFastMode) {
         Button() {
           SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-            .fontSize(newSessionFontSize(18))
+            .fontSize(uiFontSize(18))
             .fontColor([$r('app.color.text_secondary')])
         }
         .width(34)
@@ -1968,7 +1802,7 @@ struct NewSessionPage {
       Column({ space: 8 }) {
         if (this.visibleModelOptions().length === 0) {
           Text('当前电脑未提供模型列表')
-            .fontSize(newSessionFontSize(14))
+            .fontSize(uiFontSize(14))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
             .textAlign(TextAlign.Center)
@@ -1991,7 +1825,7 @@ struct NewSessionPage {
     Scroll() {
       Column({ space: 12 }) {
         Text(this.currentModelLabel())
-          .fontSize(newSessionFontSize(19))
+          .fontSize(uiFontSize(19))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .width('100%')
@@ -2000,7 +1834,7 @@ struct NewSessionPage {
         if (this.currentEffortOptions().length > 0) {
           Column({ space: 8 }) {
             Text('推理强度')
-              .fontSize(newSessionFontSize(14))
+              .fontSize(uiFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
               .width('100%')
@@ -2008,7 +1842,7 @@ struct NewSessionPage {
               ForEach(this.currentEffortOptions(), (option: RuntimeChoiceOption) => {
                 Button(option.label)
                   .height(38)
-                  .fontSize(newSessionFontSize(14))
+                  .fontSize(uiFontSize(14))
                   .fontColor(option.id === this.effort
                     ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
                   .backgroundColor(option.id === this.effort
@@ -2031,10 +1865,10 @@ struct NewSessionPage {
             this.contextRowIcon($r('sys.symbol.bolt'))
             Column({ space: 2 }) {
               Text('Fast 模式')
-                .fontSize(newSessionFontSize(16))
+                .fontSize(uiFontSize(16))
                 .fontColor($r('app.color.text_primary'))
               Text('使用当前模型的快速服务通道')
-                .fontSize(newSessionFontSize(12))
+                .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_tertiary'))
             }
             .layoutWeight(1)
@@ -2060,7 +1894,7 @@ struct NewSessionPage {
         if (this.contextSheetPage !== 'main') {
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(newSessionFontSize(20))
+              .fontSize(uiFontSize(20))
               .fontColor([$r('app.color.text_primary')])
           }
           .width(36)
@@ -2081,7 +1915,7 @@ struct NewSessionPage {
             : this.contextSheetPage === 'model'
               ? '模型'
               : '上下文')
-          .fontSize(newSessionFontSize(17))
+          .fontSize(uiFontSize(17))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .textAlign(TextAlign.Center)

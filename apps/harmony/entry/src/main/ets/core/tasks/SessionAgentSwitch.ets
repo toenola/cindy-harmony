@@ -61,9 +61,3 @@ export function parseSessionAgentSwitchIntent(value: Object | undefined): Sessio
   return intent;
 }
 
-export function sessionAgentKind(session: RemoteSession | undefined): string {
-  if (session === undefined) return 'claude-code';
-  if (session.agentKind === 'codex' || session.agentKind === 'pi') return session.agentKind;
-  return 'claude-code';
-}
-

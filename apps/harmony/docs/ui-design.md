@@ -14,7 +14,8 @@ Harmony 端不是把 iOS / Android 页面原样搬过来，也不是把桌面端
 
 ```text
 LoginPage
-HomePage
+TaskListPage
+NewSessionPage
 TaskPage
 Permission / Ask User / Plan Review
 SettingsPage

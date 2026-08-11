@@ -29,7 +29,6 @@ export const UI_RADIUS_PILL = 999;
 export const UI_MOTION_INSTANT = 80;
 export const UI_MOTION_FAST = 150;
 export const UI_MOTION_BASE = 200;
-export const UI_MOTION_ENTER = 250;
 /** 功能性加载圆环完整旋转一周的语义周期（DESIGN.md §14.4）。 */
 export const UI_MOTION_SPINNER_CYCLE = 1000;
 
