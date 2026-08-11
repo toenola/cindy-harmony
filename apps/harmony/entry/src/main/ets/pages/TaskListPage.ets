@@ -358,11 +358,9 @@ struct TaskListPage {
   }
 
   private selectSession(entry: TaskListEntry): void {
-    uiAnimateState(this.getUIContext(), () => {
-      this.selectedSessionDeviceId = entry.deviceId;
-      this.selectedSessionId = entry.session.id;
-      this.selectedMessageClientId = '';
-    });
+    this.selectedSessionDeviceId = entry.deviceId;
+    this.selectedSessionId = entry.session.id;
+    this.selectedMessageClientId = '';
   }
 
   private tryOpenPendingDeepLink(): void {
