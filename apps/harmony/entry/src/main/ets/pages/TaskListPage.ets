@@ -1460,6 +1460,8 @@ struct TaskListPage {
 
   @Builder
   buildTaskListEntries(category: TaskListCategory) {
+    // 滑动只负责露出操作按钮；不要配置 actionAreaDistance / onAction，
+    // 避免长距离滑动松手时直接置顶或归档，所有操作都必须由按钮点击触发。
     List() {
       if (this.pinnedEntries(category).length > 0) {
         ListItem() {
@@ -1485,18 +1487,10 @@ struct TaskListPage {
                 builder: () => {
                   this.swipePinAction(entry)
                 },
-                actionAreaDistance: 56,
-                onAction: () => {
-                  void this.togglePinned(entry);
-                },
               },
               end: {
                 builder: () => {
                   this.swipeArchiveAction(entry)
-                },
-                actionAreaDistance: 56,
-                onAction: () => {
-                  void this.archiveOrRestore(entry);
                 },
               },
               edgeEffect: SwipeEdgeEffect.Spring,
@@ -1522,18 +1516,10 @@ struct TaskListPage {
                       builder: () => {
                         this.swipePinAction(entry)
                       },
-                      actionAreaDistance: 56,
-                      onAction: () => {
-                        void this.togglePinned(entry);
-                      },
                     },
                     end: {
                       builder: () => {
                         this.swipeArchiveAction(entry)
-                      },
-                      actionAreaDistance: 56,
-                      onAction: () => {
-                        void this.archiveOrRestore(entry);
                       },
                     },
                     edgeEffect: SwipeEdgeEffect.Spring,
@@ -1566,18 +1552,10 @@ struct TaskListPage {
                 builder: () => {
                   this.swipePinAction(entry)
                 },
-                actionAreaDistance: 56,
-                onAction: () => {
-                  void this.togglePinned(entry);
-                },
               },
               end: {
                 builder: () => {
                   this.swipeArchiveAction(entry)
-                },
-                actionAreaDistance: 56,
-                onAction: () => {
-                  void this.archiveOrRestore(entry);
                 },
               },
               edgeEffect: SwipeEdgeEffect.Spring,
