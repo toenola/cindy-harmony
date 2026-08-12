@@ -220,6 +220,30 @@ function isTurnUserBoundary(message: RemoteMessage): boolean {
     && !message.isSyntheticTrigger && !message.presentedAsAgent;
 }
 
+/** 计划归属只把用户真正开启的新一轮视作边界；续跑、Hook、steer 与子代理行都属于原轮。 */
+function isPlanUserBoundary(message: RemoteMessage): boolean {
+  return message.role === 'user' && !isSyntheticPlanRow(message);
+}
+
+function isSyntheticPlanRow(message: RemoteMessage): boolean {
+  return message.isSyntheticTrigger || message.presentedAsAgent || message.automationOrigin
+    || readStr(message.agentMeta, 'delivery') === 'steer'
+    || Object.keys(readObj(message.agentMeta, 'hookSource')).length > 0
+    || hasSubagentPlanOwner(message);
+}
+
+/** 旧转录也把普通链边放进 parentUuid；只认 SDK/tool-use id 形态，避免误伤历史顶层计划。 */
+function hasSubagentPlanOwner(message: RemoteMessage): boolean {
+  const explicit = readStr(message.agentMeta, 'parentToolUseId')
+    || readStr(message.agentMeta, 'parent_tool_use_id');
+  if (explicit.length > 0) {
+    return !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(explicit.trim());
+  }
+  const parent = readStr(message.agentMeta, 'parentUuid').trim();
+  return /^(?:toolu|call)[_-]/iu.test(parent)
+    || /^[A-Za-z][A-Za-z0-9_-]*_x*\d+(?:_dup\d+)?$/u.test(parent);
+}
+
 /** 单个工具调用（含配对结果）。 */
 export class RenderToolItem {
   seq: number = 0;
@@ -727,7 +751,7 @@ export function applyCodexPlanSnapshotOnDone(
 export function markCodexPlanTurnFailed(messages: RemoteMessage[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (message.role === 'user' && readStr(message.agentMeta, 'delivery') !== 'steer') return false;
+    if (isPlanUserBoundary(message)) return false;
     if (message.role !== 'tool_use') continue;
     const tool = parseToolUse(message);
     if (tool.toolName !== 'update_plan') continue;
@@ -960,8 +984,14 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
   const sessions: TodoPlanSession[] = [];
   const lastBySource = new Map<string, TodoPlanSession>();
   const taskState = new Map<string, RenderTodoItem>();
+  let lastUserBoundaryIndex = -1;
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
+    if (message.role === 'user') {
+      if (isPlanUserBoundary(message)) lastUserBoundaryIndex = i;
+      continue;
+    }
+    if (hasSubagentPlanOwner(message)) continue;
     if (message.role !== 'tool_use') continue;
     const tool = parseToolUse(message);
     const source = planSource(tool.toolName);
@@ -987,7 +1017,12 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
     const continuesCompletedTask = source === 'task' && previousAllDone
       && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState);
     const previousSealed = previous !== undefined && planRowSealed(messages[previous.lastIndex]);
+    const crossesUserBoundary = previous !== undefined
+      && lastUserBoundaryIndex > previous.lastIndex
+      && !(source === 'task'
+        && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState));
     const startsNew = previous === undefined || previousSealed
+      || crossesUserBoundary
       || (previousAllDone && !continuesCompletedTask);
     if (source === 'task' && startsNew) taskState.clear();
     const parsed = extractTodos(tool.toolName, tool.inputRaw)
@@ -1018,6 +1053,87 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
     out.set(session.lastIndex, insertion);
   }
   return out;
+}
+
+/**
+ * 当前分页窗口能否完整重建最新 Task* 计划。未看到真实用户边界、权威 TaskList，
+ * 或出现找不到 TaskCreate 的状态更新时，先继续回填历史，避免显示残缺的“1/1”。
+ */
+export function latestTaskPlanWindowResolved(
+  messages: RemoteMessage[],
+  hasEarlierMessages: boolean,
+): boolean {
+  let latestTaskIndex = -1;
+  let lastUserBoundaryIndex = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (isPlanUserBoundary(messages[i])) lastUserBoundaryIndex = i;
+    if (messages[i].role !== 'tool_use' || hasSubagentPlanOwner(messages[i])) continue;
+    if (planSource(parseToolUse(messages[i]).toolName) === 'task') latestTaskIndex = i;
+  }
+  if (latestTaskIndex < 0 || !hasEarlierMessages) return true;
+
+  const resultByUseId = new Map<string, string>();
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role !== 'tool_result') continue;
+    const useId = toolResultUseId(messages[i]);
+    if (useId.length > 0) resultByUseId.set(useId, contentPreview(messages[i].content));
+  }
+  const knownTaskIds = new Set<string>();
+  const unresolvedTaskIds = new Set<string>();
+  let boundaryKnown = lastUserBoundaryIndex >= 0 && lastUserBoundaryIndex < latestTaskIndex;
+  const start = boundaryKnown ? lastUserBoundaryIndex + 1 : 0;
+  for (let i = start; i <= latestTaskIndex; i++) {
+    const message = messages[i];
+    if (message.role !== 'tool_use' || hasSubagentPlanOwner(message)) continue;
+    const tool = parseToolUse(message);
+    if (planSource(tool.toolName) !== 'task') continue;
+    let input: Record<string, Object> | null = null;
+    try {
+      input = taskRecord(JSON.parse(tool.inputRaw) as Object);
+    } catch (_err) {
+      input = null;
+    }
+    const resultText = resultByUseId.get(tool.toolUseId) ?? '';
+    const resultTasks = taskRecordsFromResult(resultText);
+    if (tool.toolName === 'TaskList' && taskListResultIsAuthoritative(resultText)) {
+      boundaryKnown = true;
+      knownTaskIds.clear();
+      unresolvedTaskIds.clear();
+      for (let j = 0; j < resultTasks.length; j++) {
+        const id = taskId(resultTasks[j]);
+        if (id.length > 0) knownTaskIds.add(id);
+      }
+      continue;
+    }
+    const id = taskId(input) || (resultTasks.length > 0 ? taskId(resultTasks[0]) : '');
+    if (tool.toolName === 'TaskCreate') {
+      if (id.length > 0) {
+        knownTaskIds.add(id);
+        unresolvedTaskIds.delete(id);
+      }
+    } else if (id.length > 0 && !knownTaskIds.has(id)) {
+      unresolvedTaskIds.add(id);
+    }
+  }
+  return boundaryKnown && unresolvedTaskIds.size === 0;
+}
+
+function visibleTodoPlanInsertions(
+  messages: RemoteMessage[],
+  taskHistoryMayBeIncomplete: boolean,
+): Map<number, TodoPlanInsertion> {
+  const insertions = findTodoPlanInsertions(messages);
+  if (latestTaskPlanWindowResolved(messages, taskHistoryMayBeIncomplete)) return insertions;
+  // 只压住最新的残缺 Task 卡；Codex/TodoWrite 与更早已完整计划仍正常显示。
+  let latestTaskInsertionIndex = -1;
+  insertions.forEach((_insertion: TodoPlanInsertion, index: number) => {
+    if (index < 0 || index >= messages.length || messages[index].role !== 'tool_use') return;
+    if (planSource(parseToolUse(messages[index]).toolName) === 'task') {
+      latestTaskInsertionIndex = Math.max(latestTaskInsertionIndex, index);
+    }
+  });
+  if (latestTaskInsertionIndex >= 0) insertions.delete(latestTaskInsertionIndex);
+  return insertions;
 }
 
 /** JSON 摘要（截断避免大 input 撑爆 UI）。 */
@@ -1272,11 +1388,12 @@ function buildLinearRenderItems(
   continuationCapability: string = 'unknown',
   makerTurnRunning: boolean = false,
   lastUserInputClientId: string = '',
+  taskHistoryMayBeIncomplete: boolean = false,
 ): RenderItem[] {
   const items: RenderItem[] = [];
   const errorTailClientId = findErrorTailClientId(messages);
   const finalAssistantIds = turnFinalAssistantIds(messages, isSessionStreaming);
-  const todoInsertAt = findTodoPlanInsertions(messages);
+  const todoInsertAt = visibleTodoPlanInsertions(messages, taskHistoryMayBeIncomplete);
   const renderedTaskKeys = new Set<string>();
 
   // 结果必须只作为 tool_use 的 secondary body 消费。之前把 tool_result 再建成一个
@@ -1607,6 +1724,7 @@ export function buildRenderItems(
   continuationTurnClientId: string = '',
   continuationCapability: string = 'unknown',
   makerTurnRunning: boolean = false,
+  taskHistoryMayBeIncomplete: boolean = false,
 ): RenderItem[] {
   collapseConsecutiveAutoResumeCards(messages);
   let lastUserInputClientId = '';
@@ -1626,7 +1744,8 @@ export function buildRenderItems(
   if (!hasAgent) {
     return buildLinearRenderItems(
       messages, isSessionStreaming, taskUpdates, renderOrphanTaskUpdates,
-      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId,
+      taskHistoryMayBeIncomplete);
   }
 
   const byParent = new Map<string, RemoteMessage[]>();
@@ -1646,7 +1765,8 @@ export function buildRenderItems(
   const consumed = new Set<string>();
   const out = buildSubagentLevel(
     topLevel, byParent, resultMeta, isSessionStreaming, taskUpdates, 0, consumed,
-    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
+    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId,
+    taskHistoryMayBeIncomplete);
 
   const leftover: RemoteMessage[] = [];
   byParent.forEach((bucket: RemoteMessage[], parent: string) => {
@@ -1656,7 +1776,8 @@ export function buildRenderItems(
     leftover.sort(compareRemoteMessages);
     const flat = buildLinearRenderItems(
       leftover, isSessionStreaming, taskUpdates, false,
-      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId,
+      false);
     for (let i = 0; i < flat.length; i++) out.push(flat[i]);
   }
   if (renderOrphanTaskUpdates && taskUpdates !== undefined) {
@@ -1713,6 +1834,7 @@ function buildSubagentLevel(
   continuationCapability: string,
   makerTurnRunning: boolean,
   lastUserInputClientId: string,
+  taskHistoryMayBeIncomplete: boolean,
 ): RenderItem[] {
   const out: RenderItem[] = [];
   let run: RemoteMessage[] = [];
@@ -1720,7 +1842,8 @@ function buildSubagentLevel(
     if (run.length === 0) return;
     const built = buildLinearRenderItems(
       run, streaming, taskUpdates, false,
-      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
+      continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId,
+      taskHistoryMayBeIncomplete);
     for (let i = 0; i < built.length; i++) out.push(built[i]);
     run = [];
   };
@@ -1730,7 +1853,8 @@ function buildSubagentLevel(
       flushRun();
       out.push(buildSubagentGroup(
         message, byParent, resultMeta, streaming, taskUpdates, depth, consumed,
-        continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId));
+        continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId,
+        taskHistoryMayBeIncomplete));
     } else {
       run.push(message);
     }
@@ -1751,6 +1875,7 @@ function buildSubagentGroup(
   continuationCapability: string,
   makerTurnRunning: boolean,
   lastUserInputClientId: string,
+  taskHistoryMayBeIncomplete: boolean,
 ): RenderSubagentGroupItem {
   const id = rawToolUseId(message);
   if (id.length > 0) consumed.add(id);
@@ -1760,7 +1885,7 @@ function buildSubagentGroup(
   group.key = `subagent-${id.length > 0 ? id : message.id}`;
   group.children = buildSubagentLevel(
     childMessages, byParent, resultMeta, streaming, taskUpdates, depth + 1, consumed,
-    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId);
+    continuationTurnClientId, continuationCapability, makerTurnRunning, lastUserInputClientId, false);
   const tool = parseToolUse(message);
   try {
     const input = JSON.parse(tool.inputRaw) as Object;

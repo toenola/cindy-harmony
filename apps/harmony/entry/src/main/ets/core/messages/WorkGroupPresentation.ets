@@ -98,6 +98,13 @@ export function workPreviewRows(item: RenderWorkGroupItem, limit: number = 5): W
   return dedupeWorkRowsFromTail(rawRows, limit);
 }
 
+/** 活动预览已经覆盖全部步骤时，展开不会增加信息，不再展示无效入口。 */
+export function workGroupHasHiddenRows(item: RenderWorkGroupItem, limit: number = 5): boolean {
+  if (!item.isStreaming) return true;
+  const allRows = workPreviewRows(item, 0);
+  return allRows.length > workPreviewRows(item, limit).length;
+}
+
 export function workExplorationSummary(item: RenderWorkGroupItem): string {
   const count = new WorkExplorationCount();
   const rows = workPreviewRows(item, 0);

@@ -43,6 +43,7 @@ import {
   todoCardIndexAtRankFromTail,
   todoCardRankFromTail,
   findTodoPlanInsertions,
+  latestTaskPlanWindowResolved,
   applyCodexPlanSnapshotOnDone,
   markCodexPlanTurnFailed,
   planRowSealed,
@@ -53,6 +54,7 @@ import {
 } from '../main/ets/core/messages/MessageRender';
 import {
   workExplorationSummary,
+  workGroupHasHiddenRows,
   workPreviewRows,
 } from '../main/ets/core/messages/WorkGroupPresentation';
 import {
@@ -1053,6 +1055,18 @@ export default function localUnitTest() {
       expect(rows[1].done).assertEqual(true);
       expect(rows[2].explorationKind).assertEqual('search');
       expect(workExplorationSummary(work)).assertEqual('读取 1 个文件 · 搜索 1 次');
+      work.isStreaming = true;
+      expect(workGroupHasHiddenRows(work)).assertEqual(false);
+
+      for (let i = 0; i < 4; i++) {
+        const extra = new RenderThinkingItem();
+        extra.type = 'thinking';
+        extra.key = `thinking-extra-${i}`;
+        extra.body = `继续分析 ${i}`;
+        work.children.push(extra);
+      }
+      expect(workPreviewRows(work).length).assertEqual(5);
+      expect(workGroupHasHiddenRows(work)).assertEqual(true);
     });
 
     it('splitsSafeCodexCommandActionsAndRejectsSideEffectingShellLabels', 0, () => {
@@ -1529,7 +1543,7 @@ export default function localUnitTest() {
       expect(insertions.get(2)?.todos[0].status).assertEqual('completed');
     });
 
-    it('keepsPlanSessionsAcrossUserBoundariesAndOrdinaryTools', 0, () => {
+    it('startsANewPlanSessionAcrossRealUserBoundaries', 0, () => {
       const firstStep: Record<string, Object> = {};
       firstStep['step'] = '读取代码';
       firstStep['status'] = 'in_progress';
@@ -1549,9 +1563,57 @@ export default function localUnitTest() {
         first, userBoundary('user-between'), ordinary, second,
       ]);
 
-      expect(insertions.size).assertEqual(1);
-      expect(insertions.get(3)?.key).assertEqual('todo-plan-first');
+      expect(insertions.size).assertEqual(2);
+      expect(insertions.get(0)?.key).assertEqual('todo-plan-first');
+      expect(insertions.get(3)?.key).assertEqual('todo-plan-second');
       expect(insertions.get(3)?.todos[0].status).assertEqual('completed');
+    });
+
+    it('keepsPlanOwnershipAcrossSteerAndSyntheticRows', 0, () => {
+      const step: Record<string, Object> = {};
+      step['step'] = '继续执行';
+      step['status'] = 'in_progress';
+      const input: Record<string, Object> = {};
+      input['plan'] = [step];
+      const first = planToolMessage('plan-owner', 'update_plan', input, 'plan-owner-use');
+      const steer = userBoundary('steer-row');
+      steer.agentMeta['delivery'] = 'steer';
+      const synthetic = userBoundary('resume-row');
+      synthetic.isSyntheticTrigger = true;
+      const second = planToolMessage('plan-update', 'update_plan', input, 'plan-update-use');
+      const insertions = findTodoPlanInsertions([first, steer, synthetic, second]);
+      expect(insertions.size).assertEqual(1);
+      expect(insertions.get(3)?.key).assertEqual('todo-plan-owner');
+    });
+
+    it('doesNotLetSubagentPlansCompeteWithTheMainPlan', 0, () => {
+      const step: Record<string, Object> = {};
+      step['step'] = '主计划';
+      step['status'] = 'in_progress';
+      const input: Record<string, Object> = {};
+      input['plan'] = [step];
+      const main = planToolMessage('main-plan', 'update_plan', input, 'main-plan-use');
+      const child = planToolMessage('child-plan', 'update_plan', input, 'child-plan-use');
+      child.agentMeta['parentUuid'] = 'toolu_parent';
+      const insertions = findTodoPlanInsertions([main, child]);
+      expect(insertions.size).assertEqual(1);
+      expect(insertions.get(0)?.key).assertEqual('todo-main-plan');
+    });
+
+    it('requiresEarlierHistoryForStatusOnlyTaskPlans', 0, () => {
+      const boundary = userBoundary('task-owner');
+      const updateInput: Record<string, Object> = {};
+      updateInput['taskId'] = '42';
+      updateInput['status'] = 'completed';
+      const update = planToolMessage('task-update-only', 'TaskUpdate', updateInput, 'task-update-use');
+      expect(latestTaskPlanWindowResolved([update], true)).assertEqual(false);
+      expect(latestTaskPlanWindowResolved([boundary, update], true)).assertEqual(false);
+
+      const createInput: Record<string, Object> = {};
+      createInput['taskId'] = '42';
+      createInput['subject'] = '完整任务';
+      const create = planToolMessage('task-create-complete', 'TaskCreate', createInput, 'task-create-use');
+      expect(latestTaskPlanWindowResolved([boundary, create, update], true)).assertEqual(true);
     });
 
     it('startsANewPlanSessionAfterThePreviousPlanCompletes', 0, () => {

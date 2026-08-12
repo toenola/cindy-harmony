@@ -55,7 +55,6 @@ import {
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_FAST,
-  UI_MOTION_SPINNER_CYCLE,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
@@ -81,7 +80,7 @@ import {
   permissionModeDescription,
 } from '../core/ComposerCatalog';
 import { SessionMetaPatch, unwrapInvokeResult } from '../core/tasks/TaskStore';
-import { RemoteSession, readBool, readNum, readObj, readStr, recordOrEmpty } from '../core/tasks/TaskModels';
+import { RemoteMessage, RemoteSession, readBool, readNum, readObj, readStr, recordOrEmpty } from '../core/tasks/TaskModels';
 import {
   NewSessionCreationTask,
   shouldBlockNewSessionRemoteOperation,
@@ -106,6 +105,7 @@ import {
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
+  latestTaskPlanWindowResolved,
   todoCardContentSignature, todoCardIndexAtRankFromTail, todoCardRankFromTail,
 } from '../core/messages/MessageRender';
 import {
@@ -206,14 +206,14 @@ import {
 import {
   WorkPreviewRow,
   workExplorationSummary,
+  workGroupHasHiddenRows,
   workPreviewRows,
 } from '../core/messages/WorkGroupPresentation';
 
-const TODO_STATUS_ICON_SIZE = 13;
-const TODO_STATUS_STROKE_WIDTH = 1.25;
-const TODO_STATUS_CHECKMARK_SIZE = 9;
-const TODO_STATUS_ACTIVE_DOT_SIZE = 4;
-const TODO_STATUS_SPINNER_DASH: number[] = [24, 16];
+const TODO_STATUS_ICON_SIZE = 16;
+const TODO_STATUS_STROKE_WIDTH = 1.5;
+const TODO_STATUS_CHECKMARK_SIZE = 10;
+const TODO_STATUS_ACTIVE_DOT_SIZE = 6;
 const MESSAGE_LIST_HORIZONTAL_PADDING = 16;
 const USER_MESSAGE_BUBBLE_MAX_RATIO = 0.86;
 const USER_MESSAGE_BUBBLE_FALLBACK_AREA_WIDTH = 360;
@@ -223,10 +223,10 @@ const TODO_STATUS_FRAME_RATE: ExpectedFrameRateRange = {
   expected: 120,
 };
 
-/** 步骤状态统一使用 13vp 可见外径；只旋转外层，圆弧几何保持静态。 */
+/** 真实运行步骤使用 16vp 呼吸圆点；空闲/失败后由调用方切回静态状态。 */
 @Component
 struct TodoRunningStatusIcon {
-  @State rotation: number = 0;
+  @State breathOpacity: number = 1;
   private reduceMotion: boolean = false;
 
   aboutToAppear(): void {
@@ -240,25 +240,22 @@ struct TodoRunningStatusIcon {
   build() {
     Stack({ alignContent: Alignment.Center }) {
       Circle()
-        .width(TODO_STATUS_ICON_SIZE)
-        .height(TODO_STATUS_ICON_SIZE)
-        .fill(Color.Transparent)
-        .stroke($r('app.color.text_secondary'))
-        .strokeWidth(TODO_STATUS_STROKE_WIDTH)
-        .strokeDashArray(TODO_STATUS_SPINNER_DASH)
-        .strokeLineCap(LineCapStyle.Round)
+        .width(TODO_STATUS_ACTIVE_DOT_SIZE)
+        .height(TODO_STATUS_ACTIVE_DOT_SIZE)
+        .fill($r('app.color.chat_status_accent'))
     }
     .width(TODO_STATUS_ICON_SIZE)
     .height(TODO_STATUS_ICON_SIZE)
-    .rotate({ angle: this.rotation })
+    .opacity(this.breathOpacity)
     .animation({
-      duration: UI_MOTION_SPINNER_CYCLE,
-      curve: Curve.Linear,
+      duration: 900,
+      curve: Curve.EaseInOut,
       iterations: -1,
+      playMode: PlayMode.Alternate,
       expectedFrameRateRange: TODO_STATUS_FRAME_RATE,
     })
     .onAppear(() => {
-      if (!this.reduceMotion) this.rotation = 360;
+      if (!this.reduceMotion) this.breathOpacity = 0.38;
     })
   }
 }
@@ -426,6 +423,8 @@ export struct TaskPageContent {
   /** 冷开短窗口的剩余自动补页次数；真实上翻后不再受此预算限制。 */
   private initialHistoryAutofillRemaining: number = INITIAL_HISTORY_AUTOFILL_PAGES;
   private historyLastAttemptFirstKey: string = '';
+  /** 最新 Task 计划缺历史上下文时只定向补页，不占用普通冷开补窗预算。 */
+  private taskPlanBackfillPending: boolean = false;
   /** 新手势、跳尾或离页会作废尚未执行的历史锚点恢复。 */
   private historyAnchorRestoreGeneration: number = 0;
   /** 快速响应撞上手指仍按住时，等 Touch Up 再恢复，不丢弃整页锚点。 */
@@ -1992,6 +1991,7 @@ export struct TaskPageContent {
       projection.continuationTurnClientId,
       projection.continuationInFlightProjectionCapability,
       AppServices.instance.messages.isMakerTurnRunning(this.sessionId),
+      this.hasOlderMessages,
     );
     const nextTailToken = this.renderTailToken(nextItems);
     const tailChanged = previousTailToken.length > 0 && previousTailToken !== nextTailToken;
@@ -2001,6 +2001,7 @@ export struct TaskPageContent {
     this.tableColumnWidthCache.clear();
     this.reconcileCollapsedTodoCards(this.items, nextItems);
     this.items = nextItems;
+    this.backfillIncompleteTaskPlan(messages);
     this.reconcileSearchSelection();
     this.loadFailed = AppServices.instance.messages.loadFailed(this.sessionId);
     this.ensureImageUrls();
@@ -2015,6 +2016,22 @@ export struct TaskPageContent {
     } else {
       this.hasNewMessages = true;
     }
+  }
+
+  private backfillIncompleteTaskPlan(messages: RemoteMessage[]): void {
+    const needsBackfill = this.hasOlderMessages
+      && !latestTaskPlanWindowResolved(messages, true);
+    if (!needsBackfill) {
+      this.taskPlanBackfillPending = false;
+      return;
+    }
+    if (this.taskPlanBackfillPending || this.loadingOlder) return;
+    this.taskPlanBackfillPending = true;
+    setTimeout(() => {
+      this.taskPlanBackfillPending = false;
+      if (!this.hasOlderMessages || this.loadingOlder) return;
+      this.loadOlder(false, true);
+    }, 0);
   }
 
   /** 尾部内容 token 同时覆盖同 key 的流式正文增长和工作组内部步骤变化。 */
@@ -5389,16 +5406,17 @@ export struct TaskPageContent {
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_tertiary'))
         }
-        this.disclosureChevron(
-          this.isIn(this.expandedWorkGroups, item.key),
-          $r('app.color.text_tertiary'),
-        )
+        if (workGroupHasHiddenRows(item)) {
+          this.disclosureChevron(
+            this.isIn(this.expandedWorkGroups, item.key),
+            $r('app.color.text_tertiary'),
+          )
+        }
       }
       .constraintSize({ minHeight: 22 })
       .padding({ top: 2, bottom: 2 })
-      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => {
-        this.toggleWorkGroup(item.key);
+        if (workGroupHasHiddenRows(item)) this.toggleWorkGroup(item.key);
       })
       .width('100%')
 
