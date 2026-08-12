@@ -117,6 +117,7 @@ struct LoginPage {
             .onClick(() => this.login())
         }
         .width('85%')
+        .constraintSize({ maxWidth: 540 })
         .margin({ top: 32 })
       }
       .width('100%')
