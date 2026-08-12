@@ -5,7 +5,7 @@
  * 任务和消息真相仍由被控端桌面维护。
  */
 
-import { router, promptAction } from '@kit.ArkUI';
+import { KeyboardAvoidMode, router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import {
@@ -170,6 +170,9 @@ struct NewSessionPage {
   private attachmentsDisposed: boolean = false;
 
   aboutToAppear(): void {
+    // KeyboardAvoidMode 属于 UIContext 级状态；展开双栏会为详情栏关闭系统避让。
+    // 新建页必须主动恢复页面级 OFFSET，确保底部 Composer 始终位于输入法上方。
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     const params = (router.getParams() ?? {}) as Record<string, Object>;
     this.routeDeviceId = readStr(params, 'deviceId');
     const editDraft = AppServices.instance.newSessionCreations.consumeEditDraft();

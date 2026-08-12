@@ -21,6 +21,7 @@ import {
 } from '../core/tasks/TaskListReconcilePolicy';
 import { TaskPageContent } from './TaskPage';
 import {
+  consumeTaskSplitRouteSelection,
   isWideTaskLayout,
   TASK_SPLIT_DEFAULT_RATIO,
   taskDetailKeyboardInset,
@@ -154,10 +155,20 @@ struct TaskListPage {
       this.selectedSessionId = readStr(params, 'sessionId');
       this.routeParamsInitialized = true;
     }
+    const splitRouteSelection = consumeTaskSplitRouteSelection();
+    if (splitRouteSelection !== null) {
+      this.selectedDeviceId = splitRouteSelection.deviceId;
+      this.selectedSessionDeviceId = splitRouteSelection.deviceId;
+      this.selectedSessionId = splitRouteSelection.sessionId;
+      this.selectedMessageClientId = splitRouteSelection.messageClientId;
+    }
     this.hydratePreferences();
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
     this.observeFoldStatus();
+    // KeyboardAvoidMode 是 UIContext 级状态；从新建页等单栏页面返回时，
+    // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
+    this.updateKeyboardAvoidance();
     void this.observeKeyboardHeight();
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {

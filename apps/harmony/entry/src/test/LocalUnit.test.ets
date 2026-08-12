@@ -109,6 +109,8 @@ import {
   TaskListPreferences,
 } from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
+  consumeTaskSplitRouteSelection,
+  handoffTaskSplitRouteSelection,
   isWideTaskLayout,
   TASK_FOLD_STATUS_EXPANDED,
   TASK_FOLD_STATUS_FOLDED,
@@ -2207,6 +2209,15 @@ export default function localUnitTest() {
       const dragged = taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, 200);
       expect(dragged > 0.55 && dragged <= 0.6).assertEqual(true);
       expect(taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, -500)).assertEqual(0.25);
+    });
+
+    it('handsCurrentTaskBackToSplitLayoutOnlyOnce', 0, () => {
+      handoffTaskSplitRouteSelection('device-1', 'session-1', 'message-1');
+      const selection = consumeTaskSplitRouteSelection();
+      expect(selection?.deviceId).assertEqual('device-1');
+      expect(selection?.sessionId).assertEqual('session-1');
+      expect(selection?.messageClientId).assertEqual('message-1');
+      expect(consumeTaskSplitRouteSelection()).assertNull();
     });
 
     it('projectsTaskListCopyAndRelativeTimeLikeMobile', 0, () => {

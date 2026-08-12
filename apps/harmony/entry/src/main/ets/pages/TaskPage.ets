@@ -11,7 +11,7 @@
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { LengthMetrics, router, promptAction } from '@kit.ArkUI';
+import { display, LengthMetrics, router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -86,6 +86,10 @@ import {
   NewSessionCreationTask,
   shouldBlockNewSessionRemoteOperation,
 } from '../core/tasks/NewSessionCreationStore';
+import {
+  handoffTaskSplitRouteSelection,
+  isWideTaskLayout,
+} from './TaskSplitLayout';
 import {
   PiSessionTreeNode,
   PiSessionTreeSnapshot,
@@ -7318,7 +7322,7 @@ export struct TaskPageContent {
   tableBlock(b: MdBlock) {
     Scroll() {
       Column() {
-        Row() {
+        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Stretch }) {
           ForEach(this.tableColumnIndexes(b), (hIndex: number) => {
             Row() {
               if (this.hasImageToken(this.tableHeaderTokens(b, hIndex))) {
@@ -7328,6 +7332,7 @@ export struct TaskPageContent {
               }
             }
             .width(this.tableColumnWidths(b)[hIndex])
+            .alignItems(VerticalAlign.Top)
             .padding({ left: 10, right: 10, top: 7, bottom: 7 })
             .backgroundColor($r('app.color.bg_chip'))
             .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
@@ -7336,7 +7341,7 @@ export struct TaskPageContent {
         .width(this.tableContentWidth(b))
 
         ForEach(b.rows, (row: string[], rowIndex?: number) => {
-          Row() {
+          Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Stretch }) {
             ForEach(this.tableColumnIndexes(b), (cellIndex: number) => {
               Row() {
                 if (this.hasImageToken(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex))) {
@@ -7347,6 +7352,8 @@ export struct TaskPageContent {
                 }
               }
               .width(this.tableColumnWidths(b)[cellIndex])
+              // 同行高度由最长内容决定；短单元格必须拉伸到整行，边框不能停在行中间。
+              .alignItems(VerticalAlign.Top)
               .padding({ left: 10, right: 10, top: 7, bottom: 7 })
               .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
             }, (cellIndex: number) => `${b.seq}-${rowIndex ?? 0}-${cellIndex}`)
@@ -8696,11 +8703,80 @@ export struct TaskPageContent {
 @Entry
 @Component
 struct TaskPage {
+  @State viewportWidth: number = 0;
+  @State viewportHeight: number = 0;
+  @State foldStatus: number = -1;
+  private foldStatusListening: boolean = false;
+  private splitNavigationPending: boolean = false;
+  private foldStatusListener: (status: number) => void = (status: number): void => {
+    this.foldStatus = status;
+    this.openSplitLayoutIfNeeded();
+  };
+
+  aboutToAppear(): void {
+    this.splitNavigationPending = false;
+    this.observeFoldStatus();
+  }
+
+  aboutToDisappear(): void {
+    this.stopFoldStatusObservation();
+  }
+
+  private observeFoldStatus(): void {
+    if (this.foldStatusListening) return;
+    try {
+      if (!display.isFoldable()) return;
+      this.foldStatus = Number(display.getFoldStatus());
+      display.on('foldStatusChange', this.foldStatusListener);
+      this.foldStatusListening = true;
+    } catch (_err) {
+      this.foldStatus = -1;
+      this.foldStatusListening = false;
+    }
+  }
+
+  private stopFoldStatusObservation(): void {
+    if (!this.foldStatusListening) return;
+    try {
+      display.off('foldStatusChange', this.foldStatusListener);
+    } catch (_err) {
+      // 页面退出时系统可能已经清理监听。
+    }
+    this.foldStatusListening = false;
+  }
+
+  private handleAreaChange(_oldArea: Area, newArea: Area): void {
+    const width = typeof newArea.width === 'number' ? newArea.width : 0;
+    const height = typeof newArea.height === 'number' ? newArea.height : 0;
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
+    this.viewportWidth = width;
+    this.viewportHeight = height;
+    this.openSplitLayoutIfNeeded();
+  }
+
+  /** 竖屏独立详情进入展开横屏时，回到承载主从双栏的任务列表页。 */
+  private openSplitLayoutIfNeeded(): void {
+    if (this.splitNavigationPending
+      || !isWideTaskLayout(this.viewportWidth, this.viewportHeight, this.foldStatus)) {
+      return;
+    }
+    const params = recordOrEmpty(router.getParams());
+    const deviceId = readStr(params, 'deviceId');
+    const sessionId = readStr(params, 'sessionId');
+    if (deviceId.length === 0 || sessionId.length === 0) return;
+    this.splitNavigationPending = true;
+    handoffTaskSplitRouteSelection(deviceId, sessionId, readStr(params, 'message'));
+    router.back();
+  }
+
   build() {
     Column() {
       TaskPageContent()
     }
     .width('100%')
     .height('100%')
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      this.handleAreaChange(oldArea, newArea);
+    })
   }
 }

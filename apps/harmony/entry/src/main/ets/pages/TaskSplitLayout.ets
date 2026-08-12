@@ -17,6 +17,36 @@ export const TASK_FOLD_STATUS_EXPANDED = 1;
 export const TASK_FOLD_STATUS_FOLDED = 2;
 export const TASK_FOLD_STATUS_HALF_FOLDED = 3;
 
+/**
+ * 独立详情页转入宽屏双栏时，先把当前任务交还给仍在路由栈中的列表页。
+ * 这是一次性内存交接，不持久化，也不会覆盖用户之后在列表中的选择。
+ */
+export class TaskSplitRouteSelection {
+  deviceId: string = '';
+  sessionId: string = '';
+  messageClientId: string = '';
+}
+
+let pendingTaskSplitRouteSelection: TaskSplitRouteSelection | null = null;
+
+export function handoffTaskSplitRouteSelection(
+  deviceId: string,
+  sessionId: string,
+  messageClientId: string = '',
+): void {
+  const selection = new TaskSplitRouteSelection();
+  selection.deviceId = deviceId;
+  selection.sessionId = sessionId;
+  selection.messageClientId = messageClientId;
+  pendingTaskSplitRouteSelection = selection;
+}
+
+export function consumeTaskSplitRouteSelection(): TaskSplitRouteSelection | null {
+  const selection = pendingTaskSplitRouteSelection;
+  pendingTaskSplitRouteSelection = null;
+  return selection;
+}
+
 export function isWideTaskLayout(
   viewportWidth: number,
   viewportHeight: number,
