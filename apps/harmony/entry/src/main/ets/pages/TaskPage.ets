@@ -5958,6 +5958,24 @@ export struct TaskPageContent {
       .onClick(action)
   }
 
+  /** Ask User 主按钮需在 Builder 内直接读取草稿，确保选项点击后 enabled 当帧刷新。 */
+  @Builder
+  askUserPrimaryButton(item: PendingInteraction) {
+    Button(this.askIsLast(item) ? '提交回答' : '下一题')
+      .type(ButtonType.Normal)
+      .height(34)
+      .fontSize(uiFontSize(13))
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('app.color.chat_cta_text'))
+      .backgroundColor($r('app.color.chat_cta'))
+      .borderRadius(UI_RADIUS_PILL)
+      .padding({ left: 16, right: 16 })
+      .enabled(!this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0)
+      .opacity(!this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0 ? 1 : 0.55)
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(() => this.submitAskQuestion(item))
+  }
+
   /** Permission 卡：允许一次 / 始终允许 / 拒绝。 */
   @Builder
   permissionCard(item: PendingInteraction) {
@@ -6128,9 +6146,7 @@ export struct TaskPageContent {
           this.interactionSecondaryButton('跳过', false,
             () => this.skipAskQuestion(item), !this.interactionBusy(item))
           Row().layoutWeight(1)
-          this.interactionPrimaryButton(this.askIsLast(item) ? '提交回答' : '下一题',
-            () => this.submitAskQuestion(item),
-            !this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0)
+          this.askUserPrimaryButton(item)
         }
         .width('100%')
       }
@@ -6392,6 +6408,24 @@ export struct TaskPageContent {
     return Math.max(1, Math.floor(contentWidth * USER_MESSAGE_BUBBLE_MAX_RATIO));
   }
 
+  /**
+   * ArkUI 的全宽 Markdown 子树需要在测量前拿到确定的父宽度：列表必须固定；
+   * 普通正文预计超过一行时也必须固定，否则 Text 会按单行自然宽度排版后被裁切。
+   */
+  private userMessageNeedsFixedBubbleWidth(item: RenderMessageItem): boolean {
+    if (item.kind !== 'user') return false;
+    for (let i = 0; i < item.mdBlocks.length; i++) {
+      if (item.mdBlocks[i].type === 'list') return true;
+    }
+    for (let segmentIndex = 0; segmentIndex < item.segments.length; segmentIndex++) {
+      const blocks = item.segments[segmentIndex].mdBlocks;
+      for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+        if (blocks[blockIndex].type === 'list') return true;
+      }
+    }
+    return this.estimatedUserMessageLines(item.body) > 1;
+  }
+
   private hasMessageActions(item: RenderMessageItem): boolean {
     return item.kind === 'user'
       || (item.kind === 'assistant' && item.isTurnFinalAssistant);
@@ -6575,6 +6609,8 @@ export struct TaskPageContent {
           }
         }
         .constraintSize({
+          minWidth: this.userMessageNeedsFixedBubbleWidth(item)
+            ? this.userMessageBubbleMaxWidth() : 0,
           maxWidth: item.kind === 'user' ? this.userMessageBubbleMaxWidth() : '100%',
         })
         .alignItems(HorizontalAlign.Start)
@@ -7188,13 +7224,21 @@ export struct TaskPageContent {
         ForEach(b.items, (it: string, idx?: number) => {
           Row({ space: 6 }) {
             this.markdownListMarker(b, idx ?? 0)
-            if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
-              this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
-            } else {
-              this.inlineText(it)
+            Column() {
+              if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
+                this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
+              } else {
+                this.inlineText(it)
+              }
             }
+            // 正文只能占项目符号之后的剩余宽度；内部 Text 的 100% 以此为基准，
+            // 避免“marker + spacing + 整行 100%”把文字推出用户消息气泡。
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
           }
-          .width('100%')
+          // 使用父容器拉伸而不是百分比宽度。ArkUI 在带 padding 的定宽气泡中会把
+          // Row 的 100% 按外层消息区重算，导致列表 marker 悬到气泡左边框之外。
+          .alignSelf(ItemAlign.Stretch)
           .alignItems(VerticalAlign.Top)
         }, (it: string, idx?: number) => `${b.seq}:${idx ?? 0}:${it}`)
       }
@@ -7274,6 +7318,7 @@ export struct TaskPageContent {
       Text(b.itemOrdered[index] === true
         ? (b.itemMarkers[index] ?? `${index + 1}.`) : '•')
         .fontSize(uiFontSize(17))
+        .lineHeight(uiLineHeight(26))
         .fontColor($r('app.color.text_secondary'))
     }
   }
@@ -7441,7 +7486,9 @@ export struct TaskPageContent {
     .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
     .fontColor(secondary ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
     .textAlign(TextAlign.Start)
-    .width('100%')
+    // 与列表行一致，避免 ArkUI 在定宽气泡内把 100% 按外层消息区测量：
+    // Text 在父内容区内拉伸后，长段落会按气泡宽度换行而不是在右边界被裁切。
+    .alignSelf(ItemAlign.Stretch)
   }
 
   // ─── 样式/工具 ──────────────────────────────────────────────────────────────
@@ -8453,6 +8500,7 @@ export struct TaskPageContent {
   private toggleAskSelection(item: PendingInteraction, label: string): void {
     const draft = this.mutableAskDraft(item);
     if (!this.askMultiSelect(item)) {
+      this.getUIContext().getFocusController().clearFocus();
       draft.selectedLabels = [label];
       draft.customInput = '';
       draft.showCustomInput = false;
