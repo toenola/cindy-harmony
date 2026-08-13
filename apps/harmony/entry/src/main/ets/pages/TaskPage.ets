@@ -4578,6 +4578,44 @@ export struct TaskPageContent {
     }
   }
 
+  /** 模型列表使用紧凑标识；供应商标题只承担分组，不重复展示大图标。 */
+  @Builder
+  modelRowMark(option: ComposerModelOption) {
+    if (modelProviderKind(option) === 'claude') {
+      Text('♟')
+        .fontSize(uiFontSize(15))
+        .fontColor($r('app.color.text_secondary'))
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+    } else if (modelProviderKind(option) === 'deepseek') {
+      Text('◉')
+        .fontSize(uiFontSize(15))
+        .fontColor($r('app.color.text_secondary'))
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+    } else if (modelProviderKind(option) === 'openai') {
+      Text('✣')
+        .fontSize(uiFontSize(14))
+        .fontColor($r('app.color.text_secondary'))
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+    } else {
+      Text(option.providerName.length > 0
+        ? option.providerName.charAt(0).toUpperCase() : 'S')
+        .fontSize(uiFontSize(11))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_secondary'))
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+        .border({ width: 1, color: $r('app.color.text_secondary') })
+        .borderRadius(10)
+    }
+  }
+
   @Builder
   agentContextView() {
     Scroll() {
@@ -4620,60 +4658,60 @@ export struct TaskPageContent {
   @Builder
   modelProviderGroup(group: ComposerModelGroup) {
     Column({ space: 2 }) {
-      Row({ space: 8 }) {
-        this.modelProviderMark(group.options[0])
+      Row() {
         Text(group.name)
-          .fontSize(uiFontSize(13))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_secondary'))
+          .fontSize(uiFontSize(12))
+          .fontWeight(FontWeight.Normal)
+          .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
       }
-      .width('calc(100% - 32vp)')
-      .height(32)
-      .margin({ left: 16, right: 16, top: 4 })
+      .width('calc(100% - 36vp)')
+      .height(26)
+      .margin({ left: 18, right: 18, top: 4 })
 
       ForEach(group.options, (option: ComposerModelOption) => {
         this.modelOptionRow(option)
       }, (option: ComposerModelOption) => composerModelKey(option))
+
+      Divider()
+        .strokeWidth(0.5)
+        .color($r('app.color.border'))
+        .margin({ left: 12, right: 12, top: 4, bottom: 4 })
     }
     .width('100%')
   }
 
   @Builder
   modelOptionRow(option: ComposerModelOption) {
-    Row({ space: 10 }) {
-      this.modelProviderMark(option)
-      Column({ space: 1 }) {
-        Row({ space: 8 }) {
-          Text(option.label)
-            .fontSize(uiFontSize(17))
-            .lineHeight(uiLineHeight(23))
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (option.subscription) {
-            Text('订阅')
-              .fontSize(uiFontSize(12))
-              .fontColor($r('app.color.text_secondary'))
-              .backgroundColor($r('app.color.bg_chip'))
-              .borderRadius(UI_RADIUS_CONTROL)
-              .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-          }
-          if (this.modelEffortText(option).length > 0) {
-            Text(this.modelEffortText(option))
-              .fontSize(uiFontSize(15))
-              .lineHeight(uiLineHeight(22))
-              .fontColor($r('app.color.text_secondary'))
-          }
+    Row({ space: 8 }) {
+      this.modelRowMark(option)
+      Row({ space: 7 }) {
+        Text(option.label)
+          .fontSize(uiFontSize(15))
+          .lineHeight(uiLineHeight(21))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.modelEffortText(option).length > 0) {
+          Text(this.modelEffortText(option))
+            .fontSize(uiFontSize(13))
+            .lineHeight(uiLineHeight(19))
+            .fontColor($r('app.color.text_secondary'))
         }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
       }
       .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
+      .alignItems(VerticalAlign.Center)
+      if (option.subscription) {
+        Text('订阅')
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_CONTROL)
+          .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+      }
       if (this.modelOptionIsCurrent(option)) {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(uiFontSize(20))
@@ -4695,13 +4733,13 @@ export struct TaskPageContent {
       .clickEffect(UI_ICON_CLICK_EFFECT)
       .onClick(() => this.openModelOptions(option))
     }
-    .width('calc(100% - 32vp)')
-    .constraintSize({ minHeight: 52 })
-    .padding({ left: 4, right: 4, top: 5, bottom: 5 })
-    .margin({ left: 16, right: 16 })
+    .width('calc(100% - 24vp)')
+    .constraintSize({ minHeight: 46 })
+    .padding({ left: 10, right: 6, top: 4, bottom: 4 })
+    .margin({ left: 12, right: 12 })
     .backgroundColor(this.modelOptionIsCurrent(option)
       ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(UI_RADIUS_PILL)
+    .borderRadius(UI_RADIUS_CONTROL)
     .opacity(this.contextRpcBusy ? 0.6 : 1)
     .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => {
