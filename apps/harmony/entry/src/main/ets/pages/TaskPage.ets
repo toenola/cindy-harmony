@@ -332,6 +332,8 @@ export struct TaskPageContent {
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
   @Prop paneMessageClientId: string = '';
+  /** 分栏父页面传入，与左侧 HdsTabs 浮栏共享同一安全底边。 */
+  @Prop paneComposerBottomInset: number = 16;
   @State items: RenderItem[] = [];
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
@@ -4312,6 +4314,8 @@ export struct TaskPageContent {
       effortLabel: this.currentModelEffortLabel(),
       showAddButton: true,
       showStreamingStatus: true,
+      floatingGlass: true,
+      floatingBottomInset: this.paneComposerBottomInset,
       inputId: 'task-composer-input',
       onInputChange: (value: string): void => {
         if (this.leavingForCreationEdit) return;

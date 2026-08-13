@@ -61,6 +61,10 @@ export struct ConversationComposer {
   @Prop effortLabel: string = '';
   @Prop showAddButton: boolean = true;
   @Prop showStreamingStatus: boolean = true;
+  /** 会话详情使用华为官方浮动操作栏同款组件材质；新建任务仍保留表单内嵌样式。 */
+  @Prop floatingGlass: boolean = false;
+  /** 浮动背板距当前可用区域底边的间距，由分栏父页面与 HdsTabs 共用同一口径。 */
+  @Prop floatingBottomInset: number = 2;
   @Prop inputId: string = 'task-composer-input';
   @Prop placeholder: string = '输入远程消息';
 
@@ -554,13 +558,21 @@ export struct ConversationComposer {
       .padding({
         left: 10,
         right: 10,
-        top: this.expanded() ? 8 : 4,
-        bottom: this.expanded() ? 8 : 4,
+        top: this.expanded() ? 8 : (this.floatingGlass ? 12 : 4),
+        bottom: this.expanded() ? 8 : (this.floatingGlass ? 12 : 4),
       })
-      .backgroundColor($r('app.color.composer_surface'))
+      .backgroundColor(this.floatingGlass
+        ? Color.Transparent : $r('app.color.composer_surface'))
+      // HdsActionBar 的官方默认背板材质。系统负责明暗、对比度与热控降级，
+      // 不在业务层自定义 blur 半径、亮度或蒙版颜色。
+      .backgroundBlurStyle(this.floatingGlass
+        ? BlurStyle.COMPONENT_REGULAR : BlurStyle.NONE, {}, {
+        disableSystemAdaptation: false,
+      })
       .border({ width: 1, color: $r('app.color.composer_border') })
       // 收起态使用实际高度的一半做胶囊圆角，避免动画在 999→12 间插值抖动。
-      .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 24)
+      .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
+      .clip(true)
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')
@@ -569,8 +581,8 @@ export struct ConversationComposer {
     .padding({
       left: 12,
       right: 12,
-      top: 4,
-      bottom: 2,
+      top: this.floatingGlass ? 0 : 4,
+      bottom: this.floatingGlass ? this.floatingBottomInset : 2,
     })
   }
 }

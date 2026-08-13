@@ -151,6 +151,11 @@ struct TaskListPage {
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
+    // 输入法出现时 ArkUI 可能按当前焦点重新应用页面级避让。展开分栏必须继续保持
+    // 全窗口不偏移，只由右侧详情栏消费一次键盘高度，左侧列表留在原位并由键盘覆盖。
+    if (this.splitLayoutEnabled()) {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+    }
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
   private systemInsetWindow: window.Window | null = null;
@@ -543,6 +548,11 @@ struct TaskListPage {
 
   private floatingBarContentInset(): number {
     return FLOATING_BAR_CONTENT_INSET + this.bottomSystemInset;
+  }
+
+  private detailComposerBottomInset(): number {
+    // 键盘出现后详情栏底边已经是键盘上沿，不能再叠加系统手势区高度。
+    return this.keyboardHeight > 0 ? FLOATING_BAR_BOTTOM_MARGIN : this.floatingBarBottomMargin();
   }
 
   private detailKeyboardInset(): number {
@@ -1336,7 +1346,12 @@ struct TaskListPage {
     .backgroundColor($r('app.color.bg_page'))
     .width('100%')
     .height('100%')
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+    .expandSafeArea(
+      this.splitLayoutEnabled()
+        ? [SafeAreaType.SYSTEM, SafeAreaType.KEYBOARD]
+        : [SafeAreaType.SYSTEM],
+      [SafeAreaEdge.BOTTOM],
+    )
     .onAreaChange((oldArea: Area, newArea: Area) => {
       this.handleAreaChange(oldArea, newArea);
     })
@@ -1536,6 +1551,7 @@ struct TaskListPage {
           paneDeviceId: this.selectedSessionDeviceId,
           paneSessionId: this.selectedSessionId,
           paneMessageClientId: this.selectedMessageClientId,
+          paneComposerBottomInset: this.detailComposerBottomInset(),
         })
           .transition(uiRevealTransition())
       }, (key: string) => key)
