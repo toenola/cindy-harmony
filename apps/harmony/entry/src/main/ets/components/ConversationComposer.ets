@@ -52,9 +52,11 @@ export struct ConversationComposer {
   @Prop pickingImages: boolean = false;
   @Prop contextBusy: boolean = false;
   @Prop hasPermissionOptions: boolean = false;
+  @Prop hasAgentOptions: boolean = false;
   @Prop hasModelOptions: boolean = false;
   @Prop permissionMode: string = '';
   @Prop planModeEnabled: boolean = false;
+  @Prop agentLabel: string = '';
   @Prop modelLabel: string = '';
   @Prop effortLabel: string = '';
   @Prop showAddButton: boolean = true;
@@ -66,6 +68,7 @@ export struct ConversationComposer {
   onFocusChange: (focused: boolean) => void = () => {};
   onAdd: () => void = () => {};
   onPermission: () => void = () => {};
+  onAgent: () => void = () => {};
   onModel: () => void = () => {};
   onPlanToggle: () => void = () => {};
   onSend: () => void = () => {};
@@ -102,6 +105,10 @@ export struct ConversationComposer {
 
   private hasModelChip(): boolean {
     return this.hasModelOptions && this.expanded();
+  }
+
+  private hasAgentChip(): boolean {
+    return this.hasAgentOptions && this.expanded();
   }
 
   private expanded(): boolean {
@@ -311,6 +318,35 @@ export struct ConversationComposer {
     .onClick(() => this.onModel())
   }
 
+  /** 展开态工具栏里的独立 Agent 胶囊，位于模型胶囊之前。 */
+  @Builder
+  composerAgentButton() {
+    Button() {
+      Row({ space: 4 }) {
+        Text(this.agentLabel)
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(11)
+          .fontColor([$r('app.color.text_tertiary')])
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .type(ButtonType.Normal)
+    .height(30)
+    .constraintSize({ minWidth: 58, maxWidth: 92 })
+    .padding({ left: 10, right: 8 })
+    .borderRadius(UI_RADIUS_PILL)
+    .backgroundColor($r('app.color.bg_chip'))
+    .clickEffect(UI_CLICK_EFFECT)
+    .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
+    .onClick(() => this.onAgent())
+  }
+
   @Builder
   composerPrimaryButton() {
     Button() {
@@ -499,6 +535,10 @@ export struct ConversationComposer {
             }
 
             Row().layoutWeight(1)
+
+            if (this.hasAgentChip()) {
+              this.composerAgentButton()
+            }
 
             if (this.hasModelChip()) {
               this.composerModelButton()

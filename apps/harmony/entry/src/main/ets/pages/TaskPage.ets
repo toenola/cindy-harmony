@@ -267,6 +267,12 @@ class ComposerPaletteItem {
   relPath: string = '';
 }
 
+class ComposerModelGroup {
+  key: string = '';
+  name: string = '';
+  options: ComposerModelOption[] = [];
+}
+
 class PiTreeRow {
   node: PiSessionTreeNode = new PiSessionTreeNode();
   depth: number = 0;
@@ -442,6 +448,8 @@ export struct TaskPageContent {
   private reconcilingDeliveredClientIds: boolean = false;
   /** Composer 加号的原生上下文 Sheet。 */
   @State contextSheetOpen: boolean = false;
+  /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
+  @State detailComposerSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
   @State contextSelectedUris: string[] = [];
   /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
@@ -478,7 +486,6 @@ export struct TaskPageContent {
   @State fastModeCapability: boolean = false;
   /** 模型浮窗可以浏览其它 Agent 的能力目录；选中后走真实 agent-switch RPC。 */
   @State modelAgentTab: string = '';
-  @State modelSearchQuery: string = '';
   @State alternateModelOptions: ComposerModelOption[] = [];
   @State alternateEffortOptions: ComposerChoiceOption[] = [];
   @State alternateFastModeCapability: boolean = false;
@@ -655,7 +662,7 @@ export struct TaskPageContent {
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.initialScrollSettling = false;
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.sessionActionOpen = false;
     this.sessionTreeOpen = false;
     this.sessionTreeGeneration += 1;
@@ -1075,6 +1082,10 @@ export struct TaskPageContent {
     return modelAgentId(this.agentKindForCapability(this.session() ?? new RemoteSession()));
   }
 
+  private composerAgentKind(): string {
+    return this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
+  }
+
   private browsingCurrentAgent(): boolean {
     return this.modelAgentTab.length === 0 || this.modelAgentTab === this.currentAgentTab();
   }
@@ -1094,20 +1105,34 @@ export struct TaskPageContent {
     return this.browsingCurrentAgent() ? this.fastModeCapability : this.alternateFastModeCapability;
   }
 
-  private filteredModelOptions(): ComposerModelOption[] {
-    const query = this.modelSearchQuery.trim().toLowerCase();
+  private groupedModelOptions(): ComposerModelGroup[] {
+    const groups: ComposerModelGroup[] = [];
     const source = this.visibleModelOptions();
-    if (query.length === 0) return source;
-    const out: ComposerModelOption[] = [];
     for (let i = 0; i < source.length; i++) {
       const option = source[i];
-      if (option.label.toLowerCase().includes(query)
-        || option.id.toLowerCase().includes(query)
-        || option.description.toLowerCase().includes(query)) {
-        out.push(option);
+      const providerId = option.providerId.trim();
+      const providerName = option.providerName.trim();
+      const key = providerId.length > 0
+        ? providerId
+        : providerName.length > 0 ? providerName : 'default-provider';
+      let group: ComposerModelGroup | null = null;
+      for (let j = 0; j < groups.length; j++) {
+        if (groups[j].key === key) {
+          group = groups[j];
+          break;
+        }
       }
+      if (group === null) {
+        group = new ComposerModelGroup();
+        group.key = key;
+        group.name = providerName.length > 0
+          ? providerName
+          : providerId.length > 0 ? providerId : '默认供应商';
+        groups.push(group);
+      }
+      group.options.push(option);
     }
-    return out;
+    return groups;
   }
 
 
@@ -1264,30 +1289,45 @@ export struct TaskPageContent {
       || this.isCreationBlockingRemoteOps()) {
       return;
     }
+    if (page === 'model' || page === 'agent') {
+      if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
+    }
     if (page === 'model') {
-      this.modelAgentTab = this.currentAgentTab();
-      this.modelSearchQuery = '';
       this.modelOptionsTargetId = '';
       this.alternateModelOptions = [];
       this.alternateEffortOptions = [];
       this.alternateFastModeCapability = false;
-      if (this.providerModelAgent !== this.currentAgentTab()) {
-        void this.loadProviderModelOptions(this.currentAgentTab());
+      const targetAgent = this.composerAgentKind();
+      if (this.providerModelAgent !== targetAgent) {
+        void this.loadProviderModelOptions(targetAgent);
       }
     }
     this.contextSheetPage = page;
     this.getUIContext().getFocusController().clearFocus();
+    if ((page === 'model' || page === 'agent') && this.isEmbeddedDetailPane()) {
+      this.detailComposerSheetOpen = true;
+      return;
+    }
     this.contextSheetOpen = true;
   }
 
-  private async browseModelAgent(kind: string): Promise<void> {
-    if (kind === this.modelAgentTab || this.contextRpcBusy) return;
+  private isEmbeddedDetailPane(): boolean {
+    return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
+  }
+
+  private closeContextSheet(): void {
+    this.contextSheetOpen = false;
+    this.detailComposerSheetOpen = false;
+  }
+
+  private async browseModelAgent(kind: string): Promise<boolean> {
+    if (kind === this.modelAgentTab) return true;
+    if (this.contextRpcBusy) return false;
     if (!this.canSwitchSessionAgent()) {
       promptAction.showToast({ message: '当前任务不支持切换 Agent' });
-      return;
+      return false;
     }
     this.modelAgentTab = kind;
-    this.modelSearchQuery = '';
     this.contextRpcBusy = true;
     try {
       const result = await this.invokeContextRpc('maker:get-capabilities', [kind]);
@@ -1299,15 +1339,22 @@ export struct TaskPageContent {
       this.alternateEffortOptions = parseChoiceOptions(capabilities['effortLevels'], false);
       this.alternateFastModeCapability = readBool(capabilities, 'hasFastMode', false);
       await this.loadProviderModelOptions(kind);
+      return true;
     } catch (e) {
       this.modelAgentTab = this.currentAgentTab();
       this.alternateModelOptions = [];
       this.alternateEffortOptions = [];
       this.alternateFastModeCapability = false;
       promptAction.showToast({ message: '无法加载该 Agent 的模型' });
+      return false;
     } finally {
       this.contextRpcBusy = false;
     }
+  }
+
+  private async selectComposerAgent(kind: string): Promise<void> {
+    const loaded = await this.browseModelAgent(kind);
+    if (loaded) this.closeContextSheet();
   }
 
   private openModelOptions(option: ComposerModelOption): void {
@@ -1357,7 +1404,7 @@ export struct TaskPageContent {
     try {
       await this.invokeContextRpc('maker:set-permission-mode', [session.id, option.id]);
       this.permissionModeBeforePlan = option.id;
-      this.contextSheetOpen = false;
+      this.closeContextSheet();
     } catch (e) {
       promptAction.showToast({ message: '权限模式更新失败，请重试' });
     } finally {
@@ -1397,7 +1444,7 @@ export struct TaskPageContent {
     }
     if (session.model === option.id && targetAgent === currentAgent) {
       if (keepOpen) this.contextSheetPage = 'model-options';
-      else this.contextSheetOpen = false;
+      else this.closeContextSheet();
       return;
     }
     this.contextRpcBusy = true;
@@ -1426,7 +1473,7 @@ export struct TaskPageContent {
       if (keepOpen) {
         this.contextSheetPage = 'model-options';
       } else {
-        this.contextSheetOpen = false;
+        this.closeContextSheet();
       }
     } catch (e) {
       promptAction.showToast({ message: '模型切换失败，请重试' });
@@ -1503,7 +1550,7 @@ export struct TaskPageContent {
       await AppServices.instance.goals.start(this.deviceId, this.sessionId, objective, limits);
       this.goalState = AppServices.instance.goals.getState(this.sessionId);
       this.setComposerDocument(emptyComposerDocument());
-      this.contextSheetOpen = false;
+      this.closeContextSheet();
       this.contextSheetPage = 'main';
       this.followLatestSoon();
     } catch (e) {
@@ -1852,6 +1899,7 @@ export struct TaskPageContent {
       // Picker 尚未挂载时无需清理；新组件会从空选择开始。
     }
     this.getUIContext().getFocusController().clearFocus();
+    this.detailComposerSheetOpen = false;
     this.contextSheetOpen = true;
   }
 
@@ -1872,7 +1920,7 @@ export struct TaskPageContent {
 
   private addRecentSelection(): void {
     const uris = this.contextSelectedUris.slice();
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.contextSelectedUris = [];
     this.imageQueue.enqueue(uris);
   }
@@ -1886,7 +1934,7 @@ export struct TaskPageContent {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.imageQueue.pickImages();
   }
 
@@ -1898,7 +1946,7 @@ export struct TaskPageContent {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.imageQueue.pickScreenshots(getContext(this) as common.UIAbilityContext);
   }
 
@@ -1910,7 +1958,7 @@ export struct TaskPageContent {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.imageQueue.takePhoto(getContext(this) as common.UIAbilityContext);
   }
 
@@ -1920,7 +1968,7 @@ export struct TaskPageContent {
       promptAction.showToast({ message: '每条消息最多添加 20 个附件' });
       return;
     }
-    this.contextSheetOpen = false;
+    this.closeContextSheet();
     this.fileQueue.pick(getContext(this) as common.UIAbilityContext);
   }
 
@@ -3111,7 +3159,8 @@ export struct TaskPageContent {
   }
 
   build() {
-    Column() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column() {
       this.taskHeader()
       if (this.searchOpen) {
         this.sessionSearchBar()
@@ -3203,13 +3252,24 @@ export struct TaskPageContent {
       if (this.sessionTreeOpen) {
         this.sessionTreeLayer()
       }
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor($r('app.color.bg_page'))
+
+      if (this.detailComposerSheetOpen) {
+        this.detailComposerSheetLayer()
+      }
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
-      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      detents: this.contextSheetPage === 'model'
+        || this.contextSheetPage === 'model-options'
+        || this.contextSheetPage === 'agent'
+        ? [SheetSize.MEDIUM] : [SheetSize.MEDIUM, SheetSize.LARGE],
       dragBar: true,
       showClose: false,
       preferType: SheetType.BOTTOM,
@@ -4209,9 +4269,11 @@ export struct TaskPageContent {
       pickingImages: this.pickingImages,
       contextBusy: this.contextRpcBusy,
       hasPermissionOptions: this.permissionOptions.length > 0,
+      hasAgentOptions: this.canSwitchSessionAgent(),
       hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
       permissionMode: this.effectivePermissionMode(),
       planModeEnabled: this.planModeEnabled,
+      agentLabel: modelAgentLabel(this.composerAgentKind()),
       modelLabel: this.currentModelLabel(),
       effortLabel: this.currentModelEffortLabel(),
       showAddButton: true,
@@ -4226,6 +4288,7 @@ export struct TaskPageContent {
       },
       onAdd: (): void => this.openContextSheet(),
       onPermission: (): void => this.openComposerControlSheet('permission'),
+      onAgent: (): void => this.openComposerControlSheet('agent'),
       onModel: (): void => this.openComposerControlSheet('model'),
       onPlanToggle: (): void => {
         void this.togglePlanMode();
@@ -4248,7 +4311,31 @@ export struct TaskPageContent {
     })
   }
 
-  /** iOS 加号同层级：原生可拖拽 Sheet，主视图与目标模式二级视图共用。 */
+  /** 分栏详情内的 Composer 选择层；复用原有模型目录和推理设置内容。 */
+  @Builder
+  detailComposerSheetLayer() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.overlay'))
+        .onClick(() => this.closeContextSheet())
+
+      Column() {
+        this.contextSheet()
+      }
+      .width('100%')
+      .height('50%')
+      .backgroundColor($r('app.color.bg_card'))
+      .borderRadius(UI_RADIUS_CONTAINER)
+      .clip(true)
+      .transition(uiOverlayTransition())
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(98)
+  }
+
   @Builder
   contextSheet() {
     Column() {
@@ -4268,6 +4355,8 @@ export struct TaskPageContent {
             ? '权限模式'
             : this.contextSheetPage === 'model-options'
               ? '推理设置'
+              : this.contextSheetPage === 'agent'
+                ? '引擎'
               : this.contextSheetPage === 'model'
                 ? '模型'
                 : '上下文')
@@ -4291,6 +4380,8 @@ export struct TaskPageContent {
         this.goalContextView()
       } else if (this.contextSheetPage === 'permission') {
         this.permissionContextView()
+      } else if (this.contextSheetPage === 'agent') {
+        this.agentContextView()
       } else if (this.contextSheetPage === 'model') {
         this.modelContextView()
       } else if (this.contextSheetPage === 'model-options') {
@@ -4488,43 +4579,66 @@ export struct TaskPageContent {
   }
 
   @Builder
-  modelAgentSwitcher() {
-    Row({ space: 4 }) {
-      ForEach(MODEL_AGENT_KINDS, (kind: string) => {
-        Button() {
-          Row({ space: 7 }) {
-            this.modelAgentMark(kind, this.modelAgentIsActive(kind))
+  agentContextView() {
+    Scroll() {
+      Column({ space: 2 }) {
+        ForEach(MODEL_AGENT_KINDS, (kind: string) => {
+          Row({ space: 10 }) {
+            this.modelAgentMark(kind, false)
             Text(modelAgentLabel(kind))
               .fontSize(uiFontSize(16))
               .fontWeight(this.modelAgentIsActive(kind) ? FontWeight.Medium : FontWeight.Normal)
-              .fontColor(this.modelAgentIsActive(kind)
-                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+              .fontColor($r('app.color.text_primary'))
+              .layoutWeight(1)
+            if (this.modelAgentIsActive(kind)) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(uiFontSize(18))
+                .fontColor([$r('app.color.chat_cta')])
+            }
           }
-          .justifyContent(FlexAlign.Center)
           .width('100%')
-          .height('100%')
-        }
-        .layoutWeight(1)
-        .height(42)
-        .padding(0)
-        .borderRadius(UI_RADIUS_PILL)
-        .backgroundColor(this.modelAgentIsActive(kind)
-          ? $r('app.color.chat_cta') : Color.Transparent)
-        .enabled(!this.contextRpcBusy
-          && (this.modelAgentIsActive(kind) || this.canSwitchSessionAgent()))
-        .clickEffect(UI_CLICK_EFFECT)
-        .onClick(() => {
-          void this.browseModelAgent(kind);
-        })
-      }, (kind: string) => kind)
+          .height(48)
+          .padding({ left: 14, right: 14 })
+          .backgroundColor(this.modelAgentIsActive(kind)
+            ? $r('app.color.bg_chip') : Color.Transparent)
+          .borderRadius(UI_RADIUS_CONTROL)
+          .enabled(!this.contextRpcBusy
+            && (this.modelAgentIsActive(kind) || this.canSwitchSessionAgent()))
+          .clickEffect(UI_LIST_CLICK_EFFECT)
+          .onClick(() => {
+            void this.selectComposerAgent(kind);
+          })
+        }, (kind: string) => kind)
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 18 })
     }
     .width('100%')
-    .height(52)
-    .padding(5)
-    .backgroundColor($r('app.color.bg_chip'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(UI_RADIUS_PILL)
-    .margin({ left: 16, right: 16, top: 10 })
+    .layoutWeight(1)
+  }
+
+  @Builder
+  modelProviderGroup(group: ComposerModelGroup) {
+    Column({ space: 2 }) {
+      Row({ space: 8 }) {
+        this.modelProviderMark(group.options[0])
+        Text(group.name)
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('calc(100% - 32vp)')
+      .height(32)
+      .margin({ left: 16, right: 16, top: 4 })
+
+      ForEach(group.options, (option: ComposerModelOption) => {
+        this.modelOptionRow(option)
+      }, (option: ComposerModelOption) => composerModelKey(option))
+    }
+    .width('100%')
   }
 
   @Builder
@@ -4582,8 +4696,8 @@ export struct TaskPageContent {
       .onClick(() => this.openModelOptions(option))
     }
     .width('calc(100% - 32vp)')
-    .constraintSize({ minHeight: 66 })
-    .padding({ left: 4, right: 4, top: 8, bottom: 8 })
+    .constraintSize({ minHeight: 52 })
+    .padding({ left: 4, right: 4, top: 5, bottom: 5 })
     .margin({ left: 16, right: 16 })
     .backgroundColor(this.modelOptionIsCurrent(option)
       ? $r('app.color.bg_chip') : Color.Transparent)
@@ -4599,10 +4713,6 @@ export struct TaskPageContent {
   modelContextView() {
     Scroll() {
       Column({ space: 12 }) {
-        if (this.canSwitchSessionAgent()) {
-          this.modelAgentSwitcher()
-        }
-
         if (this.pendingAgentSwitchIntent !== null) {
           Row({ space: 9 }) {
             SymbolGlyph($r('sys.symbol.clock'))
@@ -4629,45 +4739,22 @@ export struct TaskPageContent {
           .borderRadius(UI_RADIUS_CONTROL)
         }
 
-        Row({ space: 8 }) {
-          SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_secondary')])
-          TextInput({ placeholder: '搜索模型...', text: this.modelSearchQuery })
-            .fontSize(uiFontSize(15))
-            .fontColor($r('app.color.text_primary'))
-            .placeholderColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .layoutWeight(1)
-            .height(40)
-            .padding(0)
-            .onChange((value: string) => {
-              this.modelSearchQuery = value;
-            })
-        }
-        .width('calc(100% - 32vp)')
-        .height(44)
-        .padding({ left: 14, right: 12 })
-        .border({ width: 1, color: $r('app.color.border') })
-        .borderRadius(UI_RADIUS_PILL)
-        .margin({ left: 16, right: 16, top: 2, bottom: 2 })
-
         Column() {
-          if (this.filteredModelOptions().length === 0) {
-            Text(this.contextRpcBusy ? '正在加载模型...' : '没有匹配的模型')
+          if (this.groupedModelOptions().length === 0) {
+            Text(this.contextRpcBusy ? '正在加载模型...' : '没有可用模型')
               .fontSize(uiFontSize(14))
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
               .textAlign(TextAlign.Center)
               .padding({ top: 28, bottom: 28 })
           } else {
-            ForEach(this.filteredModelOptions(), (option: ComposerModelOption) => {
-              this.modelOptionRow(option)
-            }, (option: ComposerModelOption) => composerModelKey(option))
+            ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
+              this.modelProviderGroup(group)
+            }, (group: ComposerModelGroup) => group.key)
           }
         }
         .width('100%')
-        .padding({ top: 2, bottom: 20 })
+        .padding({ top: 2, bottom: 16 })
       }
       .width('100%')
     }
