@@ -32,6 +32,8 @@ import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
 import { NewSessionCreationStore } from './tasks/NewSessionCreationStore';
 import { SessionDeepLinkIntent, parseSessionDeepLink } from './navigation/SessionDeepLink';
+import { TaskCompletionPushPreferenceStore } from './notifications/TaskCompletionPushPreferenceStore';
+import { TaskCompletionPushService } from './notifications/TaskCompletionPushService';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
@@ -53,6 +55,10 @@ export class AppServices {
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
+  readonly taskCompletionPushPreference: TaskCompletionPushPreferenceStore =
+    new TaskCompletionPushPreferenceStore();
+  readonly taskCompletionPush: TaskCompletionPushService =
+    new TaskCompletionPushService(this.taskCompletionPushPreference);
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
@@ -170,8 +176,10 @@ export class AppServices {
       this.composerDrafts.init(context),
       this.taskListPreferences.init(context),
       this.taskListSnapshot.init(context),
+      this.taskCompletionPushPreference.init(context),
       this.messages.initCache(context),
     ]);
+    await this.taskCompletionPush.init(context);
   }
 
   /** 登录态确认后、网络握手前恢复可丢弃的任务列表首屏快照。 */

@@ -12,6 +12,13 @@
  */
 
 import { display, LengthMetrics, router, promptAction } from '@kit.ArkUI';
+import {
+  BlurStrategy,
+  HdsNavigation,
+  HdsNavigationTitleMode,
+  ScrollEffectType,
+  hdsMaterial,
+} from '@kit.UIDesignKit';
 import { common } from '@kit.AbilityKit';
 import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -3160,8 +3167,8 @@ export struct TaskPageContent {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      Column() {
-      this.taskHeader()
+      HdsNavigation() {
+        Column() {
       if (this.searchOpen) {
         this.sessionSearchBar()
       }
@@ -3252,7 +3259,36 @@ export struct TaskPageContent {
       if (this.sessionTreeOpen) {
         this.sessionTreeLayer()
       }
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.bg_page'))
       }
+      .titleBar({
+        enableComponentSafeArea: true,
+        style: {
+          scrollEffectOpts: {
+            enableScrollEffect: true,
+            scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
+            blurEffectiveStartOffset: LengthMetrics.vp(0),
+            blurEffectiveEndOffset: LengthMetrics.vp(20),
+          },
+          blurStrategy: BlurStrategy.ADAPTIVE,
+          thermoCtrl: true,
+          systemMaterialEffect: {
+            materialType: hdsMaterial.MaterialType.IMMERSIVE,
+            materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+          },
+        },
+        content: {
+          title: { mainTitle: '' },
+          stackBuilder: (): void => this.taskHeader(),
+        },
+      })
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .titleMode(HdsNavigationTitleMode.MINI)
+      .bindToScrollable([this.listScroller])
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.bg_page'))
@@ -3653,11 +3689,7 @@ export struct TaskPageContent {
     .width('100%')
     .constraintSize({ minHeight: 50 })
     .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-    .backgroundColor(this.isEmbedded()
-      ? $r('app.color.bg_page')
-      : $r('app.color.chat_header_surface'))
-    .backgroundBlurStyle(this.isEmbedded() ? BlurStyle.NONE : BlurStyle.Thin)
-    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.chat_header_divider') } })
+    .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -4129,6 +4161,8 @@ export struct TaskPageContent {
         .width('100%')
         .height('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+        .clip(false)
+        .cachedCount(3, true)
         .onScrollIndex((start: number, end: number, _center: number) => {
           this.visibleStartIndex = start;
           this.visibleEndIndex = end;

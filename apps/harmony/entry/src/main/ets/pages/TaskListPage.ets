@@ -8,8 +8,28 @@
  * 胶囊交互元素；行点击使用系统 clickEffect 弹性反馈，菜单淡入淡出。
  */
 
-import { accessibility } from '@kit.AccessibilityKit';
-import { display, KeyboardAvoidMode, promptAction, router, window } from '@kit.ArkUI';
+import {
+  display,
+  KeyboardAvoidMode,
+  LengthMetrics,
+  promptAction,
+  router,
+  SymbolGlyphModifier,
+  window,
+} from '@kit.ArkUI';
+import {
+  BlurStrategy,
+  DividerMode,
+  HdsAnimationMode,
+  HdsBarLayoutMode,
+  HdsBarStyle,
+  HdsNavigation,
+  HdsNavigationTitleMode,
+  HdsTabs,
+  HdsTabsController,
+  ScrollEffectType,
+  hdsMaterial,
+} from '@kit.UIDesignKit';
 import { AppServices } from '../core/AppServices';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
@@ -47,7 +67,6 @@ import {
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
-  UI_MOTION_BASE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
@@ -59,12 +78,10 @@ import {
 } from '../components/UiKit';
 
 const LIST_INSET = 16;
-const LIST_TAB_SWIPER_ID = 'task-list-tab-swiper';
-const LIST_TAB_FRAME_RATE: ExpectedFrameRateRange = {
-  min: 60,
-  max: 120,
-  expected: 120,
-};
+const FLOATING_BAR_BOTTOM_MARGIN = 16;
+const FLOATING_BAR_CONTENT_INSET = 104;
+const FLOATING_BAR_SHOW_OFFSET = 0.5;
+const FLOATING_BAR_HIDE_VELOCITY = 600;
 /** 项目组内联展示的任务数上限，超出后由「查看全部」展开。 */
 const PROJECT_INLINE_LIMIT = 5;
 
@@ -117,6 +134,7 @@ struct TaskListPage {
   @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   @State dividerActive: boolean = false;
   @State keyboardHeight: number = 0;
+  @State bottomSystemInset: number = 0;
 
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
@@ -135,8 +153,18 @@ struct TaskListPage {
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
-  private listTabSwiperController: SwiperController = new SwiperController();
-  private listTabSwiperAppeared: boolean = false;
+  private systemInsetWindow: window.Window | null = null;
+  private systemInsetListening: boolean = false;
+  private systemInsetListener: (options: window.AvoidAreaOptions) => void =
+    (_options: window.AvoidAreaOptions): void => {
+      this.refreshBottomSystemInset();
+    };
+  private listTabController: HdsTabsController = new HdsTabsController();
+  private projectsScroller: Scroller = new Scroller();
+  private dialoguesScroller: Scroller = new Scroller();
+  private automationsScroller: Scroller = new Scroller();
+  private listTabsAppeared: boolean = false;
+  private floatingBarHidden: boolean = false;
   private initialListTabIndex: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
     const wasSplit = this.splitLayoutEnabled();
@@ -170,6 +198,7 @@ struct TaskListPage {
     // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
     this.updateKeyboardAvoidance();
     void this.observeKeyboardHeight();
+    void this.observeBottomSystemInset();
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
@@ -219,9 +248,12 @@ struct TaskListPage {
     this.taskListReconcileBackoff.clear();
     this.stopFoldStatusObservation();
     this.stopKeyboardHeightObservation();
+    this.stopBottomSystemInsetObservation();
     this.keyboardHeight = 0;
+    this.bottomSystemInset = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
-    this.listTabSwiperAppeared = false;
+    this.listTabsAppeared = false;
+    this.floatingBarHidden = false;
     void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
     this.sortMenuOpen = false;
@@ -456,6 +488,63 @@ struct TaskListPage {
     this.keyboardHeightListening = false;
   }
 
+  private async observeBottomSystemInset(): Promise<void> {
+    if (this.systemInsetListening) return;
+    const hostContext = this.getUIContext().getHostContext();
+    if (hostContext === undefined) return;
+    try {
+      const hostWindow = await window.getLastWindow(hostContext);
+      if (!this.pageActive || this.systemInsetListening) return;
+      this.systemInsetWindow = hostWindow;
+      hostWindow.on('avoidAreaChange', this.systemInsetListener);
+      this.systemInsetListening = true;
+      this.refreshBottomSystemInset();
+    } catch (_err) {
+      // 避让区查询不可用时保留 HdsTabs 的官方基础边距。
+      this.bottomSystemInset = 0;
+    }
+  }
+
+  private refreshBottomSystemInset(): void {
+    if (this.systemInsetWindow === null) return;
+    try {
+      const systemArea = this.systemInsetWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const gestureArea = this.systemInsetWindow.getWindowAvoidArea(
+        window.AvoidAreaType.TYPE_SYSTEM_GESTURE,
+      );
+      const indicatorArea = this.systemInsetWindow.getWindowAvoidArea(
+        window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR,
+      );
+      const bottomHeightPx = Math.max(
+        systemArea.visible ? systemArea.bottomRect.height : 0,
+        gestureArea.visible ? gestureArea.bottomRect.height : 0,
+        indicatorArea.visible ? indicatorArea.bottomRect.height : 0,
+      );
+      this.bottomSystemInset = Math.max(0, this.getUIContext().px2vp(bottomHeightPx));
+    } catch (_err) {
+      this.bottomSystemInset = 0;
+    }
+  }
+
+  private stopBottomSystemInsetObservation(): void {
+    if (!this.systemInsetListening || this.systemInsetWindow === null) return;
+    try {
+      this.systemInsetWindow.off('avoidAreaChange', this.systemInsetListener);
+    } catch (_err) {
+      // 页面退出时窗口可能已经销毁，本地监听状态仍需清理。
+    }
+    this.systemInsetWindow = null;
+    this.systemInsetListening = false;
+  }
+
+  private floatingBarBottomMargin(): number {
+    return FLOATING_BAR_BOTTOM_MARGIN + this.bottomSystemInset;
+  }
+
+  private floatingBarContentInset(): number {
+    return FLOATING_BAR_CONTENT_INSET + this.bottomSystemInset;
+  }
+
   private detailKeyboardInset(): number {
     return taskDetailKeyboardInset(
       this.viewportWidth,
@@ -508,7 +597,7 @@ struct TaskListPage {
     if (deviceId.length === 0 || targetSession === null) return;
     AppServices.instance.consumePendingDeepLink();
     if (this.splitLayoutEnabled()) {
-      this.setActiveListTab(taskListCategory(targetSession), false);
+      this.setActiveListTab(taskListCategory(targetSession));
       if (this.selectedDeviceId.length > 0) this.selectedDeviceId = deviceId;
       this.selectedSessionDeviceId = deviceId;
       this.selectedSessionId = intent.sessionId;
@@ -526,24 +615,14 @@ struct TaskListPage {
     });
   }
 
-  private selectListTab(tab: TaskListCategory): void {
-    if (this.activeListTab === tab) return;
-    this.setActiveListTab(tab, true);
-    this.ensureWideSelection();
-    this.persistPreferences();
-  }
-
-  private setActiveListTab(tab: TaskListCategory, animate: boolean): void {
+  private setActiveListTab(tab: TaskListCategory): void {
     const index = this.listTabIndex(tab);
     this.activeListTab = tab;
-    if (!this.listTabSwiperAppeared) {
+    if (!this.listTabsAppeared) {
       this.initialListTabIndex = index;
       return;
     }
-    this.listTabSwiperController.changeIndex(
-      index,
-      animate && this.listTabIndicatorDuration() > 0,
-    );
+    this.listTabController.changeIndex(index);
   }
 
   private listTabIndex(tab: TaskListCategory): number {
@@ -552,31 +631,56 @@ struct TaskListPage {
     return 0;
   }
 
-  private listTabIndicatorTranslateX(): string {
-    if (this.activeListTab === 'dialogues') return '100%';
-    if (this.activeListTab === 'automations') return '200%';
-    return '0%';
+  private listTabCategory(index: number): TaskListCategory {
+    if (index === 1) return 'dialogues';
+    if (index === 2) return 'automations';
+    return 'projects';
   }
 
-  private listTabIndicatorDuration(): number {
-    try {
-      return accessibility.isAnimationReduceEnabledSync() ? 0 : UI_MOTION_BASE;
-    } catch (_err) {
-      return UI_MOTION_BASE;
+  private handleListTabChange(index: number): void {
+    const category = this.listTabCategory(index);
+    if (category === this.activeListTab) return;
+    this.activeListTab = category;
+    this.ensureWideSelection();
+    this.persistPreferences();
+  }
+
+  private handleListTabsAppear(): void {
+    this.listTabsAppeared = true;
+    this.listTabController.changeIndex(this.listTabIndex(this.activeListTab));
+    // HdsTabsController 会保留上一次动画状态；每次进入页面都明确恢复默认显示态。
+    this.floatingBarHidden = false;
+    this.listTabController.applyShowAnimation(HdsAnimationMode.SCROLL_ANIMATION);
+  }
+
+  private scrollerForCategory(category: TaskListCategory): Scroller {
+    if (category === 'dialogues') return this.dialoguesScroller;
+    if (category === 'automations') return this.automationsScroller;
+    return this.projectsScroller;
+  }
+
+  private handleTaskListScroll(scrollOffset: number, scrollState: ScrollState): void {
+    // 只响应手指拖动，忽略惯性回弹，避免快速下滑到底后因 Spring 回弹又把浮岛唤回。
+    if (scrollState === ScrollState.Scroll && scrollOffset <= -FLOATING_BAR_SHOW_OFFSET) {
+      this.showFloatingBar();
     }
   }
 
-  private handleListTabSwiperAppear(): void {
-    this.listTabSwiperAppeared = true;
-    this.listTabSwiperController.changeIndex(this.listTabIndex(this.activeListTab), false);
-    try {
-      const scenes = this.getUIContext().requireDynamicSyncScene(LIST_TAB_SWIPER_ID);
-      for (let i = 0; i < scenes.length; i++) {
-        scenes[i].setFrameRateRange(LIST_TAB_FRAME_RATE);
-      }
-    } catch (_err) {
-      // 不支持动态帧率场景的设备仍使用系统原生 Swiper 动画。
-    }
+  private handleTaskListDragRelease(velocity: number): void {
+    // ArkUI 定义内容向上滚动为正速度；只有明显的快速向下浏览才收起浮岛。
+    if (velocity >= FLOATING_BAR_HIDE_VELOCITY) this.hideFloatingBar();
+  }
+
+  private hideFloatingBar(): void {
+    if (this.floatingBarHidden || !this.listTabsAppeared) return;
+    this.floatingBarHidden = true;
+    this.listTabController.applyHideAnimation(HdsAnimationMode.SCROLL_ANIMATION);
+  }
+
+  private showFloatingBar(): void {
+    if (!this.floatingBarHidden || !this.listTabsAppeared) return;
+    this.floatingBarHidden = false;
+    this.listTabController.applyShowAnimation(HdsAnimationMode.SCROLL_ANIMATION);
   }
 
   private handleDividerTouch(event: TouchEvent): void {
@@ -675,7 +779,11 @@ struct TaskListPage {
   }
 
   private sortMenuTop(): number {
-    return 60 + (this.connectionStatus === 'online' ? 0 : 36) + 52;
+    return 60 + (this.connectionStatus === 'online' ? 0 : 36) + 4;
+  }
+
+  private sortMenuRightInset(): number {
+    return LIST_INSET + 3 * 40;
   }
 
   private selectDevice(deviceId: string): void {
@@ -1236,37 +1344,106 @@ struct TaskListPage {
 
   @Builder
   taskListPane() {
-    Column() {
-      this.pageHeader()
+    HdsNavigation() {
+      Column() {
       if (this.connectionStatus !== 'online') {
         this.connectionBanner()
       }
-      this.taskListTabs()
       if (this.searchOpen) {
         this.taskSearchField()
       }
-      Swiper(this.listTabSwiperController) {
-        this.taskListTabPage('projects')
-        this.taskListTabPage('dialogues')
-        this.taskListTabPage('automations')
+      HdsTabs({ controller: this.listTabController, index: this.initialListTabIndex }) {
+        TabContent() {
+          this.taskListTabPage('projects')
+        }
+        .tabBar(this.taskListTabBarStyle(
+          '项目',
+          $r('sys.symbol.folder'),
+        ))
+
+        TabContent() {
+          this.taskListTabPage('dialogues')
+        }
+        .tabBar(this.taskListTabBarStyle(
+          '对话',
+          $r('sys.symbol.ellipsis_message'),
+        ))
+
+        TabContent() {
+          this.taskListTabPage('automations')
+        }
+        .tabBar(this.taskListTabBarStyle(
+          '自动化',
+          $r('sys.symbol.bolt'),
+        ))
       }
-      .id(LIST_TAB_SWIPER_ID)
-      .index(this.initialListTabIndex)
-      .indicator(false)
-      .loop(false)
-      .disableSwipe(true)
-      .cachedCount(2)
-      .duration(this.listTabIndicatorDuration())
-      .curve(UI_CURVE_MOVE)
+      .barPosition(BarPosition.End)
+      .vertical(false)
+      .scrollable(false)
+      .barOverlap(true)
+      .divider({ mode: DividerMode.NONE })
+      .barFloatingStyle({
+        barBottomMargin: this.floatingBarBottomMargin(),
+        gradientMask: {
+          maskColor: $r('app.color.bg_page'),
+          maskHeight: FLOATING_BAR_CONTENT_INSET,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+        adaptToHandedness: true,
+        thermoCtrl: true,
+        miniBar: {
+          miniBarBuilder: () => this.newSessionMiniBar(),
+          miniBarStyle: HdsBarStyle.COLLAPSE,
+          enableMiniBarBackground: true,
+          enableMiniBarClip: true,
+          barLayoutMode: HdsBarLayoutMode.HORIZONTAL,
+        },
+      })
+      .onChange((index: number) => this.handleListTabChange(index))
       .layoutWeight(1)
       .width('100%')
       .backgroundColor($r('app.color.bg_page'))
-      .onAppear(() => this.handleListTabSwiperAppear())
+      .onAppear(() => this.handleListTabsAppear())
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor($r('app.color.bg_page'))
     }
+    .titleBar({
+      enableComponentSafeArea: true,
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
+          blurEffectiveStartOffset: LengthMetrics.vp(0),
+          blurEffectiveEndOffset: LengthMetrics.vp(20),
+        },
+        blurStrategy: BlurStrategy.ADAPTIVE,
+        thermoCtrl: true,
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      },
+      content: {
+        title: { mainTitle: '' },
+        stackBuilder: (): void => this.pageHeader(),
+      },
+    })
+    .hideBackButton(true)
+    .hideToolBar(true)
+    .titleMode(HdsNavigationTitleMode.MINI)
+    .bindToScrollable([
+      this.projectsScroller,
+      this.dialoguesScroller,
+      this.automationsScroller,
+    ])
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
   }
 
   @Builder
@@ -1281,6 +1458,42 @@ struct TaskListPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
+  }
+
+  private taskListTabBarStyle(label: string, icon: Resource): BottomTabBarStyle {
+    return new BottomTabBarStyle({
+      normal: new SymbolGlyphModifier(icon)
+        .fontSize(22)
+        .fontColor([$r('app.color.text_secondary')]),
+      selected: new SymbolGlyphModifier(icon)
+        .fontSize(22)
+        .fontColor([$r('app.color.accent')]),
+    }, label)
+      .labelStyle({
+        font: { size: 11, weight: FontWeight.Medium },
+        selectedColor: $r('app.color.text_primary'),
+        unselectedColor: $r('app.color.text_secondary'),
+        maxLines: 1,
+      })
+      .layoutMode(LayoutMode.VERTICAL)
+      .padding({ left: 4, right: 4, top: 4, bottom: 4 });
+  }
+
+  @Builder
+  newSessionMiniBar() {
+    Button() {
+      SymbolGlyph($r('sys.symbol.plus'))
+        .fontSize(22)
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .type(ButtonType.Circle)
+    .width(56)
+    .height(56)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .accessibilityText('新建任务')
+    .onClick(() => this.openNewSession())
   }
 
   @Builder
@@ -1307,7 +1520,7 @@ struct TaskListPage {
     }
     .width(20)
     .height('100%')
-    .backgroundColor(Color.Transparent)
+    .backgroundColor($r('app.color.bg_page'))
     .onTouch((event: TouchEvent) => {
       this.handleDividerTouch(event);
     })
@@ -1373,19 +1586,30 @@ struct TaskListPage {
         this.openDeviceScopeMenu();
       })
 
-      this.headerSymbolButton($r('sys.symbol.gearshape'), () => this.openSettings())
-      this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch())
+      this.headerSymbolButton(
+        $r('sys.symbol.slider_horizontal_2'),
+        () => this.openSortMenu(),
+        '排序',
+      )
       this.refreshHeaderButton()
-      this.headerSymbolButton($r('sys.symbol.plus'), () => this.openNewSession())
+      this.headerSymbolButton(
+        $r('sys.symbol.magnifyingglass'),
+        () => this.toggleSearch(),
+        '搜索',
+      )
+      this.headerSymbolButton(
+        $r('sys.symbol.gearshape'),
+        () => this.openSettings(),
+        '设置',
+      )
     }
     .width('100%')
-    .height(60)
-    .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 12 })
-    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
+    .height(56)
+    .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 8 })
   }
 
   @Builder
-  headerSymbolButton(symbol: Resource, action: () => void) {
+  headerSymbolButton(symbol: Resource, action: () => void, accessibilityLabel: string = '') {
     Button() {
       SymbolGlyph(symbol)
         .fontSize(18)
@@ -1397,6 +1621,7 @@ struct TaskListPage {
     .padding(0)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
+    .accessibilityText(accessibilityLabel)
     .onClick(action)
   }
 
@@ -1446,78 +1671,6 @@ struct TaskListPage {
     .height(36)
     .padding({ left: LIST_INSET, right: LIST_INSET })
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
-  }
-
-  @Builder
-  taskListTabs() {
-    Row({ space: 8 }) {
-      Stack({ alignContent: Alignment.Start }) {
-        Row()
-          .width('33.3333%')
-          .height(34)
-          .backgroundColor($r('app.color.task_list_group_surface'))
-          .border({ width: 1, color: $r('app.color.border') })
-          .borderRadius(UI_RADIUS_PILL)
-          .translate({ x: this.listTabIndicatorTranslateX() })
-          .animation({
-            duration: this.listTabIndicatorDuration(),
-            curve: UI_CURVE_MOVE,
-            expectedFrameRateRange: LIST_TAB_FRAME_RATE,
-          })
-          .hitTestBehavior(HitTestMode.None)
-
-        Row() {
-          this.listTabButton('项目', 'projects')
-          this.listTabButton('对话', 'dialogues')
-          this.listTabButton('自动化', 'automations')
-        }
-        .width('100%')
-        .height('100%')
-      }
-      .layoutWeight(1)
-      .height(40)
-      .padding(3)
-      .backgroundColor($r('app.color.bg_chip'))
-      .borderRadius(UI_RADIUS_PILL)
-
-      Button() {
-        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(17)
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .type(ButtonType.Circle)
-      .width(36)
-      .height(36)
-      .padding(0)
-      .backgroundColor($r('app.color.bg_chip'))
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .accessibilityText('排序')
-      .onClick(() => this.openSortMenu())
-    }
-    .width('100%')
-    .height(56)
-    .padding({ left: LIST_INSET, right: LIST_INSET, top: 8, bottom: 8 })
-    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.border') } })
-  }
-
-  @Builder
-  listTabButton(label: string, tab: TaskListCategory) {
-    Button() {
-      Text(label)
-        .fontSize(14)
-        .fontWeight(this.activeListTab === tab ? FontWeight.Medium : FontWeight.Regular)
-        .fontColor(this.activeListTab === tab
-          ? $r('app.color.text_primary')
-          : $r('app.color.text_secondary'))
-    }
-    .type(ButtonType.Normal)
-    .layoutWeight(1)
-    .height(34)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .borderRadius(UI_RADIUS_PILL)
-    .stateEffect(false)
-    .onClick(() => this.selectListTab(tab))
   }
 
   @Builder
@@ -1590,7 +1743,7 @@ struct TaskListPage {
   buildTaskListEntries(category: TaskListCategory) {
     // 滑动只负责露出操作按钮；不要配置 actionAreaDistance / onAction，
     // 避免长距离滑动松手时直接置顶或归档，所有操作都必须由按钮点击触发。
-    List() {
+    List({ scroller: this.scrollerForCategory(category) }) {
       if (this.pinnedEntries(category).length > 0) {
         ListItem() {
           this.sectionHeader(
@@ -1699,10 +1852,18 @@ struct TaskListPage {
     }
     .width('100%')
     .layoutWeight(1)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+    .contentEndOffset(this.floatingBarContentInset())
     .padding({ top: 8 })
+    .clip(false)
+    .cachedCount(3, true)
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+    .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
+      this.handleTaskListScroll(scrollOffset, scrollState);
+    })
+    .onWillStopDragging((velocity: number) => {
+      this.handleTaskListDragRelease(velocity);
+    })
   }
 
   @Builder
@@ -2085,7 +2246,7 @@ struct TaskListPage {
         })
       }
       .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
-      .padding({ right: LIST_INSET })
+      .padding({ right: this.sortMenuRightInset() })
       .margin({ top: this.sortMenuTop() })
       .justifyContent(FlexAlign.End)
     }

@@ -1,7 +1,11 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { window } from '@kit.ArkUI';
+import { router, window } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
+import {
+  taskCompletedPushDataFromWant,
+  taskSessionDeepLink,
+} from '../core/notifications/TaskCompletionPushModels';
 
 const DOMAIN = 0x0000;
 
@@ -10,6 +14,7 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.acceptDeepLinkWant(want);
+    AppServices.instance.taskCompletionPush.attachAbility(this);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
@@ -19,10 +24,13 @@ export default class EntryAbility extends UIAbility {
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    this.acceptDeepLinkWant(want);
+    if (this.acceptDeepLinkWant(want)) {
+      router.replaceUrl({ url: 'pages/TaskListPage' });
+    }
   }
 
   onDestroy(): void {
+    AppServices.instance.taskCompletionPush.detachAbility();
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onDestroy');
   }
 
@@ -72,7 +80,8 @@ export default class EntryAbility extends UIAbility {
   private async applySystemBarAppearance(windowStage: window.WindowStage): Promise<void> {
     try {
       const resourceManager = this.context.resourceManager;
-      // 状态栏与导航栏共用页面背景 bg_page，使系统栏与页面视觉无缝融合（沉浸式）。
+      // 状态栏保持透明，由 HdsNavigation 的沉浸材质连续绘制到屏幕顶端；
+      // 底部导航栏仍使用页面语义背景，避免手势区透出不相关内容。
       const barColor = this.colorToHex(resourceManager.getColorByNameSync('bg_page'));
       const barContentColor = this.colorToHex(
         resourceManager.getColorByNameSync('text_primary'));
@@ -81,7 +90,7 @@ export default class EntryAbility extends UIAbility {
       const lightIcon = isDarkMode;
       const mainWindow = await windowStage.getMainWindow();
       await mainWindow.setWindowSystemBarProperties({
-        statusBarColor: barColor,
+        statusBarColor: '#00000000',
         statusBarContentColor: barContentColor,
         isStatusBarLightIcon: lightIcon,
         navigationBarColor: barColor,
@@ -94,10 +103,13 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  private acceptDeepLinkWant(want: Want): void {
+  private acceptDeepLinkWant(want: Want): boolean {
     if (typeof want.uri === 'string' && want.uri.length > 0) {
-      AppServices.instance.acceptDeepLinkUri(want.uri);
+      if (AppServices.instance.acceptDeepLinkUri(want.uri)) return true;
     }
+    const pushData = taskCompletedPushDataFromWant(want);
+    if (pushData === null) return false;
+    return AppServices.instance.acceptDeepLinkUri(taskSessionDeepLink(pushData));
   }
 
   private colorToHex(color: number): string {
