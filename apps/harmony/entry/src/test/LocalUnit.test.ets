@@ -2253,18 +2253,18 @@ export default function localUnitTest() {
     });
 
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {
-      expect(isWideTaskLayout(599, 400)).assertEqual(false);
-      expect(isWideTaskLayout(600, 400)).assertEqual(true);
+      expect(isWideTaskLayout(639, 400)).assertEqual(false);
+      expect(isWideTaskLayout(640, 400)).assertEqual(true);
       expect(isWideTaskLayout(900, 1200, TASK_FOLD_STATUS_EXPANDED)).assertEqual(false);
       expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_EXPANDED)).assertEqual(true);
       expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_FOLDED)).assertEqual(false);
       expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_HALF_FOLDED)).assertEqual(false);
       expect(isWideTaskLayout(1200, 900, 0)).assertEqual(false);
-      expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(293);
-      expect(taskListPaneWidth(600, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(220);
-      expect(taskDetailKeyboardInset(599, 400, -1, 320)).assertEqual(0);
+      expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
+      expect(taskListPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
+      expect(taskDetailKeyboardInset(639, 400, -1, 320)).assertEqual(0);
       expect(taskDetailKeyboardInset(900, 600, -1, 320)).assertEqual(320);
-      expect(taskDetailKeyboardInset(600, 900, -1, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(640, 900, -1, 320)).assertEqual(0);
       expect(taskDetailKeyboardInset(900, 600, TASK_FOLD_STATUS_FOLDED, 320)).assertEqual(0);
       expect(taskDetailKeyboardInset(900, 600, -1, -1)).assertEqual(0);
 

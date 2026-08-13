@@ -1,14 +1,15 @@
 /**
  * 任务页宽屏双栏布局的纯计算。
  *
- * 600vp 对齐 Mobile 的 medium 窗口档位；只有展开态横屏才使用主从双栏，
- * 竖屏、盒盖态和半折叠态都回到单页导航。比例只约束列表宽度，分隔条和详情
- * 最小宽度固定留出触控与阅读空间。
+ * 640vp 是左右栏内容下限之和：列表栏 300vp + 分隔条 20vp + 详情栏 320vp。
+ * 只有展开态横屏才使用主从双栏，竖屏、盒盖态和半折叠态都回到单页导航。
+ * 比例只约束列表宽度，分隔条和详情最小宽度固定留出触控与阅读空间。
  */
 
-export const WIDE_TASK_LAYOUT_MIN_WIDTH = 600;
+export const WIDE_TASK_LAYOUT_MIN_WIDTH = 640;
 export const TASK_SPLIT_DIVIDER_WIDTH = 20;
-export const TASK_SPLIT_MIN_LIST_WIDTH = 220;
+/** 容纳设备下拉、四个头部操作按钮和底部导航，不允许控件彼此覆盖。 */
+export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
 export const TASK_SPLIT_MIN_DETAIL_WIDTH = 320;
 export const TASK_SPLIT_DEFAULT_RATIO = 1 / 3;
 export const TASK_SPLIT_MIN_RATIO = 0.25;
