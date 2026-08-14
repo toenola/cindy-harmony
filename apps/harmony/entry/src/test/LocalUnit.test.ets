@@ -119,6 +119,7 @@ import {
   TASK_FOLD_STATUS_FOLDED,
   TASK_FOLD_STATUS_HALF_FOLDED,
   taskDetailKeyboardInset,
+  taskDetailPaneWidth,
   taskListPaneWidth,
   taskSplitRatioForDrag,
   TASK_SPLIT_DEFAULT_RATIO,
@@ -2296,6 +2297,11 @@ export default function localUnitTest() {
       expect(isWideTaskLayout(1200, 900, 0)).assertEqual(false);
       expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
       expect(taskListPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
+      expect(taskDetailPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(580);
+      expect(taskDetailPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(320);
+      expect(taskListPaneWidth(1200, 0.4)
+        + 20
+        + taskDetailPaneWidth(1200, 0.4)).assertEqual(1200);
       expect(taskDetailKeyboardInset(639, 400, -1, 320)).assertEqual(0);
       expect(taskDetailKeyboardInset(900, 600, -1, 320)).assertEqual(320);
       expect(taskDetailKeyboardInset(640, 900, -1, 320)).assertEqual(0);

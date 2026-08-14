@@ -78,6 +78,19 @@ export function taskListPaneWidth(viewportWidth: number, ratio: number): number 
   return Math.min(maxListWidth, Math.max(minListWidth, requestedWidth));
 }
 
+/**
+ * 详情栏必须显式吃满列表栏和分隔条以外的全部宽度。
+ * HdsNavigation 嵌套在 Row 的 layoutWeight 子节点时可能回退到内容固有宽度，
+ * 因此不能只依赖权重分配，否则大屏右侧会残留一块空白窗口背景。
+ */
+export function taskDetailPaneWidth(viewportWidth: number, ratio: number): number {
+  if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 0;
+  return Math.max(
+    0,
+    viewportWidth - taskListPaneWidth(viewportWidth, ratio) - TASK_SPLIT_DIVIDER_WIDTH,
+  );
+}
+
 export function taskSplitRatioForDrag(
   viewportWidth: number,
   startRatio: number,

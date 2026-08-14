@@ -286,6 +286,13 @@ class PiTreeRow {
 }
 
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
+/** 与任务列表悬浮控件同高；收起态是会话详情右下角的玻璃入口。 */
+const COMPOSER_PREVIEW_BAR_HEIGHT = 52;
+const COMPOSER_PREVIEW_CONTENT_HEIGHT = 40;
+const COMPOSER_PREVIEW_LIST_INSET = 72;
+/** 单铅笔与“铅笔 + 停止”两种收起态分别固定浮栏宽度，避免运行中按钮溢出系统玻璃背板。 */
+const COMPOSER_PREVIEW_IDLE_BAR_WIDTH = 56;
+const COMPOSER_PREVIEW_RUNNING_BAR_WIDTH = 96;
 
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
@@ -332,7 +339,7 @@ export struct TaskPageContent {
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
   @Prop paneMessageClientId: string = '';
-  /** 分栏父页面传入，与左侧 HdsTabs 浮栏共享同一安全底边。 */
+  /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
   @State items: RenderItem[] = [];
   @State input: string = '';
@@ -377,6 +384,9 @@ export struct TaskPageContent {
   @State hasNewMessages: boolean = false;
   /** Composer 焦点态切换为多行卡片几何。 */
   @State composerFocused: boolean = false;
+  /** 焦点离开后延后一帧收起，保证工具栏点击不会先卸载真实 Composer。 */
+  @State composerSurfaceVisible: boolean = false;
+  private composerBlurGeneration: number = 0;
   /** 会话内本地搜索；Header 搜索按钮展开紧凑搜索栏。 */
   @State searchOpen: boolean = false;
   @State searchQuery: string = '';
@@ -610,6 +620,9 @@ export struct TaskPageContent {
     this.pendingAgentSwitchIntent = null;
     this.composerDocument = emptyComposerDocument();
     this.input = '';
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
+    this.composerBlurGeneration += 1;
     this.imageSources = new Map();
     this.imageStates = new Map();
     this.imageResolutions.clear();
@@ -1690,6 +1703,7 @@ export struct TaskPageContent {
     this.imageQueue.removeSent(sentImages);
     this.fileQueue.removeSent(sentFiles);
     this.error = '';
+    this.collapseComposerAfterSend();
     if (deferForCreation) {
       AppServices.instance.inputQueue.deferDocument(
         this.deviceId, s, serialized, readyImages, readyFiles);
@@ -1763,6 +1777,7 @@ export struct TaskPageContent {
         composerDocumentFromPersistedContent(item.persistedContent) ?? textComposerDocument(item.text),
         false,
       );
+      this.expandComposerForEditing(true);
       this.selectedQueueClientId = '';
       void AppServices.instance.inputQueue.setEditLock(
         this.deviceId, this.sessionId, clientId, true).catch(() => {
@@ -3010,6 +3025,70 @@ export struct TaskPageContent {
       || this.composerImages.length > 0 || this.composerFiles.length > 0;
   }
 
+  /**
+   * 真实 Composer 只在需要编辑或维护附件/atom 时出现；收起态仅保留右下角入口。
+   */
+  private composerUsesExpandedSurface(): boolean {
+    return this.composerSurfaceVisible
+      || this.composerImages.length > 0
+      || this.composerFiles.length > 0
+      || composerAtomPresentations(this.composerDocument).length > 0
+      || this.composerPaletteMode.length > 0;
+  }
+
+  private shouldShowComposerPreview(): boolean {
+    return !this.deviceDisabled
+      && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions)
+      && !this.composerUsesExpandedSurface();
+  }
+
+  private composerPreviewBarWidth(): number {
+    return this.sending || this.sessionStreaming
+      ? COMPOSER_PREVIEW_RUNNING_BAR_WIDTH
+      : COMPOSER_PREVIEW_IDLE_BAR_WIDTH;
+  }
+
+  private openComposerFromPreview(): void {
+    if (!this.shouldShowComposerPreview()) return;
+    this.expandComposerForEditing(true);
+  }
+
+  /** 由消息操作、队列编辑等入口带入草稿时，也必须落到真实可编辑的 Composer。 */
+  private expandComposerForEditing(requestFocus: boolean): void {
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = requestFocus;
+    if (requestFocus) {
+      // Composer 在同一帧才会挂载；下一轮向真实 TextArea 请求焦点，避免丢失首次点击。
+      setTimeout(() => focusControl.requestFocus('task-composer-input'), 0);
+    }
+  }
+
+  /** 正常发送后立即释放 TextArea 焦点并回到右下角的收起态入口。 */
+  private collapseComposerAfterSend(): void {
+    this.getUIContext().getFocusController().clearFocus();
+    this.composerBlurGeneration += 1;
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
+  }
+
+  private handleComposerFocusChange(focused: boolean): void {
+    this.composerFocused = focused;
+    if (focused) {
+      this.composerBlurGeneration += 1;
+      this.composerSurfaceVisible = true;
+      return;
+    }
+    const generation = ++this.composerBlurGeneration;
+    setTimeout(() => {
+      if (generation !== this.composerBlurGeneration || this.composerFocused) return;
+      if (this.composerImages.length > 0 || this.composerFiles.length > 0
+        || composerAtomPresentations(this.composerDocument).length > 0
+        || this.composerPaletteMode.length > 0) return;
+      this.composerSurfaceVisible = false;
+    }, 0);
+  }
+
   private canSend(): boolean {
     if (this.sending || this.deviceDisabled) return false;
     if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) return false;
@@ -3190,10 +3269,11 @@ export struct TaskPageContent {
     setTimeout(() => focusControl.requestFocus('task-composer-input'), 0);
   }
 
-  build() {
+  @Builder
+  taskPageBody() {
     Stack({ alignContent: Alignment.Bottom }) {
-      HdsNavigation() {
-        Column() {
+          HdsNavigation() {
+            Column() {
       if (this.searchOpen) {
         this.sessionSearchBar()
       }
@@ -3239,10 +3319,12 @@ export struct TaskPageContent {
           .border({ width: { top: 1 }, color: { top: $r('app.color.chat_header_divider') } })
       } else if (!pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
         // 只有 Mobile 本端可终结的 pending 接管 Composer；桌面专属/未知卡仅作提示。
-        if (this.composerPaletteMode.length > 0) {
-          this.composerPalettePanel()
+        if (this.composerUsesExpandedSurface()) {
+          if (this.composerPaletteMode.length > 0) {
+            this.composerPalettePanel()
+          }
+          this.composerBar()
         }
-        this.composerBar()
       }
 
       // 全屏图片预览层
@@ -3284,14 +3366,22 @@ export struct TaskPageContent {
       if (this.sessionTreeOpen) {
         this.sessionTreeLayer()
       }
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.bg_page'))
-      }
-      .titleBar({
+            }
+            .width('100%')
+            .height('100%')
+            .backgroundColor($r('app.color.bg_page'))
+          }
+          .titleBar({
         enableComponentSafeArea: true,
-        style: {
+        style: this.isEmbedded() ? {
+          scrollEffectOpts: { enableScrollEffect: false },
+          originalStyle: {
+            backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
+          },
+          scrollEffectStyle: {
+            backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
+          },
+        } : {
           scrollEffectOpts: {
             enableScrollEffect: true,
             scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
@@ -3309,34 +3399,49 @@ export struct TaskPageContent {
           title: { mainTitle: '' },
           stackBuilder: (): void => this.taskHeader(),
         },
-      })
-      .hideBackButton(true)
-      .hideToolBar(true)
-      .titleMode(HdsNavigationTitleMode.MINI)
-      .bindToScrollable([this.listScroller])
-      .width('100%')
-      .height('100%')
-      .backgroundColor($r('app.color.bg_page'))
+          })
+          .hideBackButton(true)
+          .hideToolBar(true)
+      // 嵌入任务列表的详情栏本身就是最终内容，不能让 NavigationMode.Auto 在宽栏内
+      // 再创建一层 navBar/content 分栏，否则 content 侧会显示成大块空白占位区。
+          .mode(NavigationMode.Stack)
+          .titleMode(HdsNavigationTitleMode.MINI)
+          .bindToScrollable([this.listScroller])
+          .width('100%')
+          .height('100%')
+          .backgroundColor(this.isEmbedded() ? Color.Transparent : $r('app.color.bg_page'))
 
-      if (this.detailComposerSheetOpen) {
-        this.detailComposerSheetLayer()
-      }
+          if (this.detailComposerSheetOpen) {
+            this.detailComposerSheetLayer()
+          }
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.isEmbedded() ? Color.Transparent : $r('app.color.bg_page'))
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
+        .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
+          detents: this.contextSheetPage === 'model'
+            || this.contextSheetPage === 'model-options'
+            || this.contextSheetPage === 'agent'
+            ? [SheetSize.MEDIUM] : [SheetSize.MEDIUM, SheetSize.LARGE],
+          dragBar: true,
+          showClose: false,
+          preferType: SheetType.BOTTOM,
+          backgroundColor: $r('app.color.bg_card'),
+          maskColor: $r('app.color.overlay'),
+        })
+    .width('100%')
+    .height('100%')
+    .backgroundColor(this.isEmbedded() ? Color.Transparent : $r('app.color.bg_page'))
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.BottomEnd }) {
+      this.taskPageBody()
+      this.composerPreviewFloatingEntry()
     }
     .width('100%')
     .height('100%')
-    .backgroundColor($r('app.color.bg_page'))
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
-    .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
-      detents: this.contextSheetPage === 'model'
-        || this.contextSheetPage === 'model-options'
-        || this.contextSheetPage === 'agent'
-        ? [SheetSize.MEDIUM] : [SheetSize.MEDIUM, SheetSize.LARGE],
-      dragBar: true,
-      showClose: false,
-      preferType: SheetType.BOTTOM,
-      backgroundColor: $r('app.color.bg_card'),
-      maskColor: $r('app.color.overlay'),
-    })
   }
 
   private contextUsageLabel(): string {
@@ -4185,7 +4290,14 @@ export struct TaskPageContent {
         }
         .width('100%')
         .height('100%')
-        .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+        // 收起态悬浮入口会叠在内容上，尾部必须预留同一块阅读空间；
+        // 展开真实 Composer 时它重新参与 Column 布局，不再额外叠加留白。
+        .padding({
+          left: 16,
+          right: 16,
+          top: 8,
+          bottom: this.shouldShowComposerPreview() ? COMPOSER_PREVIEW_LIST_INSET : 16,
+        })
         .clip(false)
         .cachedCount(3, true)
         .onScrollIndex((start: number, end: number, _center: number) => {
@@ -4228,7 +4340,10 @@ export struct TaskPageContent {
         .borderRadius(UI_RADIUS_PILL)
         .backgroundColor($r('app.color.chat_fab_surface'))
         .border({ width: 1, color: $r('app.color.chat_fab_border') })
-        .margin({ right: 23, bottom: 12 })
+        .margin({
+          right: 23,
+          bottom: this.shouldShowComposerPreview() ? COMPOSER_PREVIEW_LIST_INSET : 12,
+        })
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .transition(uiRevealTransition())
         .onClick(() => this.jumpToLatest())
@@ -4311,6 +4426,50 @@ export struct TaskPageContent {
   }
 
   @Builder
+  composerPreviewFloatingEntry() {
+    if (this.shouldShowComposerPreview()) {
+      Row({ space: 10 }) {
+        SymbolGlyph($r('sys.symbol.square_and_pencil'))
+          .fontSize(18)
+          .fontColor([$r('app.color.text_secondary')])
+        if (this.sending || this.sessionStreaming) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.square'))
+              .fontSize(11)
+              .fontColor([$r('app.color.chat_cta_text')])
+          }
+          .type(ButtonType.Circle)
+          .width(32)
+          .height(32)
+          .padding(0)
+          .backgroundColor($r('app.color.chat_cta'))
+          .clickEffect(UI_ICON_CLICK_EFFECT)
+          .accessibilityText('停止')
+          .onClick(() => this.abort())
+        }
+      }
+      .width('100%')
+      .height(COMPOSER_PREVIEW_CONTENT_HEIGHT)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      // 单图标不再借用居中的 TabBar：它是会话详情右下角的独立悬浮入口。
+      .backgroundColor($r('app.color.chat_fab_surface'))
+      .backgroundBlurStyle(BlurStyle.COMPONENT_REGULAR, {}, {
+        disableSystemAdaptation: false,
+      })
+      .border({ width: 1, color: $r('app.color.chat_fab_border') })
+      .borderRadius(UI_RADIUS_PILL)
+      .clip(true)
+      .clickEffect(UI_LIST_CLICK_EFFECT)
+      .accessibilityText('继续输入')
+      .onClick(() => this.openComposerFromPreview())
+      .width(this.composerPreviewBarWidth())
+      .height(COMPOSER_PREVIEW_BAR_HEIGHT)
+      .margin({ right: 16, bottom: 16 })
+    }
+  }
+
+  @Builder
   composerBar() {
     ConversationComposer({
       input: this.input,
@@ -4345,7 +4504,7 @@ export struct TaskPageContent {
         this.applyComposerTextChange(value);
       },
       onFocusChange: (focused: boolean): void => {
-        this.composerFocused = focused;
+        this.handleComposerFocusChange(focused);
       },
       onAdd: (): void => this.openContextSheet(),
       onPermission: (): void => this.openComposerControlSheet('permission'),
@@ -7954,6 +8113,7 @@ export struct TaskPageContent {
     if (body.length === 0) return;
     const next = this.input.trim().length === 0 ? body : `${this.input}\n\n${body}`;
     this.setComposerDocument(reconcileComposerProjectedText(this.composerDocument, next));
+    this.expandComposerForEditing(true);
     promptAction.showToast({ message: '已添加到输入框' });
   }
 
@@ -8944,6 +9104,7 @@ export struct TaskPageContent {
       AppServices.instance.tasks.upsertSession(this.deviceId, session);
       await AppServices.instance.messages.reloadSession(this.deviceId, this.sessionId);
       this.setComposerDocument(textComposerDocument(draftText));
+      this.expandComposerForEditing(true);
       promptAction.showToast({ message: '已回退，可编辑原消息后重新发送' });
     } catch (e) {
       promptAction.showToast({ message: '回退失败' });

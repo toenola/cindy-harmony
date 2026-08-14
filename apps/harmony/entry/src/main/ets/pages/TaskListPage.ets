@@ -45,6 +45,7 @@ import {
   isWideTaskLayout,
   TASK_SPLIT_DEFAULT_RATIO,
   taskDetailKeyboardInset,
+  taskDetailPaneWidth,
   taskListPaneWidth,
   taskSplitRatioForDrag,
 } from './TaskSplitLayout';
@@ -78,10 +79,13 @@ import {
 } from '../components/UiKit';
 
 const LIST_INSET = 16;
-const FLOATING_BAR_BOTTOM_MARGIN = 16;
-const FLOATING_BAR_CONTENT_INSET = 104;
+const FLOATING_BAR_BOTTOM_MARGIN = 0;
+const FLOATING_BAR_HEIGHT = 52;
+const FLOATING_BAR_CONTENT_INSET = 72;
 const FLOATING_BAR_SHOW_OFFSET = 0.5;
 const FLOATING_BAR_HIDE_VELOCITY = 600;
+/** 两侧 HdsNavigation 的 MINI 标题栏共用 56vp 内容高；分割线从其下方开始。 */
+const SPLIT_HEADER_HEIGHT = 56;
 /** 项目组内联展示的任务数上限，超出后由「查看全部」展开。 */
 const PROJECT_INLINE_LIMIT = 5;
 
@@ -132,9 +136,7 @@ struct TaskListPage {
   @State viewportHeight: number = 0;
   @State foldStatus: number = -1;
   @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
-  @State dividerActive: boolean = false;
   @State keyboardHeight: number = 0;
-  @State bottomSystemInset: number = 0;
 
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
@@ -158,12 +160,6 @@ struct TaskListPage {
     }
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
-  private systemInsetWindow: window.Window | null = null;
-  private systemInsetListening: boolean = false;
-  private systemInsetListener: (options: window.AvoidAreaOptions) => void =
-    (_options: window.AvoidAreaOptions): void => {
-      this.refreshBottomSystemInset();
-    };
   private listTabController: HdsTabsController = new HdsTabsController();
   private projectsScroller: Scroller = new Scroller();
   private dialoguesScroller: Scroller = new Scroller();
@@ -203,7 +199,6 @@ struct TaskListPage {
     // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
     this.updateKeyboardAvoidance();
     void this.observeKeyboardHeight();
-    void this.observeBottomSystemInset();
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
@@ -253,9 +248,7 @@ struct TaskListPage {
     this.taskListReconcileBackoff.clear();
     this.stopFoldStatusObservation();
     this.stopKeyboardHeightObservation();
-    this.stopBottomSystemInsetObservation();
     this.keyboardHeight = 0;
-    this.bottomSystemInset = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     this.listTabsAppeared = false;
     this.floatingBarHidden = false;
@@ -493,66 +486,17 @@ struct TaskListPage {
     this.keyboardHeightListening = false;
   }
 
-  private async observeBottomSystemInset(): Promise<void> {
-    if (this.systemInsetListening) return;
-    const hostContext = this.getUIContext().getHostContext();
-    if (hostContext === undefined) return;
-    try {
-      const hostWindow = await window.getLastWindow(hostContext);
-      if (!this.pageActive || this.systemInsetListening) return;
-      this.systemInsetWindow = hostWindow;
-      hostWindow.on('avoidAreaChange', this.systemInsetListener);
-      this.systemInsetListening = true;
-      this.refreshBottomSystemInset();
-    } catch (_err) {
-      // 避让区查询不可用时保留 HdsTabs 的官方基础边距。
-      this.bottomSystemInset = 0;
-    }
-  }
-
-  private refreshBottomSystemInset(): void {
-    if (this.systemInsetWindow === null) return;
-    try {
-      const systemArea = this.systemInsetWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-      const gestureArea = this.systemInsetWindow.getWindowAvoidArea(
-        window.AvoidAreaType.TYPE_SYSTEM_GESTURE,
-      );
-      const indicatorArea = this.systemInsetWindow.getWindowAvoidArea(
-        window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR,
-      );
-      const bottomHeightPx = Math.max(
-        systemArea.visible ? systemArea.bottomRect.height : 0,
-        gestureArea.visible ? gestureArea.bottomRect.height : 0,
-        indicatorArea.visible ? indicatorArea.bottomRect.height : 0,
-      );
-      this.bottomSystemInset = Math.max(0, this.getUIContext().px2vp(bottomHeightPx));
-    } catch (_err) {
-      this.bottomSystemInset = 0;
-    }
-  }
-
-  private stopBottomSystemInsetObservation(): void {
-    if (!this.systemInsetListening || this.systemInsetWindow === null) return;
-    try {
-      this.systemInsetWindow.off('avoidAreaChange', this.systemInsetListener);
-    } catch (_err) {
-      // 页面退出时窗口可能已经销毁，本地监听状态仍需清理。
-    }
-    this.systemInsetWindow = null;
-    this.systemInsetListening = false;
-  }
-
   private floatingBarBottomMargin(): number {
-    return FLOATING_BAR_BOTTOM_MARGIN + this.bottomSystemInset;
+    // HdsTabs 已按系统安全区定位，业务层只保留视觉间距，不能重复叠加手势区高度。
+    return FLOATING_BAR_BOTTOM_MARGIN;
   }
 
   private floatingBarContentInset(): number {
-    return FLOATING_BAR_CONTENT_INSET + this.bottomSystemInset;
+    return FLOATING_BAR_CONTENT_INSET;
   }
 
   private detailComposerBottomInset(): number {
-    // 键盘出现后详情栏底边已经是键盘上沿，不能再叠加系统手势区高度。
-    return this.keyboardHeight > 0 ? FLOATING_BAR_BOTTOM_MARGIN : this.floatingBarBottomMargin();
+    return FLOATING_BAR_BOTTOM_MARGIN;
   }
 
   private detailKeyboardInset(): number {
@@ -566,6 +510,10 @@ struct TaskListPage {
 
   private listPaneWidth(): number {
     return taskListPaneWidth(this.viewportWidth, this.listPaneRatio);
+  }
+
+  private detailPaneWidth(): number {
+    return taskDetailPaneWidth(this.viewportWidth, this.listPaneRatio);
   }
 
   private selectedTaskKey(): string {
@@ -695,7 +643,6 @@ struct TaskListPage {
 
   private handleDividerTouch(event: TouchEvent): void {
     if (event.type === TouchType.Cancel) {
-      this.dividerActive = false;
       return;
     }
     if (event.changedTouches.length === 0) return;
@@ -703,7 +650,6 @@ struct TaskListPage {
     if (event.type === TouchType.Down) {
       this.dividerTouchStartX = point.displayX;
       this.dividerTouchStartRatio = this.listPaneRatio;
-      this.dividerActive = true;
       return;
     }
     if (event.type === TouchType.Move) {
@@ -714,9 +660,6 @@ struct TaskListPage {
         point.displayX - this.dividerTouchStartX,
       );
       return;
-    }
-    if (event.type === TouchType.Up) {
-      this.dividerActive = false;
     }
   }
 
@@ -1318,6 +1261,9 @@ struct TaskListPage {
 
   build() {
     Stack() {
+      if (this.splitLayoutEnabled()) {
+        this.splitHeaderBackground()
+      }
       Row() {
         this.taskListPane()
         if (this.splitLayoutEnabled()) {
@@ -1325,7 +1271,7 @@ struct TaskListPage {
           Column() {
             this.detailPane()
           }
-          .layoutWeight(1)
+          .width(this.detailPaneWidth())
           .height('100%')
           .padding({ bottom: this.detailKeyboardInset() })
         }
@@ -1350,7 +1296,9 @@ struct TaskListPage {
       this.splitLayoutEnabled()
         ? [SafeAreaType.SYSTEM, SafeAreaType.KEYBOARD]
         : [SafeAreaType.SYSTEM],
-      [SafeAreaEdge.BOTTOM],
+      this.splitLayoutEnabled()
+        ? [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]
+        : [SafeAreaEdge.BOTTOM],
     )
     .onAreaChange((oldArea: Area, newArea: Area) => {
       this.handleAreaChange(oldArea, newArea);
@@ -1395,14 +1343,11 @@ struct TaskListPage {
       .barPosition(BarPosition.End)
       .vertical(false)
       .scrollable(false)
+      .barHeight(FLOATING_BAR_HEIGHT)
       .barOverlap(true)
       .divider({ mode: DividerMode.NONE })
       .barFloatingStyle({
         barBottomMargin: this.floatingBarBottomMargin(),
-        gradientMask: {
-          maskColor: $r('app.color.bg_page'),
-          maskHeight: FLOATING_BAR_CONTENT_INSET,
-        },
         systemMaterialEffect: {
           materialType: hdsMaterial.MaterialType.IMMERSIVE,
           materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
@@ -1429,7 +1374,15 @@ struct TaskListPage {
     }
     .titleBar({
       enableComponentSafeArea: true,
-      style: {
+      style: this.splitLayoutEnabled() ? {
+        scrollEffectOpts: { enableScrollEffect: false },
+        originalStyle: {
+          backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
+        },
+        scrollEffectStyle: {
+          backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
+        },
+      } : {
         scrollEffectOpts: {
           enableScrollEffect: true,
           scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
@@ -1450,6 +1403,9 @@ struct TaskListPage {
     })
     .hideBackButton(true)
     .hideToolBar(true)
+    // 页面自身已经负责主从双栏；禁止 HdsNavigation 在大于 600vp 时再次进入 Auto Split，
+    // 否则它会把当前列表当成 navBar，并在右侧生成一块没有 NavDestination 的空内容区。
+    .mode(NavigationMode.Stack)
     .titleMode(HdsNavigationTitleMode.MINI)
     .bindToScrollable([
       this.projectsScroller,
@@ -1458,7 +1414,44 @@ struct TaskListPage {
     ])
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
-    .backgroundColor($r('app.color.bg_page'))
+    .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
+  }
+
+  /** 展开双栏共用一整块官方 HdsNavigation 顶部材质；两侧标题栏只负责内容。 */
+  @Builder
+  splitHeaderBackground() {
+    HdsNavigation() {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Transparent)
+    }
+    .titleBar({
+      enableComponentSafeArea: true,
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
+          blurEffectiveStartOffset: LengthMetrics.vp(0),
+          blurEffectiveEndOffset: LengthMetrics.vp(20),
+        },
+        blurStrategy: BlurStrategy.ADAPTIVE,
+        thermoCtrl: true,
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      },
+      content: { title: { mainTitle: '' } },
+    })
+    .hideBackButton(true)
+    .hideToolBar(true)
+    .mode(NavigationMode.Stack)
+    .titleMode(HdsNavigationTitleMode.MINI)
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Color.Transparent)
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -1502,8 +1495,8 @@ struct TaskListPage {
         .fontColor([$r('app.color.text_primary')])
     }
     .type(ButtonType.Circle)
-    .width(56)
-    .height(56)
+    .width(FLOATING_BAR_HEIGHT)
+    .height(FLOATING_BAR_HEIGHT)
     .padding(0)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
@@ -1513,29 +1506,16 @@ struct TaskListPage {
 
   @Builder
   splitDivider() {
-    Stack({ alignContent: Alignment.Center }) {
+    Stack({ alignContent: Alignment.Bottom }) {
       Row()
         .width(1)
-        .height('100%')
+        .height(`calc(100% - ${SPLIT_HEADER_HEIGHT}vp)`)
         .backgroundColor($r('app.color.border'))
-      Stack({ alignContent: Alignment.Center }) {
-        Row()
-          .width(3)
-          .height(20)
-          .backgroundColor(this.dividerActive
-            ? $r('app.color.accent')
-            : $r('app.color.text_tertiary'))
-          .borderRadius(UI_RADIUS_PILL)
-      }
-      .width(12)
-      .height(44)
-      .backgroundColor($r('app.color.task_list_group_surface'))
-      .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(UI_RADIUS_PILL)
     }
     .width(20)
     .height('100%')
-    .backgroundColor($r('app.color.bg_page'))
+    // 20vp 只作为拖拽命中区，视觉上不铺底、不加玻璃层，只保留中央 1px 分隔线。
+    .backgroundColor(Color.Transparent)
     .onTouch((event: TouchEvent) => {
       this.handleDividerTouch(event);
     })

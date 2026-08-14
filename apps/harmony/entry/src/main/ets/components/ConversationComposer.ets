@@ -119,6 +119,15 @@ export struct ConversationComposer {
     return this.focused || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
   }
 
+  /**
+   * 收起态入口切换过来时，页面会先挂载真实 Composer 再展示输入区。
+   * 等 TextArea 自身出现后重试焦点，确保首次点击直接得到光标与系统键盘。
+   */
+  private focusInputAfterAppear(): void {
+    if (!this.focused || !this.composerEnabled) return;
+    setTimeout(() => focusControl.requestFocus(this.inputId), 0);
+  }
+
   private tapPrimaryAction(): void {
     if (this.streaming && !this.hasContent) {
       this.onAbort();
@@ -487,6 +496,7 @@ export struct ConversationComposer {
                 minHeight: 40,
                 maxHeight: this.expanded() ? this.inputMaxHeight : 40,
               })
+              .onAppear(() => this.focusInputAfterAppear())
               .onFocus(() => this.onFocusChange(true))
               .onBlur(() => this.onFocusChange(false))
               .onChange((value: string) => this.onInputChange(value))
@@ -558,8 +568,9 @@ export struct ConversationComposer {
       .padding({
         left: 10,
         right: 10,
-        top: this.expanded() ? 8 : (this.floatingGlass ? 12 : 4),
-        bottom: this.expanded() ? 8 : (this.floatingGlass ? 12 : 4),
+        // 浮动收起态与左侧 HdsTabs/miniBar 共用 52vp：40vp 内容 + 6vp × 2。
+        top: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
+        bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
       })
       .backgroundColor(this.floatingGlass
         ? Color.Transparent : $r('app.color.composer_surface'))
@@ -576,7 +587,7 @@ export struct ConversationComposer {
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')
-    .constraintSize({ maxWidth: 760 })
+    .constraintSize({ maxWidth: this.floatingGlass ? 720 : 760 })
     .alignSelf(ItemAlign.Center)
     .padding({
       left: 12,
