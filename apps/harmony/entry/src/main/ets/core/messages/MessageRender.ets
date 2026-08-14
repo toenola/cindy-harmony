@@ -33,6 +33,35 @@ import {
 import { isAutoResumeRowInFlight } from './AutoResumePresentation';
 import { findErrorTailClientId } from './SessionTailPresentation';
 
+const MAX_MARKDOWN_PARSE_CACHE_ENTRIES = 2048;
+
+class MarkdownParseCacheEntry {
+  text: string = '';
+  blocks: MdBlock[] = [];
+}
+
+/**
+ * 尾部增长会让渲染投影重扫当前历史窗。稳定消息按身份复用解析结果，流式消息
+ * 原位替换同一身份的缓存，避免 token 数 × 历史长度的重复 Markdown 解析。
+ */
+const markdownParseCache: Map<string, MarkdownParseCacheEntry> = new Map();
+
+function parseMessageMarkdown(identity: string, text: string): MdBlock[] {
+  if (identity.length === 0) return parseMarkdown(text);
+  const cached = markdownParseCache.get(identity);
+  if (cached !== undefined && cached.text === text) return cached.blocks;
+  const entry = new MarkdownParseCacheEntry();
+  entry.text = text;
+  entry.blocks = parseMarkdown(text);
+  if (!markdownParseCache.has(identity)
+    && markdownParseCache.size >= MAX_MARKDOWN_PARSE_CACHE_ENTRIES) {
+    const oldest = markdownParseCache.keys().next();
+    if (!oldest.done) markdownParseCache.delete(oldest.value);
+  }
+  markdownParseCache.set(identity, entry);
+  return entry.blocks;
+}
+
 // ─── 渲染项类型 ──────────────────────────────────────────────────────────────
 
 export class RenderItem {
@@ -1301,7 +1330,12 @@ export function shouldAutoCollapseUserMessage(
  * - 无粘贴标记但超长（14/4 视觉行）：整段折叠块；
  * - 否则：整段正常渲染。
  */
-function buildSegments(text: string, ranges: RenderPasteRange[], isAutomation: boolean): RenderTextSegment[] {
+function buildSegments(
+  text: string,
+  ranges: RenderPasteRange[],
+  isAutomation: boolean,
+  messageIdentity: string,
+): RenderTextSegment[] {
   const out: RenderTextSegment[] = [];
   let seq = 0;
   const push = (segText: string, isPasted: boolean, display: string): void => {
@@ -1311,7 +1345,9 @@ function buildSegments(text: string, ranges: RenderPasteRange[], isAutomation: b
     seg.text = segText;
     seg.isPasted = isPasted;
     seg.display = display;
-    seg.mdBlocks = parseMarkdown(segText);
+    seg.mdBlocks = messageIdentity.length > 0
+      ? parseMessageMarkdown(`${messageIdentity}:segment:${seq - 1}`, segText)
+      : parseMarkdown(segText);
     out.push(seg);
   };
   if (ranges.length > 0) {
@@ -1601,7 +1637,10 @@ function buildLinearRenderItems(
       item.durationMs = presentation.durationMs;
       item.redacted = presentation.redacted;
       item.createdAt = presentation.startedAt;
-      item.mdBlocks = parseMarkdown(item.body);
+      const thinkingIdentity = m.id.length > 0 ? m.id : m.clientId;
+      item.mdBlocks = thinkingIdentity.length > 0
+        ? parseMessageMarkdown(`${m.sessionId}:${thinkingIdentity}:thinking`, item.body)
+        : parseMarkdown(item.body);
       items.push(item);
       continue;
     }
@@ -1650,7 +1689,10 @@ function buildLinearRenderItems(
         item.kind = 'system';
         item.label = m.originLabel.length > 0 ? m.originLabel : 'Cindy';
         item.body = m.originBody;
-        item.mdBlocks = parseMarkdown(item.body);
+        const agentIdentity = m.id.length > 0 ? m.id : m.clientId;
+        item.mdBlocks = agentIdentity.length > 0
+          ? parseMessageMarkdown(`${m.sessionId}:${agentIdentity}:presented-agent`, item.body)
+          : parseMarkdown(item.body);
         item.message = m;
         items.push(item);
         continue;
@@ -1658,9 +1700,12 @@ function buildLinearRenderItems(
       item.kind = 'user';
       item.label = '你';
       const parsed = parseUserContent(m.content);
+      const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
+      const identity = rawIdentity.length > 0 ? `${m.sessionId}:${rawIdentity}` : '';
       item.body = parsed.text;
-      item.segments = buildSegments(parsed.text, parsed.ranges, m.automationOrigin);
-      item.mdBlocks = item.segments.length > 0 ? item.segments[0].mdBlocks : parseMarkdown(item.body);
+      item.segments = buildSegments(parsed.text, parsed.ranges, m.automationOrigin, identity);
+      item.mdBlocks = item.segments.length > 0
+        ? item.segments[0].mdBlocks : parseMessageMarkdown(identity, item.body);
       item.images = parsed.images;
       item.files = parsed.files;
       item.message = m;
@@ -1676,11 +1721,12 @@ function buildLinearRenderItems(
     item.body = contentPreview(m.content);
     // 空的 assistant 是协议占位，不应在真实答复下方制造一条空消息。
     if (item.kind === 'assistant' && item.body.trim().length === 0) continue;
-    item.mdBlocks = parseMarkdown(item.body);
+    const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
+    const identity = rawIdentity.length > 0 ? `${m.sessionId}:${rawIdentity}` : '';
+    item.mdBlocks = parseMessageMarkdown(identity, item.body);
     item.message = m;
     if (item.kind === 'assistant') {
-      const identity = m.id.length > 0 ? m.id : m.clientId;
-      item.isTurnFinalAssistant = identity.length > 0 && finalAssistantIds.has(identity);
+      item.isTurnFinalAssistant = rawIdentity.length > 0 && finalAssistantIds.has(rawIdentity);
     }
     if (item.kind === 'error' && errorTailClientId.length > 0
       && (m.clientId === errorTailClientId || m.id === errorTailClientId)) item.hidden = true;

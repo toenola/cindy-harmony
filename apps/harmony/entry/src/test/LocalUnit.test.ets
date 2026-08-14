@@ -73,6 +73,7 @@ import {
   buildAgentUserContent,
   buildPersistedUserContent,
   MessageStore,
+  TEXT_DELTA_BATCH_INTERVAL_MS,
   preferIncomingCreatedMessage,
   reconcileDeferredAuthoritativeEmptyMessages,
   shouldDeferAuthoritativeEmptyWindow,
@@ -1183,6 +1184,39 @@ export default function localUnitTest() {
 
       const legacy = projectToolUseActions('Bash', JSON.stringify(JSON.stringify(input)), '');
       expect(legacy[0].label).assertEqual('读取鸿蒙消息实现');
+    });
+
+    it('batchesRapidTextNotificationsAndFlushesBeforeToolBoundaries', 0, () => {
+      const store = new MessageStore();
+      let notifications = 0;
+      const unsubscribe = store.onChanged(() => {
+        notifications += 1;
+      });
+      const firstData: Record<string, Object> = {};
+      firstData['text'] = '前';
+      const firstEvent: Record<string, Object> = {};
+      firstEvent['type'] = 'text';
+      firstEvent['data'] = firstData;
+      store.handleMakerEvent('batched-text', firstEvent, 'answer-1');
+      const secondData: Record<string, Object> = {};
+      secondData['text'] = '进';
+      const secondEvent: Record<string, Object> = {};
+      secondEvent['type'] = 'text';
+      secondEvent['data'] = secondData;
+      store.handleMakerEvent('batched-text', secondEvent, 'answer-1');
+      expect(notifications).assertEqual(0);
+      expect(store.getStreaming('batched-text')?.text ?? '').assertEqual('前进');
+
+      const toolData: Record<string, Object> = {};
+      toolData['toolUseId'] = 'batch-tool';
+      toolData['toolName'] = 'Read';
+      const toolEvent: Record<string, Object> = {};
+      toolEvent['type'] = 'tool_use';
+      toolEvent['data'] = toolData;
+      store.handleMakerEvent('batched-text', toolEvent, 'tool-1');
+      expect(notifications).assertEqual(1);
+      expect(TEXT_DELTA_BATCH_INTERVAL_MS).assertEqual(32);
+      unsubscribe();
     });
 
     it('closesEarlierWorkImmediatelyWhenSameMillisecondProgressPushArrives', 0, () => {

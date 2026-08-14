@@ -455,6 +455,9 @@ export struct TaskPageContent {
   private composerInputRevision: number = 0;
   /** 正式消息回流对账会同步触发 queue notify；避免同一栈内递归刷新受控输入框。 */
   private reconcilingDeliveredClientIds: boolean = false;
+  /** 同一事件栈内消息/队列可能连续 notify；页面只在下一轮任务重建一次消息投影。 */
+  private itemsRefreshScheduled: boolean = false;
+  private itemsRefreshGeneration: number = 0;
   /** Composer 加号的原生上下文 Sheet。 */
   @State contextSheetOpen: boolean = false;
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
@@ -612,14 +615,14 @@ export struct TaskPageContent {
     this.imageResolutions.clear();
 
     this.unsubs.push(AppServices.instance.messages.onChanged(() => {
-      this.refreshItems();
+      this.scheduleItemsRefresh();
     }));
     this.refreshItems();
 
     // 输入队列由应用级 Store 持有；页面仅镜像展示并触发操作。
     this.unsubs.push(AppServices.instance.inputQueue.onChanged(() => {
       this.refreshQueueState();
-      if (!this.reconcilingDeliveredClientIds) this.refreshItems();
+      if (!this.reconcilingDeliveredClientIds) this.scheduleItemsRefresh();
     }));
     this.refreshQueueState();
 
@@ -658,6 +661,8 @@ export struct TaskPageContent {
   }
 
   aboutToDisappear(): void {
+    this.itemsRefreshGeneration += 1;
+    this.itemsRefreshScheduled = false;
     this.initialScrollGeneration += 1;
     this.followScrollGeneration += 1;
     this.followScrollScheduled = false;
@@ -2020,6 +2025,17 @@ export struct TaskPageContent {
     this.beginInitialLoad();
   }
 
+  private scheduleItemsRefresh(): void {
+    if (this.itemsRefreshScheduled) return;
+    this.itemsRefreshScheduled = true;
+    const generation = this.itemsRefreshGeneration;
+    setTimeout(() => {
+      if (generation !== this.itemsRefreshGeneration) return;
+      this.itemsRefreshScheduled = false;
+      this.refreshItems();
+    }, 0);
+  }
+
   /** 历史 + 流式统一进入同一个渲染模型，并把会话是否正在流式传入聚合层。 */
   private refreshItems(): void {
     this.syncMessageCount();
@@ -2055,7 +2071,7 @@ export struct TaskPageContent {
     this.sessionStreaming = streaming;
     if (streaming) this.tailInterruptAcked = true;
     this.syncWorkClock(streaming);
-    this.tableColumnWidthCache.clear();
+    // 仅宽度变化才会让表格列宽缓存失效；消息增量不能把整窗表格重算一遍。
     this.reconcileCollapsedTodoCards(this.items, nextItems);
     this.items = nextItems;
     this.backfillIncompleteTaskPlan(messages);
@@ -2224,6 +2240,8 @@ export struct TaskPageContent {
 
   /** 贴底态的流式补滚；不在用户回看历史或 prepend 期间抢阅读位置。 */
   private followLatestSoon(): void {
+    // 手势期间不排队自动滚动；尾部仍会更新，松手后由用户位置决定是否继续跟随。
+    if (this.listTouchActive) return;
     if (this.followScrollScheduled) {
       this.followScrollTrailingRequested = true;
       return;
@@ -2243,6 +2261,7 @@ export struct TaskPageContent {
       if (sessionGeneration !== this.initialScrollGeneration
         || followGeneration !== this.followScrollGeneration
         || !this.followingLatest
+        || this.listTouchActive
         || this.loadingOlder
         || (this.items.length === 0 && this.queueBubbles.length === 0)) return;
       this.listScroller.scrollToIndex(this.bottomSentinelListIndex(), false, ScrollAlign.END);
@@ -2409,6 +2428,10 @@ export struct TaskPageContent {
     if (event.type === TouchType.Down) {
       this.listTouchStartY = point.displayY;
       this.listTouchActive = true;
+      // 使 24/80/180ms 的旧贴底任务立即失效，避免拖动时继续争抢列表几何。
+      this.followScrollGeneration += 1;
+      this.followScrollScheduled = false;
+      this.followScrollTrailingRequested = false;
       this.historyAnchorRestoreGeneration += 1;
       this.listTouchPulledDown = false;
       this.listTouchPushedUp = false;

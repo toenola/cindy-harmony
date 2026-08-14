@@ -71,6 +71,8 @@ const TAG = 'CindyMsg';
 // 会按 80 → 40 → 20 → 10 → 5 → 1 自动降档。
 const HISTORY_PAGE_LIMIT = 80;
 const RECONNECT_MESSAGE_WINDOW_LIMIT = 80;
+/** 对齐 Mobile：连续正文增量按两帧左右合并，避免每个 token 都重建整棵消息树。 */
+export const TEXT_DELTA_BATCH_INTERVAL_MS = 32;
 /** 进程内保留更多已上翻历史；超限时按最近访问淘汰整个非活动会话。 */
 const MAX_MEMORY_CACHED_MESSAGE_ROWS = 1600;
 
@@ -220,6 +222,9 @@ export class MessageStore {
   private pendingStreamingProjectionKeysBySession: Map<string, Set<string>> = new Map();
   /** 消息 push 代次；旧的空历史响应不能覆盖请求期间刚到的权威增量。 */
   private authoritativeMessageRevisions: Map<string, number> = new Map();
+  /** 正文内容立即累积，但 UI 通知按 Mobile 的 32ms 窗口合并。 */
+  private pendingTextDeltaNotificationSessions: Set<string> = new Set();
+  private textDeltaNotificationTimer: number = -1;
 
   async initCache(context: common.Context): Promise<void> {
     await this.sessionMessageCache.init(context);
@@ -280,6 +285,7 @@ export class MessageStore {
     this.deferredAuthoritativeEmptySessions.clear();
     this.pendingStreamingProjectionKeysBySession.clear();
     this.authoritativeMessageRevisions.clear();
+    this.clearTextDeltaNotifications();
     await this.sessionMessageCache.clear();
     if (hadRunningSession) this.notifyRunningStateChanged();
     this.notify();
@@ -322,6 +328,36 @@ export class MessageStore {
 
   private notifyRunningStateChanged(): void {
     for (const listener of this.runningStateListeners) listener();
+  }
+
+  private scheduleTextDeltaNotification(sessionId: string): void {
+    this.pendingTextDeltaNotificationSessions.add(sessionId);
+    if (this.textDeltaNotificationTimer >= 0) return;
+    this.textDeltaNotificationTimer = setTimeout(() => {
+      this.textDeltaNotificationTimer = -1;
+      if (this.pendingTextDeltaNotificationSessions.size === 0) return;
+      this.pendingTextDeltaNotificationSessions.clear();
+      this.notify();
+    }, TEXT_DELTA_BATCH_INTERVAL_MS);
+  }
+
+  /** 结构/终态边界会自行 notify，只需吞掉尚未发出的正文通知，保证同帧只刷新一次。 */
+  private consumePendingTextDeltaNotification(sessionId: string): boolean {
+    const consumed = this.pendingTextDeltaNotificationSessions.delete(sessionId);
+    if (this.pendingTextDeltaNotificationSessions.size === 0
+      && this.textDeltaNotificationTimer >= 0) {
+      clearTimeout(this.textDeltaNotificationTimer);
+      this.textDeltaNotificationTimer = -1;
+    }
+    return consumed;
+  }
+
+  private clearTextDeltaNotifications(): void {
+    this.pendingTextDeltaNotificationSessions.clear();
+    if (this.textDeltaNotificationTimer >= 0) {
+      clearTimeout(this.textDeltaNotificationTimer);
+      this.textDeltaNotificationTimer = -1;
+    }
   }
 
   private touchSessionCache(sessionId: string): void {
@@ -416,6 +452,7 @@ export class MessageStore {
   }
 
   private evictMemorySession(sessionId: string): void {
+    this.consumePendingTextDeltaNotification(sessionId);
     this.messagesBySession.delete(sessionId);
     this.hasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
@@ -690,6 +727,7 @@ export class MessageStore {
    * 真正内存回收由 LRU 负责；落盘只保留稳定消息的最近一页。
    */
   async closeSession(sessionId: string): Promise<void> {
+    this.consumePendingTextDeltaNotification(sessionId);
     const deviceId = this.subscribed.get(sessionId);
     this.nextSessionLease(sessionId);
     this.subscribed.delete(sessionId);
@@ -960,6 +998,7 @@ export class MessageStore {
         sessionId, data, source, this.taskUpdatesBySession.get(sessionId));
       const next = applyAgentTaskUpdateEvent(previous, data, source, new Date().toISOString());
       if (next !== null) {
+        this.consumePendingTextDeltaNotification(sessionId);
         this.taskUpdatesBySession.set(sessionId, next);
         this.notify();
       }
@@ -968,6 +1007,7 @@ export class MessageStore {
 
     if (type === 'compact_boundary') {
       // 压缩边界结束旧投影，但通常仍属于同一产品 turn；后续事件会重新建立新投影。
+      this.consumePendingTextDeltaNotification(sessionId);
       this.markSessionRunning(sessionId, true);
       this.appendCompactBoundary(sessionId, data);
       return;
@@ -978,9 +1018,15 @@ export class MessageStore {
       if (delta.length === 0) {
         return;
       }
+      const active = this.streamingBySession.get(sessionId);
+      const startsNewProjection = active !== undefined && (active.finished
+        || (persistId.length > 0 && active.persistId.length > 0
+          && active.persistId !== persistId));
+      if (startsNewProjection) this.consumePendingTextDeltaNotification(sessionId);
       const s = this.ensureStreaming(sessionId, persistId);
       s.text += delta;
-      this.notify();
+      if (startsNewProjection) this.notify();
+      else this.scheduleTextDeltaNotification(sessionId);
       return;
     }
     if (type === 'tool_use') {
@@ -989,6 +1035,7 @@ export class MessageStore {
       if (toolUseId.length === 0) {
         return;
       }
+      this.consumePendingTextDeltaNotification(sessionId);
       const active = this.streamingBySession.get(sessionId);
       const updatesCurrentTool = active !== undefined
         && active.tools.some((tool: StreamingToolRow) => tool.toolUseId === toolUseId);
@@ -1018,6 +1065,7 @@ export class MessageStore {
       return;
     }
     if (type === 'tool_result' || type === 'tool_result_full') {
+      this.consumePendingTextDeltaNotification(sessionId);
       this.markSessionRunning(sessionId, true);
       // 结果事件：标记对应 tool 行完成（正文继续流式，落库行稍后到达）。
       const s = this.streamingBySession.get(sessionId);
@@ -1038,12 +1086,14 @@ export class MessageStore {
       return;
     }
     if (type === 'thinking') {
+      this.consumePendingTextDeltaNotification(sessionId);
       this.markSessionRunning(sessionId, true);
       // thinking 不增量；由落库行（role=thinking）驱动正文渲染。
       this.notify();
       return;
     }
     if (type === 'status') {
+      this.consumePendingTextDeltaNotification(sessionId);
       const isRunning = ev['data'] !== undefined && typeof data['isRunning'] === 'boolean'
         ? data['isRunning'] as boolean
         : undefined;
@@ -1066,6 +1116,7 @@ export class MessageStore {
       return;
     }
     if (type === 'done') {
+      this.consumePendingTextDeltaNotification(sessionId);
       const s = this.streamingBySession.get(sessionId);
       if (s !== undefined) {
         s.tools.forEach((t: StreamingToolRow) => {
@@ -1098,6 +1149,7 @@ export class MessageStore {
       return;
     }
     if (type === 'error') {
+      this.consumePendingTextDeltaNotification(sessionId);
       const terminal = readBool(data, 'isTerminal', !readBool(data, 'willRetry', false));
       if (terminal) {
         if (eventSource === 'codex') {
@@ -1329,6 +1381,7 @@ export class MessageStore {
     const p = payload as Record<string, Object>;
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0 || readStr(p, 'status') !== 'closed') return;
+    this.consumePendingTextDeltaNotification(sessionId);
     this.bumpRunningStateRevision(sessionId);
     this.makerTurnRunningBySession.delete(sessionId);
     this.finalizeSessionStreaming(sessionId);
@@ -1341,6 +1394,7 @@ export class MessageStore {
     const p = payload as Record<string, Object>;
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
+    this.consumePendingTextDeltaNotification(sessionId);
     const phase = readStr(p, 'phase');
     const rawRunning = p['isRunning'];
     this.bumpRunningStateRevision(sessionId);
@@ -1521,18 +1575,16 @@ export class MessageStore {
   }
 
   /** assistant 正文落库时只清同 persistId 投影；旧块 push 不能清掉新块。 */
-  private clearStreamingIfAssistant(sessionId: string, message: RemoteMessage): void {
+  private clearStreamingIfAssistant(sessionId: string, message: RemoteMessage): boolean {
     if (message.role !== 'assistant') {
-      return;
+      return false;
     }
     const streaming = this.streamingBySession.get(sessionId);
-    if (streaming === undefined) return;
+    if (streaming === undefined) return false;
     if (streaming.persistId.length > 0
       && message.id !== streaming.persistId
-      && message.clientId !== streaming.persistId) return;
-    if (this.streamingBySession.delete(sessionId)) {
-      this.notify();
-    }
+      && message.clientId !== streaming.persistId) return false;
+    return this.streamingBySession.delete(sessionId);
   }
 
   private async loadInitial(
@@ -1822,6 +1874,7 @@ export class MessageStore {
     if (sessionId.length === 0 || Object.keys(rawMessage).length === 0) return;
     const message = parseMessage(rawMessage);
     if (message.id.length === 0) return;
+    this.consumePendingTextDeltaNotification(sessionId);
     this.authoritativeMessageRevisions.set(sessionId,
       (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
     this.deferredAuthoritativeEmptySessions.cancel(sessionId);
@@ -1848,13 +1901,15 @@ export class MessageStore {
     const existingIndex = list.findIndex((m: RemoteMessage) =>
       m.id === message.id || (message.clientId.length > 0 && m.clientId === message.clientId));
     if (existingIndex >= 0) {
+      let changed = false;
       if (preferIncomingCreatedMessage(list[existingIndex], message)) {
         list[existingIndex] = message;
         list.sort(sortMessagesAsc);
         this.setSessionMessages(sessionId, list);
-        this.notify();
+        changed = true;
       }
-      this.clearStreamingIfAssistant(sessionId, message);
+      changed = this.clearStreamingIfAssistant(sessionId, message) || changed;
+      if (changed) this.notify();
       return;
     }
     list.push(message);
@@ -1885,6 +1940,7 @@ export class MessageStore {
       if (single.length > 0) clientIds.push(single);
     }
     if (sessionId.length === 0 || clientIds.length === 0) return;
+    this.consumePendingTextDeltaNotification(sessionId);
     this.authoritativeMessageRevisions.set(sessionId,
       (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
     this.deferredAuthoritativeEmptySessions.cancel(sessionId);
