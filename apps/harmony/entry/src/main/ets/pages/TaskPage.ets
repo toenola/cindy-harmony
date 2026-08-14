@@ -11,7 +11,7 @@
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { display, LengthMetrics, router, promptAction } from '@kit.ArkUI';
+import { display, KeyboardAvoidMode, LengthMetrics, router, promptAction, window } from '@kit.ArkUI';
 import {
   BlurStrategy,
   HdsNavigation,
@@ -341,6 +341,11 @@ export struct TaskPageContent {
   @Prop paneMessageClientId: string = '';
   /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
+  /**
+   * 当前详情页由谁承载键盘，谁就把键盘高度传进来。
+   * 详情自身消费这段可用高度，避免 HdsNavigation 的内容树绕过页面级 OFFSET。
+   */
+  @Prop paneKeyboardInset: number = 0;
   @State items: RenderItem[] = [];
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
@@ -3442,6 +3447,7 @@ export struct TaskPageContent {
     }
     .width('100%')
     .height('100%')
+    .padding({ bottom: this.paneKeyboardInset })
   }
 
   private contextUsageLabel(): string {
@@ -9119,20 +9125,64 @@ struct TaskPage {
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
   @State foldStatus: number = -1;
+  /** 独立详情页的键盘高度；展开横屏转入 TaskListPage 后由右侧详情栏继续接管。 */
+  @State keyboardHeight: number = 0;
   private foldStatusListening: boolean = false;
   private splitNavigationPending: boolean = false;
+  private pageActive: boolean = false;
+  private keyboardWindow: window.Window | null = null;
+  private keyboardHeightListening: boolean = false;
+  private keyboardHeightListener: (height: number) => void = (height: number): void => {
+    this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
+  };
   private foldStatusListener: (status: number) => void = (status: number): void => {
     this.foldStatus = status;
     this.openSplitLayoutIfNeeded();
   };
 
   aboutToAppear(): void {
+    this.pageActive = true;
     this.splitNavigationPending = false;
+    this.keyboardHeight = 0;
+    // 单页详情显式缩小内容可用高度；不能依赖 HdsNavigation 内层对全局 OFFSET 的响应。
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
     this.observeFoldStatus();
+    void this.observeKeyboardHeight();
   }
 
   aboutToDisappear(): void {
+    this.pageActive = false;
     this.stopFoldStatusObservation();
+    this.stopKeyboardHeightObservation();
+    this.keyboardHeight = 0;
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+  }
+
+  private async observeKeyboardHeight(): Promise<void> {
+    if (this.keyboardHeightListening) return;
+    const hostContext = this.getUIContext().getHostContext();
+    if (hostContext === undefined) return;
+    try {
+      const hostWindow = await window.getLastWindow(hostContext);
+      if (!this.pageActive || this.keyboardHeightListening) return;
+      this.keyboardWindow = hostWindow;
+      hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
+      this.keyboardHeightListening = true;
+    } catch (_err) {
+      // 极少数设备不提供高度通知时，退回系统避让，仍优先保证输入区可见。
+      if (this.pageActive) this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+    }
+  }
+
+  private stopKeyboardHeightObservation(): void {
+    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    try {
+      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+    } catch (_err) {
+      // 页面退出时窗口可能已先被系统回收。
+    }
+    this.keyboardWindow = null;
+    this.keyboardHeightListening = false;
   }
 
   private observeFoldStatus(): void {
@@ -9184,7 +9234,7 @@ struct TaskPage {
 
   build() {
     Column() {
-      TaskPageContent()
+      TaskPageContent({ paneKeyboardInset: this.keyboardHeight })
     }
     .width('100%')
     .height('100%')

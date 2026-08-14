@@ -5,7 +5,7 @@
  * 任务和消息真相仍由被控端桌面维护。
  */
 
-import { KeyboardAvoidMode, router, promptAction } from '@kit.ArkUI';
+import { KeyboardAvoidMode, router, promptAction, window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import {
@@ -156,6 +156,8 @@ struct NewSessionPage {
   @State creating: boolean = false;
   @State error: string = '';
   @State taskRevision: number = 0;
+  /** 页面显式消费软键盘高度，保证 Hds 容器内的完整 Composer 不被盖住。 */
+  @State keyboardHeight: number = 0;
   private recentPickerOptions: PickerOptions = createRecentPickerOptions();
   @State recentPickerController: PickerController = new PickerController();
 
@@ -168,11 +170,20 @@ struct NewSessionPage {
   /** 首条消息附件一旦交给 creation store，页面销毁时不得再回收。 */
   private attachmentsHandedOff: boolean = false;
   private attachmentsDisposed: boolean = false;
+  private pageActive: boolean = false;
+  private keyboardWindow: window.Window | null = null;
+  private keyboardHeightListening: boolean = false;
+  private keyboardHeightListener: (height: number) => void = (height: number): void => {
+    this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
+  };
 
   aboutToAppear(): void {
-    // KeyboardAvoidMode 属于 UIContext 级状态；展开双栏会为详情栏关闭系统避让。
-    // 新建页必须主动恢复页面级 OFFSET，确保底部 Composer 始终位于输入法上方。
-    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+    this.pageActive = true;
+    this.keyboardHeight = 0;
+    // 同 Mobile 的 KeyboardAvoidingView 语义：可用高度由页面直接缩小。
+    // 不能只依赖全局 OFFSET，否则横屏 Hds 容器可能仍按全高摆放 Composer。
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+    void this.observeKeyboardHeight();
     const params = (router.getParams() ?? {}) as Record<string, Object>;
     this.routeDeviceId = readStr(params, 'deviceId');
     const editDraft = AppServices.instance.newSessionCreations.consumeEditDraft();
@@ -201,12 +212,43 @@ struct NewSessionPage {
   }
 
   aboutToDisappear(): void {
+    this.pageActive = false;
+    this.stopKeyboardHeightObservation();
+    this.keyboardHeight = 0;
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     this.runtimeLoadGeneration += 1;
     if (!this.attachmentsHandedOff) this.disposeUnsentAttachments();
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
     }
     this.unsubs = [];
+  }
+
+  private async observeKeyboardHeight(): Promise<void> {
+    if (this.keyboardHeightListening) return;
+    const hostContext = this.getUIContext().getHostContext();
+    if (hostContext === undefined) return;
+    try {
+      const hostWindow = await window.getLastWindow(hostContext);
+      if (!this.pageActive || this.keyboardHeightListening) return;
+      this.keyboardWindow = hostWindow;
+      hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
+      this.keyboardHeightListening = true;
+    } catch (_err) {
+      // 无法获得高度通知时交还给系统，避免极端设备上完全失去输入法避让。
+      if (this.pageActive) this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+    }
+  }
+
+  private stopKeyboardHeightObservation(): void {
+    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    try {
+      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+    } catch (_err) {
+      // 页面退出时窗口可能已由系统回收。
+    }
+    this.keyboardWindow = null;
+    this.keyboardHeightListening = false;
   }
 
   /** 直接返回时使在途上传失效，并回收所有仍由新建页持有的 OSS 引用。 */
@@ -1182,6 +1224,7 @@ struct NewSessionPage {
     }
       .width('100%')
     .height('100%')
+    .padding({ bottom: this.keyboardHeight })
     .backgroundColor($r('app.color.bg_page'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .bindSheet($$this.contextSheetOpen, this.contextSheet(), {

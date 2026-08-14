@@ -1273,7 +1273,6 @@ struct TaskListPage {
           }
           .width(this.detailPaneWidth())
           .height('100%')
-          .padding({ bottom: this.detailKeyboardInset() })
         }
       }
       .width('100%')
@@ -1532,6 +1531,7 @@ struct TaskListPage {
           paneSessionId: this.selectedSessionId,
           paneMessageClientId: this.selectedMessageClientId,
           paneComposerBottomInset: this.detailComposerBottomInset(),
+          paneKeyboardInset: this.detailKeyboardInset(),
         })
           .transition(uiRevealTransition())
       }, (key: string) => key)
