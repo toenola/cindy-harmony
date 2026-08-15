@@ -44,6 +44,7 @@ import {
   consumeTaskSplitRouteSelection,
   isWideTaskLayout,
   TASK_SPLIT_DEFAULT_RATIO,
+  TASK_SPLIT_DIVIDER_WIDTH,
   taskDetailKeyboardInset,
   taskDetailPaneWidth,
   taskListPaneWidth,
@@ -86,6 +87,8 @@ const FLOATING_BAR_SHOW_OFFSET = 0.5;
 const FLOATING_BAR_HIDE_VELOCITY = 600;
 /** 两侧 HdsNavigation 的 MINI 标题栏共用 56vp 内容高；分割线从其下方开始。 */
 const SPLIT_HEADER_HEIGHT = 56;
+/** 左侧标题栏不向列表内容额外延伸，避免首条会话落入标题栏的磨砂蒙层。 */
+const LIST_HEADER_MASK_EXTRA_HEIGHT = 0;
 /** 项目组内联展示的任务数上限，超出后由「查看全部」展开。 */
 const PROJECT_INLINE_LIMIT = 5;
 
@@ -1261,22 +1264,23 @@ struct TaskListPage {
 
   build() {
     Stack() {
-      if (this.splitLayoutEnabled()) {
-        this.splitHeaderBackground()
-      }
       Row() {
         this.taskListPane()
         if (this.splitLayoutEnabled()) {
-          this.splitDivider()
           Column() {
             this.detailPane()
           }
-          .width(this.detailPaneWidth())
+          // 分隔区覆盖在详情栏左缘，避免把顶部玻璃材质切成两个横向区域。
+          .width(this.detailPaneWidth() + TASK_SPLIT_DIVIDER_WIDTH)
           .height('100%')
         }
       }
       .width('100%')
       .height('100%')
+
+      if (this.splitLayoutEnabled()) {
+        this.splitDivider()
+      }
 
       if (this.scopeMenuOpen) {
         this.scopeMenuLayer()
@@ -1364,29 +1368,31 @@ struct TaskListPage {
       .onChange((index: number) => this.handleListTabChange(index))
       .layoutWeight(1)
       .width('100%')
-      .backgroundColor($r('app.color.bg_page'))
+      .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
       .onAppear(() => this.handleListTabsAppear())
       }
       .width('100%')
       .height('100%')
-      .backgroundColor($r('app.color.bg_page'))
+      .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
     }
     .titleBar({
       enableComponentSafeArea: true,
-      style: this.splitLayoutEnabled() ? {
-        scrollEffectOpts: { enableScrollEffect: false },
-        originalStyle: {
-          backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
-        },
-        scrollEffectStyle: {
-          backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
-        },
-      } : {
+      style: {
         scrollEffectOpts: {
           enableScrollEffect: true,
           scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
           blurEffectiveStartOffset: LengthMetrics.vp(0),
           blurEffectiveEndOffset: LengthMetrics.vp(20),
+        },
+        originalStyle: {
+          backgroundStyle: {
+            maskExtraHeight: LIST_HEADER_MASK_EXTRA_HEIGHT,
+          },
+        },
+        scrollEffectStyle: {
+          backgroundStyle: {
+            maskExtraHeight: LIST_HEADER_MASK_EXTRA_HEIGHT,
+          },
         },
         blurStrategy: BlurStrategy.ADAPTIVE,
         thermoCtrl: true,
@@ -1414,43 +1420,6 @@ struct TaskListPage {
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
-  }
-
-  /** 展开双栏共用一整块官方 HdsNavigation 顶部材质；两侧标题栏只负责内容。 */
-  @Builder
-  splitHeaderBackground() {
-    HdsNavigation() {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(Color.Transparent)
-    }
-    .titleBar({
-      enableComponentSafeArea: true,
-      style: {
-        scrollEffectOpts: {
-          enableScrollEffect: true,
-          scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
-          blurEffectiveStartOffset: LengthMetrics.vp(0),
-          blurEffectiveEndOffset: LengthMetrics.vp(20),
-        },
-        blurStrategy: BlurStrategy.ADAPTIVE,
-        thermoCtrl: true,
-        systemMaterialEffect: {
-          materialType: hdsMaterial.MaterialType.IMMERSIVE,
-          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
-        },
-      },
-      content: { title: { mainTitle: '' } },
-    })
-    .hideBackButton(true)
-    .hideToolBar(true)
-    .mode(NavigationMode.Stack)
-    .titleMode(HdsNavigationTitleMode.MINI)
-    .width('100%')
-    .height('100%')
-    .backgroundColor(Color.Transparent)
-    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -1513,6 +1482,7 @@ struct TaskListPage {
     }
     .width(20)
     .height('100%')
+    .position({ x: this.listPaneWidth(), y: 0 })
     // 20vp 只作为拖拽命中区，视觉上不铺底、不加玻璃层，只保留中央 1px 分隔线。
     .backgroundColor(Color.Transparent)
     .onTouch((event: TouchEvent) => {

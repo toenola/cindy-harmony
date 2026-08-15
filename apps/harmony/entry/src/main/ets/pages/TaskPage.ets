@@ -3378,15 +3378,7 @@ export struct TaskPageContent {
           }
           .titleBar({
         enableComponentSafeArea: true,
-        style: this.isEmbedded() ? {
-          scrollEffectOpts: { enableScrollEffect: false },
-          originalStyle: {
-            backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
-          },
-          scrollEffectStyle: {
-            backgroundStyle: { backgroundColor: Color.Transparent, maskExtraHeight: 0 },
-          },
-        } : {
+        style: {
           scrollEffectOpts: {
             enableScrollEffect: true,
             scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
