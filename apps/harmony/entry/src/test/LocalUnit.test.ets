@@ -171,6 +171,7 @@ import {
   parseModelOptions,
   parseModelVisibilityOverrides,
   parseProviderModelOptions,
+  reconcileModelEffort,
 } from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
 import {
@@ -2571,6 +2572,21 @@ export default function localUnitTest() {
       expect(options.length).assertEqual(2);
       expect(options[0].id).assertEqual('ask');
       expect(options[1].id).assertEqual('acceptEdits');
+    });
+
+    it('reconcilesEffortWhenSwitchingComposerModels', 0, () => {
+      const rawModel: Record<string, Object> = {};
+      rawModel['id'] = 'model-a';
+      rawModel['efforts'] = ['medium', 'high'];
+      rawModel['defaultEffort'] = 'high';
+      const model = parseModelOptions([rawModel])[0];
+      expect(reconcileModelEffort(model, 'medium')).assertEqual('medium');
+      expect(reconcileModelEffort(model, 'low')).assertEqual('high');
+
+      const rawNoEffortModel: Record<string, Object> = {};
+      rawNoEffortModel['id'] = 'model-b';
+      const noEffortModel = parseModelOptions([rawNoEffortModel])[0];
+      expect(reconcileModelEffort(noEffortModel, 'high')).assertEqual('');
     });
 
     it('parsesSharedComposerModelsForNewAndExistingTasks', 0, () => {

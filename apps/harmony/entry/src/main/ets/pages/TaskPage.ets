@@ -85,6 +85,7 @@ import {
   parseModelVisibilityOverrides,
   parseProviderModelOptions,
   permissionModeDescription,
+  reconcileModelEffort,
 } from '../core/ComposerCatalog';
 import { SessionMetaPatch, unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteMessage, RemoteSession, readBool, readNum, readObj, readStr, recordOrEmpty } from '../core/tasks/TaskModels';
@@ -351,6 +352,8 @@ export struct TaskPageContent {
   /** TextArea 只是这一语义文档的投影。 */
   private composerDocument: ComposerDocument = new ComposerDocument();
   private composerDraftGeneration: number = 0;
+  /** 返回动作跨一帧提交 Composer 收起态时，防止连续点击重复 pop 路由。 */
+  private leavingDetailPage: boolean = false;
   @State sending: boolean = false;
   /** Desktop 输入投影产生的排队/派发/失败气泡。 */
   @State queueBubbles: PendingQueueBubble[] = [];
@@ -478,6 +481,11 @@ export struct TaskPageContent {
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
   @State detailComposerSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
+  /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并写入。 */
+  @State modelEffortMemory: Map<string, string> = new Map();
+  @State modelFastMemory: Map<string, boolean> = new Map();
+  /** RPC 进行中先把勾选移动到用户刚点击的模型，失败时再回退。 */
+  @State pendingModelSelectionKey: string = '';
   @State contextSelectedUris: string[] = [];
   /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
   @State sessionActionOpen: boolean = false;
@@ -519,7 +527,6 @@ export struct TaskPageContent {
   @State sessionAgentSwitchSupported: boolean = false;
   /** 被控端公开的 pending intent；仅用于提示，不提前改任务行的 agent/model。 */
   @State pendingAgentSwitchIntent: SessionAgentSwitchIntent | null = null;
-  @State modelOptionsTargetId: string = '';
   @State contextRpcBusy: boolean = false;
   @State goalState: GoalModeState | null = null;
   @State goalObjective: string = '';
@@ -591,6 +598,7 @@ export struct TaskPageContent {
     this.messageFocusLoadStarted = false;
     this.sessionSyncStarted = false;
     this.inputQueueActivated = false;
+    this.leavingDetailPage = false;
     this.creationDraftHandoffDone = false;
     this.leavingForCreationEdit = false;
     this.newSessionCreationStatus = '';
@@ -679,6 +687,9 @@ export struct TaskPageContent {
   }
 
   aboutToDisappear(): void {
+    // ArkUI 返回栈可能在下一次进入同一路由前短暂复用上一帧；离页时先同步收口
+    // TextArea 的焦点与展开态，避免已发送文本随旧 Composer 节点闪现。
+    this.collapseComposerSurface();
     this.itemsRefreshGeneration += 1;
     this.itemsRefreshScheduled = false;
     this.initialScrollGeneration += 1;
@@ -1169,6 +1180,9 @@ export struct TaskPageContent {
 
 
   private modelOptionIsCurrent(option: ComposerModelOption): boolean {
+    if (this.pendingModelSelectionKey.length > 0) {
+      return this.pendingModelSelectionKey === this.modelRuntimeKey(option);
+    }
     const session = this.session();
     if (!this.browsingCurrentAgent() || session === undefined || option.id !== session.model) return false;
     if (session.providerId.length > 0) return option.providerId === session.providerId;
@@ -1188,35 +1202,90 @@ export struct TaskPageContent {
     return effortLevelLabel(id, fallback);
   }
 
-  private modelEffortText(option: ComposerModelOption): string {
+  private modelRuntimeKey(option: ComposerModelOption): string {
+    return `${this.modelAgentTab}:${composerModelKey(option)}`;
+  }
+
+  private modelEffortForRow(option: ComposerModelOption): string {
     const session = this.session();
-    const effort = this.modelOptionIsCurrent(option) && session !== undefined
-      ? session.effort
-      : option.defaultEffort;
+    if (this.modelOptionIsCurrent(option) && session !== undefined && session.effort.length > 0) {
+      return session.effort;
+    }
+    const remembered = this.modelEffortMemory.get(this.modelRuntimeKey(option));
+    if (remembered !== undefined && option.efforts.indexOf(remembered) >= 0) return remembered;
+    if (option.defaultEffort.length > 0) return option.defaultEffort;
+    return option.efforts.length > 0 ? option.efforts[0] : '';
+  }
+
+  private modelFastForRow(option: ComposerModelOption): boolean {
+    if (!this.visibleFastModeCapability() || !option.supportsFastMode) return false;
+    if (this.modelOptionIsCurrent(option)) return this.session()?.fastMode ?? false;
+    return this.modelFastMemory.get(this.modelRuntimeKey(option)) ?? false;
+  }
+
+  private modelEffortOptions(option: ComposerModelOption): ComposerChoiceOption[] {
+    const effortSource = this.browsingCurrentAgent() ? this.effortOptions : this.alternateEffortOptions;
+    const out: ComposerChoiceOption[] = [];
+    for (let i = 0; i < option.efforts.length; i++) {
+      const id = option.efforts[i];
+      let label = option.effortDisplayNames[id] ?? '';
+      let description = '';
+      for (let j = 0; j < effortSource.length; j++) {
+        if (effortSource[j].id === id) {
+          if (label.length === 0) label = effortSource[j].label;
+          description = effortSource[j].description;
+          break;
+        }
+      }
+      const choice = new ComposerChoiceOption();
+      choice.id = id;
+      choice.label = label.length > 0 ? label : effortLevelLabel(id, id);
+      choice.description = description;
+      out.push(choice);
+    }
+    return out;
+  }
+
+  private modelEffortMenuItems(option: ComposerModelOption): MenuElement[] {
+    const choices = this.modelEffortOptions(option);
+    const items: MenuElement[] = [];
+    for (let i = 0; i < choices.length; i++) {
+      const choice = choices[i];
+      items.push({
+        value: choice.label,
+        enabled: !this.contextRpcBusy,
+        action: (): void => this.setModelRowEffort(option, choice),
+      });
+    }
+    return items;
+  }
+
+  private setModelRowEffort(option: ComposerModelOption, effort: ComposerChoiceOption): void {
+    if (this.contextRpcBusy) return;
+    if (this.modelOptionIsCurrent(option)) {
+      void this.selectComposerEffort(effort);
+      return;
+    }
+    const next = new Map(this.modelEffortMemory);
+    next.set(this.modelRuntimeKey(option), effort.id);
+    this.modelEffortMemory = next;
+  }
+
+  private setModelRowFast(option: ComposerModelOption, enabled: boolean): void {
+    if (this.contextRpcBusy || !this.visibleFastModeCapability() || !option.supportsFastMode) return;
+    if (this.modelOptionIsCurrent(option)) {
+      void this.setFastMode(enabled);
+      return;
+    }
+    const next = new Map(this.modelFastMemory);
+    next.set(this.modelRuntimeKey(option), enabled);
+    this.modelFastMemory = next;
+  }
+
+  private modelEffortText(option: ComposerModelOption): string {
+    const effort = this.modelEffortForRow(option);
     if (effort.length === 0) return '';
     return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
-  }
-
-  private currentModelKey(): string {
-    const source = this.visibleModelOptions();
-    for (let i = 0; i < source.length; i++) {
-      if (this.modelOptionIsCurrent(source[i])) return composerModelKey(source[i]);
-    }
-    return this.session()?.model ?? '';
-  }
-
-  private modelOptionsForTarget(target: string): ComposerModelOption[] {
-    const source = this.visibleModelOptions();
-    for (let i = 0; i < source.length; i++) {
-      if (composerModelKey(source[i]) === target) return [source[i]];
-    }
-    for (let i = 0; i < source.length; i++) {
-      if (source[i].id === target && this.modelOptionIsCurrent(source[i])) return [source[i]];
-    }
-    for (let i = 0; i < source.length; i++) {
-      if (source[i].id === target) return [source[i]];
-    }
-    return [];
   }
 
   private currentModelOption(): ComposerModelOption | null {
@@ -1252,11 +1321,7 @@ export struct TaskPageContent {
   }
 
   private currentModelEffortOptions(): ComposerChoiceOption[] {
-    const targetId = this.modelOptionsTargetId.length > 0
-      ? this.modelOptionsTargetId
-      : this.currentModelKey();
-    const source = this.modelOptionsForTarget(targetId);
-    const model = source.length > 0 ? source[0] : this.currentModelOption();
+    const model = this.currentModelOption();
     if (model === null || model.efforts.length === 0) return [];
     const effortSource = this.browsingCurrentAgent() ? this.effortOptions : this.alternateEffortOptions;
     const out: ComposerChoiceOption[] = [];
@@ -1294,25 +1359,12 @@ export struct TaskPageContent {
     return this.modelAgentTab === kind;
   }
 
-
-  private modelOptionHasOptions(option: ComposerModelOption): boolean {
-    return option.efforts.length > 0 || (this.visibleFastModeCapability() && option.supportsFastMode);
-  }
-
-  private modelOptionsTarget(): ComposerModelOption[] {
-    return this.modelOptionsForTarget(this.modelOptionsTargetId);
-  }
-
   private modelOptionEffortSelected(option: ComposerChoiceOption): boolean {
     return option.id === (this.session()?.effort ?? '');
   }
 
   private currentModelSupportsFastMode(): boolean {
-    const modelId = this.modelOptionsTargetId.length > 0
-      ? this.modelOptionsTargetId
-      : this.currentModelKey();
-    const source = this.modelOptionsForTarget(modelId);
-    const model = source.length > 0 ? source[0] : this.currentModelOption();
+    const model = this.currentModelOption();
     return this.visibleFastModeCapability() && model !== null && model.supportsFastMode;
   }
 
@@ -1325,10 +1377,6 @@ export struct TaskPageContent {
       if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
     }
     if (page === 'model') {
-      this.modelOptionsTargetId = '';
-      this.alternateModelOptions = [];
-      this.alternateEffortOptions = [];
-      this.alternateFastModeCapability = false;
       const targetAgent = this.composerAgentKind();
       if (this.providerModelAgent !== targetAgent) {
         void this.loadProviderModelOptions(targetAgent);
@@ -1389,19 +1437,6 @@ export struct TaskPageContent {
     if (loaded) this.closeContextSheet();
   }
 
-  private openModelOptions(option: ComposerModelOption): void {
-    if (this.contextRpcBusy) return;
-    const session = this.session();
-    if (session === undefined) return;
-    this.modelOptionsTargetId = composerModelKey(option);
-    if (!this.modelOptionIsCurrent(option) || !this.browsingCurrentAgent()) {
-      // 非当前模型先完成真实模型/Agent 切换；在远端状态回流前不伪造其推理设置。
-      void this.selectComposerModel(option, false);
-      return;
-    }
-    this.contextSheetPage = 'model-options';
-  }
-
   private requestPermissionMode(option: ComposerChoiceOption): void {
     if (option.id === this.effectivePermissionMode() || this.contextRpcBusy) {
       return;
@@ -1444,7 +1479,7 @@ export struct TaskPageContent {
     }
   }
 
-  private async selectComposerModel(option: ComposerModelOption, keepOpen: boolean = false): Promise<void> {
+  private async selectComposerModel(option: ComposerModelOption): Promise<void> {
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
       return;
@@ -1468,46 +1503,71 @@ export struct TaskPageContent {
           value: '继续',
           action: () => {
             this.agentSwitchConfirmed = true;
-            void this.selectComposerModel(option, keepOpen);
+            void this.selectComposerModel(option);
           },
         },
       });
       return;
     }
-    if (session.model === option.id && targetAgent === currentAgent) {
-      if (keepOpen) this.contextSheetPage = 'model-options';
-      else this.closeContextSheet();
+    if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent) {
+      this.closeContextSheet();
       return;
     }
+    const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
+    const nextFastMode = this.modelFastForRow(option);
+    const selectionKey = this.modelRuntimeKey(option);
+    this.pendingModelSelectionKey = selectionKey;
+    this.closeContextSheet();
     this.contextRpcBusy = true;
     try {
       let result: Object | undefined;
       if (targetAgent !== currentAgent) {
         const writeGeneration = ++this.agentSwitchWriteGeneration;
-        const effort = option.defaultEffort.length > 0
-          ? option.defaultEffort
-          : (option.efforts.length > 0 ? option.efforts[0] : '');
+        const effort = nextEffort;
         result = await this.invokeContextRpc('maker:switch-session-agent', [
-          session.id, targetAgent, option.id, option.providerId, effort, false,
+          session.id, targetAgent, option.id, option.providerId, effort, nextFastMode,
         ]);
-        if (writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) return;
+        if (writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) {
+          this.pendingModelSelectionKey = '';
+          return;
+        }
         await this.loadPendingAgentSwitchIntent();
       } else {
         const args: Object[] = option.providerId.length > 0
           ? [session.id, option.id, option.providerId]
           : [session.id, option.id];
         result = await this.invokeContextRpc('maker:set-model', args);
+        let runtimeSettingsFailed = false;
+        if (nextEffort.length > 0 && nextEffort !== session.effort) {
+          try {
+            await this.invokeContextRpc('maker:set-effort', [session.id, nextEffort]);
+          } catch (e) {
+            runtimeSettingsFailed = true;
+          }
+        }
+        // 模型切换必须写穿 false；目标模型不支持 Fast 时，不能把旧 true 留在服务端。
+        if (nextFastMode !== session.fastMode) {
+          try {
+            await this.invokeContextRpc('maker:set-fast-mode', [session.id, nextFastMode]);
+          } catch (e) {
+            runtimeSettingsFailed = true;
+          }
+        }
+        if (runtimeSettingsFailed) {
+          promptAction.showToast({ message: '模型已切换，部分运行设置更新失败' });
+        }
       }
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)
         && readBool(result as Record<string, Object>, 'deferred', false)) {
         promptAction.showToast({ message: '将在当前运行结束后切换模型' });
       }
-      if (keepOpen) {
-        this.contextSheetPage = 'model-options';
-      } else {
-        this.closeContextSheet();
-      }
+      setTimeout(() => {
+        if (this.pendingModelSelectionKey === selectionKey) {
+          this.pendingModelSelectionKey = '';
+        }
+      }, 800);
     } catch (e) {
+      this.pendingModelSelectionKey = '';
       promptAction.showToast({ message: '模型切换失败，请重试' });
     } finally {
       this.contextRpcBusy = false;
@@ -1522,6 +1582,12 @@ export struct TaskPageContent {
     this.contextRpcBusy = true;
     try {
       await this.invokeContextRpc('maker:set-effort', [session.id, option.id]);
+      const model = this.currentModelOption();
+      if (model !== null) {
+        const next = new Map(this.modelEffortMemory);
+        next.set(this.modelRuntimeKey(model), option.id);
+        this.modelEffortMemory = next;
+      }
     } catch (e) {
       promptAction.showToast({ message: '推理强度更新失败，请重试' });
     } finally {
@@ -1529,14 +1595,21 @@ export struct TaskPageContent {
     }
   }
 
-  private async toggleFastMode(): Promise<void> {
+  private async setFastMode(enabled: boolean): Promise<void> {
     const session = this.session();
-    if (session === undefined || this.contextRpcBusy || !this.currentModelSupportsFastMode()) {
+    if (session === undefined || this.contextRpcBusy || !this.currentModelSupportsFastMode()
+      || session.fastMode === enabled) {
       return;
     }
     this.contextRpcBusy = true;
     try {
-      await this.invokeContextRpc('maker:set-fast-mode', [session.id, !session.fastMode]);
+      await this.invokeContextRpc('maker:set-fast-mode', [session.id, enabled]);
+      const model = this.currentModelOption();
+      if (model !== null) {
+        const next = new Map(this.modelFastMemory);
+        next.set(this.modelRuntimeKey(model), enabled);
+        this.modelFastMemory = next;
+      }
     } catch (e) {
       promptAction.showToast({ message: 'Fast 模式更新失败，请重试' });
     } finally {
@@ -3069,12 +3142,25 @@ export struct TaskPageContent {
     }
   }
 
-  /** 正常发送后立即释放 TextArea 焦点并回到右下角的收起态入口。 */
-  private collapseComposerAfterSend(): void {
+  /** 释放 TextArea 焦点并回到右下角收起态；离页前也必须同步执行，避免返回栈复用旧输入首帧。 */
+  private collapseComposerSurface(): void {
     this.getUIContext().getFocusController().clearFocus();
     this.composerBlurGeneration += 1;
     this.composerFocused = false;
     this.composerSurfaceVisible = false;
+  }
+
+  /** 正常发送后立即释放 TextArea 焦点并回到右下角的收起态入口。 */
+  private collapseComposerAfterSend(): void {
+    this.collapseComposerSurface();
+  }
+
+  /** 先提交收起态再返回，让系统转场快照不再携带已展开的旧 Composer。 */
+  private leaveDetailPage(): void {
+    if (this.leavingDetailPage) return;
+    this.leavingDetailPage = true;
+    this.collapseComposerSurface();
+    setTimeout(() => router.back(), 0);
   }
 
   private handleComposerFocusChange(focused: boolean): void {
@@ -3418,12 +3504,12 @@ export struct TaskPageContent {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
         .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
           detents: this.contextSheetPage === 'model'
-            || this.contextSheetPage === 'model-options'
-            || this.contextSheetPage === 'agent'
-            ? [SheetSize.MEDIUM] : [SheetSize.MEDIUM, SheetSize.LARGE],
-          dragBar: true,
+            ? [420]
+            : this.contextSheetPage === 'agent'
+              ? [SheetSize.MEDIUM] : [SheetSize.MEDIUM, SheetSize.LARGE],
+          dragBar: this.contextSheetPage !== 'model',
           showClose: false,
-          preferType: SheetType.BOTTOM,
+          preferType: this.contextSheetPage === 'model' ? SheetType.CENTER : SheetType.BOTTOM,
           backgroundColor: $r('app.color.bg_card'),
           maskColor: $r('app.color.overlay'),
         })
@@ -3770,7 +3856,7 @@ export struct TaskPageContent {
   taskHeader() {
     Row({ space: 4 }) {
       if (!this.isEmbedded()) {
-        this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => router.back())
+        this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => this.leaveDetailPage())
       }
 
       Column({ space: 1 }) {
@@ -4529,25 +4615,38 @@ export struct TaskPageContent {
     })
   }
 
-  /** 分栏详情内的 Composer 选择层；复用原有模型目录和推理设置内容。 */
+  /** 分栏详情内的 Composer 选择层；模型使用紧凑弹窗，其它选择仍沿用底部面板。 */
   @Builder
   detailComposerSheetLayer() {
-    Stack({ alignContent: Alignment.Bottom }) {
+    Stack({ alignContent: this.contextSheetPage === 'model' ? Alignment.Center : Alignment.Bottom }) {
       Column()
         .width('100%')
         .height('100%')
         .backgroundColor($r('app.color.overlay'))
         .onClick(() => this.closeContextSheet())
 
-      Column() {
-        this.contextSheet()
+      if (this.contextSheetPage === 'model') {
+        Column() {
+          this.contextSheet()
+        }
+        .width('calc(100% - 32vp)')
+        .constraintSize({ maxWidth: 480, maxHeight: 'calc(100% - 32vp)' })
+        .height(420)
+        .backgroundColor($r('app.color.bg_card'))
+        .borderRadius(UI_RADIUS_CONTAINER)
+        .clip(true)
+        .transition(uiOverlayTransition())
+      } else {
+        Column() {
+          this.contextSheet()
+        }
+        .width('100%')
+        .height('50%')
+        .backgroundColor($r('app.color.bg_card'))
+        .borderRadius(UI_RADIUS_CONTAINER)
+        .clip(true)
+        .transition(uiOverlayTransition())
       }
-      .width('100%')
-      .height('50%')
-      .backgroundColor($r('app.color.bg_card'))
-      .borderRadius(UI_RADIUS_CONTAINER)
-      .clip(true)
-      .transition(uiOverlayTransition())
     }
     .width('100%')
     .height('100%')
@@ -4560,9 +4659,13 @@ export struct TaskPageContent {
       Row() {
         if (this.contextSheetPage !== 'main') {
           this.taskIconButton($r('sys.symbol.chevron_left'), 36, false, true, () => {
-            uiAnimateState(this.getUIContext(), () => {
-              this.contextSheetPage = this.contextSheetPage === 'model-options' ? 'model' : 'main';
-            });
+            if (this.contextSheetPage === 'goal') {
+              uiAnimateState(this.getUIContext(), () => {
+                this.contextSheetPage = 'main';
+              });
+            } else {
+              this.closeContextSheet();
+            }
           })
         } else {
           Row().width(36).height(36)
@@ -4571,10 +4674,8 @@ export struct TaskPageContent {
           ? '目标模式'
           : this.contextSheetPage === 'permission'
             ? '权限模式'
-            : this.contextSheetPage === 'model-options'
-              ? '推理设置'
-              : this.contextSheetPage === 'agent'
-                ? '引擎'
+            : this.contextSheetPage === 'agent'
+              ? '引擎'
               : this.contextSheetPage === 'model'
                 ? '模型'
                 : '上下文')
@@ -4602,8 +4703,6 @@ export struct TaskPageContent {
         this.agentContextView()
       } else if (this.contextSheetPage === 'model') {
         this.modelContextView()
-      } else if (this.contextSheetPage === 'model-options') {
-        this.modelOptionsContextView()
       } else {
         this.contextMainView()
       }
@@ -4904,8 +5003,14 @@ export struct TaskPageContent {
   @Builder
   modelOptionRow(option: ComposerModelOption) {
     Row({ space: 8 }) {
-      this.modelRowMark(option)
-      Row({ space: 7 }) {
+      Stack() {
+        this.modelRowMark(option)
+      }
+      .onClick(() => {
+        void this.selectComposerModel(option);
+      })
+
+      Row({ space: 2 }) {
         Text(option.label)
           .fontSize(uiFontSize(15))
           .lineHeight(uiLineHeight(21))
@@ -4913,15 +5018,47 @@ export struct TaskPageContent {
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        if (this.modelEffortText(option).length > 0) {
-          Text(this.modelEffortText(option))
-            .fontSize(uiFontSize(13))
-            .lineHeight(uiLineHeight(19))
-            .fontColor($r('app.color.text_secondary'))
+          .constraintSize({ maxWidth: option.efforts.length > 0 ? '70%' : '100%' })
+          .onClick(() => {
+            void this.selectComposerModel(option);
+          })
+
+        if (option.efforts.length > 0) {
+          Button() {
+            Row({ space: 3 }) {
+              Text(this.modelEffortText(option))
+                .fontSize(uiFontSize(13))
+                .lineHeight(uiLineHeight(19))
+                .fontColor($r('app.color.text_secondary'))
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(uiFontSize(10))
+                .fontColor([$r('app.color.text_tertiary')])
+            }
+          }
+          .height(32)
+          .padding({ left: 5, right: 5 })
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.contextRpcBusy)
+          .accessibilityText(`${option.label}思考强度`)
+          .bindMenu(this.modelEffortMenuItems(option))
         }
+
+        Blank()
+          .layoutWeight(1)
+          .onClick(() => {
+            void this.selectComposerModel(option);
+          })
       }
       .layoutWeight(1)
-      .alignItems(VerticalAlign.Center)
+
+      if (this.visibleFastModeCapability() && option.supportsFastMode) {
+        Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+          .selectedColor($r('app.color.accent'))
+          .enabled(!this.contextRpcBusy)
+          .accessibilityText(`${option.label}快速模式`)
+          .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+      }
+
       if (option.subscription) {
         Text('订阅')
           .fontSize(uiFontSize(11))
@@ -4929,27 +5066,19 @@ export struct TaskPageContent {
           .backgroundColor($r('app.color.bg_chip'))
           .borderRadius(UI_RADIUS_CONTROL)
           .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+          .onClick(() => {
+            void this.selectComposerModel(option);
+          })
       }
       if (this.modelOptionIsCurrent(option)) {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(uiFontSize(20))
           .fontColor([$r('app.color.text_primary')])
-          .margin({ right: 2 })
+          .margin({ right: 4 })
+          .onClick(() => {
+            void this.selectComposerModel(option);
+          })
       }
-      Button() {
-        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-          .fontSize(uiFontSize(20))
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .width(38)
-      .height(38)
-      .padding(0)
-      .borderRadius(UI_RADIUS_PILL)
-      .backgroundColor(Color.Transparent)
-      .enabled(!this.contextRpcBusy && this.modelOptionHasOptions(option))
-      .opacity(this.modelOptionHasOptions(option) ? 1 : 0.4)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .onClick(() => this.openModelOptions(option))
     }
     .width('calc(100% - 24vp)')
     .constraintSize({ minHeight: 46 })
@@ -4959,145 +5088,62 @@ export struct TaskPageContent {
       ? $r('app.color.bg_chip') : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
     .opacity(this.contextRpcBusy ? 0.6 : 1)
-    .clickEffect(UI_LIST_CLICK_EFFECT)
-    .onClick(() => {
-      void this.selectComposerModel(option);
-    })
+    .enabled(!this.contextRpcBusy)
   }
 
   @Builder
   modelContextView() {
-    Scroll() {
-      Column({ space: 12 }) {
-        if (this.pendingAgentSwitchIntent !== null) {
-          Row({ space: 9 }) {
-            SymbolGlyph($r('sys.symbol.clock'))
-              .fontSize(uiFontSize(15))
-              .fontColor([$r('app.color.text_secondary')])
-            Column({ space: 2 }) {
-              Text('Agent 切换等待中')
-                .fontSize(uiFontSize(13))
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.text_primary'))
-              Text(`${modelAgentLabel(this.pendingAgentSwitchIntent.targetAgentKind)} · ${this.pendingAgentSwitchIntent.model}`)
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_secondary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
+    Column() {
+      Scroll() {
+        Column({ space: 12 }) {
+          if (this.pendingAgentSwitchIntent !== null) {
+            Row({ space: 9 }) {
+              SymbolGlyph($r('sys.symbol.clock'))
+                .fontSize(uiFontSize(15))
+                .fontColor([$r('app.color.text_secondary')])
+              Column({ space: 2 }) {
+                Text('Agent 切换等待中')
+                  .fontSize(uiFontSize(13))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text(`${modelAgentLabel(this.pendingAgentSwitchIntent.targetAgentKind)} · ${this.pendingAgentSwitchIntent.model}`)
+                  .fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
             }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
+            .width('calc(100% - 32vp)')
+            .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+            .margin({ left: 16, right: 16 })
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
           }
-          .width('calc(100% - 32vp)')
-          .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-          .margin({ left: 16, right: 16 })
-          .backgroundColor($r('app.color.bg_chip'))
-          .borderRadius(UI_RADIUS_CONTROL)
-        }
 
-        Column() {
-          if (this.groupedModelOptions().length === 0) {
-            Text(this.contextRpcBusy ? '正在加载模型...' : '没有可用模型')
-              .fontSize(uiFontSize(14))
-              .fontColor($r('app.color.text_secondary'))
-              .width('100%')
-              .textAlign(TextAlign.Center)
-              .padding({ top: 28, bottom: 28 })
-          } else {
-            ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
-              this.modelProviderGroup(group)
-            }, (group: ComposerModelGroup) => group.key)
+          Column() {
+            if (this.groupedModelOptions().length === 0) {
+              Text(this.contextRpcBusy ? '正在加载模型...' : '没有可用模型')
+                .fontSize(uiFontSize(14))
+                .fontColor($r('app.color.text_secondary'))
+                .width('100%')
+                .textAlign(TextAlign.Center)
+                .padding({ top: 28, bottom: 28 })
+            } else {
+              ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
+                this.modelProviderGroup(group)
+              }, (group: ComposerModelGroup) => group.key)
+            }
           }
+          .width('100%')
+          .padding({ top: 2, bottom: 12 })
         }
         .width('100%')
-        .padding({ top: 2, bottom: 16 })
       }
       .width('100%')
-    }
-    .width('100%')
-    .layoutWeight(1)
-  }
-
-  @Builder
-  modelOptionsContextView() {
-    Scroll() {
-      Column({ space: 12 }) {
-        if (this.modelOptionsTarget().length > 0) {
-          Row({ space: 10 }) {
-            this.modelProviderMark(this.modelOptionsTarget()[0])
-            Column({ space: 2 }) {
-              Text(this.modelOptionsTarget()[0].label)
-                .fontSize(uiFontSize(19))
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.text_primary'))
-              Text('选择推理强度')
-                .fontSize(uiFontSize(13))
-                .fontColor($r('app.color.text_secondary'))
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-          }
-          .width('100%')
-          .padding({ left: 20, right: 20, top: 18, bottom: 8 })
-        }
-
-        if (this.currentModelEffortOptions().length > 0) {
-          Column({ space: 8 }) {
-            Text('推理强度')
-              .fontSize(uiFontSize(14))
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
-              .width('100%')
-            Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
-              ForEach(this.currentModelEffortOptions(), (option: ComposerChoiceOption) => {
-                Button(option.label)
-                  .height(38)
-                  .fontSize(uiFontSize(14))
-                  .fontColor(this.modelOptionEffortSelected(option)
-                    ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
-                  .backgroundColor(this.modelOptionEffortSelected(option)
-                    ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-                  .borderRadius(UI_RADIUS_PILL)
-                  .margin({ right: 8, bottom: 8 })
-                  .enabled(!this.contextRpcBusy)
-                  .clickEffect(UI_CLICK_EFFECT)
-                  .onClick(() => {
-                    void this.selectComposerEffort(option);
-                  })
-              }, (option: ComposerChoiceOption) => option.id)
-            }
-            .width('100%')
-          }
-          .width('100%')
-          .alignItems(HorizontalAlign.Start)
-          .padding({ left: 20, right: 20, top: 12 })
-        }
-
-        if (this.currentModelSupportsFastMode()) {
-          Row({ space: 12 }) {
-            this.contextRowIcon($r('sys.symbol.bolt'))
-            Column({ space: 2 }) {
-              Text('Fast 模式')
-                .fontSize(uiFontSize(16))
-                .fontColor($r('app.color.text_primary'))
-              Text('使用当前模型的快速服务通道')
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_tertiary'))
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-            Toggle({ type: ToggleType.Switch, isOn: this.session()?.fastMode ?? false })
-              .enabled(!this.contextRpcBusy)
-              .onChange(() => {
-                void this.toggleFastMode();
-              })
-          }
-          .width('100%')
-          .padding({ left: 20, right: 20, top: 8, bottom: 8 })
-        }
-      }
-      .width('100%')
-      .padding({ bottom: 24 })
+      .layoutWeight(1)
+      .scrollBar(BarState.Auto)
     }
     .width('100%')
     .layoutWeight(1)
@@ -8046,7 +8092,7 @@ export struct TaskPageContent {
       return false;
     }
     this.closeSessionActions();
-    if (leaveDetail && !this.isEmbedded()) router.back();
+    if (leaveDetail && !this.isEmbedded()) this.leaveDetailPage();
     return true;
   }
 
@@ -9085,7 +9131,7 @@ export struct TaskPageContent {
       if (newSessionId.length > 0) {
         promptAction.showToast({ message: '已创建新任务' });
         // 返回任务列表（列表会刷新显示新任务）。嵌入式详情留在右侧，等待列表选择状态更新。
-        if (!this.isEmbedded()) router.back();
+        if (!this.isEmbedded()) this.leaveDetailPage();
       } else {
         promptAction.showToast({ message: '分叉失败' });
       }

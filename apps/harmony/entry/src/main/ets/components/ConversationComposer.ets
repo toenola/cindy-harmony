@@ -4,7 +4,10 @@ import {
   composerAttachmentRenderKey,
 } from '../core/attachments/AttachmentModels';
 import { ComposerFile } from '../core/attachments/ComposerFileQueue';
-import { ComposerAtomPresentation } from '../core/messages/ComposerDocument';
+import {
+  ComposerAtomPresentation,
+  LONG_PASTE_MAX_CHARS,
+} from '../core/messages/ComposerDocument';
 import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
@@ -154,16 +157,19 @@ export struct ConversationComposer {
           .onClick(() => {
             if (image.status === 'ready') this.onPreviewImage(image);
           })
-        Stack({ alignContent: Alignment.Center }) {
+        Button() {
           SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(10)
+            .fontSize(11)
             .fontColor([$r('app.color.chat_overlay_text')])
         }
-        .width(18)
-        .height(18)
+        .type(ButtonType.Circle)
+        .width(28)
+        .height(28)
+        .padding(0)
         .backgroundColor($r('app.color.overlay'))
         .borderRadius(UI_RADIUS_PILL)
         .clickEffect(UI_ICON_CLICK_EFFECT)
+        .zIndex(1)
         .onClick(() => this.onRemoveImage(image))
       }
       if (image.status === 'uploading') {
@@ -488,6 +494,7 @@ export struct ConversationComposer {
               .placeholderColor($r('app.color.text_placeholder'))
               .caretColor($r('app.color.chat_input_caret'))
               .backgroundColor(Color.Transparent)
+              .maxLength(LONG_PASTE_MAX_CHARS)
               .align(Alignment.Center)
               .textAlign(TextAlign.Start)
               .padding({ left: 4, right: 4 })

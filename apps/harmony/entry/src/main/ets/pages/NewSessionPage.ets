@@ -24,6 +24,7 @@ import {
   parseProviderModelOptions as parseComposerProviderModelOptions,
   permissionModeDescription,
   permissionModeLabel,
+  reconcileModelEffort,
 } from '../core/ComposerCatalog';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
 import {
@@ -42,6 +43,11 @@ import {
 } from '../core/tasks/NewSessionCreationStore';
 import { normalizeAutoTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import {
+  ComposerDocument,
+  composerDocumentProjectedText,
+  textComposerDocument,
+} from '../core/messages/ComposerDocument';
 import {
   UI_ICON_CLICK_EFFECT,
   uiAnimateFastState,
@@ -66,6 +72,9 @@ class RemoteDirectory {
 
 const NEW_AGENT_OPTIONS: NewAgentKind[] = ['claude-code', 'codex', 'pi'];
 const MAX_COMPOSER_IMAGES = 20;
+/** 新建任务尚无 sessionId，使用保留键复用会话 Composer 的防抖持久化。 */
+const NEW_SESSION_COMPOSER_DRAFT_ID = '__new-session__';
+const NEW_SESSION_DRAFT_CHECKPOINT_MS = 1500;
 function createRecentPickerOptions(): PickerOptions {
   const options = new PickerOptions();
   options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
@@ -128,6 +137,9 @@ struct NewSessionPage {
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
+  /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并应用。 */
+  @State modelEffortMemory: Map<string, string> = new Map();
+  @State modelFastMemory: Map<string, boolean> = new Map();
   @State contextSelectedUris: string[] = [];
   @State selectorOpen: string = '';
   @State browseOpen: boolean = false;
@@ -164,6 +176,12 @@ struct NewSessionPage {
   private unsubs: Array<() => void> = [];
   private routeDeviceId: string = '';
   private runtimeLoadGeneration: number = 0;
+  /** 异步能力目录返回后，不得覆盖用户在加载窗口内已经选定的运行参数。 */
+  private runtimeModelTouchedGeneration: number = -1;
+  private runtimeEffortTouchedGeneration: number = -1;
+  private runtimePermissionTouchedGeneration: number = -1;
+  private runtimePlanTouchedGeneration: number = -1;
+  private runtimeFastTouchedGeneration: number = -1;
   private agentTouched: boolean = false;
   /** create-failed 返回编辑后，等待 capabilities 回包再恢复一次运行参数。 */
   private pendingEditDraft: NewSessionEditDraft | null = null;
@@ -173,6 +191,9 @@ struct NewSessionPage {
   private pageActive: boolean = false;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
+  private newSessionDraftGeneration: number = 0;
+  private newSessionInputRevision: number = 0;
+  private newSessionDraftCheckpointTimer: number = -1;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
@@ -194,7 +215,7 @@ struct NewSessionPage {
       this.selectedAgentKind = this.editDraftAgentKind(editDraft.agentKind);
       this.workspaceKind = editDraft.workspaceKind === 'project' ? 'project' : 'dialogue';
       this.workingDir = editDraft.workingDir;
-      this.input = editDraft.text;
+      this.applyNewSessionInput(editDraft.text);
       this.composerImages = this.editDraftImages(editDraft.images);
       this.composerFiles = this.editDraftFiles(editDraft.files);
       const missingAttachments = editDraft.images.length - this.composerImages.length
@@ -203,6 +224,8 @@ struct NewSessionPage {
         this.error = `有 ${missingAttachments} 个附件因数量上限未恢复`;
       }
       this.resolveEditDraftImagePreviews();
+    } else {
+      this.restoreNewSessionDraft();
     }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
@@ -213,6 +236,9 @@ struct NewSessionPage {
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    this.newSessionDraftGeneration += 1;
+    this.cancelNewSessionDraftCheckpoint();
+    void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
     this.stopKeyboardHeightObservation();
     this.keyboardHeight = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
@@ -249,6 +275,43 @@ struct NewSessionPage {
     }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
+  }
+
+  private restoreNewSessionDraft(): void {
+    const generation = ++this.newSessionDraftGeneration;
+    const inputRevision = this.newSessionInputRevision;
+    void AppServices.instance.composerDrafts.read(NEW_SESSION_COMPOSER_DRAFT_ID)
+      .then((document: ComposerDocument | null) => {
+        if (!this.pageActive || generation !== this.newSessionDraftGeneration
+          || inputRevision !== this.newSessionInputRevision || document === null) return;
+        this.input = composerDocumentProjectedText(document);
+      });
+  }
+
+  private applyNewSessionInput(value: string): void {
+    this.input = value;
+    this.newSessionInputRevision += 1;
+    AppServices.instance.composerDrafts.save(
+      NEW_SESSION_COMPOSER_DRAFT_ID,
+      textComposerDocument(value),
+    );
+    this.scheduleNewSessionDraftCheckpoint();
+  }
+
+  /** trailing debounce 之外再做固定间隔检查点，持续输入时也不会一直没有落盘版本。 */
+  private scheduleNewSessionDraftCheckpoint(): void {
+    if (this.newSessionDraftCheckpointTimer >= 0) return;
+    this.newSessionDraftCheckpointTimer = setTimeout(() => {
+      this.newSessionDraftCheckpointTimer = -1;
+      if (!this.pageActive) return;
+      void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
+    }, NEW_SESSION_DRAFT_CHECKPOINT_MS);
+  }
+
+  private cancelNewSessionDraftCheckpoint(): void {
+    if (this.newSessionDraftCheckpointTimer < 0) return;
+    clearTimeout(this.newSessionDraftCheckpointTimer);
+    this.newSessionDraftCheckpointTimer = -1;
   }
 
   /** 直接返回时使在途上传失效，并回收所有仍由新建页持有的 OSS 引用。 */
@@ -419,20 +482,23 @@ struct NewSessionPage {
 
   private selectModel(option: RuntimeModelOption): void {
     if (this.creating) return;
+    this.runtimeModelTouchedGeneration = this.runtimeLoadGeneration;
+    // 选模型时会一起 reconcile effort / Fast，后续异步目录回包也不能把它们改回默认值。
+    this.runtimeEffortTouchedGeneration = this.runtimeLoadGeneration;
+    this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
+    const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
+    const nextFastMode = this.modelFastForRow(option);
     this.model = option.id;
     this.providerId = option.providerId;
-    if (option.defaultEffort.length > 0) {
-      this.effort = option.defaultEffort;
-    } else if (!this.modelSupportsEffort(option, this.effort) && option.efforts.length > 0) {
-      this.effort = option.efforts[0];
-    }
-    if (!this.fastModeCapability || !option.supportsFastMode) this.fastMode = false;
+    this.effort = nextEffort;
+    this.fastMode = nextFastMode;
     this.selectorOpen = '';
     this.error = '';
   }
 
   private togglePlanMode(): void {
     if (this.creating || !this.planModeSupported) return;
+    this.runtimePlanTouchedGeneration = this.runtimeLoadGeneration;
     if (!this.planModeEnabled) {
       this.permissionModeBeforePlan = this.permissionMode;
     }
@@ -442,6 +508,7 @@ struct NewSessionPage {
   private toggleFastMode(): void {
     const model = this.findModelOption(this.model, this.providerId);
     if (!this.fastModeCapability || model === undefined || !model.supportsFastMode || this.creating) return;
+    this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
     this.fastMode = !this.fastMode;
   }
 
@@ -810,15 +877,21 @@ struct NewSessionPage {
     return latest;
   }
 
-  private async loadProviderModelOptions(agent: NewAgentKind, deviceId: string): Promise<void> {
+  private async loadProviderModelOptions(
+    agent: NewAgentKind,
+    deviceId: string,
+    generation: number,
+  ): Promise<void> {
     try {
       await AppServices.instance.openLink(deviceId);
+      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
       const options = new DlInvokeOptions();
       options.channel = 'maker:provider:list';
       const request = new ProviderListOptions();
       request.capabilities = ['provider-logo-kinds-v2'];
       options.args = [request];
       const envelope = await AppServices.instance.client.invoke(deviceId, options);
+      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
       const result = unwrapInvokeResult(envelope);
       const providerOptions = this.parseProviderModelOptions(result, agent);
       this.providerModelOptions = providerOptions;
@@ -831,6 +904,7 @@ struct NewSessionPage {
         this.providerModelAgent = this.providerModelOptions.length > 0 ? agent : '';
       }
     } catch (e) {
+      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
       this.providerModelOptions = [];
       this.providerModelAgent = '';
       this.modelVisibilityOverrides = new Map();
@@ -875,6 +949,64 @@ struct NewSessionPage {
 
   private modelOptionKey(option: RuntimeModelOption): string {
     return composerModelKey(option);
+  }
+
+  private modelRuntimeKey(option: RuntimeModelOption): string {
+    return `${this.selectedAgentKind}:${this.modelOptionKey(option)}`;
+  }
+
+  private modelOptionIsCurrent(option: RuntimeModelOption): boolean {
+    return option.id === this.model && option.providerId === this.providerId;
+  }
+
+  private modelEffortForRow(option: RuntimeModelOption): string {
+    if (this.modelOptionIsCurrent(option) && this.effort.length > 0) return this.effort;
+    const remembered = this.modelEffortMemory.get(this.modelRuntimeKey(option));
+    if (remembered !== undefined && this.modelSupportsEffort(option, remembered)) return remembered;
+    if (option.defaultEffort.length > 0) return option.defaultEffort;
+    return option.efforts.length > 0 ? option.efforts[0] : '';
+  }
+
+  private modelFastForRow(option: RuntimeModelOption): boolean {
+    if (!this.fastModeCapability || !option.supportsFastMode) return false;
+    if (this.modelOptionIsCurrent(option)) return this.fastMode;
+    return this.modelFastMemory.get(this.modelRuntimeKey(option)) ?? false;
+  }
+
+  private modelEffortMenuItems(option: RuntimeModelOption): MenuElement[] {
+    const items: MenuElement[] = [];
+    for (let i = 0; i < option.efforts.length; i++) {
+      const effort = option.efforts[i];
+      items.push({
+        value: this.modelEffortLabel(option, effort),
+        action: (): void => this.selectModelRowEffort(option, effort),
+      });
+    }
+    return items;
+  }
+
+  private selectModelRowEffort(option: RuntimeModelOption, effort: string): void {
+    if (this.creating) return;
+    const next = new Map(this.modelEffortMemory);
+    next.set(this.modelRuntimeKey(option), effort);
+    this.modelEffortMemory = next;
+    if (this.modelOptionIsCurrent(option)) {
+      this.runtimeEffortTouchedGeneration = this.runtimeLoadGeneration;
+      this.effort = effort;
+    }
+    this.error = '';
+  }
+
+  private setModelRowFast(option: RuntimeModelOption, enabled: boolean): void {
+    if (this.creating || !this.fastModeCapability || !option.supportsFastMode) return;
+    const next = new Map(this.modelFastMemory);
+    next.set(this.modelRuntimeKey(option), enabled);
+    this.modelFastMemory = next;
+    if (this.modelOptionIsCurrent(option)) {
+      this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
+      this.fastMode = enabled;
+    }
+    this.error = '';
   }
 
   private choiceExists(options: RuntimeChoiceOption[], id: string): boolean {
@@ -939,6 +1071,8 @@ struct NewSessionPage {
     if (deviceId.length === 0) return;
     const generation = ++this.runtimeLoadGeneration;
     this.resetRuntimeDefaults(agent);
+    // 编辑失败返回的新建草稿在能力目录加载期间也应保持可见，避免用户看到并操作到临时默认值。
+    this.applyPendingEditRuntime(deviceId, agent, false);
     try {
       await AppServices.instance.openLink(deviceId);
       const options = new DlInvokeOptions();
@@ -956,49 +1090,74 @@ struct NewSessionPage {
 
       this.planModeNative = this.capabilityHasNativePlan(capabilities);
       this.planModeSupported = this.planModeNative || this.capabilityHasLegacyPlan(capabilities);
-      await this.loadProviderModelOptions(agent, deviceId);
+      await this.loadProviderModelOptions(agent, deviceId, generation);
       if (generation !== this.runtimeLoadGeneration) return;
 
       const recent = this.latestSessionForAgent(agent);
-      this.planModeEnabled = recent?.planModeEnabled === true || recent?.permissionMode === 'plan';
-      if (recent !== undefined && recent.permissionMode.length > 0 && recent.permissionMode !== 'plan') {
+      const modelTouched = this.runtimeModelTouchedGeneration === generation;
+      const effortTouched = this.runtimeEffortTouchedGeneration === generation;
+      const permissionTouched = this.runtimePermissionTouchedGeneration === generation;
+      const planTouched = this.runtimePlanTouchedGeneration === generation;
+      const fastTouched = this.runtimeFastTouchedGeneration === generation;
+      if (!planTouched) {
+        this.planModeEnabled = recent?.planModeEnabled === true || recent?.permissionMode === 'plan';
+      }
+      if (!permissionTouched
+        && recent !== undefined && recent.permissionMode.length > 0 && recent.permissionMode !== 'plan') {
         this.permissionMode = recent.permissionMode;
         this.permissionModeBeforePlan = recent.permissionMode;
       }
       const source = this.visibleModelOptions();
       let selectedModel: RuntimeModelOption | undefined = undefined;
-      if (recent !== undefined && recent.model.length > 0) {
-        selectedModel = this.findModelOption(recent.model, recent.providerId);
+      if (!modelTouched) {
+        if (recent !== undefined && recent.model.length > 0) {
+          selectedModel = this.findModelOption(recent.model, recent.providerId);
+        }
+        if (selectedModel === undefined) {
+          const fallback = fallbackModel(agent);
+          selectedModel = this.findModelOption(fallback);
+        }
+        if (selectedModel === undefined && source.length > 0) selectedModel = source[0];
+        if (selectedModel !== undefined) {
+          this.model = selectedModel.id;
+          this.providerId = selectedModel.providerId;
+        }
       }
-      if (selectedModel === undefined) {
-        const fallback = fallbackModel(agent);
-        selectedModel = this.findModelOption(fallback);
+      if (!effortTouched) {
+        if (selectedModel !== undefined) {
+          this.effort = reconcileModelEffort(selectedModel, this.effort);
+        }
+        const currentModel = this.findModelOption(this.model, this.providerId);
+        const effortValid = currentModel === undefined
+          ? this.choiceExists(this.effortOptions, this.effort)
+          : this.modelSupportsEffort(currentModel, this.effort)
+            && (this.effortOptions.length === 0 || this.choiceExists(this.effortOptions, this.effort));
+        if (this.effortOptions.length > 0 && !effortValid) {
+          this.effort = this.effortOptions[0].id;
+        }
       }
-      if (selectedModel === undefined && source.length > 0) selectedModel = source[0];
-      if (selectedModel !== undefined) {
-        this.model = selectedModel.id;
-        this.providerId = selectedModel.providerId;
-        if (selectedModel.defaultEffort.length > 0) this.effort = selectedModel.defaultEffort;
-      }
-      const currentModel = this.findModelOption(this.model, this.providerId);
-      const effortValid = currentModel === undefined
-        ? this.choiceExists(this.effortOptions, this.effort)
-        : this.modelSupportsEffort(currentModel, this.effort)
-          && (this.effortOptions.length === 0 || this.choiceExists(this.effortOptions, this.effort));
-      if (this.effortOptions.length > 0 && !effortValid) {
-        this.effort = this.effortOptions[0].id;
-      }
-      if (this.permissionOptions.length > 0 && !this.choiceExists(this.permissionOptions, this.permissionMode)) {
+      if (!permissionTouched && this.permissionOptions.length > 0
+        && !this.choiceExists(this.permissionOptions, this.permissionMode)) {
         this.permissionMode = this.choiceExists(this.permissionOptions, 'auto')
           ? 'auto' : this.permissionOptions[0].id;
         this.permissionModeBeforePlan = this.permissionMode;
       }
-      this.fastMode = false;
+      if (!fastTouched) this.fastMode = false;
     } catch (e) {
       // 旧版本被控端可能没有 capabilities；内置默认仍可被 create-session 校验。
     } finally {
       if (generation === this.runtimeLoadGeneration) {
-        this.applyPendingEditRuntime(deviceId, agent, true);
+        const runtimeTouched = this.runtimeModelTouchedGeneration === generation
+          || this.runtimeEffortTouchedGeneration === generation
+          || this.runtimePermissionTouchedGeneration === generation
+          || this.runtimePlanTouchedGeneration === generation
+          || this.runtimeFastTouchedGeneration === generation;
+        if (runtimeTouched) {
+          // 用户已在加载窗口内编辑草稿，旧的失败编辑草稿不能在下一次加载时回写覆盖它。
+          this.pendingEditDraft = null;
+        } else {
+          this.applyPendingEditRuntime(deviceId, agent, true);
+        }
       }
     }
   }
@@ -1158,6 +1317,8 @@ struct NewSessionPage {
     params.legacyPlanRestore = !this.planModeNative && this.planModeEnabled
       ? (this.permissionModeBeforePlan || this.permissionMode) : '';
     AppServices.instance.newSessionCreations.start(params);
+    this.cancelNewSessionDraftCheckpoint();
+    AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
     this.attachmentsHandedOff = true;
     router.replaceUrl({
       url: 'pages/TaskPage',
@@ -1228,10 +1389,11 @@ struct NewSessionPage {
     .backgroundColor($r('app.color.bg_page'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
-      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
-      dragBar: true,
+      detents: this.contextSheetPage === 'model'
+        ? [420] : [SheetSize.MEDIUM, SheetSize.LARGE],
+      dragBar: this.contextSheetPage !== 'model',
       showClose: false,
-      preferType: SheetType.BOTTOM,
+      preferType: this.contextSheetPage === 'model' ? SheetType.CENTER : SheetType.BOTTOM,
       backgroundColor: $r('app.color.bg_card'),
       maskColor: $r('app.color.overlay'),
     })
@@ -1653,6 +1815,7 @@ struct NewSessionPage {
         secondaryButton: {
           value: '继续',
           action: () => {
+            this.runtimePermissionTouchedGeneration = this.runtimeLoadGeneration;
             this.permissionMode = option.id;
             this.permissionModeBeforePlan = option.id;
             this.contextSheetOpen = false;
@@ -1661,6 +1824,7 @@ struct NewSessionPage {
       });
       return;
     }
+    this.runtimePermissionTouchedGeneration = this.runtimeLoadGeneration;
     this.permissionMode = option.id;
     this.permissionModeBeforePlan = option.id;
     this.contextSheetOpen = false;
@@ -1670,21 +1834,6 @@ struct NewSessionPage {
   private selectContextModel(option: RuntimeModelOption): void {
     this.selectModel(option);
     this.contextSheetOpen = false;
-  }
-
-  private selectContextEffort(option: RuntimeChoiceOption): void {
-    if (this.creating) return;
-    this.effort = option.id;
-    this.error = '';
-  }
-
-  private openContextModelOptions(option: RuntimeModelOption): void {
-    if (this.creating) return;
-    if (option.id === this.model && option.providerId === this.providerId) {
-      this.contextSheetPage = 'model-options';
-      return;
-    }
-    this.selectContextModel(option);
   }
 
   @Builder
@@ -1797,137 +1946,101 @@ struct NewSessionPage {
 
   @Builder
   contextModelRow(option: RuntimeModelOption) {
-    Row({ space: 10 }) {
-      this.selectorIcon(agentMark(this.selectedAgentKind))
+    Row({ space: 8 }) {
+      Stack() {
+        this.selectorIcon(agentMark(this.selectedAgentKind))
+      }
+      .onClick(() => this.selectContextModel(option))
+
       Column({ space: 1 }) {
-        Text(option.label)
-          .fontSize(uiFontSize(16))
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Row({ space: 2 }) {
+          Text(option.label)
+            .fontSize(uiFontSize(16))
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: option.efforts.length > 0 ? '70%' : '100%' })
+            .onClick(() => this.selectContextModel(option))
+          if (option.efforts.length > 0) {
+            Button() {
+              Row({ space: 3 }) {
+                Text(this.modelEffortLabel(option, this.modelEffortForRow(option)))
+                  .fontSize(uiFontSize(13))
+                  .fontColor($r('app.color.text_secondary'))
+                SymbolGlyph($r('sys.symbol.chevron_down'))
+                  .fontSize(uiFontSize(10))
+                  .fontColor([$r('app.color.text_tertiary')])
+              }
+            }
+            .height(32)
+            .padding({ left: 5, right: 5 })
+            .backgroundColor(Color.Transparent)
+            .enabled(!this.creating)
+            .accessibilityText(`${option.label}思考强度`)
+            .bindMenu(this.modelEffortMenuItems(option))
+          }
+          Blank()
+            .layoutWeight(1)
+            .onClick(() => this.selectContextModel(option))
+        }
+        .width('100%')
         if (option.providerName.length > 0 || option.description.length > 0) {
           Text(option.providerName.length > 0 ? option.providerName : option.description)
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .onClick(() => this.selectContextModel(option))
         }
       }
       .layoutWeight(1)
-      if (option.id === this.model && option.providerId === this.providerId) {
+
+      if (this.fastModeCapability && option.supportsFastMode) {
+        Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+          .selectedColor($r('app.color.accent'))
+          .enabled(!this.creating)
+          .accessibilityText(`${option.label}快速模式`)
+          .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+      }
+
+      if (this.modelOptionIsCurrent(option)) {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(uiFontSize(18))
           .fontColor([$r('app.color.chat_cta')])
-      }
-      if (option.efforts.length > 0 || option.supportsFastMode) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-            .fontSize(uiFontSize(18))
-            .fontColor([$r('app.color.text_secondary')])
-        }
-        .width(34)
-        .height(34)
-        .padding(0)
-        .borderRadius(17)
-        .backgroundColor(Color.Transparent)
-        .onClick(() => this.openContextModelOptions(option))
+          .onClick(() => this.selectContextModel(option))
       }
     }
     .width('100%')
     .constraintSize({ minHeight: option.providerName.length > 0 ? 58 : 46 })
-    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
-    .backgroundColor(option.id === this.model && option.providerId === this.providerId
-      ? $r('app.color.bg_chip') : Color.Transparent)
+    .padding({ left: 16, right: 12, top: 8, bottom: 8 })
+    .backgroundColor(this.modelOptionIsCurrent(option) ? $r('app.color.bg_chip') : Color.Transparent)
     .borderRadius(28)
-    .onClick(() => this.selectContextModel(option))
   }
 
   @Builder
   modelContextView() {
-    Scroll() {
-      Column({ space: 8 }) {
-        if (this.visibleModelOptions().length === 0) {
-          Text('当前电脑未提供模型列表')
-            .fontSize(uiFontSize(14))
-            .fontColor($r('app.color.text_secondary'))
-            .width('100%')
-            .textAlign(TextAlign.Center)
-            .padding({ top: 28, bottom: 28 })
-        } else {
-          ForEach(this.visibleModelOptions(), (option: RuntimeModelOption) => {
-            this.contextModelRow(option)
-          }, (option: RuntimeModelOption) => this.modelOptionKey(option))
-        }
-      }
-      .width('100%')
-      .padding({ top: 8, bottom: 24 })
-    }
-    .width('100%')
-    .layoutWeight(1)
-  }
-
-  @Builder
-  modelOptionsContextView() {
-    Scroll() {
-      Column({ space: 12 }) {
-        Text(this.currentModelLabel())
-          .fontSize(uiFontSize(19))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-          .padding({ left: 20, right: 20, top: 18, bottom: 4 })
-
-        if (this.currentEffortOptions().length > 0) {
-          Column({ space: 8 }) {
-            Text('推理强度')
+    Column() {
+      Scroll() {
+        Column({ space: 8 }) {
+          if (this.visibleModelOptions().length === 0) {
+            Text('当前电脑未提供模型列表')
               .fontSize(uiFontSize(14))
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
+              .fontColor($r('app.color.text_secondary'))
               .width('100%')
-            Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
-              ForEach(this.currentEffortOptions(), (option: RuntimeChoiceOption) => {
-                Button(option.label)
-                  .height(38)
-                  .fontSize(uiFontSize(14))
-                  .fontColor(option.id === this.effort
-                    ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
-                  .backgroundColor(option.id === this.effort
-                    ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-                  .borderRadius(19)
-                  .margin({ right: 8, bottom: 8 })
-                  .enabled(!this.creating)
-                  .onClick(() => this.selectContextEffort(option))
-              }, (option: RuntimeChoiceOption) => option.id)
-            }
-            .width('100%')
+              .textAlign(TextAlign.Center)
+              .padding({ top: 28, bottom: 28 })
+          } else {
+            ForEach(this.visibleModelOptions(), (option: RuntimeModelOption) => {
+              this.contextModelRow(option)
+            }, (option: RuntimeModelOption) => this.modelOptionKey(option))
           }
-          .width('100%')
-          .alignItems(HorizontalAlign.Start)
-          .padding({ left: 20, right: 20, top: 12 })
         }
-
-        if (this.currentModelSupportsFastMode()) {
-          Row({ space: 12 }) {
-            this.contextRowIcon($r('sys.symbol.bolt'))
-            Column({ space: 2 }) {
-              Text('Fast 模式')
-                .fontSize(uiFontSize(16))
-                .fontColor($r('app.color.text_primary'))
-              Text('使用当前模型的快速服务通道')
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_tertiary'))
-            }
-            .layoutWeight(1)
-            Toggle({ type: ToggleType.Switch, isOn: this.fastMode })
-              .enabled(!this.creating)
-              .onChange(() => this.toggleFastMode())
-          }
-          .width('100%')
-          .padding({ left: 20, right: 20, top: 8, bottom: 8 })
-        }
+        .width('100%')
+        .padding({ top: 8, bottom: 16 })
       }
       .width('100%')
-      .padding({ bottom: 24 })
+      .layoutWeight(1)
+      .scrollBar(BarState.Auto)
     }
     .width('100%')
     .layoutWeight(1)
@@ -1949,18 +2062,16 @@ struct NewSessionPage {
           .borderRadius(18)
           .backgroundColor(Color.Transparent)
           .onClick(() => {
-            this.contextSheetPage = this.contextSheetPage === 'model-options' ? 'model' : 'main';
+            this.contextSheetOpen = false;
           })
         } else {
           Row().width(36).height(36)
         }
         Text(this.contextSheetPage === 'permission'
           ? '权限模式'
-          : this.contextSheetPage === 'model-options'
-            ? '推理设置'
-            : this.contextSheetPage === 'model'
-              ? '模型'
-              : '上下文')
+          : this.contextSheetPage === 'model'
+            ? '模型'
+            : '上下文')
           .fontSize(uiFontSize(17))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
@@ -1980,8 +2091,6 @@ struct NewSessionPage {
         this.permissionContextView()
       } else if (this.contextSheetPage === 'model') {
         this.modelContextView()
-      } else if (this.contextSheetPage === 'model-options') {
-        this.modelOptionsContextView()
       } else {
         this.contextMainView()
       }
@@ -2025,7 +2134,7 @@ struct NewSessionPage {
         showStreamingStatus: false,
         inputId: 'new-session-composer-input',
         onInputChange: (value: string): void => {
-          this.input = value;
+          this.applyNewSessionInput(value);
           this.error = '';
         },
         onFocusChange: (focused: boolean): void => {

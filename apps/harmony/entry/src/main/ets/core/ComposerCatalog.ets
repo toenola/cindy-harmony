@@ -72,6 +72,16 @@ export function composerModelKey(option: ComposerModelOption): string {
   return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
 }
 
+/** 与 Mobile 新建页同口径：切换模型后保留仍受支持的档位，否则回落模型默认档。 */
+export function reconcileModelEffort(option: ComposerModelOption, currentEffort: string): string {
+  if (option.efforts.length === 0) return '';
+  if (option.efforts.indexOf(currentEffort) >= 0) return currentEffort;
+  if (option.defaultEffort.length > 0 && option.efforts.indexOf(option.defaultEffort) >= 0) {
+    return option.defaultEffort;
+  }
+  return option.efforts[0];
+}
+
 export function stringArrayHas(value: Object | undefined, expected: string): boolean {
   if (!Array.isArray(value)) return false;
   const values = value as Object[];
