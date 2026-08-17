@@ -43,6 +43,8 @@ export class ComposerImage {
 export struct ConversationComposer {
   @Prop input: string = '';
   @Prop focused: boolean = false;
+  /** 父页面在选择层打开期间保留完整 Composer，避免清焦后退回收起态。 */
+  @Prop surfaceExpanded: boolean = false;
   @Prop images: ComposerImage[] = [];
   @Prop files: ComposerFile[] = [];
   @Prop atoms: ComposerAtomPresentation[] = [];
@@ -64,7 +66,7 @@ export struct ConversationComposer {
   @Prop effortLabel: string = '';
   @Prop showAddButton: boolean = true;
   @Prop showStreamingStatus: boolean = true;
-  /** 会话详情使用华为官方浮动操作栏同款组件材质；新建任务仍保留表单内嵌样式。 */
+  /** 会话详情与新建任务共用华为官方浮动操作栏同款组件材质。 */
   @Prop floatingGlass: boolean = false;
   /** 浮动背板距当前可用区域底边的间距，由分栏父页面与 HdsTabs 共用同一口径。 */
   @Prop floatingBottomInset: number = 2;
@@ -119,7 +121,8 @@ export struct ConversationComposer {
   }
 
   private expanded(): boolean {
-    return this.focused || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
+    return this.surfaceExpanded || this.focused
+      || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
   }
 
   /**

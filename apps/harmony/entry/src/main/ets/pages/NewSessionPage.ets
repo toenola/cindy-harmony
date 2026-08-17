@@ -130,6 +130,9 @@ struct NewSessionPage {
   @State workingDir: string = '';
   @State input: string = '';
   @State composerFocused: boolean = false;
+  /** 模型选择等临时清焦期间仍保留与任务详情一致的完整输入卡片。 */
+  @State composerSurfaceVisible: boolean = false;
+  private composerBlurGeneration: number = 0;
   @State composerImages: ComposerImage[] = [];
   @State composerFiles: ComposerFile[] = [];
   @State pickingImages: boolean = false;
@@ -137,6 +140,7 @@ struct NewSessionPage {
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
   @State contextSheetPage: string = 'main';
+  private restoreComposerFocusOnSheetDisappear: boolean = false;
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并应用。 */
   @State modelEffortMemory: Map<string, string> = new Map();
   @State modelFastMemory: Map<string, boolean> = new Map();
@@ -236,6 +240,12 @@ struct NewSessionPage {
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    this.getUIContext().getFocusController().clearFocus();
+    this.composerBlurGeneration += 1;
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
+    this.contextSheetOpen = false;
+    this.restoreComposerFocusOnSheetDisappear = false;
     this.newSessionDraftGeneration += 1;
     this.cancelNewSessionDraftCheckpoint();
     void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
@@ -549,8 +559,46 @@ struct NewSessionPage {
     } catch (e) {
       // Picker 尚未挂载时无需清理；下一次打开仍从空选择开始。
     }
+    if (page === 'model') this.composerSurfaceVisible = true;
     this.getUIContext().getFocusController().clearFocus();
     this.contextSheetOpen = true;
+  }
+
+  private handleComposerFocusChange(focused: boolean): void {
+    this.composerFocused = focused;
+    if (focused) {
+      this.composerBlurGeneration += 1;
+      this.composerSurfaceVisible = true;
+      return;
+    }
+    const generation = ++this.composerBlurGeneration;
+    setTimeout(() => {
+      if (generation !== this.composerBlurGeneration || this.composerFocused
+        || this.contextSheetOpen) return;
+      if (this.composerImages.length > 0 || this.composerFiles.length > 0) return;
+      this.composerSurfaceVisible = false;
+    }, 0);
+  }
+
+  private returnToComposerAfterModelSheet(): void {
+    this.restoreComposerFocusOnSheetDisappear = true;
+    this.contextSheetOpen = false;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = false;
+  }
+
+  private restoreComposerFocusAfterSheetDisappear(): void {
+    if (!this.restoreComposerFocusOnSheetDisappear || !this.pageActive) return;
+    this.restoreComposerFocusOnSheetDisappear = false;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = true;
+    try {
+      this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
+    } catch (e) {
+      // 页面退场或输入节点尚未恢复时保持展开态，用户仍可直接点击继续输入。
+    }
   }
 
   private remainingImageSlots(): number {
@@ -1396,6 +1444,7 @@ struct NewSessionPage {
       preferType: this.contextSheetPage === 'model' ? SheetType.CENTER : SheetType.BOTTOM,
       backgroundColor: $r('app.color.bg_card'),
       maskColor: $r('app.color.overlay'),
+      onDisappear: (): void => this.restoreComposerFocusAfterSheetDisappear(),
     })
   }
 
@@ -1833,7 +1882,7 @@ struct NewSessionPage {
 
   private selectContextModel(option: RuntimeModelOption): void {
     this.selectModel(option);
-    this.contextSheetOpen = false;
+    this.returnToComposerAfterModelSheet();
   }
 
   @Builder
@@ -1959,7 +2008,11 @@ struct NewSessionPage {
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({ maxWidth: option.efforts.length > 0 ? '70%' : '100%' })
+            .constraintSize({
+              maxWidth: this.fastModeCapability && option.supportsFastMode
+                ? (option.efforts.length > 0 ? '48%' : '70%')
+                : (option.efforts.length > 0 ? '70%' : '100%'),
+            })
             .onClick(() => this.selectContextModel(option))
           if (option.efforts.length > 0) {
             Button() {
@@ -1979,6 +2032,13 @@ struct NewSessionPage {
             .accessibilityText(`${option.label}思考强度`)
             .bindMenu(this.modelEffortMenuItems(option))
           }
+          if (this.fastModeCapability && option.supportsFastMode) {
+            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+              .selectedColor($r('app.color.accent'))
+              .enabled(!this.creating)
+              .accessibilityText(`${option.label}快速模式`)
+              .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+          }
           Blank()
             .layoutWeight(1)
             .onClick(() => this.selectContextModel(option))
@@ -1995,20 +2055,17 @@ struct NewSessionPage {
       }
       .layoutWeight(1)
 
-      if (this.fastModeCapability && option.supportsFastMode) {
-        Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-          .selectedColor($r('app.color.accent'))
-          .enabled(!this.creating)
-          .accessibilityText(`${option.label}快速模式`)
-          .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+      Row() {
+        if (this.modelOptionIsCurrent(option)) {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(uiFontSize(18))
+            .fontColor([$r('app.color.chat_cta')])
+            .onClick(() => this.selectContextModel(option))
+        }
       }
-
-      if (this.modelOptionIsCurrent(option)) {
-        SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(uiFontSize(18))
-          .fontColor([$r('app.color.chat_cta')])
-          .onClick(() => this.selectContextModel(option))
-      }
+      .width(24)
+      .height(24)
+      .justifyContent(FlexAlign.Center)
     }
     .width('100%')
     .constraintSize({ minHeight: option.providerName.length > 0 ? 58 : 46 })
@@ -2062,7 +2119,11 @@ struct NewSessionPage {
           .borderRadius(18)
           .backgroundColor(Color.Transparent)
           .onClick(() => {
-            this.contextSheetOpen = false;
+            if (this.contextSheetPage === 'model') {
+              this.returnToComposerAfterModelSheet();
+            } else {
+              this.contextSheetOpen = false;
+            }
           })
         } else {
           Row().width(36).height(36)
@@ -2115,6 +2176,7 @@ struct NewSessionPage {
       ConversationComposer({
         input: this.input,
         focused: this.composerFocused,
+        surfaceExpanded: this.composerSurfaceVisible,
         images: this.composerImages,
         files: this.composerFiles,
         pickingImages: this.pickingImages,
@@ -2132,13 +2194,15 @@ struct NewSessionPage {
         effortLabel: this.currentEffortLabel(),
         showAddButton: true,
         showStreamingStatus: false,
+        floatingGlass: true,
+        floatingBottomInset: 16,
         inputId: 'new-session-composer-input',
         onInputChange: (value: string): void => {
           this.applyNewSessionInput(value);
           this.error = '';
         },
         onFocusChange: (focused: boolean): void => {
-          this.composerFocused = focused;
+          this.handleComposerFocusChange(focused);
         },
         onAdd: (): void => this.openContextSheet(),
         onPermission: (): void => this.openContextSheet('permission'),
@@ -2159,6 +2223,6 @@ struct NewSessionPage {
       })
     }
     .width('100%')
-    .padding({ top: 4, bottom: 2 })
+    .padding({ top: 4, bottom: 0 })
   }
 }

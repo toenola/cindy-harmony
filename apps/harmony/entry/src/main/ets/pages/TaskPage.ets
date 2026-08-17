@@ -480,6 +480,7 @@ export struct TaskPageContent {
   @State contextSheetOpen: boolean = false;
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
   @State detailComposerSheetOpen: boolean = false;
+  private restoreComposerFocusOnSheetDisappear: boolean = false;
   @State contextSheetPage: string = 'main';
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并写入。 */
   @State modelEffortMemory: Map<string, string> = new Map();
@@ -705,6 +706,7 @@ export struct TaskPageContent {
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.initialScrollSettling = false;
+    this.restoreComposerFocusOnSheetDisappear = false;
     this.closeContextSheet();
     this.sessionActionOpen = false;
     this.sessionTreeOpen = false;
@@ -1383,6 +1385,8 @@ export struct TaskPageContent {
       }
     }
     this.contextSheetPage = page;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
     this.getUIContext().getFocusController().clearFocus();
     if ((page === 'model' || page === 'agent') && this.isEmbeddedDetailPane()) {
       this.detailComposerSheetOpen = true;
@@ -1398,6 +1402,23 @@ export struct TaskPageContent {
   private closeContextSheet(): void {
     this.contextSheetOpen = false;
     this.detailComposerSheetOpen = false;
+  }
+
+  private returnToComposerAfterModelSheet(): void {
+    const embedded = this.isEmbeddedDetailPane();
+    this.closeContextSheet();
+    if (embedded) {
+      this.expandComposerForEditing(true);
+      return;
+    }
+    this.restoreComposerFocusOnSheetDisappear = true;
+    this.expandComposerForEditing(false);
+  }
+
+  private restoreComposerFocusAfterSheetDisappear(): void {
+    if (!this.restoreComposerFocusOnSheetDisappear || this.leavingDetailPage) return;
+    this.restoreComposerFocusOnSheetDisappear = false;
+    this.expandComposerForEditing(true);
   }
 
   private async browseModelAgent(kind: string): Promise<boolean> {
@@ -1510,14 +1531,14 @@ export struct TaskPageContent {
       return;
     }
     if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent) {
-      this.closeContextSheet();
+      this.returnToComposerAfterModelSheet();
       return;
     }
     const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
     const nextFastMode = this.modelFastForRow(option);
     const selectionKey = this.modelRuntimeKey(option);
     this.pendingModelSelectionKey = selectionKey;
-    this.closeContextSheet();
+    this.returnToComposerAfterModelSheet();
     this.contextRpcBusy = true;
     try {
       let result: Object | undefined;
@@ -3172,7 +3193,8 @@ export struct TaskPageContent {
     }
     const generation = ++this.composerBlurGeneration;
     setTimeout(() => {
-      if (generation !== this.composerBlurGeneration || this.composerFocused) return;
+      if (generation !== this.composerBlurGeneration || this.composerFocused
+        || this.contextSheetOpen || this.detailComposerSheetOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0
         || composerAtomPresentations(this.composerDocument).length > 0
         || this.composerPaletteMode.length > 0) return;
@@ -3512,6 +3534,7 @@ export struct TaskPageContent {
           preferType: this.contextSheetPage === 'model' ? SheetType.CENTER : SheetType.BOTTOM,
           backgroundColor: $r('app.color.bg_card'),
           maskColor: $r('app.color.overlay'),
+          onDisappear: (): void => this.restoreComposerFocusAfterSheetDisappear(),
         })
     .width('100%')
     .height('100%')
@@ -4558,6 +4581,7 @@ export struct TaskPageContent {
     ConversationComposer({
       input: this.input,
       focused: this.composerFocused,
+      surfaceExpanded: this.composerSurfaceVisible,
       images: this.composerImages,
       files: this.composerFiles,
       atoms: composerAtomPresentations(this.composerDocument),
@@ -4623,7 +4647,13 @@ export struct TaskPageContent {
         .width('100%')
         .height('100%')
         .backgroundColor($r('app.color.overlay'))
-        .onClick(() => this.closeContextSheet())
+        .onClick(() => {
+          if (this.contextSheetPage === 'model') {
+            this.returnToComposerAfterModelSheet();
+          } else {
+            this.closeContextSheet();
+          }
+        })
 
       if (this.contextSheetPage === 'model') {
         Column() {
@@ -4663,6 +4693,8 @@ export struct TaskPageContent {
               uiAnimateState(this.getUIContext(), () => {
                 this.contextSheetPage = 'main';
               });
+            } else if (this.contextSheetPage === 'model') {
+              this.returnToComposerAfterModelSheet();
             } else {
               this.closeContextSheet();
             }
@@ -5018,7 +5050,11 @@ export struct TaskPageContent {
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: option.efforts.length > 0 ? '70%' : '100%' })
+          .constraintSize({
+            maxWidth: this.visibleFastModeCapability() && option.supportsFastMode
+              ? (option.efforts.length > 0 ? '48%' : '70%')
+              : (option.efforts.length > 0 ? '70%' : '100%'),
+          })
           .onClick(() => {
             void this.selectComposerModel(option);
           })
@@ -5043,6 +5079,14 @@ export struct TaskPageContent {
           .bindMenu(this.modelEffortMenuItems(option))
         }
 
+        if (this.visibleFastModeCapability() && option.supportsFastMode) {
+          Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+            .selectedColor($r('app.color.accent'))
+            .enabled(!this.contextRpcBusy)
+            .accessibilityText(`${option.label}快速模式`)
+            .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+        }
+
         Blank()
           .layoutWeight(1)
           .onClick(() => {
@@ -5050,14 +5094,6 @@ export struct TaskPageContent {
           })
       }
       .layoutWeight(1)
-
-      if (this.visibleFastModeCapability() && option.supportsFastMode) {
-        Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-          .selectedColor($r('app.color.accent'))
-          .enabled(!this.contextRpcBusy)
-          .accessibilityText(`${option.label}快速模式`)
-          .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-      }
 
       if (option.subscription) {
         Text('订阅')
@@ -5070,15 +5106,19 @@ export struct TaskPageContent {
             void this.selectComposerModel(option);
           })
       }
-      if (this.modelOptionIsCurrent(option)) {
-        SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(uiFontSize(20))
-          .fontColor([$r('app.color.text_primary')])
-          .margin({ right: 4 })
-          .onClick(() => {
-            void this.selectComposerModel(option);
-          })
+      Row() {
+        if (this.modelOptionIsCurrent(option)) {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(uiFontSize(20))
+            .fontColor([$r('app.color.text_primary')])
+            .onClick(() => {
+              void this.selectComposerModel(option);
+            })
+        }
       }
+      .width(24)
+      .height(24)
+      .justifyContent(FlexAlign.Center)
     }
     .width('calc(100% - 24vp)')
     .constraintSize({ minHeight: 46 })
