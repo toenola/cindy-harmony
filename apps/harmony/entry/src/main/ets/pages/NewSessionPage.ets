@@ -5,7 +5,22 @@
  * 任务和消息真相仍由被控端桌面维护。
  */
 
-import { KeyboardAvoidMode, router, promptAction, window } from '@kit.ArkUI';
+import {
+  KeyboardAvoidMode,
+  LengthMetrics,
+  LevelMode,
+  promptAction,
+  router,
+  uiMaterial,
+  window,
+} from '@kit.ArkUI';
+import {
+  BlurStrategy,
+  HdsNavigation,
+  HdsNavigationTitleMode,
+  ScrollEffectType,
+  hdsMaterial,
+} from '@kit.UIDesignKit';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import {
@@ -50,8 +65,10 @@ import {
   textComposerDocument,
 } from '../core/messages/ComposerDocument';
 import {
+  UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
+  UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   uiAnimateFastState,
   uiFontSize,
@@ -124,9 +141,22 @@ function newAgentKindFromSession(session: RemoteSession): NewAgentKind {
   return 'claude-code';
 }
 
-@Entry
 @Component
-struct NewSessionPage {
+export struct NewSessionPageContent {
+  /** 宽屏详情栏直接传入目标设备；独立页面为空时读取路由参数。 */
+  @Prop paneDeviceId: string = '';
+  /** 键盘高度由实际页面承载者消费，宽屏时只缩小右侧详情栏。 */
+  @Prop paneKeyboardInset: number = 0;
+  @Prop paneComposerBottomInset: number = 16;
+  @Prop embedded: boolean = false;
+  onClose: () => void = () => router.back();
+  onSessionStarted: (deviceId: string, sessionId: string) => void =
+    (deviceId: string, sessionId: string): void => {
+      router.replaceUrl({
+        url: 'pages/TaskPage',
+        params: { deviceId: deviceId, sessionId: sessionId },
+      });
+    };
   @State devices: PresenceSnapshot[] = [];
   @State selectedDeviceId: string = '';
   @State selectedAgentKind: NewAgentKind = 'claude-code';
@@ -143,7 +173,9 @@ struct NewSessionPage {
   /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
+  @State workspacePopupOpen: boolean = false;
   @State composerPermissionPopupOpen: boolean = false;
+  @State composerAgentPopupOpen: boolean = false;
   @State composerModelPopupOpen: boolean = false;
   /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
   private composerPopupRestoreFocus: boolean = false;
@@ -154,7 +186,6 @@ struct NewSessionPage {
   @State modelFastMemory: Map<string, boolean> = new Map();
   @State modelEffortPickerKey: string = '';
   @State contextSelectedUris: string[] = [];
-  @State selectorOpen: string = '';
   @State browseOpen: boolean = false;
   @State browsePath: string = '';
   @State browseParent: string = '';
@@ -182,8 +213,6 @@ struct NewSessionPage {
   @State creating: boolean = false;
   @State error: string = '';
   @State taskRevision: number = 0;
-  /** 页面显式消费软键盘高度，保证 Hds 容器内的完整 Composer 不被盖住。 */
-  @State keyboardHeight: number = 0;
   private recentPickerOptions: PickerOptions = createRecentPickerOptions();
   @State recentPickerController: PickerController = new PickerController();
 
@@ -205,24 +234,14 @@ struct NewSessionPage {
   private attachmentsHandedOff: boolean = false;
   private attachmentsDisposed: boolean = false;
   private pageActive: boolean = false;
-  private keyboardWindow: window.Window | null = null;
-  private keyboardHeightListening: boolean = false;
   private newSessionDraftGeneration: number = 0;
   private newSessionInputRevision: number = 0;
   private newSessionDraftCheckpointTimer: number = -1;
-  private keyboardHeightListener: (height: number) => void = (height: number): void => {
-    this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
-  };
-
   aboutToAppear(): void {
     this.pageActive = true;
-    this.keyboardHeight = 0;
-    // 同 Mobile 的 KeyboardAvoidingView 语义：可用高度由页面直接缩小。
-    // 不能只依赖全局 OFFSET，否则横屏 Hds 容器可能仍按全高摆放 Composer。
-    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
-    void this.observeKeyboardHeight();
     const params = (router.getParams() ?? {}) as Record<string, Object>;
-    this.routeDeviceId = readStr(params, 'deviceId');
+    this.routeDeviceId = this.paneDeviceId.length > 0
+      ? this.paneDeviceId : readStr(params, 'deviceId');
     const editDraft = AppServices.instance.newSessionCreations.consumeEditDraft();
     if (editDraft !== null) {
       this.pendingEditDraft = editDraft;
@@ -261,9 +280,6 @@ struct NewSessionPage {
     this.newSessionDraftGeneration += 1;
     this.cancelNewSessionDraftCheckpoint();
     void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
-    this.stopKeyboardHeightObservation();
-    this.keyboardHeight = 0;
-    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     this.runtimeLoadGeneration += 1;
     this.runtimeToolbarLoadActive = false;
     this.composerToolbarReady = false;
@@ -272,33 +288,6 @@ struct NewSessionPage {
       unsubscribe();
     }
     this.unsubs = [];
-  }
-
-  private async observeKeyboardHeight(): Promise<void> {
-    if (this.keyboardHeightListening) return;
-    const hostContext = this.getUIContext().getHostContext();
-    if (hostContext === undefined) return;
-    try {
-      const hostWindow = await window.getLastWindow(hostContext);
-      if (!this.pageActive || this.keyboardHeightListening) return;
-      this.keyboardWindow = hostWindow;
-      hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
-      this.keyboardHeightListening = true;
-    } catch (_err) {
-      // 无法获得高度通知时交还给系统，避免极端设备上完全失去输入法避让。
-      if (this.pageActive) this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
-    }
-  }
-
-  private stopKeyboardHeightObservation(): void {
-    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
-    try {
-      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
-    } catch (_err) {
-      // 页面退出时窗口可能已由系统回收。
-    }
-    this.keyboardWindow = null;
-    this.keyboardHeightListening = false;
   }
 
   private restoreNewSessionDraft(): void {
@@ -503,7 +492,6 @@ struct NewSessionPage {
     if (this.creating) return;
     this.agentTouched = true;
     this.selectedAgentKind = kind;
-    this.selectorOpen = '';
     this.error = '';
     void this.loadRuntimeDefaults(this.selectedDeviceId, kind);
   }
@@ -520,7 +508,6 @@ struct NewSessionPage {
     this.providerId = option.providerId;
     this.effort = nextEffort;
     this.fastMode = nextFastMode;
-    this.selectorOpen = '';
     this.error = '';
   }
 
@@ -543,7 +530,7 @@ struct NewSessionPage {
   private selectDialogue(): void {
     this.workspaceKind = 'dialogue';
     this.workingDir = '';
-    this.selectorOpen = '';
+    this.workspacePopupOpen = false;
     this.browseOpen = false;
     this.showHiddenDirectories = false;
   }
@@ -553,23 +540,15 @@ struct NewSessionPage {
     if (value.length === 0) return;
     this.workspaceKind = 'project';
     this.workingDir = value;
-    this.selectorOpen = '';
+    this.workspacePopupOpen = false;
     this.browseOpen = false;
     this.browseError = '';
     this.showHiddenDirectories = false;
   }
 
-  private toggleSelector(name: string): void {
-    if (this.creating) return;
-    this.browseOpen = false;
-    this.browseError = '';
-    this.selectorOpen = this.selectorOpen === name ? '' : name;
-  }
-
   /** Composer 的上下文 Sheet 与详情页同层级：图片、计划和运行时设置都从这里进入。 */
   private openContextSheet(page: string = 'main'): void {
     if (this.creating || this.pickingImages) return;
-    this.selectorOpen = '';
     this.contextSheetPage = page;
     this.contextSelectedUris = [];
     try {
@@ -584,19 +563,20 @@ struct NewSessionPage {
 
   private openComposerControlPopup(page: string): void {
     if (this.creating || this.pickingImages) return;
-    this.selectorOpen = '';
     this.contextSheetPage = page;
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
-    this.composerPopupRestoreFocus = this.composerFocused || this.keyboardHeight > 0;
+    this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
     this.getUIContext().getFocusController().clearFocus();
     this.composerPermissionPopupOpen = page === 'permission';
+    this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
   }
 
   private dismissComposerControlPopup(page: string): void {
     if (page === 'permission') this.composerPermissionPopupOpen = false;
+    if (page === 'agent') this.composerAgentPopupOpen = false;
     if (page === 'model') {
       this.composerModelPopupOpen = false;
       this.modelEffortPickerKey = '';
@@ -608,7 +588,7 @@ struct NewSessionPage {
     this.composerFocused = true;
     setTimeout(() => {
       if (!this.pageActive || this.composerPermissionPopupOpen
-        || this.composerModelPopupOpen) return;
+        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       try {
         this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
       } catch (_err) {
@@ -628,17 +608,34 @@ struct NewSessionPage {
     setTimeout(() => {
       if (generation !== this.composerBlurGeneration || this.composerFocused
         || this.contextSheetOpen || this.composerPermissionPopupOpen
-        || this.composerModelPopupOpen) return;
+        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0) return;
       this.composerSurfaceVisible = false;
     }, 0);
   }
 
+  private expandComposerForEditing(): void {
+    if (this.creating) return;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = true;
+    setTimeout(() => {
+      if (!this.pageActive) return;
+      try {
+        this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
+      } catch (_err) {
+        // 页面正在切换时保持展开态，下一次点击仍可直接进入输入。
+      }
+    }, 0);
+  }
+
   private returnToComposerAfterModelSheet(): void {
-    const popupWasOpen = this.composerPermissionPopupOpen || this.composerModelPopupOpen;
+    const popupWasOpen = this.composerPermissionPopupOpen
+      || this.composerAgentPopupOpen || this.composerModelPopupOpen;
     this.restoreComposerFocusOnSheetDisappear = !popupWasOpen;
     this.contextSheetOpen = false;
     this.composerPermissionPopupOpen = false;
+    this.composerAgentPopupOpen = false;
     this.composerModelPopupOpen = false;
     this.modelEffortPickerKey = '';
     this.composerBlurGeneration += 1;
@@ -1344,14 +1341,18 @@ struct NewSessionPage {
       return;
     }
     this.workspaceKind = 'project';
-    this.selectorOpen = '';
+    this.workspacePopupOpen = false;
     this.browseOpen = true;
+    this.contextSheetPage = 'workspace';
+    this.contextSheetOpen = true;
     this.showHiddenDirectories = false;
     void this.loadBrowsePath(this.workingDir.trim() || '~');
   }
 
   private selectCurrentBrowsePath(): void {
-    if (this.browsePath.length > 0) this.selectProject(this.browsePath);
+    if (this.browsePath.length === 0) return;
+    this.selectProject(this.browsePath);
+    this.contextSheetOpen = false;
   }
 
   private createOptions(sessionId: string = ''): Record<string, Object> {
@@ -1421,7 +1422,7 @@ struct NewSessionPage {
     }
     if (this.workspaceKind === 'project' && this.workingDir.trim().length === 0) {
       this.error = '请选择项目目录';
-      this.selectorOpen = 'workspace';
+      this.workspacePopupOpen = true;
       return;
     }
     this.creating = true;
@@ -1443,10 +1444,7 @@ struct NewSessionPage {
     this.cancelNewSessionDraftCheckpoint();
     AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
     this.attachmentsHandedOff = true;
-    router.replaceUrl({
-      url: 'pages/TaskPage',
-      params: { deviceId: params.deviceId, sessionId: sessionId },
-    });
+    this.onSessionStarted(params.deviceId, sessionId);
   }
 
   private closeImagePreview(): void {
@@ -1456,25 +1454,47 @@ struct NewSessionPage {
   }
 
   build() {
-    Column() {
-      this.topBar()
-      Column() {
+    Stack() {
+      HdsNavigation() {
         Column() {
-          if (this.selectorOpen === 'agent') this.agentPanel()
-          this.agentSelector()
-          if (this.selectorOpen === 'workspace') this.workspacePanel()
-          this.workspaceSelector()
-          if (this.browseOpen) this.browsePanel()
+          // 尚未发送时没有远端消息，也不制造“正在同步”或空态卡片。
+          Blank()
+            .width('100%')
+            .layoutWeight(1)
+          this.composer()
         }
         .width('100%')
-        .padding({ left: 20, right: 20, bottom: 8 })
-        .layoutWeight(1)
-        .justifyContent(FlexAlign.End)
-
-        this.composer()
+        .height('100%')
+        .backgroundColor($r('app.color.bg_page'))
       }
+      .titleBar({
+        enableComponentSafeArea: true,
+        style: {
+          scrollEffectOpts: {
+            enableScrollEffect: true,
+            scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
+            blurEffectiveStartOffset: LengthMetrics.vp(0),
+            blurEffectiveEndOffset: LengthMetrics.vp(20),
+          },
+          blurStrategy: BlurStrategy.ADAPTIVE,
+          thermoCtrl: true,
+          systemMaterialEffect: {
+            materialType: hdsMaterial.MaterialType.IMMERSIVE,
+            materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+          },
+        },
+        content: {
+          title: { mainTitle: '' },
+          stackBuilder: (): void => this.newSessionHeader(),
+        },
+      })
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .mode(NavigationMode.Stack)
+      .titleMode(HdsNavigationTitleMode.MINI)
       .width('100%')
-      .layoutWeight(1)
+      .height('100%')
+      .backgroundColor($r('app.color.bg_page'))
 
       // 与任务详情 Composer 共用同一交互：ready 图片点击后进入全屏预览。
       if (this.previewImageUrl.length > 0) {
@@ -1506,9 +1526,9 @@ struct NewSessionPage {
         .onClick(() => this.closeImagePreview())
       }
     }
-      .width('100%')
+    .width('100%')
     .height('100%')
-    .padding({ bottom: this.keyboardHeight })
+    .padding({ bottom: this.paneKeyboardInset })
     .backgroundColor($r('app.color.bg_page'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .bindSheet($$this.contextSheetOpen, this.contextSheet(), {
@@ -1524,30 +1544,47 @@ struct NewSessionPage {
   }
 
   @Builder
-  topBar() {
-    Row() {
-      Button() {
-        SymbolGlyph($r('sys.symbol.chevron_left'))
-          .fontSize(20)
-          .fontColor([$r('app.color.text_primary')])
+  newSessionHeader() {
+    Row({ space: 4 }) {
+      if (!this.embedded) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(uiFontSize(20))
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(44)
+        .height(44)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .clickEffect(UI_ICON_CLICK_EFFECT)
+        .accessibilityText('返回任务列表')
+        .onClick(() => this.onClose())
       }
-      .type(ButtonType.Normal)
-      .width(44)
-      .height(44)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .onClick(() => router.back())
+
+      Text('新任务')
+        .fontSize(uiFontSize(16))
+        .lineHeight(uiLineHeight(22))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+
+      this.workspaceSelector()
+
+      Blank()
+        .layoutWeight(1)
+
       if (this.creating) {
         LoadingProgress()
           .width(16)
           .height(16)
           .color($r('app.color.text_secondary'))
-          .margin({ left: 8 })
       }
     }
     .width('100%')
-    .height(56)
-    .padding({ left: 16, right: 16 })
+    .constraintSize({ minHeight: 50 })
+    .padding({ left: this.embedded ? 12 : 8, right: 12, top: 4, bottom: 4 })
+    .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -1563,91 +1600,111 @@ struct NewSessionPage {
   }
 
   @Builder
-  agentSelector() {
-    Button() {
-      Row({ space: 10 }) {
-        this.selectorIcon(agentMark(this.selectedAgentKind))
-        Text(agentLabel(this.selectedAgentKind))
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
-          .layoutWeight(1)
-        SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(15)
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .width('100%')
-    }
-    .type(ButtonType.Normal)
-    .width('100%')
-    .height(42)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .enabled(!this.creating)
-    .onClick(() => this.toggleSelector('agent'))
-  }
-
-
-
-
-
-
-  @Builder
   workspaceSelector() {
     Button() {
-      Row({ space: 10 }) {
-        Text(this.workspaceKind === 'dialogue' ? '◯' : '□')
-          .fontSize(18)
-          .fontColor($r('app.color.text_secondary'))
-          .width(24)
+      Row({ space: 4 }) {
         Text(this.workspaceKind === 'dialogue' ? '对话' : directoryTitle(this.workingDir))
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
+          .constraintSize({ maxWidth: 150 })
         SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(15)
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .width('100%')
+          .fontSize(11)
+          .fontColor([$r('app.color.text_tertiary')])
+      }.alignItems(VerticalAlign.Center)
     }
     .type(ButtonType.Normal)
-    .width('100%')
-    .height(42)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
+    .height(32)
+    .constraintSize({ maxWidth: 180 })
+    .padding({ left: 10, right: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_CLICK_EFFECT)
     .enabled(!this.creating)
-    .onClick(() => this.toggleSelector('workspace'))
+    .accessibilityText(`工作目录：${this.workspaceKind === 'dialogue'
+      ? '对话' : this.workingDir}`)
+    .onClick(() => this.workspacePopupOpen = true)
+    .bindPopup(this.workspacePopupOpen, {
+      builder: this.workspacePopup,
+      placement: Placement.Bottom,
+      enableArrow: false,
+      targetSpace: 8,
+      autoCancel: true,
+      showInSubWindow: false,
+      followTransformOfTarget: true,
+      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
+      levelMode: LevelMode.EMBEDDED,
+      popupColor: Color.Transparent,
+      radius: UI_RADIUS_CONTAINER,
+      shadow: ShadowStyle.OUTER_DEFAULT_XS,
+      systemMaterial: new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        colorInvert: true,
+        interactive: true,
+      }),
+      onStateChange: (event) => {
+        this.workspacePopupOpen = event.isVisible;
+      },
+    })
+  }
+
+  @Builder
+  workspacePopup() {
+    Column() {
+      Row() {
+        Text('切换工作目录')
+          .fontSize(uiFontSize(14))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+      }
+      .width('100%')
+      .height(38)
+      .padding({ left: 14, right: 14 })
+      this.workspacePanel()
+    }
+    .width(320)
+    .constraintSize({ maxHeight: 420 })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clip(true)
   }
 
 
   @Builder
   agentPanel() {
-    Column() {
-      ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
-        Row({ space: 10 }) {
-          this.selectorIcon(agentMark(kind))
-          Text(agentLabel(kind))
-            .fontSize(15)
-            .fontColor($r('app.color.text_primary'))
-            .layoutWeight(1)
-          if (kind === this.selectedAgentKind) {
-            SymbolGlyph($r('sys.symbol.checkmark'))
-              .fontSize(18)
-              .fontColor([$r('app.color.text_primary')])
+    Scroll() {
+      Column({ space: 2 }) {
+        ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
+          Row({ space: 10 }) {
+            this.selectorIcon(agentMark(kind))
+            Text(agentLabel(kind))
+              .fontSize(uiFontSize(15))
+              .fontColor($r('app.color.text_primary'))
+              .layoutWeight(1)
+            if (kind === this.selectedAgentKind) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(uiFontSize(18))
+                .fontColor([$r('app.color.chat_cta')])
+            }
           }
-        }
-        .width('100%')
-        .height(44)
-        .padding({ left: 10, right: 10 })
-        .onClick(() => this.selectAgent(kind))
-      }, (kind: NewAgentKind) => `new-agent:${kind}`)
+          .width('100%')
+          .height(44)
+          .padding({ left: 10, right: 10 })
+          .backgroundColor(kind === this.selectedAgentKind
+            ? $r('app.color.bg_chip') : Color.Transparent)
+          .borderRadius(UI_RADIUS_CONTROL)
+          .clickEffect(UI_LIST_CLICK_EFFECT)
+          .onClick(() => {
+            this.selectAgent(kind);
+            this.composerAgentPopupOpen = false;
+          })
+        }, (kind: NewAgentKind) => `new-agent:${kind}`)
+      }
+      .width('100%')
+      .padding({ left: 10, right: 10, top: 4, bottom: 10 })
     }
     .width('100%')
-    .padding(6)
-    .backgroundColor($r('app.color.bg_card'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(14)
+    .layoutWeight(1)
   }
 
   @Builder
@@ -1671,6 +1728,10 @@ struct NewSessionPage {
       .width('100%')
       .height(44)
       .padding({ left: 10, right: 10 })
+      .backgroundColor(this.workspaceKind === 'dialogue'
+        ? $r('app.color.bg_chip') : Color.Transparent)
+      .borderRadius(UI_RADIUS_CONTROL)
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => this.selectDialogue())
       Divider()
         .color($r('app.color.border'))
@@ -1711,13 +1772,12 @@ struct NewSessionPage {
       .width('100%')
       .height(48)
       .padding({ left: 10, right: 10 })
+      .borderRadius(UI_RADIUS_CONTROL)
+      .clickEffect(UI_LIST_CLICK_EFFECT)
       .onClick(() => this.openProjectBrowse())
     }
     .width('100%')
-    .padding(6)
-    .backgroundColor($r('app.color.bg_card'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(14)
+    .padding({ left: 8, right: 8, bottom: 8 })
   }
 
   @Builder
@@ -1751,6 +1811,10 @@ struct NewSessionPage {
     .width('100%')
     .height(56)
     .padding({ left: 10, right: 10 })
+    .backgroundColor(this.workspaceKind === 'project' && this.workingDir === project.path
+      ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.selectProject(project.path))
   }
 
@@ -1891,7 +1955,10 @@ struct NewSessionPage {
     .width('100%')
     .height(46)
     .padding({ left: 10, right: 4 })
-    .onClick(() => this.selectProject(entry.path))
+    .onClick(() => {
+      this.selectProject(entry.path);
+      this.contextSheetOpen = false;
+    })
   }
 
   @Builder
@@ -2237,7 +2304,9 @@ struct NewSessionPage {
         } else {
           Row().width(36).height(36)
         }
-        Text(this.contextSheetPage === 'permission'
+        Text(this.contextSheetPage === 'workspace'
+          ? '选择工作目录'
+          : this.contextSheetPage === 'permission'
           ? '权限模式'
           : this.contextSheetPage === 'model'
             ? '模型'
@@ -2257,7 +2326,9 @@ struct NewSessionPage {
         .strokeWidth(0.5)
         .color($r('app.color.border'))
 
-      if (this.contextSheetPage === 'permission') {
+      if (this.contextSheetPage === 'workspace') {
+        this.browsePanel()
+      } else if (this.contextSheetPage === 'permission') {
         this.permissionContextView()
       } else if (this.contextSheetPage === 'model') {
         this.modelContextView()
@@ -2297,18 +2368,22 @@ struct NewSessionPage {
         contextBusy: this.creating,
         toolbarReady: this.composerToolbarReady,
         hasPermissionOptions: this.permissionOptions.length > 0,
+        hasAgentOptions: NEW_AGENT_OPTIONS.length > 1,
         hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
         permissionMode: this.permissionMode,
         permissionLabel: this.currentPermissionModeLabel(),
         planModeEnabled: this.planModeEnabled,
+        agentLabel: agentLabel(this.selectedAgentKind),
         modelLabel: this.currentModelLabel(),
         effortLabel: this.currentEffortLabel(),
         permissionPopupVisible: this.composerPermissionPopupOpen,
+        agentPopupVisible: this.composerAgentPopupOpen,
         modelPopupVisible: this.composerModelPopupOpen,
         showAddButton: true,
         showStreamingStatus: false,
         floatingGlass: true,
-        floatingBottomInset: 16,
+        compactToolbar: true,
+        floatingBottomInset: this.paneComposerBottomInset,
         inputId: 'new-session-composer-input',
         onInputChange: (value: string): void => {
           this.applyNewSessionInput(value);
@@ -2319,9 +2394,13 @@ struct NewSessionPage {
         },
         onAdd: (): void => this.openContextSheet(),
         onPermission: (): void => this.openComposerControlPopup('permission'),
+        onAgent: (): void => this.openComposerControlPopup('agent'),
         onModel: (): void => this.openComposerControlPopup('model'),
         onPermissionPopupDismiss: (): void => {
           this.dismissComposerControlPopup('permission');
+        },
+        onAgentPopupDismiss: (): void => {
+          this.dismissComposerControlPopup('agent');
         },
         onModelPopupDismiss: (): void => {
           this.dismissComposerControlPopup('model');
@@ -2329,10 +2408,14 @@ struct NewSessionPage {
         permissionPopupContent: (): void => {
           this.permissionContextView();
         },
+        agentPopupContent: (): void => {
+          this.agentPanel();
+        },
         modelPopupContent: (): void => {
           this.modelContextView();
         },
         onPlanToggle: (): void => this.togglePlanMode(),
+        onExpand: (): void => this.expandComposerForEditing(),
         onSend: (): void => {
           void this.send();
         },
@@ -2349,5 +2432,66 @@ struct NewSessionPage {
     }
     .width('100%')
     .padding({ top: 4, bottom: 0 })
+  }
+}
+
+/** 独立新建路由入口；宽屏双栏直接使用上面的可嵌入草稿组件。 */
+@Entry
+@Component
+struct NewSessionPage {
+  @State keyboardHeight: number = 0;
+  private pageActive: boolean = false;
+  private keyboardWindow: window.Window | null = null;
+  private keyboardHeightListening: boolean = false;
+  private keyboardHeightListener: (height: number) => void = (height: number): void => {
+    this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
+  };
+
+  aboutToAppear(): void {
+    this.pageActive = true;
+    this.keyboardHeight = 0;
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+    void this.observeKeyboardHeight();
+  }
+
+  aboutToDisappear(): void {
+    this.pageActive = false;
+    this.stopKeyboardHeightObservation();
+    this.keyboardHeight = 0;
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+  }
+
+  private async observeKeyboardHeight(): Promise<void> {
+    if (this.keyboardHeightListening) return;
+    const hostContext = this.getUIContext().getHostContext();
+    if (hostContext === undefined) return;
+    try {
+      const hostWindow = await window.getLastWindow(hostContext);
+      if (!this.pageActive || this.keyboardHeightListening) return;
+      this.keyboardWindow = hostWindow;
+      hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
+      this.keyboardHeightListening = true;
+    } catch (_err) {
+      if (this.pageActive) this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
+    }
+  }
+
+  private stopKeyboardHeightObservation(): void {
+    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    try {
+      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+    } catch (_err) {
+      // 页面退出时窗口可能已经回收。
+    }
+    this.keyboardWindow = null;
+    this.keyboardHeightListening = false;
+  }
+
+  build() {
+    Column() {
+      NewSessionPageContent({ paneKeyboardInset: this.keyboardHeight })
+    }
+    .width('100%')
+    .height('100%')
   }
 }

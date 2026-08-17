@@ -40,6 +40,7 @@ import {
   TaskListReconcileBackoff,
 } from '../core/tasks/TaskListReconcilePolicy';
 import { TaskPageContent } from './TaskPage';
+import { NewSessionPageContent } from './NewSessionPage';
 import {
   consumeTaskSplitRouteSelection,
   isWideTaskLayout,
@@ -117,6 +118,9 @@ struct TaskListPage {
   @State selectedSessionDeviceId: string = '';
   @State selectedSessionId: string = '';
   @State selectedMessageClientId: string = '';
+  /** 新任务只在当前页面保留本地草稿；宽屏放在右栏，窄屏覆盖整页。 */
+  @State newSessionDraftOpen: boolean = false;
+  @State newSessionDraftDeviceId: string = '';
   @State scopeMenuOpen: boolean = false;
   @State sortMenuOpen: boolean = false;
   @State activeListTab: TaskListCategory = 'projects';
@@ -271,6 +275,11 @@ struct TaskListPage {
       this.closeSortMenu();
       return true;
     }
+    if (this.newSessionDraftOpen) {
+      this.newSessionDraftOpen = false;
+      this.ensureWideSelection();
+      return true;
+    }
     return false;
   }
 
@@ -376,6 +385,7 @@ struct TaskListPage {
 
   private ensureWideSelection(): void {
     if (!this.splitLayoutEnabled()) return;
+    if (this.newSessionDraftOpen) return;
     const scoped = this.activeListEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].deviceId === this.selectedSessionDeviceId
@@ -410,7 +420,7 @@ struct TaskListPage {
   private handleSplitLayoutChange(wasSplit: boolean): void {
     const splitEnabled = this.splitLayoutEnabled();
     if (splitEnabled) this.ensureWideSelection();
-    if (wasSplit && !splitEnabled) {
+    if (wasSplit && !splitEnabled && !this.newSessionDraftOpen) {
       void this.openSelectedTaskAfterSplitExit();
     }
     this.updateKeyboardAvoidance();
@@ -418,13 +428,10 @@ struct TaskListPage {
 
   /** 折叠或横转竖退出双栏时，保持用户正在查看的任务详情，而不是退回列表。 */
   private async openSelectedTaskAfterSplitExit(): Promise<void> {
-    if (this.singlePaneNavigationPending
-      || this.selectedSessionDeviceId.length === 0
-      || this.selectedSessionId.length === 0) {
-      return;
-    }
+    if (this.singlePaneNavigationPending || this.newSessionDraftOpen) return;
     this.singlePaneNavigationPending = true;
     try {
+      if (this.selectedSessionDeviceId.length === 0 || this.selectedSessionId.length === 0) return;
       if (this.selectedMessageClientId.length > 0) {
         await router.pushUrl({
           url: 'pages/TaskPage',
@@ -531,12 +538,13 @@ struct TaskListPage {
   }
 
   private entrySelected(entry: TaskListEntry): boolean {
-    return this.splitLayoutEnabled()
+    return this.splitLayoutEnabled() && !this.newSessionDraftOpen
       && entry.deviceId === this.selectedSessionDeviceId
       && entry.session.id === this.selectedSessionId;
   }
 
   private selectSession(entry: TaskListEntry): void {
+    this.newSessionDraftOpen = false;
     this.selectedSessionDeviceId = entry.deviceId;
     this.selectedSessionId = entry.session.id;
     this.selectedMessageClientId = '';
@@ -690,10 +698,8 @@ struct TaskListPage {
   }
 
   private openNewSession(): void {
-    router.pushUrl({
-      url: 'pages/NewSessionPage',
-      params: { deviceId: this.selectedDeviceId },
-    });
+    this.newSessionDraftDeviceId = this.selectedDeviceId;
+    this.newSessionDraftOpen = true;
   }
 
   /** 菜单开合统一走轻量可见性动效，保证浮层进退场完整播放。 */
@@ -1281,6 +1287,38 @@ struct TaskListPage {
       }
       .width('100%')
       .height('100%')
+
+      // 新任务草稿始终由同一个节点持有：窄屏覆盖整页，宽屏只覆盖详情栏。
+      // 旋转或折叠只更新尺寸，避免组件重建时释放尚未发送的附件。
+      if (this.newSessionDraftOpen) {
+        NewSessionPageContent({
+          paneDeviceId: this.newSessionDraftDeviceId,
+          paneKeyboardInset: this.detailKeyboardInset(),
+          paneComposerBottomInset: this.detailComposerBottomInset(),
+          embedded: this.splitLayoutEnabled(),
+          onClose: (): void => {
+            this.newSessionDraftOpen = false;
+            this.ensureWideSelection();
+          },
+          onSessionStarted: (deviceId: string, sessionId: string): void => {
+            this.newSessionDraftOpen = false;
+            this.selectedSessionDeviceId = deviceId;
+            this.selectedSessionId = sessionId;
+            this.selectedMessageClientId = '';
+            if (!this.splitLayoutEnabled()) {
+              void router.pushUrl({
+                url: 'pages/TaskPage',
+                params: { deviceId: deviceId, sessionId: sessionId },
+              });
+            }
+          },
+        })
+          .width(this.splitLayoutEnabled()
+            ? this.detailPaneWidth() + TASK_SPLIT_DIVIDER_WIDTH : '100%')
+          .height('100%')
+          .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() : 0, y: 0 })
+          .transition(uiRevealTransition())
+      }
 
       if (this.splitLayoutEnabled()) {
         this.splitDivider()
