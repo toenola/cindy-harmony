@@ -1651,6 +1651,75 @@ export default function localUnitTest() {
       expect(group.tools[0].hasResult).assertEqual(true);
     });
 
+    it('keepsTheTerminalPlanSnapshotWhenTheInitialDatabaseRowArrivesLate', 0, () => {
+      const store = new MessageStore();
+      const initialStep: Record<string, Object> = {};
+      initialStep['step'] = '已经完成的步骤';
+      initialStep['status'] = 'in_progress';
+      const pendingStep: Record<string, Object> = {};
+      pendingStep['step'] = '确实没有完成的步骤';
+      pendingStep['status'] = 'pending';
+      const initialInput: Record<string, Object> = {};
+      initialInput['plan'] = [initialStep, pendingStep];
+      const liveData: Record<string, Object> = {};
+      liveData['toolUseId'] = 'plan:turn-late-row';
+      liveData['toolName'] = 'update_plan';
+      liveData['input'] = initialInput;
+      const liveEvent: Record<string, Object> = {};
+      liveEvent['type'] = 'tool_use';
+      liveEvent['source'] = 'codex';
+      liveEvent['data'] = liveData;
+      store.handleMakerEvent('late-plan-session', liveEvent, 'persisted-plan-row');
+
+      const completedStep: Record<string, Object> = {};
+      completedStep['step'] = '已经完成的步骤';
+      completedStep['status'] = 'completed';
+      const finalPendingStep: Record<string, Object> = {};
+      finalPendingStep['step'] = '确实没有完成的步骤';
+      finalPendingStep['status'] = 'pending';
+      const raw: Record<string, Object> = {};
+      raw['id'] = 'turn-late-row';
+      raw['status'] = 'completed';
+      const doneData: Record<string, Object> = {};
+      doneData['raw'] = raw;
+      doneData['plan'] = [completedStep, finalPendingStep];
+      doneData['planUpdatedAtMs'] = 1_700_000_000_000;
+      const doneEvent: Record<string, Object> = {};
+      doneEvent['type'] = 'done';
+      doneEvent['source'] = 'codex';
+      doneEvent['data'] = doneData;
+      store.handleMakerEvent('late-plan-session', doneEvent);
+
+      // Desktop 的异步 DB create 仍可能携带首次 0/N 快照；overlay 必须保留 done 真相。
+      const staleContent: Record<string, Object> = {};
+      staleContent['toolUseId'] = 'plan:turn-late-row';
+      staleContent['toolName'] = 'update_plan';
+      staleContent['input'] = initialInput;
+      const staleMessage: Record<string, Object> = {};
+      staleMessage['id'] = 'persisted-plan-row';
+      staleMessage['clientId'] = 'persisted-plan-row';
+      staleMessage['sessionId'] = 'late-plan-session';
+      staleMessage['role'] = 'tool_use';
+      staleMessage['toolUseId'] = 'plan:turn-late-row';
+      staleMessage['content'] = staleContent;
+      const push: Record<string, Object> = {};
+      push['sessionId'] = 'late-plan-session';
+      push['message'] = staleMessage;
+      store.handleSessionPush('', 'local-db:messages:created', push);
+
+      const rows = store.getMessages('late-plan-session');
+      const planRow = rows.find((row: RemoteMessage) =>
+        row.role === 'tool_use' && row.toolUseId === 'plan:turn-late-row');
+      expect(planRow !== undefined).assertEqual(true);
+      expect(planRowSealed(planRow)).assertEqual(true);
+      const insertions = findTodoPlanInsertions(planRow === undefined ? [] : [planRow]);
+      const insertion = insertions.get(0);
+      expect(insertion?.todos.length).assertEqual(2);
+      expect(insertion?.todos[0].status).assertEqual('completed');
+      // 会话正常结束不等于所有步骤都完成，必须保留 done.plan 的真实 pending。
+      expect(insertion?.todos[1].status).assertEqual('pending');
+    });
+
     it('reconstructsTaskCreateAndTaskUpdateIntoOnePlanSession', 0, () => {
       const createInput: Record<string, Object> = {};
       createInput['subject'] = '检查鸿蒙工作步骤';

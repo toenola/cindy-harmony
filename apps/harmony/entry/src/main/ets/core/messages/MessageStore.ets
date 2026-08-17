@@ -133,6 +133,17 @@ export class StreamingMessage {
   finished: boolean = false;
 }
 
+/**
+ * maker:event 会早于 Desktop 的异步消息落库。Codex 的 update_plan 又会复用同一
+ * toolUseId 原地更新，所以必须短暂保留最新快照，避免晚到的首次 0/N 持久行把
+ * 已完成状态覆盖回去。
+ */
+class LivePlanSnapshot {
+  content: Record<string, Object> = {};
+  persistId: string = '';
+  toolUseId: string = '';
+}
+
 /** history:messages 一页响应（messages:list 复用）。 */
 class HistoryPage {
   items: RemoteMessage[] = [];
@@ -174,6 +185,8 @@ export class MessageStore {
   /** 仅在运行 boolean 翻转时通知，避免任务列表随每个流式事件整页重绘。 */
   private runningStateListeners: Array<() => void> = [];
   private messagesBySession: Map<string, RemoteMessage[]> = new Map();
+  /** Mobile 同源的 live plan overlay；按 toolUseId 与 persistId 双重索引。 */
+  private livePlanSnapshotsBySession: Map<string, Map<string, LivePlanSnapshot>> = new Map();
   /** sessionId -> deviceId（当前订阅关系）。 */
   private subscribed: Map<string, string> = new Map();
   private hasMoreBySession: Map<string, boolean> = new Map();
@@ -262,6 +275,7 @@ export class MessageStore {
       await Promise.all(pendingUnsubscribes);
     }
     this.messagesBySession.clear();
+    this.livePlanSnapshotsBySession.clear();
     this.hasMoreBySession.clear();
     this.messageCountBySession.clear();
     this.streamingBySession.clear();
@@ -378,7 +392,63 @@ export class MessageStore {
     this.sessionMessageCache.save(deviceId, sessionId, this.messagesBySession.get(sessionId) ?? []);
   }
 
+  private rememberLivePlanSnapshot(sessionId: string, snapshot: LivePlanSnapshot): void {
+    let sessionSnapshots = this.livePlanSnapshotsBySession.get(sessionId);
+    if (sessionSnapshots === undefined) {
+      sessionSnapshots = new Map<string, LivePlanSnapshot>();
+      this.livePlanSnapshotsBySession.set(sessionId, sessionSnapshots);
+    }
+    sessionSnapshots.set(`tool:${snapshot.toolUseId}`, snapshot);
+    if (snapshot.persistId.length > 0) {
+      sessionSnapshots.set(`persist:${snapshot.persistId}`, snapshot);
+    }
+  }
+
+  private rememberLivePlanContent(
+    sessionId: string,
+    toolUseId: string,
+    content: Record<string, Object>,
+  ): void {
+    const previous = this.livePlanSnapshotsBySession.get(sessionId)?.get(`tool:${toolUseId}`);
+    const snapshot = new LivePlanSnapshot();
+    snapshot.content = content;
+    snapshot.toolUseId = toolUseId;
+    snapshot.persistId = previous?.persistId ?? '';
+    this.rememberLivePlanSnapshot(sessionId, snapshot);
+  }
+
+  /** 晚到或重拉的旧 DB 行只能补身份，不能让计划内容倒退。 */
+  private overlayLivePlanSnapshot(sessionId: string, message: RemoteMessage): void {
+    if (message.role !== 'tool_use') return;
+    const sessionSnapshots = this.livePlanSnapshotsBySession.get(sessionId);
+    if (sessionSnapshots === undefined) return;
+    let content: Record<string, Object> = {};
+    if (message.content !== undefined && typeof message.content === 'object'
+      && !Array.isArray(message.content)) {
+      content = message.content as Record<string, Object>;
+    }
+    const contentToolUseId = readStr(content, 'toolUseId');
+    const snapshot = sessionSnapshots.get(`persist:${message.id}`)
+      ?? sessionSnapshots.get(`persist:${message.clientId}`)
+      ?? (message.toolUseId.length > 0
+        ? sessionSnapshots.get(`tool:${message.toolUseId}`) : undefined)
+      ?? (contentToolUseId.length > 0
+        ? sessionSnapshots.get(`tool:${contentToolUseId}`) : undefined);
+    if (snapshot === undefined) return;
+    message.content = snapshot.content;
+    message.toolUseId = snapshot.toolUseId;
+    message.terminalPlanSnapshot = readBool(snapshot.content, 'terminalPlanSnapshot', false);
+    message.terminalPlanAtMs = readNum(snapshot.content, 'terminalPlanAtMs', 0);
+    if (typeof snapshot.content['turnCompleted'] === 'boolean') {
+      message.hasTurnCompleted = true;
+      message.turnCompleted = snapshot.content['turnCompleted'] as boolean;
+    }
+  }
+
   private setSessionMessages(sessionId: string, messages: RemoteMessage[]): void {
+    for (let i = 0; i < messages.length; i++) {
+      this.overlayLivePlanSnapshot(sessionId, messages[i]);
+    }
     this.messagesBySession.set(sessionId, messages);
     this.touchSessionCache(sessionId);
     this.persistSessionMessages(sessionId);
@@ -438,6 +508,8 @@ export class MessageStore {
     this.messagesBySession.forEach((_messages: RemoteMessage[], sessionId: string) => ids.add(sessionId));
     this.streamingBySession.forEach((_streaming: StreamingMessage, sessionId: string) => ids.add(sessionId));
     this.taskUpdatesBySession.forEach((_updates: Map<string, AgentTaskUpdate>, sessionId: string) => ids.add(sessionId));
+    this.livePlanSnapshotsBySession.forEach(
+      (_snapshots: Map<string, LivePlanSnapshot>, sessionId: string) => ids.add(sessionId));
     const out: string[] = [];
     ids.forEach((sessionId: string) => out.push(sessionId));
     return out;
@@ -454,6 +526,7 @@ export class MessageStore {
   private evictMemorySession(sessionId: string): void {
     this.consumePendingTextDeltaNotification(sessionId);
     this.messagesBySession.delete(sessionId);
+    this.livePlanSnapshotsBySession.delete(sessionId);
     this.hasMoreBySession.delete(sessionId);
     this.messageCountBySession.delete(sessionId);
     this.loadFailedBySession.delete(sessionId);
@@ -979,6 +1052,71 @@ export class MessageStore {
     }
   }
 
+  /** 把重复 update_plan 同步到唯一持久行，并记住可覆盖迟到 DB 行的最新内容。 */
+  private applyLivePlanToolUse(
+    sessionId: string,
+    data: Record<string, Object>,
+    persistId: string,
+  ): boolean {
+    if (readStr(data, 'toolName') !== 'update_plan') return false;
+    const toolUseId = readStr(data, 'toolUseId');
+    if (toolUseId.length === 0) return true;
+    const content: Record<string, Object> = {};
+    content['toolUseId'] = toolUseId;
+    content['toolName'] = 'update_plan';
+    if (data['input'] !== undefined) content['input'] = data['input'];
+    const snapshot = new LivePlanSnapshot();
+    snapshot.content = content;
+    snapshot.persistId = persistId;
+    snapshot.toolUseId = toolUseId;
+    this.rememberLivePlanSnapshot(sessionId, snapshot);
+
+    const messages = this.messagesBySession.get(sessionId) ?? [];
+    const index = messages.findIndex((message: RemoteMessage) => {
+      if (message.role !== 'tool_use') return false;
+      if (persistId.length > 0 && (message.id === persistId || message.clientId === persistId)) {
+        return true;
+      }
+      if (message.toolUseId === toolUseId) return true;
+      if (message.content === undefined || typeof message.content !== 'object'
+        || Array.isArray(message.content)) return false;
+      return readStr(message.content as Record<string, Object>, 'toolUseId') === toolUseId;
+    });
+    if (index >= 0) {
+      messages[index].content = content;
+      messages[index].toolUseId = toolUseId;
+      messages[index].terminalPlanSnapshot = false;
+      messages[index].terminalPlanAtMs = 0;
+      messages[index].hasTurnCompleted = false;
+      this.setSessionMessages(sessionId, messages);
+    }
+    return true;
+  }
+
+  /** done 可能先于持久工具行到达；终态也必须写进 live overlay。 */
+  private completeLivePlanSnapshotOnDone(
+    sessionId: string,
+    plan: Object | undefined,
+    turnId: string,
+    terminalStatus: string,
+    planUpdatedAtMs: number,
+    cancelled: boolean,
+  ): void {
+    if (turnId.length === 0) return;
+    const toolUseId = `plan:${turnId}`;
+    const live = this.livePlanSnapshotsBySession.get(sessionId)?.get(`tool:${toolUseId}`);
+    if (live === undefined) return;
+    const row = new RemoteMessage();
+    row.role = 'tool_use';
+    row.toolUseId = toolUseId;
+    row.content = live.content;
+    if (!applyCodexPlanSnapshotOnDone(
+      [row], plan, turnId, terminalStatus, planUpdatedAtMs, cancelled)) return;
+    if (row.content === undefined || typeof row.content !== 'object'
+      || Array.isArray(row.content)) return;
+    this.rememberLivePlanContent(sessionId, toolUseId, row.content as Record<string, Object>);
+  }
+
   /** maker:event 处理：运行态按终态语义收口，流式正文保留到持久化行回流。 */
   handleMakerEvent(sessionId: string, event: Object | undefined, persistId: string = ''): void {
     if (event === undefined || typeof event !== 'object') {
@@ -1031,6 +1169,7 @@ export class MessageStore {
     }
     if (type === 'tool_use') {
       this.markSessionRunning(sessionId, true);
+      this.applyLivePlanToolUse(sessionId, data, persistId);
       const toolUseId = readStr(data, 'toolUseId');
       if (toolUseId.length === 0) {
         return;
@@ -1129,14 +1268,27 @@ export class MessageStore {
           this.streamingBySession.delete(sessionId);
         }
         const raw = readObj(data, 'raw');
-        applyCodexPlanSnapshotOnDone(
-          this.messagesBySession.get(sessionId) ?? [],
+        const turnId = readStr(raw, 'id');
+        const terminalStatus = readStr(raw, 'status');
+        const planUpdatedAtMs = readNum(data, 'planUpdatedAtMs', 0);
+        const cancelled = readBool(data, 'cancelled', false);
+        this.completeLivePlanSnapshotOnDone(
+          sessionId,
           data['plan'],
-          readStr(raw, 'id'),
-          readStr(raw, 'status'),
-          readNum(data, 'planUpdatedAtMs', 0),
-          readBool(data, 'cancelled', false),
+          turnId,
+          terminalStatus,
+          planUpdatedAtMs,
+          cancelled,
         );
+        const messages = this.messagesBySession.get(sessionId) ?? [];
+        if (applyCodexPlanSnapshotOnDone(
+          messages,
+          data['plan'],
+          turnId,
+          terminalStatus,
+          planUpdatedAtMs,
+          cancelled,
+        )) this.setSessionMessages(sessionId, messages);
       }
       if (hasTurnContinuation(ev)) {
         // SDK segment 结束但产品 turn 仍会继续，不能把 Composer 切回停止态。
