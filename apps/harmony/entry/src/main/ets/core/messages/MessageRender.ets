@@ -46,13 +46,44 @@ class MarkdownParseCacheEntry {
  */
 const markdownParseCache: Map<string, MarkdownParseCacheEntry> = new Map();
 
+/**
+ * 流式尾部每次增长都会重新解析全文；内容未变的前序块继续复用原对象，让 ArkUI
+ * 只重建正在增长的尾块。签名使用解析前保留在块上的原始字段，行内 token 由它们派生。
+ */
+function markdownBlockSignature(block: MdBlock): string {
+  const rows: string[] = [];
+  for (let i = 0; i < block.rows.length; i++) rows.push(block.rows[i].join('\u001f'));
+  return [
+    block.type,
+    `${block.level}`,
+    block.text,
+    block.lang,
+    block.code,
+    block.items.join('\u001e'),
+    block.itemMarkers.join('\u001e'),
+    block.itemOrdered.map((value: boolean) => value ? '1' : '0').join(''),
+    block.itemChecked.join(','),
+    block.headers.join('\u001e'),
+    rows.join('\u001d'),
+  ].join('\u001c');
+}
+
 function parseMessageMarkdown(identity: string, text: string): MdBlock[] {
   if (identity.length === 0) return parseMarkdown(text);
   const cached = markdownParseCache.get(identity);
   if (cached !== undefined && cached.text === text) return cached.blocks;
+  const parsed = parseMarkdown(text);
+  if (cached !== undefined) {
+    const reusableCount = Math.min(cached.blocks.length, parsed.length);
+    for (let i = 0; i < reusableCount; i++) {
+      if (markdownBlockSignature(cached.blocks[i]) === markdownBlockSignature(parsed[i])) {
+        parsed[i] = cached.blocks[i];
+      }
+    }
+  }
   const entry = new MarkdownParseCacheEntry();
   entry.text = text;
-  entry.blocks = parseMarkdown(text);
+  entry.blocks = parsed;
   if (!markdownParseCache.has(identity)
     && markdownParseCache.size >= MAX_MARKDOWN_PARSE_CACHE_ENTRIES) {
     const oldest = markdownParseCache.keys().next();

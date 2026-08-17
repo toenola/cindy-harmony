@@ -123,7 +123,7 @@ import {
   RenderMediaPayload,
 } from '../core/messages/MessagePayload';
 import {
-  MdBlock, tokenizeInline, InlineToken, InlineTokenGroup, groupInlineTokens,
+  MdBlock, InlineToken, InlineTokenGroup, groupInlineTokens,
 } from '../core/messages/MarkdownParser';
 import { ThinkingTextToken, tokenizeThinkingText } from '../core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
@@ -7670,7 +7670,8 @@ export struct TaskPageContent {
       if (this.hasImageToken(b.inlineTokens)) {
         this.mdInlineContent(b.inlineTokens, 17, 26, false, false)
       } else {
-        this.inlineText(b.text)
+        // MessageRender 已预解析行内 token；流式刷新时不在 ArkUI Builder 内重复分词。
+        this.inlineTokensText(b.inlineTokens, 17, 26, false, false)
       }
     } else if (b.type === 'list') {
       Column({ space: 2 }) {
@@ -7681,7 +7682,7 @@ export struct TaskPageContent {
               if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
                 this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
               } else {
-                this.inlineText(it)
+                this.inlineTokensText(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
               }
             }
             // 正文只能占项目符号之后的剩余宽度；内部 Text 的 100% 以此为基准，
@@ -7844,7 +7845,7 @@ export struct TaskPageContent {
               if (this.hasImageToken(this.tableHeaderTokens(b, hIndex))) {
                 this.mdInlineContent(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
               } else {
-                this.inlineText(b.headers[hIndex] ?? '')
+                this.inlineTokensText(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
               }
             }
             .width(this.tableColumnWidths(b)[hIndex])
@@ -7864,7 +7865,8 @@ export struct TaskPageContent {
                   this.mdInlineContent(
                     this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
                 } else {
-                  this.inlineText(row[cellIndex] ?? '')
+                  this.inlineTokensText(
+                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
                 }
               }
               .width(this.tableColumnWidths(b)[cellIndex])
@@ -7882,11 +7884,6 @@ export struct TaskPageContent {
     }
     .width('100%')
     .scrollable(ScrollDirection.Horizontal)
-  }
-
-  @Builder
-  inlineText(text: string) {
-    this.inlineTokensText(tokenizeInline(text), 17, 26, false, false)
   }
 
   @Builder

@@ -574,6 +574,26 @@ export default function localUnitTest() {
       expect(mathCount).assertEqual(0);
     });
 
+    it('reusesStableMarkdownBlocksWhileStreamingTailGrows', 0, () => {
+      const message = new RemoteMessage();
+      message.id = 'streaming-markdown-block-reuse';
+      message.clientId = message.id;
+      message.sessionId = 'streaming-markdown-session';
+      message.role = 'assistant';
+      message.content = '已经完成的第一段\n\n正在输出';
+      message.isStreaming = true;
+
+      const first = buildRenderItems([message], true)[0] as RenderMessageItem;
+      const stableBlockSeq = first.mdBlocks[0].seq;
+      const growingBlockSeq = first.mdBlocks[1].seq;
+
+      message.content = '已经完成的第一段\n\n正在输出新内容';
+      const second = buildRenderItems([message], true)[0] as RenderMessageItem;
+      expect(second.mdBlocks[0].seq).assertEqual(stableBlockSeq);
+      expect(second.mdBlocks[1].seq === growingBlockSeq).assertEqual(false);
+      expect(second.mdBlocks[1].text).assertEqual('正在输出新内容');
+    });
+
     it('parsesOnlyCompactThinkingStrongAndCodeMarkers', 0, () => {
       const tokens = tokenizeThinkingText('**Reviewing** `TaskPage.ets` and ``a ` b``');
       expect(tokens.length).assertEqual(5);
