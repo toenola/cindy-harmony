@@ -111,6 +111,14 @@ export struct ConversationComposer {
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam modelPopupContent: () => void = this.emptyPopupContent;
+  /** 状态更新时复用同一材质对象，避免模型切换重绘期间反复重建系统材质与交互手势。 */
+  private readonly floatingGlassMaterial: uiMaterial.ImmersiveMaterial =
+    new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      colorInvert: true,
+      // 容器内有横向列表和多个按钮，交互反馈由子控件承担，整块背板不参与形变。
+      interactive: false,
+    });
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
@@ -924,21 +932,20 @@ export struct ConversationComposer {
         top: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
         bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
       })
+      // 官方沉浸光感材质必须透出底层内容；普通 Composer 继续使用原有语义表面色。
       .backgroundColor(this.floatingGlass
-        ? $r('app.color.composer_glass_surface') : $r('app.color.composer_surface'))
-      // HdsActionBar 同款系统背板模糊；语义半透明底只稳定 Light / Dark 层级，
-      // 模糊半径、亮度与热控降级仍全部交给系统。
-      .backgroundBlurStyle(this.floatingGlass
-        ? BlurStyle.COMPONENT_REGULAR : BlurStyle.NONE, {}, {
-        disableSystemAdaptation: false,
-      })
+        ? Color.Transparent : $r('app.color.composer_surface'))
       .border({
-        width: 1,
+        width: this.floatingGlass ? 0 : 1,
         color: $r('app.color.composer_hairline'),
       })
       // 收起态使用实际高度的一半做胶囊圆角，避免动画在 999→12 间插值抖动。
       .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
       .clip(true)
+      // 与工具栏 Popup 共用 THIN 沉浸光感；系统负责双模式、光感强度与低算力降级。
+      .systemMaterial(this.floatingGlass
+        ? this.floatingGlassMaterial
+        : uiMaterial.Material.empty)
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')
