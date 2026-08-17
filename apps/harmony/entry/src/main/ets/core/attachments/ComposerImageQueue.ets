@@ -290,19 +290,24 @@ export class ComposerImageQueue {
     });
   }
 
-  remove(image: ComposerImage): void {
+  remove(localId: string): void {
     if (this.isBusy()) return;
+    const index = this.images.findIndex((item: ComposerImage) => item.localId === localId);
+    if (index < 0) return;
+    const image = this.images[index];
     image.uploadRevision += 1;
     image.removed = true;
-    this.images = this.images.filter((item: ComposerImage) => item !== image);
+    this.images = this.images.filter((item: ComposerImage) => item.localId !== localId);
     this.emit();
     this.recycle(image);
   }
 
-  retry(image: ComposerImage): void {
-    if (this.isBusy() || image.removed || image.status !== 'failed') return;
-    const index = this.images.indexOf(image);
+  retry(localId: string): void {
+    if (this.isBusy()) return;
+    const index = this.images.findIndex((item: ComposerImage) => item.localId === localId);
     if (index < 0) return;
+    const image = this.images[index];
+    if (image.removed || image.status !== 'failed') return;
     // 同一对象原位重试，保持托盘顺序、文件名和 UI identity。
     this.startUpload(image, index, true);
   }

@@ -124,6 +124,7 @@ import {
 import {
   MdBlock, tokenizeInline, InlineToken, InlineTokenGroup, groupInlineTokens,
 } from '../core/messages/MarkdownParser';
+import { ThinkingTextToken, tokenizeThinkingText } from '../core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
 import {
   MessageSearchHit,
@@ -172,6 +173,7 @@ import {
   FOLLOW_LATEST_RETRY_DELAYS,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   messageListBottomIndex,
+  messageListItemPresentationState,
   messageListRenderNodeKey,
   shouldAutoLoadEarlier,
 } from './TaskScrollState';
@@ -480,11 +482,16 @@ export struct TaskPageContent {
   @State contextSheetOpen: boolean = false;
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
   @State detailComposerSheetOpen: boolean = false;
+  @State composerAgentPopupOpen: boolean = false;
+  @State composerModelPopupOpen: boolean = false;
+  /** 仅当打开选择器前键盘可见时，关闭 Popup 后才恢复输入焦点。 */
+  private composerPopupRestoreFocus: boolean = false;
   private restoreComposerFocusOnSheetDisappear: boolean = false;
   @State contextSheetPage: string = 'main';
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并写入。 */
   @State modelEffortMemory: Map<string, string> = new Map();
   @State modelFastMemory: Map<string, boolean> = new Map();
+  @State modelEffortPickerKey: string = '';
   /** RPC 进行中先把勾选移动到用户刚点击的模型，失败时再回退。 */
   @State pendingModelSelectionKey: string = '';
   @State contextSelectedUris: string[] = [];
@@ -1402,11 +1409,65 @@ export struct TaskPageContent {
   private closeContextSheet(): void {
     this.contextSheetOpen = false;
     this.detailComposerSheetOpen = false;
+    this.composerAgentPopupOpen = false;
+    this.composerModelPopupOpen = false;
+    this.modelEffortPickerKey = '';
+  }
+
+  private openComposerControlPopup(page: string): void {
+    if (this.sending || this.contextRpcBusy || this.deviceDisabled
+      || this.isCreationBlockingRemoteOps()) return;
+    if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
+    if (page === 'model') {
+      const targetAgent = this.composerAgentKind();
+      if (this.providerModelAgent !== targetAgent) void this.loadProviderModelOptions(targetAgent);
+    }
+    this.contextSheetPage = page;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.modelEffortPickerKey = '';
+    this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
+    // Popup 需要使用键盘占用的垂直空间；完整 Composer 由 surfaceVisible 保持，不会随清焦收起。
+    this.getUIContext().getFocusController().clearFocus();
+    this.composerAgentPopupOpen = page === 'agent';
+    this.composerModelPopupOpen = page === 'model';
+  }
+
+  private dismissComposerControlPopup(page: string): void {
+    if (page === 'agent') this.composerAgentPopupOpen = false;
+    if (page === 'model') {
+      this.composerModelPopupOpen = false;
+      this.modelEffortPickerKey = '';
+    }
+    this.restoreComposerFocusAfterPopupDismiss();
+  }
+
+  private restoreComposerFocusAfterPopupDismiss(): void {
+    if (!this.composerPopupRestoreFocus || this.leavingDetailPage) return;
+    this.composerPopupRestoreFocus = false;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = true;
+    setTimeout(() => {
+      if (this.leavingDetailPage || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
+      try {
+        this.getUIContext().getFocusController().requestFocus('task-composer-input');
+      } catch (_err) {
+        // 页面或分栏在 Popup 退场期间切换时，只保留展开态，不向已销毁节点请求焦点。
+      }
+    }, 0);
   }
 
   private returnToComposerAfterModelSheet(): void {
+    const popupWasOpen = this.composerAgentPopupOpen || this.composerModelPopupOpen;
     const embedded = this.isEmbeddedDetailPane();
     this.closeContextSheet();
+    if (popupWasOpen) {
+      this.composerBlurGeneration += 1;
+      this.composerSurfaceVisible = true;
+      this.composerFocused = false;
+      return;
+    }
     if (embedded) {
       this.expandComposerForEditing(true);
       return;
@@ -2962,27 +3023,7 @@ export struct TaskPageContent {
     return false;
   }
 
-  /**
-   * 子 Agent 外层也是普通对象节点：外层不重建时，内部 ForEach 不会重新执行。
-   * 因此把自身 running/completed 与后代工作组的生命周期压成紧凑状态签名；
-   * 新增或移除后代工作组也会改变签名。其它后代内容仍由各自节点更新。
-   */
-  private renderItemLifecycleState(item: RenderItem): string {
-    if (item.type === 'work_group') {
-      const work = item as RenderWorkGroupItem;
-      return work.isStreaming ? 'w1' : 'w0';
-    }
-    if (item.type !== 'subagent_group') return '';
-    const group = item as RenderSubagentGroupItem;
-    const states: string[] = [];
-    for (let i = 0; i < group.children.length; i++) {
-      const state = this.renderItemLifecycleState(group.children[i]);
-      if (state.length > 0) states.push(`${i}:${state.length}:${state}`);
-    }
-    return `s:${group.status.length}:${group.status}:${states.join(',')}`;
-  }
-
-  /** 业务 key 保持稳定，仅让会改变 builder 分支的工作/子 Agent 状态重建节点。 */
+  /** 业务 key 保持稳定；展示签名只负责让捕获旧普通对象的节点按需重建。 */
   private renderItemNodeKey(item: RenderItem, prefix: string = ''): string {
     const streaming = item.type === 'work_group'
       && (item as RenderWorkGroupItem).isStreaming;
@@ -2990,7 +3031,7 @@ export struct TaskPageContent {
       `${prefix}${item.key}`,
       item.type,
       streaming,
-      this.renderItemLifecycleState(item),
+      messageListItemPresentationState(item),
     );
   }
 
@@ -3194,7 +3235,8 @@ export struct TaskPageContent {
     const generation = ++this.composerBlurGeneration;
     setTimeout(() => {
       if (generation !== this.composerBlurGeneration || this.composerFocused
-        || this.contextSheetOpen || this.detailComposerSheetOpen) return;
+        || this.contextSheetOpen || this.detailComposerSheetOpen
+        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0
         || composerAtomPresentations(this.composerDocument).length > 0
         || this.composerPaletteMode.length > 0) return;
@@ -4602,6 +4644,8 @@ export struct TaskPageContent {
       agentLabel: modelAgentLabel(this.composerAgentKind()),
       modelLabel: this.currentModelLabel(),
       effortLabel: this.currentModelEffortLabel(),
+      agentPopupVisible: this.composerAgentPopupOpen,
+      modelPopupVisible: this.composerModelPopupOpen,
       showAddButton: true,
       showStreamingStatus: true,
       floatingGlass: true,
@@ -4616,8 +4660,20 @@ export struct TaskPageContent {
       },
       onAdd: (): void => this.openContextSheet(),
       onPermission: (): void => this.openComposerControlSheet('permission'),
-      onAgent: (): void => this.openComposerControlSheet('agent'),
-      onModel: (): void => this.openComposerControlSheet('model'),
+      onAgent: (): void => this.openComposerControlPopup('agent'),
+      onModel: (): void => this.openComposerControlPopup('model'),
+      onAgentPopupDismiss: (): void => {
+        this.dismissComposerControlPopup('agent');
+      },
+      onModelPopupDismiss: (): void => {
+        this.dismissComposerControlPopup('model');
+      },
+      agentPopupContent: (): void => {
+        this.agentContextView();
+      },
+      modelPopupContent: (): void => {
+        this.modelContextView();
+      },
       onPlanToggle: (): void => {
         void this.togglePlanMode();
       },
@@ -4629,10 +4685,10 @@ export struct TaskPageContent {
           this.previewImageUrl = image.uri;
         });
       },
-      onRemoveImage: (image: ComposerImage): void => this.imageQueue.remove(image),
-      onRetryImage: (image: ComposerImage): void => this.imageQueue.retry(image),
-      onRemoveFile: (file: ComposerFile): void => this.fileQueue.remove(file),
-      onRetryFile: (file: ComposerFile): void => this.fileQueue.retry(file),
+      onRemoveImage: (localId: string): void => this.imageQueue.remove(localId),
+      onRetryImage: (localId: string): void => this.imageQueue.retry(localId),
+      onRemoveFile: (localId: string): void => this.fileQueue.remove(localId),
+      onRetryFile: (localId: string): void => this.fileQueue.retry(localId),
       onRemoveAtom: (atom: ComposerAtomPresentation): void => {
         this.setComposerDocument(removeComposerNode(this.composerDocument, atom.index));
       },
@@ -5034,27 +5090,23 @@ export struct TaskPageContent {
 
   @Builder
   modelOptionRow(option: ComposerModelOption) {
-    Row({ space: 8 }) {
-      Stack() {
-        this.modelRowMark(option)
-      }
-      .onClick(() => {
-        void this.selectComposerModel(option);
-      })
+    Column({ space: 2 }) {
+      Row({ space: 6 }) {
+        Stack() {
+          this.modelRowMark(option)
+        }
+        .onClick(() => {
+          void this.selectComposerModel(option);
+        })
 
-      Row({ space: 2 }) {
         Text(option.label)
-          .fontSize(uiFontSize(15))
-          .lineHeight(uiLineHeight(21))
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({
-            maxWidth: this.visibleFastModeCapability() && option.supportsFastMode
-              ? (option.efforts.length > 0 ? '48%' : '70%')
-              : (option.efforts.length > 0 ? '70%' : '100%'),
-          })
+          .layoutWeight(1)
           .onClick(() => {
             void this.selectComposerModel(option);
           })
@@ -5063,20 +5115,22 @@ export struct TaskPageContent {
           Button() {
             Row({ space: 3 }) {
               Text(this.modelEffortText(option))
-                .fontSize(uiFontSize(13))
-                .lineHeight(uiLineHeight(19))
+                .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_secondary'))
               SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(uiFontSize(10))
+                .fontSize(uiFontSize(9))
                 .fontColor([$r('app.color.text_tertiary')])
             }
           }
-          .height(32)
+          .height(28)
           .padding({ left: 5, right: 5 })
           .backgroundColor(Color.Transparent)
           .enabled(!this.contextRpcBusy)
           .accessibilityText(`${option.label}思考强度`)
-          .bindMenu(this.modelEffortMenuItems(option))
+          .onClick(() => {
+            const key = composerModelKey(option);
+            this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
+          })
         }
 
         if (this.visibleFastModeCapability() && option.supportsFastMode) {
@@ -5087,42 +5141,50 @@ export struct TaskPageContent {
             .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
         }
 
-        Blank()
-          .layoutWeight(1)
-          .onClick(() => {
-            void this.selectComposerModel(option);
-          })
-      }
-      .layoutWeight(1)
-
-      if (option.subscription) {
-        Text('订阅')
-          .fontSize(uiFontSize(11))
-          .fontColor($r('app.color.text_secondary'))
-          .backgroundColor($r('app.color.bg_chip'))
-          .borderRadius(UI_RADIUS_CONTROL)
-          .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-          .onClick(() => {
-            void this.selectComposerModel(option);
-          })
-      }
-      Row() {
         if (this.modelOptionIsCurrent(option)) {
           SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(uiFontSize(20))
+            .fontSize(uiFontSize(17))
             .fontColor([$r('app.color.text_primary')])
+            .width(20)
             .onClick(() => {
               void this.selectComposerModel(option);
             })
+        } else if (option.subscription) {
+          Text('订阅')
+            .fontSize(uiFontSize(10))
+            .fontColor($r('app.color.text_secondary'))
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
+            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
         }
       }
-      .width(24)
-      .height(24)
-      .justifyContent(FlexAlign.Center)
+      .width('100%')
+      .constraintSize({ minHeight: 38 })
+
+      if (this.modelEffortPickerKey === composerModelKey(option)) {
+        Row({ space: 4 }) {
+          ForEach(this.modelEffortOptions(option), (effort: ComposerChoiceOption) => {
+            Button(effort.label)
+              .height(26)
+              .fontSize(uiFontSize(11))
+              .fontColor(effort.id === this.modelEffortForRow(option)
+                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+              .padding({ left: 9, right: 9 })
+              .backgroundColor(effort.id === this.modelEffortForRow(option)
+                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+              .borderRadius(UI_RADIUS_PILL)
+              .onClick(() => {
+                this.setModelRowEffort(option, effort);
+                this.modelEffortPickerKey = '';
+              })
+          }, (effort: ComposerChoiceOption) => effort.id)
+        }
+        .width('100%')
+        .padding({ left: 26, right: 4, bottom: 4 })
+      }
     }
     .width('calc(100% - 24vp)')
-    .constraintSize({ minHeight: 46 })
-    .padding({ left: 10, right: 6, top: 4, bottom: 4 })
+    .padding({ left: 9, right: 7, top: 3, bottom: 3 })
     .margin({ left: 12, right: 12 })
     .backgroundColor(this.modelOptionIsCurrent(option)
       ? $r('app.color.bg_chip') : Color.Transparent)
@@ -5895,7 +5957,9 @@ export struct TaskPageContent {
           .fontSize(uiFontSize(14))
           .fontColor([$r('app.color.text_tertiary')])
           .width(16)
-        Text(row.text)
+        Text() {
+          this.thinkingTextSpans(tokenizeThinkingText(row.text))
+        }
           .fontSize(uiFontSize(14))
           .lineHeight(uiLineHeight(20))
           .fontStyle(FontStyle.Italic)
@@ -7246,7 +7310,9 @@ export struct TaskPageContent {
             .fontColor($r('app.color.text_secondary'))
         } else if (item.body.trim().length > 0) {
           // Thinking 正文使用 12/18 斜体小字和 2vp rail，不继承普通消息 17/26 档。
-          Text(item.body)
+          Text() {
+            this.thinkingTextSpans(tokenizeThinkingText(item.body))
+          }
             .fontSize(uiFontSize(12))
             .lineHeight(uiLineHeight(18))
             .fontStyle(FontStyle.Italic)
@@ -7863,6 +7929,22 @@ export struct TaskPageContent {
   @Builder
   inlineText(text: string) {
     this.inlineTokensText(tokenizeInline(text), 17, 26, false, false)
+  }
+
+  @Builder
+  thinkingTextSpans(tokens: ThinkingTextToken[]) {
+    ForEach(tokens, (token: ThinkingTextToken) => {
+      if (token.kind === 'strong') {
+        Span(token.value)
+          .fontWeight(FontWeight.Medium)
+      } else if (token.kind === 'code') {
+        Span(token.value)
+          .fontFamily('monospace')
+          .fontStyle(FontStyle.Normal)
+      } else {
+        Span(token.value)
+      }
+    }, (token: ThinkingTextToken) => `${token.seq}`)
   }
 
   @Builder

@@ -37,6 +37,31 @@ export function resolveTaskRightStatus(
 }
 
 /**
+ * ArkUI ForEach 会按 key 复用旧任务行；普通 RemoteSession 对象和外部运行态不是
+ * @Observed，必须把会改变行内容的字段压成稳定签名，才能让新快照重建对应节点。
+ * 不包含当前时间，避免相对时间时钟每分钟触发整表重建。
+ */
+export function taskListEntryPresentationState(
+  session: RemoteSession,
+  rightStatus: TaskRightStatusKind,
+): string {
+  const values = [
+    session.title,
+    taskPreviewText(session.preview),
+    session.agentKind,
+    session.status,
+    session.pinnedAt,
+    taskActivityAt(session),
+    rightStatus,
+  ];
+  let state = '';
+  for (let i = 0; i < values.length; i++) {
+    state += `${values[i].length}:${values[i]}`;
+  }
+  return state;
+}
+
+/**
  * 沿用 Harmony 原状态筛选口径：优先识别调度器来源，旧数据再用标题前缀识别。
  */
 export function taskIsAutomation(session: RemoteSession): boolean {

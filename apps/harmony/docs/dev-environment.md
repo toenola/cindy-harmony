@@ -1,16 +1,16 @@
 # Harmony 开发环境
 
-> 状态：模拟器签名安装已确认，真机仍待确认
+> 状态：API 26 配置、配套工具链构建和 signed HAP 真机覆盖安装均已确认
 
 ## 1. 目标
 
-- HarmonyOS 6.1+
-- API 24+
+- HarmonyOS 7.0+
+- API 26+
 - ArkUI + ArkTS
 - Stage 模型
 - 独立 DevEco Studio 工程
 
-不考虑 API 24 以下兼容，因此不为旧系统添加兼容分支。但仍必须兼容当前 Cindy 的 Device Link 协议和桌面端版本。
+不考虑 API 26 以下兼容，因此不为旧系统添加兼容分支。但仍必须兼容当前 Cindy 的 Device Link 协议和桌面端版本。
 
 ## 2. 工程目录
 
@@ -56,10 +56,10 @@ oh-package.json5
 已完成：
 
 - DevEco Studio 已生成标准 Stage + ArkTS 工程。
-- 目标和兼容 SDK 为 `6.1.1(24)`。
-- `entry:assembleHap` 已构建成功。
-- `apps/harmony/build-profile.json5` 已配置 `signingConfigs.default`，可生成 `entry-default-signed.hap`。
-- signed HAP 已通过 `install -r` 覆盖安装到模拟器；未卸载应用、未清理应用数据。
+- 目标和兼容 SDK 已升级为 `26.0.0`。
+- API 26 构建需使用配套的 DevEco Studio 26.0.0 Beta1；旧 API 24 构建结果不能作为升级后的验证依据。
+- `apps/harmony/build-profile.json5` 保留既有 `signingConfigs.default`；API 26 工具链已成功生成 signed HAP。
+- API 26 signed HAP 已通过覆盖安装部署到 HUAWEI Pura X Max；未卸载应用、未清理应用数据。
 
 ## 6. 签名安装与数据保护
 

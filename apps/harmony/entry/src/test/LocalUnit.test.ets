@@ -16,6 +16,7 @@ import {
 import {
   RemoteImageRef,
   composerAttachmentRenderKey,
+  createComposerAttachmentLocalId,
 } from '../main/ets/core/attachments/AttachmentModels';
 import {
   isRetryablePresignStatus,
@@ -99,6 +100,7 @@ import {
   taskDisplayTitle,
   taskIsAutomation,
   taskListCategory,
+  taskListEntryPresentationState,
   taskPreviewText,
   taskProjectKey,
   taskProjectName,
@@ -130,6 +132,7 @@ import {
   parseMarkdown,
   tokenizeInline,
 } from '../main/ets/core/messages/MarkdownParser';
+import { tokenizeThinkingText } from '../main/ets/core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../main/ets/core/messages/MarkdownTableLayout';
 import {
   appendAutoResumePendingMessage,
@@ -188,6 +191,7 @@ import {
   FOLLOW_LATEST_RETRY_DELAYS,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   messageListBottomIndex,
+  messageListItemPresentationState,
   messageListRenderNodeKey,
   shouldAutoLoadEarlier,
 } from '../main/ets/pages/TaskScrollState';
@@ -417,6 +421,13 @@ export default function localUnitTest() {
       expect(composerAttachmentRenderKey('photo://1', 'ready', 1) === uploadingKey).assertEqual(false);
       expect(composerAttachmentRenderKey('photo://1', 'failed', 1) === uploadingKey).assertEqual(false);
       expect(composerAttachmentRenderKey('photo://1', 'uploading', 2) === uploadingKey).assertEqual(false);
+
+      const firstLocalId = createComposerAttachmentLocalId();
+      const secondLocalId = createComposerAttachmentLocalId();
+      expect(firstLocalId.length > 0).assertEqual(true);
+      expect(secondLocalId === firstLocalId).assertEqual(false);
+      expect(composerAttachmentRenderKey(secondLocalId, 'ready', 1) ===
+        composerAttachmentRenderKey(firstLocalId, 'ready', 1)).assertEqual(false);
     });
 
     it('recognizesSchedulerAutomationOrigin', 0, () => {
@@ -560,6 +571,27 @@ export default function localUnitTest() {
         if (currency[i].kind === 'math') mathCount += 1;
       }
       expect(mathCount).assertEqual(0);
+    });
+
+    it('parsesOnlyCompactThinkingStrongAndCodeMarkers', 0, () => {
+      const tokens = tokenizeThinkingText('**Reviewing** `TaskPage.ets` and ``a ` b``');
+      expect(tokens.length).assertEqual(5);
+      expect(tokens[0].kind).assertEqual('strong');
+      expect(tokens[0].value).assertEqual('Reviewing');
+      expect(tokens[1].kind).assertEqual('text');
+      expect(tokens[2].kind).assertEqual('code');
+      expect(tokens[2].value).assertEqual('TaskPage.ets');
+      expect(tokens[4].kind).assertEqual('code');
+      expect(tokens[4].value).assertEqual('a ` b');
+
+      const literal = tokenizeThinkingText('\\**escaped** **unclosed `also unclosed');
+      expect(literal.length).assertEqual(1);
+      expect(literal[0].kind).assertEqual('text');
+      expect(literal[0].value).assertEqual('\\**escaped** **unclosed `also unclosed');
+
+      const unsupported = tokenizeThinkingText('*emphasis* [link](https://example.com)');
+      expect(unsupported.length).assertEqual(1);
+      expect(unsupported[0].kind).assertEqual('text');
     });
 
     it('searchesNestedWorkAndPreservesTheSelectedHitAcrossPrepend', 0, () => {
@@ -1031,7 +1063,7 @@ export default function localUnitTest() {
       const thinking = new RenderThinkingItem();
       thinking.type = 'thinking';
       thinking.key = 'thinking-1';
-      thinking.body = '先检查消息存储，再继续分析。';
+      thinking.body = '**先检查** `MessageStore.ets`，再继续分析。';
 
       const tools = new RenderToolGroupItem();
       tools.type = 'tool_group';
@@ -1054,6 +1086,9 @@ export default function localUnitTest() {
       const rows = workPreviewRows(work);
       expect(rows.length).assertEqual(3);
       expect(rows[0].kind).assertEqual('thinking');
+      const thinkingTokens = tokenizeThinkingText(rows[0].text);
+      expect(thinkingTokens[0].kind).assertEqual('strong');
+      expect(thinkingTokens[2].kind).assertEqual('code');
       expect(rows[1].text).assertEqual('读取 MessageStore.ets');
       expect(rows[1].done).assertEqual(true);
       expect(rows[2].explorationKind).assertEqual('search');
@@ -1294,7 +1329,7 @@ export default function localUnitTest() {
       expect(sortMessagesAsc(liveRow, historyRow)).assertEqual(0);
     });
 
-    it('rebuildsOnlyWorkGroupNodesWhenLiveStateCloses', 0, () => {
+    it('rebuildsMessageListNodesWhenTheirPresentationChanges', 0, () => {
       expect(messageListRenderNodeKey('work-a', 'work_group', true))
         .assertEqual('render:10:work_group:6:work-a:work:live');
       expect(messageListRenderNodeKey('work-a', 'work_group', false))
@@ -1309,6 +1344,60 @@ export default function localUnitTest() {
       expect(messageListRenderNodeKey(
         'subagent-a', 'subagent_group', false, 's:9:completed:0:w0'))
         .assertEqual('render:14:subagent_group:10:subagent-a:state:18:s:9:completed:0:w0');
+
+      const todo = new RenderTodoCardItem();
+      todo.type = 'todo';
+      todo.key = 'todo-a';
+      todo.isStreaming = true;
+      const step = new RenderTodoItem();
+      step.seq = 0;
+      step.content = '完成实时刷新';
+      step.status = 'in_progress';
+      todo.todos = [step];
+      const pendingTodoKey = messageListRenderNodeKey(
+        todo.key, todo.type, false, messageListItemPresentationState(todo));
+      step.status = 'completed';
+      const completedTodoKey = messageListRenderNodeKey(
+        todo.key, todo.type, false, messageListItemPresentationState(todo));
+      expect(pendingTodoKey === completedTodoKey).assertEqual(false);
+      expect(todo.key).assertEqual('todo-a');
+
+      const agent = new RenderAgentTaskItem();
+      agent.type = 'agent_task';
+      agent.key = 'task-a';
+      agent.update = new AgentTaskUpdate();
+      agent.update.taskId = 'agent-a';
+      agent.update.status = 'running';
+      agent.update.updatedAt = '2026-08-17T10:00:00.000Z';
+      const runningAgentKey = messageListRenderNodeKey(
+        agent.key, agent.type, false, messageListItemPresentationState(agent));
+      agent.update.status = 'completed';
+      agent.update.updatedAt = '2026-08-17T10:00:01.000Z';
+      const completedAgentKey = messageListRenderNodeKey(
+        agent.key, agent.type, false, messageListItemPresentationState(agent));
+      expect(runningAgentKey === completedAgentKey).assertEqual(false);
+      expect(agent.key).assertEqual('task-a');
+
+      const toolGroup = new RenderToolGroupItem();
+      toolGroup.type = 'tool_group';
+      toolGroup.key = 'tool-a';
+      const tool = new RenderToolItem();
+      tool.toolUseId = 'tool-a';
+      tool.toolName = 'Bash';
+      toolGroup.tools = [tool];
+      const work = new RenderWorkGroupItem();
+      work.type = 'work_group';
+      work.key = 'work-a';
+      work.isStreaming = true;
+      work.children = [toolGroup];
+      const runningWorkKey = messageListRenderNodeKey(
+        work.key, work.type, true, messageListItemPresentationState(work));
+      tool.hasResult = true;
+      tool.resultText = 'ok';
+      const settledWorkKey = messageListRenderNodeKey(
+        work.key, work.type, true, messageListItemPresentationState(work));
+      expect(runningWorkKey === settledWorkKey).assertEqual(false);
+      expect(work.key).assertEqual('work-a');
     });
 
     it('keepsToolsAfterProgressTextInTheLiveWorkGroupAndPreservesTurnClock', 0, () => {
@@ -2352,6 +2441,31 @@ export default function localUnitTest() {
       expect(resolveTaskRightStatus('completed', true, 0, false)).assertEqual('done');
       expect(resolveTaskRightStatus('error', true, 0, true)).assertEqual('error');
       expect(resolveTaskRightStatus('completed', true, 1, true)).assertEqual('waiting');
+    });
+
+    it('rebuildsTaskListRowsWhenVisibleSessionStateChanges', 0, () => {
+      const session = new RemoteSession();
+      session.id = 'session-stable-id';
+      session.title = '旧标题';
+      session.preview = '正在检查';
+      session.agentKind = 'codex';
+      session.status = 'active';
+      session.updatedAt = '2026-08-17T08:00:00.000Z';
+
+      const original = taskListEntryPresentationState(session, 'running');
+      expect(taskListEntryPresentationState(session, 'running')).assertEqual(original);
+
+      session.title = '绘画已经完成';
+      const renamed = taskListEntryPresentationState(session, 'running');
+      expect(renamed === original).assertEqual(false);
+
+      session.preview = '已完成绘画';
+      const previewUpdated = taskListEntryPresentationState(session, 'running');
+      expect(previewUpdated === renamed).assertEqual(false);
+
+      const completed = taskListEntryPresentationState(session, 'time');
+      expect(completed === previewUpdated).assertEqual(false);
+      expect(session.id).assertEqual('session-stable-id');
     });
 
     it('classifiesTaskListCategoriesWithAutomationPriority', 0, () => {

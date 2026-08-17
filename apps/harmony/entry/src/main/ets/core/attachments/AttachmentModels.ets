@@ -5,6 +5,14 @@
  * （桌面 isValidImageRef 按 desktop ImageRef schema 校验，`name` 会被静默过滤）。
  */
 
+/** Composer 本地条目 ID：跨 @Prop 深拷贝仍保持稳定，只用于本次编辑生命周期。 */
+let composerAttachmentLocalIdSequence: number = 0;
+
+export function createComposerAttachmentLocalId(): string {
+  composerAttachmentLocalIdSequence += 1;
+  return `composer-${Date.now().toString(36)}-${composerAttachmentLocalIdSequence.toString(36)}`;
+}
+
 /** 发送时随消息携带的图片引用（chatMessage.images）。 */
 export class RemoteImageRef {
   url: string = '';
@@ -66,13 +74,13 @@ export class ImageAttachmentCandidate {
 export const MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 
 /**
- * Composer 附件使用稳定 uri 标识同一条目，同时把上传状态纳入渲染身份。
+ * Composer 附件使用稳定 localId 标识同一条目，同时把上传状态纳入渲染身份。
  * ArkUI ForEach 只有 key 变化时才会可靠重建原地更新过的附件节点。
  */
 export function composerAttachmentRenderKey(
-  uri: string,
+  localId: string,
   status: string,
   uploadRevision: number,
 ): string {
-  return `${uri}#${uploadRevision}#${status}`;
+  return `${localId}#${uploadRevision}#${status}`;
 }

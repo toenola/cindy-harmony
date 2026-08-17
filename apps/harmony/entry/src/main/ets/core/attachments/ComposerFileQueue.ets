@@ -3,13 +3,18 @@ import { common } from '@kit.AbilityKit';
 import { picker } from '@kit.CoreFileKit';
 import { promptAction } from '@kit.ArkUI';
 import { AppServices } from '../AppServices';
-import { RemoteSerializedAttachment } from './AttachmentModels';
+import {
+  RemoteSerializedAttachment,
+  createComposerAttachmentLocalId,
+} from './AttachmentModels';
 import { deleteUpload, uploadDocument, isUploadRevisionCurrent } from './AttachmentUpload';
 import { parseAttachmentOssRef } from './AttachmentOssRef';
 
 export const MAX_COMPOSER_ATTACHMENTS = 20;
 
 export class ComposerFile {
+  /** 跨 @Prop 深拷贝仍可定位父页面真实条目的本地 ID。 */
+  localId: string = createComposerAttachmentLocalId();
   uri: string = '';
   name: string = '';
   size: number = 0;
@@ -180,18 +185,22 @@ export class ComposerFileQueue {
     });
   }
 
-  remove(file: ComposerFile): void {
+  remove(localId: string): void {
     if (this.isBusy()) return;
+    const index = this.files.findIndex((item: ComposerFile) => item.localId === localId);
+    if (index < 0) return;
+    const file = this.files[index];
     file.uploadRevision += 1;
     file.removed = true;
-    this.files = this.files.filter((item: ComposerFile) => item !== file);
+    this.files = this.files.filter((item: ComposerFile) => item.localId !== localId);
     this.emit();
     this.recycle(file);
   }
 
-  retry(file: ComposerFile): void {
-    if (this.isBusy() || file.removed || file.status !== 'failed'
-      || this.files.indexOf(file) < 0) return;
+  retry(localId: string): void {
+    if (this.isBusy()) return;
+    const file = this.files.find((item: ComposerFile) => item.localId === localId);
+    if (file === undefined || file.removed || file.status !== 'failed') return;
     this.startUpload(file);
   }
 

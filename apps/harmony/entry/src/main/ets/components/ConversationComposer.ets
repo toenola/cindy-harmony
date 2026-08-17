@@ -1,7 +1,7 @@
-import { promptAction } from '@kit.ArkUI';
 import {
   RemoteImageRef,
   composerAttachmentRenderKey,
+  createComposerAttachmentLocalId,
 } from '../core/attachments/AttachmentModels';
 import { ComposerFile } from '../core/attachments/ComposerFileQueue';
 import {
@@ -13,6 +13,7 @@ import {
   UI_ICON_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_BASE,
+  UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
@@ -20,9 +21,12 @@ import {
   uiLineHeight,
   uiRevealTransition,
 } from './UiKit';
+import { LevelMode, uiMaterial } from '@kit.ArkUI';
 
 /** 待发送图片（上传状态机：uploading → ready / failed）。 */
 export class ComposerImage {
+  /** 跨 @Prop 深拷贝仍可定位父页面真实条目的本地 ID。 */
+  localId: string = createComposerAttachmentLocalId();
   uri: string = '';
   name: string = '';
   status: string = 'uploading';
@@ -64,6 +68,9 @@ export struct ConversationComposer {
   @Prop agentLabel: string = '';
   @Prop modelLabel: string = '';
   @Prop effortLabel: string = '';
+  /** Agent / 模型选择器由页面持有业务状态，Composer 只统一锚点、材质与尺寸。 */
+  @Prop agentPopupVisible: boolean = false;
+  @Prop modelPopupVisible: boolean = false;
   @Prop showAddButton: boolean = true;
   @Prop showStreamingStatus: boolean = true;
   /** 会话详情与新建任务共用华为官方浮动操作栏同款组件材质。 */
@@ -79,15 +86,22 @@ export struct ConversationComposer {
   onPermission: () => void = () => {};
   onAgent: () => void = () => {};
   onModel: () => void = () => {};
+  onAgentPopupDismiss: () => void = () => {};
+  onModelPopupDismiss: () => void = () => {};
   onPlanToggle: () => void = () => {};
   onSend: () => void = () => {};
   onAbort: () => void = () => {};
   onPreviewImage: (image: ComposerImage) => void = () => {};
-  onRemoveImage: (image: ComposerImage) => void = () => {};
-  onRetryImage: (image: ComposerImage) => void = () => {};
-  onRemoveFile: (file: ComposerFile) => void = () => {};
-  onRetryFile: (file: ComposerFile) => void = () => {};
+  onRemoveImage: (localId: string) => void = () => {};
+  onRetryImage: (localId: string) => void = () => {};
+  onRemoveFile: (localId: string) => void = () => {};
+  onRetryFile: (localId: string) => void = () => {};
   onRemoveAtom: (atom: ComposerAtomPresentation) => void = () => {};
+  @Builder
+  emptyPopupContent() {
+  }
+  @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
+  @BuilderParam modelPopupContent: () => void = this.emptyPopupContent;
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
@@ -120,6 +134,10 @@ export struct ConversationComposer {
     return this.hasAgentOptions && this.expanded();
   }
 
+  private primaryActionEmphasized(): boolean {
+    return this.sending || (this.streaming && !this.hasContent) || this.canSend;
+  }
+
   private expanded(): boolean {
     return this.surfaceExpanded || this.focused
       || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
@@ -139,12 +157,6 @@ export struct ConversationComposer {
       this.onAbort();
     } else if (this.canSend) {
       this.onSend();
-    } else {
-      this.onFocusChange(true);
-      setTimeout(() => {
-        focusControl.requestFocus(this.inputId);
-        promptAction.showToast({ message: '请点击系统键盘中的麦克风' });
-      }, 0);
     }
   }
 
@@ -173,7 +185,7 @@ export struct ConversationComposer {
         .borderRadius(UI_RADIUS_PILL)
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .zIndex(1)
-        .onClick(() => this.onRemoveImage(image))
+        .onClick(() => this.onRemoveImage(image.localId))
       }
       if (image.status === 'uploading') {
         Text('上传中…')
@@ -184,7 +196,7 @@ export struct ConversationComposer {
           .fontSize(uiFontSize(10))
           .fontColor($r('app.color.danger'))
           .decoration({ type: TextDecorationType.Underline })
-          .onClick(() => this.onRetryImage(image))
+          .onClick(() => this.onRetryImage(image.localId))
       } else {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(11)
@@ -222,7 +234,7 @@ export struct ConversationComposer {
           .fontColor($r('app.color.accent'))
           .padding({ left: 8, right: 8 })
           .backgroundColor(Color.Transparent)
-          .onClick(() => this.onRetryFile(file))
+          .onClick(() => this.onRetryFile(file.localId))
       }
       Button() {
         SymbolGlyph($r('sys.symbol.xmark'))
@@ -234,7 +246,7 @@ export struct ConversationComposer {
       .height(26)
       .padding(0)
       .backgroundColor($r('app.color.bg_chip'))
-      .onClick(() => this.onRemoveFile(file))
+      .onClick(() => this.onRemoveFile(file.localId))
     }
     .height(54)
     .padding({ left: 10, right: 6 })
@@ -292,7 +304,13 @@ export struct ConversationComposer {
 
   /** 胶囊内的圆形 icon 按钮（加号 / 权限）。 */
   @Builder
-  composerIconButton(symbol: Resource, tint: Resource, enabled: boolean, action: () => void) {
+  composerIconButton(
+    symbol: Resource,
+    tint: Resource,
+    enabled: boolean,
+    accessibilityLabel: string,
+    action: () => void,
+  ) {
     Button() {
       SymbolGlyph(symbol)
         .fontSize(18)
@@ -306,6 +324,7 @@ export struct ConversationComposer {
     .clickEffect(UI_ICON_CLICK_EFFECT)
     .enabled(enabled)
     .opacity(enabled ? 1 : 0.4)
+    .accessibilityText(accessibilityLabel)
     .onClick(action)
   }
 
@@ -333,10 +352,34 @@ export struct ConversationComposer {
     .constraintSize({ maxWidth: 208 })
     .padding({ left: 12, right: 10 })
     .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor($r('app.color.bg_chip'))
+    .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
+    .accessibilityText(`模型：${this.modelLabel}`)
     .onClick(() => this.onModel())
+    .bindPopup(this.modelPopupVisible, {
+      builder: this.composerModelPopup,
+      placement: Placement.Top,
+      enableArrow: false,
+      targetSpace: 8,
+      autoCancel: true,
+      showInSubWindow: false,
+      followTransformOfTarget: true,
+      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
+      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
+      levelMode: LevelMode.EMBEDDED,
+      popupColor: Color.Transparent,
+      radius: UI_RADIUS_CONTAINER,
+      shadow: ShadowStyle.OUTER_DEFAULT_XS,
+      systemMaterial: new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        colorInvert: true,
+        interactive: true,
+      }),
+      onStateChange: (event) => {
+        if (!event.isVisible) this.onModelPopupDismiss();
+      },
+    })
   }
 
   /** 展开态工具栏里的独立 Agent 胶囊，位于模型胶囊之前。 */
@@ -361,10 +404,72 @@ export struct ConversationComposer {
     .constraintSize({ maxWidth: 104 })
     .padding({ left: 10, right: 8 })
     .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor($r('app.color.bg_chip'))
+    .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
+    .accessibilityText(`Agent：${this.agentLabel}`)
     .onClick(() => this.onAgent())
+    .bindPopup(this.agentPopupVisible, {
+      builder: this.composerAgentPopup,
+      placement: Placement.Top,
+      enableArrow: false,
+      targetSpace: 8,
+      autoCancel: true,
+      showInSubWindow: false,
+      followTransformOfTarget: true,
+      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
+      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
+      levelMode: LevelMode.EMBEDDED,
+      popupColor: Color.Transparent,
+      radius: UI_RADIUS_CONTAINER,
+      shadow: ShadowStyle.OUTER_DEFAULT_XS,
+      systemMaterial: new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        colorInvert: true,
+        interactive: true,
+      }),
+      onStateChange: (event) => {
+        if (!event.isVisible) this.onAgentPopupDismiss();
+      },
+    })
+  }
+
+  @Builder
+  composerPopupHeader(title: string) {
+    Row() {
+      Text(title)
+        .fontSize(uiFontSize(14))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+    }
+    .width('100%')
+    .height(38)
+    .padding({ left: 14, right: 14 })
+  }
+
+  @Builder
+  composerAgentPopup() {
+    Column() {
+      this.composerPopupHeader('切换智能体')
+      this.agentPopupContent()
+    }
+    .width(304)
+    .height(190)
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clip(true)
+  }
+
+  @Builder
+  composerModelPopup() {
+    Column() {
+      this.composerPopupHeader('切换模型')
+      this.modelPopupContent()
+    }
+    .width(304)
+    .height(352)
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clip(true)
   }
 
   @Builder
@@ -379,14 +484,12 @@ export struct ConversationComposer {
         SymbolGlyph($r('sys.symbol.square'))
           .fontSize(11)
           .fontColor([$r('app.color.chat_cta_text')])
-      } else if (this.canSend) {
+      } else {
         SymbolGlyph($r('sys.symbol.arrow_up'))
           .fontSize(17)
-          .fontColor([$r('app.color.chat_cta_text')])
-      } else {
-        SymbolGlyph($r('sys.symbol.mic'))
-          .fontSize(18)
-          .fontColor([$r('app.color.chat_text_secondary')])
+          .fontColor([this.primaryActionEmphasized()
+            ? $r('app.color.chat_cta_text')
+            : $r('app.color.chat_text_secondary')])
       }
     }
     .type(ButtonType.Circle)
@@ -394,12 +497,18 @@ export struct ConversationComposer {
     .height(40)
     .padding(0)
     .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor((this.streaming && !this.hasContent) || this.canSend
+    .backgroundColor(this.primaryActionEmphasized()
       ? $r('app.color.chat_cta')
-      : Color.Transparent)
+      : $r('app.color.composer_control_surface'))
     .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(this.composerEnabled && !this.sending)
+    .enabled(this.composerEnabled && !this.sending
+      && ((this.streaming && !this.hasContent) || this.canSend))
+    .accessibilityText(this.sending
+      ? '发送中'
+      : this.streaming && !this.hasContent
+        ? '停止'
+        : '发送')
     .onClick(() => this.tapPrimaryAction())
   }
 
@@ -423,22 +532,30 @@ export struct ConversationComposer {
             .fontColor($r('app.color.text_tertiary'))
         }
         .width('100%')
-        .height(20)
+        .height(30)
         .padding({ left: 12, right: 12 })
+        .backgroundColor($r('app.color.composer_glass_surface'))
+        .backgroundBlurStyle(BlurStyle.COMPONENT_REGULAR, {}, {
+          disableSystemAdaptation: false,
+        })
+        .border({ width: 1, color: $r('app.color.composer_hairline') })
+        .borderRadius(UI_RADIUS_PILL)
+        .clip(true)
         .transition(uiRevealTransition())
       }
 
       Column({ space: 6 }) {
-        if (this.expanded()) {
+        if (this.images.length > 0) {
           Row() {
             Row()
-              .width(36)
-              .height(4)
+              .width(24)
+              .height(2)
               .backgroundColor(this.resizing
                 ? $r('app.color.accent') : $r('app.color.border'))
               .borderRadius(UI_RADIUS_PILL)
           }
           .width('100%')
+          // 保留 12vp 拖拽热区，仅收细可见光轨，避免视觉变轻后牺牲调高输入区的手感。
           .height(12)
           .justifyContent(FlexAlign.Center)
           .onTouch((event: TouchEvent) => this.resizeInput(event))
@@ -450,7 +567,7 @@ export struct ConversationComposer {
                 this.composerImageItem(image)
               }
             }, (image: ComposerImage) => composerAttachmentRenderKey(
-              image.uri, image.status, image.uploadRevision))
+              image.localId, image.status, image.uploadRevision))
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
@@ -463,7 +580,7 @@ export struct ConversationComposer {
             ForEach(this.files, (file: ComposerFile) => {
               ListItem() { this.composerFileItem(file) }
             }, (file: ComposerFile) => composerAttachmentRenderKey(
-              file.uri, file.status, file.uploadRevision))
+              file.localId, file.status, file.uploadRevision))
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
@@ -498,12 +615,14 @@ export struct ConversationComposer {
               .caretColor($r('app.color.chat_input_caret'))
               .backgroundColor(Color.Transparent)
               .maxLength(LONG_PASTE_MAX_CHARS)
-              .align(Alignment.Center)
+              .align(this.expanded() ? Alignment.TopStart : Alignment.Center)
               .textAlign(TextAlign.Start)
-              .padding({ left: 4, right: 4 })
+              .padding(this.expanded()
+                ? { left: 8, right: 8, top: 6, bottom: 6 }
+                : { left: 4, right: 4 })
               .width('100%')
               .constraintSize({
-                minHeight: 40,
+                minHeight: this.expanded() ? 52 : 40,
                 maxHeight: this.expanded() ? this.inputMaxHeight : 40,
               })
               .onAppear(() => this.focusInputAfterAppear())
@@ -512,6 +631,8 @@ export struct ConversationComposer {
               .onChange((value: string) => this.onInputChange(value))
           }
           .layoutWeight(1)
+          .backgroundColor(Color.Transparent)
+          .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
 
           if (!this.expanded()) {
             this.composerPrimaryButton()
@@ -528,6 +649,7 @@ export struct ConversationComposer {
                 $r('sys.symbol.plus'),
                 $r('app.color.text_primary'),
                 this.composerEnabled && !this.sending && !this.pickingImages,
+                '添加附件或上下文',
                 () => this.onAdd(),
               )
             }
@@ -539,6 +661,7 @@ export struct ConversationComposer {
                   ? $r('app.color.danger')
                   : $r('app.color.text_secondary'),
                 this.composerEnabled && !this.sending && !this.contextBusy,
+                '权限模式',
                 () => this.onPermission(),
               )
             }
@@ -553,10 +676,9 @@ export struct ConversationComposer {
                 .padding({ left: 12, right: 12 })
                 .clickEffect(UI_CLICK_EFFECT)
                 .enabled(this.composerEnabled && !this.contextBusy)
+                .accessibilityText('关闭计划模式')
                 .onClick(() => this.onPlanToggle())
             }
-
-            Row().layoutWeight(1)
 
             if (this.hasAgentChip()) {
               this.composerAgentButton()
@@ -566,10 +688,13 @@ export struct ConversationComposer {
               this.composerModelButton()
             }
 
+            Row().layoutWeight(1)
+
             this.composerPrimaryButton()
           }
           .width('100%')
           .constraintSize({ minHeight: 40 })
+          .padding({ top: 4 })
           .alignItems(VerticalAlign.Center)
         }
       }
@@ -583,14 +708,17 @@ export struct ConversationComposer {
         bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
       })
       .backgroundColor(this.floatingGlass
-        ? Color.Transparent : $r('app.color.composer_surface'))
-      // HdsActionBar 的官方默认背板材质。系统负责明暗、对比度与热控降级，
-      // 不在业务层自定义 blur 半径、亮度或蒙版颜色。
+        ? $r('app.color.composer_glass_surface') : $r('app.color.composer_surface'))
+      // HdsActionBar 同款系统背板模糊；语义半透明底只稳定 Light / Dark 层级，
+      // 模糊半径、亮度与热控降级仍全部交给系统。
       .backgroundBlurStyle(this.floatingGlass
         ? BlurStyle.COMPONENT_REGULAR : BlurStyle.NONE, {}, {
         disableSystemAdaptation: false,
       })
-      .border({ width: 1, color: $r('app.color.composer_border') })
+      .border({
+        width: 1,
+        color: $r('app.color.composer_hairline'),
+      })
       // 收起态使用实际高度的一半做胶囊圆角，避免动画在 999→12 间插值抖动。
       .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
       .clip(true)

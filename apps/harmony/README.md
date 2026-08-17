@@ -1,6 +1,6 @@
 # Cindy Harmony
 
-HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 HarmonyOS 6.1 / API 24+。
+HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 HarmonyOS 7.0 / API 26+。
 
 本应用不在鸿蒙设备本地运行 Claude Code、Codex、Pi 或 Agent。Agent、任务数据、工作目录和工具仍然运行在桌面 Cindy；Harmony 端通过 Device Link 进行远程控制。
 

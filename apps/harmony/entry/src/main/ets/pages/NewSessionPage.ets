@@ -139,11 +139,15 @@ struct NewSessionPage {
   /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
+  @State composerModelPopupOpen: boolean = false;
+  /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
+  private composerPopupRestoreFocus: boolean = false;
   @State contextSheetPage: string = 'main';
   private restoreComposerFocusOnSheetDisappear: boolean = false;
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并应用。 */
   @State modelEffortMemory: Map<string, string> = new Map();
   @State modelFastMemory: Map<string, boolean> = new Map();
+  @State modelEffortPickerKey: string = '';
   @State contextSelectedUris: string[] = [];
   @State selectorOpen: string = '';
   @State browseOpen: boolean = false;
@@ -564,6 +568,36 @@ struct NewSessionPage {
     this.contextSheetOpen = true;
   }
 
+  private openComposerModelPopup(): void {
+    if (this.creating || this.pickingImages) return;
+    this.selectorOpen = '';
+    this.contextSheetPage = 'model';
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.modelEffortPickerKey = '';
+    this.composerPopupRestoreFocus = this.composerFocused || this.keyboardHeight > 0;
+    this.getUIContext().getFocusController().clearFocus();
+    this.composerModelPopupOpen = true;
+  }
+
+  private dismissComposerModelPopup(): void {
+    this.composerModelPopupOpen = false;
+    this.modelEffortPickerKey = '';
+    if (!this.composerPopupRestoreFocus || !this.pageActive) return;
+    this.composerPopupRestoreFocus = false;
+    this.composerBlurGeneration += 1;
+    this.composerSurfaceVisible = true;
+    this.composerFocused = true;
+    setTimeout(() => {
+      if (!this.pageActive || this.composerModelPopupOpen) return;
+      try {
+        this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
+      } catch (_err) {
+        // 页面退场时保持状态收口，不向已销毁的输入节点请求焦点。
+      }
+    }, 0);
+  }
+
   private handleComposerFocusChange(focused: boolean): void {
     this.composerFocused = focused;
     if (focused) {
@@ -574,15 +608,18 @@ struct NewSessionPage {
     const generation = ++this.composerBlurGeneration;
     setTimeout(() => {
       if (generation !== this.composerBlurGeneration || this.composerFocused
-        || this.contextSheetOpen) return;
+        || this.contextSheetOpen || this.composerModelPopupOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0) return;
       this.composerSurfaceVisible = false;
     }, 0);
   }
 
   private returnToComposerAfterModelSheet(): void {
-    this.restoreComposerFocusOnSheetDisappear = true;
+    const popupWasOpen = this.composerModelPopupOpen;
+    this.restoreComposerFocusOnSheetDisappear = !popupWasOpen;
     this.contextSheetOpen = false;
+    this.composerModelPopupOpen = false;
+    this.modelEffortPickerKey = '';
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.composerFocused = false;
@@ -767,15 +804,14 @@ struct NewSessionPage {
     this.composerImages = this.composerImages.slice();
   }
 
-  private removeComposerImage(image: ComposerImage): void {
+  private removeComposerImage(localId: string): void {
     if (this.creating) return;
+    const image = this.composerImages.find((item: ComposerImage) => item.localId === localId);
+    if (image === undefined) return;
     image.uploadRevision += 1;
     image.removed = true;
-    const remaining: ComposerImage[] = [];
-    for (let i = 0; i < this.composerImages.length; i++) {
-      if (this.composerImages[i] !== image) remaining.push(this.composerImages[i]);
-    }
-    this.composerImages = remaining;
+    this.composerImages = this.composerImages.filter(
+      (item: ComposerImage) => item.localId !== localId);
     this.recycleComposerImage(image);
   }
 
@@ -794,10 +830,13 @@ struct NewSessionPage {
     });
   }
 
-  private retryComposerImage(image: ComposerImage): void {
-    if (this.creating || image.removed || image.status !== 'failed') return;
-    const index = this.composerImages.indexOf(image);
+  private retryComposerImage(localId: string): void {
+    if (this.creating) return;
+    const index = this.composerImages.findIndex(
+      (item: ComposerImage) => item.localId === localId);
     if (index < 0) return;
+    const image = this.composerImages[index];
+    if (image.removed || image.status !== 'failed') return;
     this.startComposerImageUpload(image, index, true);
   }
 
@@ -840,11 +879,14 @@ struct NewSessionPage {
     return this.input.trim().length > 0 || readyCount > 0;
   }
 
-  private removeComposerFile(file: ComposerFile): void {
+  private removeComposerFile(localId: string): void {
     if (this.creating) return;
+    const file = this.composerFiles.find((item: ComposerFile) => item.localId === localId);
+    if (file === undefined) return;
     file.uploadRevision += 1;
     file.removed = true;
-    this.composerFiles = this.composerFiles.filter((item: ComposerFile) => item !== file);
+    this.composerFiles = this.composerFiles.filter(
+      (item: ComposerFile) => item.localId !== localId);
     if (file.ref === null) return;
     this.recycleComposerFileRef(file.ref);
   }
@@ -1995,83 +2037,106 @@ struct NewSessionPage {
 
   @Builder
   contextModelRow(option: RuntimeModelOption) {
-    Row({ space: 8 }) {
-      Stack() {
-        this.selectorIcon(agentMark(this.selectedAgentKind))
-      }
-      .onClick(() => this.selectContextModel(option))
+    Column({ space: 2 }) {
+      Row({ space: 6 }) {
+        Stack() {
+          this.selectorIcon(agentMark(this.selectedAgentKind))
+        }
+        .onClick(() => this.selectContextModel(option))
 
-      Column({ space: 1 }) {
-        Row({ space: 2 }) {
-          Text(option.label)
-            .fontSize(uiFontSize(16))
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({
-              maxWidth: this.fastModeCapability && option.supportsFastMode
-                ? (option.efforts.length > 0 ? '48%' : '70%')
-                : (option.efforts.length > 0 ? '70%' : '100%'),
-            })
-            .onClick(() => this.selectContextModel(option))
-          if (option.efforts.length > 0) {
-            Button() {
-              Row({ space: 3 }) {
-                Text(this.modelEffortLabel(option, this.modelEffortForRow(option)))
-                  .fontSize(uiFontSize(13))
-                  .fontColor($r('app.color.text_secondary'))
-                SymbolGlyph($r('sys.symbol.chevron_down'))
-                  .fontSize(uiFontSize(10))
-                  .fontColor([$r('app.color.text_tertiary')])
-              }
+        Column({ space: 1 }) {
+          Row({ space: 2 }) {
+            Text(option.label)
+              .fontSize(uiFontSize(14))
+              .fontColor($r('app.color.text_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .constraintSize({
+                maxWidth: this.fastModeCapability && option.supportsFastMode
+                  ? (option.efforts.length > 0 ? '48%' : '70%')
+                  : (option.efforts.length > 0 ? '70%' : '100%'),
+              })
+              .onClick(() => this.selectContextModel(option))
+            Blank().layoutWeight(1)
+          }
+          .width('100%')
+          if (option.providerName.length > 0 || option.description.length > 0) {
+            Text(option.providerName.length > 0 ? option.providerName : option.description)
+              .fontSize(uiFontSize(10))
+              .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .onClick(() => this.selectContextModel(option))
+          }
+        }
+        .layoutWeight(1)
+        .onClick(() => this.selectContextModel(option))
+
+        if (option.efforts.length > 0) {
+          Button() {
+            Row({ space: 3 }) {
+              Text(this.modelEffortLabel(option, this.modelEffortForRow(option)))
+                .fontSize(uiFontSize(12))
+                .fontColor($r('app.color.text_secondary'))
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(uiFontSize(9))
+                .fontColor([$r('app.color.text_tertiary')])
             }
-            .height(32)
-            .padding({ left: 5, right: 5 })
-            .backgroundColor(Color.Transparent)
+          }
+          .height(28)
+          .padding({ left: 5, right: 5 })
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.creating)
+          .accessibilityText(`${option.label}思考强度`)
+          .onClick(() => {
+            const key = this.modelOptionKey(option);
+            this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
+          })
+        }
+        if (this.fastModeCapability && option.supportsFastMode) {
+          Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+            .selectedColor($r('app.color.accent'))
             .enabled(!this.creating)
-            .accessibilityText(`${option.label}思考强度`)
-            .bindMenu(this.modelEffortMenuItems(option))
-          }
-          if (this.fastModeCapability && option.supportsFastMode) {
-            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-              .selectedColor($r('app.color.accent'))
-              .enabled(!this.creating)
-              .accessibilityText(`${option.label}快速模式`)
-              .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-          }
-          Blank()
-            .layoutWeight(1)
-            .onClick(() => this.selectContextModel(option))
+            .accessibilityText(`${option.label}快速模式`)
+            .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
         }
-        .width('100%')
-        if (option.providerName.length > 0 || option.description.length > 0) {
-          Text(option.providerName.length > 0 ? option.providerName : option.description)
-            .fontSize(uiFontSize(12))
-            .fontColor($r('app.color.text_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .onClick(() => this.selectContextModel(option))
-        }
-      }
-      .layoutWeight(1)
-
-      Row() {
         if (this.modelOptionIsCurrent(option)) {
           SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(uiFontSize(18))
+            .fontSize(uiFontSize(17))
             .fontColor([$r('app.color.chat_cta')])
+            .width(20)
             .onClick(() => this.selectContextModel(option))
         }
       }
-      .width(24)
-      .height(24)
-      .justifyContent(FlexAlign.Center)
+      .width('100%')
+      .constraintSize({ minHeight: 40 })
+
+      if (this.modelEffortPickerKey === this.modelOptionKey(option)) {
+        Row({ space: 4 }) {
+          ForEach(option.efforts, (effort: string) => {
+            Button(this.modelEffortLabel(option, effort))
+              .height(26)
+              .fontSize(uiFontSize(11))
+              .fontColor(effort === this.modelEffortForRow(option)
+                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+              .padding({ left: 9, right: 9 })
+              .backgroundColor(effort === this.modelEffortForRow(option)
+                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+              .borderRadius(13)
+              .onClick(() => {
+                this.selectModelRowEffort(option, effort);
+                this.modelEffortPickerKey = '';
+              })
+          }, (effort: string) => effort)
+        }
+        .width('100%')
+        .padding({ left: 28, right: 4, bottom: 4 })
+      }
     }
     .width('100%')
-    .constraintSize({ minHeight: option.providerName.length > 0 ? 58 : 46 })
-    .padding({ left: 16, right: 12, top: 8, bottom: 8 })
+    .padding({ left: 10, right: 8, top: 3, bottom: 3 })
     .backgroundColor(this.modelOptionIsCurrent(option) ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(28)
+    .borderRadius(12)
   }
 
   @Builder
@@ -2192,6 +2257,7 @@ struct NewSessionPage {
         planModeEnabled: this.planModeEnabled,
         modelLabel: this.currentModelLabel(),
         effortLabel: this.currentEffortLabel(),
+        modelPopupVisible: this.composerModelPopupOpen,
         showAddButton: true,
         showStreamingStatus: false,
         floatingGlass: true,
@@ -2206,7 +2272,13 @@ struct NewSessionPage {
         },
         onAdd: (): void => this.openContextSheet(),
         onPermission: (): void => this.openContextSheet('permission'),
-        onModel: (): void => this.openContextSheet('model'),
+        onModel: (): void => this.openComposerModelPopup(),
+        onModelPopupDismiss: (): void => {
+          this.dismissComposerModelPopup();
+        },
+        modelPopupContent: (): void => {
+          this.modelContextView();
+        },
         onPlanToggle: (): void => this.togglePlanMode(),
         onSend: (): void => {
           void this.send();
@@ -2216,10 +2288,10 @@ struct NewSessionPage {
             this.previewImageUrl = image.uri;
           }
         },
-        onRemoveImage: (image: ComposerImage): void => this.removeComposerImage(image),
-        onRetryImage: (image: ComposerImage): void => this.retryComposerImage(image),
-        onRemoveFile: (file: ComposerFile): void => this.removeComposerFile(file),
-        onRetryFile: (_file: ComposerFile): void => {},
+        onRemoveImage: (localId: string): void => this.removeComposerImage(localId),
+        onRetryImage: (localId: string): void => this.retryComposerImage(localId),
+        onRemoveFile: (localId: string): void => this.removeComposerFile(localId),
+        onRetryFile: (_localId: string): void => {},
       })
     }
     .width('100%')

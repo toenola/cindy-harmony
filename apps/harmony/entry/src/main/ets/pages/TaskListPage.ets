@@ -56,8 +56,10 @@ import {
   resolveTaskRightStatus,
   taskActivityAt,
   taskDisplayTitle,
+  taskListEntryPresentationState,
   taskListCategory,
   TaskListCategory,
+  TaskRightStatusKind,
   TaskListSortMode,
   taskPreviewText,
   taskProjectKey,
@@ -1119,14 +1121,16 @@ struct TaskListPage {
   }
 
   private sessionEntryRenderKey(prefix: string, entry: TaskListEntry): string {
-    return `${prefix}:${entry.key}`;
+    const state = taskListEntryPresentationState(entry.session, this.taskRightStatusKind(entry));
+    return `${prefix}:${entry.key}:state:${state.length}:${state}`;
   }
 
   private projectGroupRenderKey(group: TaskProjectGroup): string {
-    // ForEach 会按 key 复用已有项目节点；成员签名确保跨端新建任务进入已有项目时真正重建。
+    // 外层项目节点也会捕获旧 entries；成员不仅新增/移除，任一行的可见状态变化
+    // 都必须进入外层 key，否则内部 ForEach 连重新计算 key 的机会都没有。
     let key = `project:${group.key}`;
     for (let i = 0; i < group.entries.length; i++) {
-      key += `:${group.entries[i].key}`;
+      key += `:${this.sessionEntryRenderKey('member', group.entries[i])}`;
     }
     return key;
   }
@@ -2005,7 +2009,7 @@ struct TaskListPage {
     })
   }
 
-  private taskRightStatusKind(entry: TaskListEntry): string {
+  private taskRightStatusKind(entry: TaskListEntry): TaskRightStatusKind {
     const activity = AppServices.instance.tasks.getLiveActivity(entry.session.id);
     return resolveTaskRightStatus(
       activity?.phase ?? '',

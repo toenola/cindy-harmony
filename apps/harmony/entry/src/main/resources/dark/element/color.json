@@ -113,6 +113,18 @@
       "value": "#3C3C3A"
     },
     {
+      "name": "composer_glass_surface",
+      "value": "#E62C2C2A"
+    },
+    {
+      "name": "composer_control_surface",
+      "value": "#993C3C3A"
+    },
+    {
+      "name": "composer_hairline",
+      "value": "#593C3C3A"
+    },
+    {
       "name": "chat_cta",
       "value": "#FFFFFF"
     },

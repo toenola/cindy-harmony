@@ -10,7 +10,7 @@
 - [实施计划](./implementation-plan.md)：按垂直切片拆分，每个切片以真机可见成果收尾
 - [行为对齐 Mobile（必读）](./mobile-alignment.md)：实现消息 / 交互行为前先读对应 iOS/Android 源码
 - [架构方案](./architecture.md)：ArkUI、ArkTS、业务层、Device Link 和消息管线
-- [开发环境](./dev-environment.md)：DevEco Studio、API 24+、构建和运行准备
+- [开发环境](./dev-environment.md)：DevEco Studio、API 26+、构建和运行准备
 - [Device Link 适配](./device-link-adaptation.md)：WebSocket、握手、重连和 invoke/push
 - [消息流与渲染](./message-rendering.md)：历史消息、消息模型、Markdown 和媒体展示
 - [图片附件](./image-attachment.md)：选图、压缩、上传、发送和历史恢复
@@ -21,7 +21,7 @@
 
 ## 文档状态
 
-- 目标平台：HarmonyOS 6.1 / API 24+
+- 目标平台：HarmonyOS 7.0 / API 26+
 - 开发语言：ArkTS
 - UI：ArkUI
 - 客户端形态：远程控制桌面 Cindy
