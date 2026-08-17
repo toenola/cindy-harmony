@@ -175,6 +175,7 @@ import {
   parseModelVisibilityOverrides,
   parseProviderModelOptions,
   reconcileModelEffort,
+  selectedPermissionModeLabel,
 } from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
 import {
@@ -2686,6 +2687,9 @@ export default function localUnitTest() {
       expect(options.length).assertEqual(2);
       expect(options[0].id).assertEqual('ask');
       expect(options[1].id).assertEqual('acceptEdits');
+      expect(selectedPermissionModeLabel(options, 'acceptEdits')).assertEqual('自动接受编辑');
+      expect(selectedPermissionModeLabel(options, 'auto')).assertEqual('自动');
+      expect(selectedPermissionModeLabel(options, '')).assertEqual('权限模式');
     });
 
     it('reconcilesEffortWhenSwitchingComposerModels', 0, () => {

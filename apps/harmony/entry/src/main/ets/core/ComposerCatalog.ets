@@ -57,6 +57,17 @@ export function permissionModeDescription(id: string, fallback: string): string 
   return fallback;
 }
 
+/** 工具栏始终展示能力目录中的当前模式名称；旧主机缺目录时使用稳定中文回退。 */
+export function selectedPermissionModeLabel(
+  options: ComposerChoiceOption[],
+  selectedId: string,
+): string {
+  for (let i = 0; i < options.length; i++) {
+    if (options[i].id === selectedId) return options[i].label;
+  }
+  return permissionModeLabel(selectedId, '权限模式');
+}
+
 export function effortLevelLabel(id: string, fallback: string): string {
   if (id === 'minimal') return '最小';
   if (id === 'low') return '低';

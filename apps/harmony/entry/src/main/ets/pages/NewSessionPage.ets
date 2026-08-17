@@ -25,6 +25,7 @@ import {
   permissionModeDescription,
   permissionModeLabel,
   reconcileModelEffort,
+  selectedPermissionModeLabel,
 } from '../core/ComposerCatalog';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
 import {
@@ -50,8 +51,11 @@ import {
 } from '../core/messages/ComposerDocument';
 import {
   UI_ICON_CLICK_EFFECT,
+  UI_LIST_CLICK_EFFECT,
+  UI_RADIUS_CONTROL,
   uiAnimateFastState,
   uiFontSize,
+  uiLineHeight,
   uiOverlayTransition,
 } from '../components/UiKit';
 
@@ -139,6 +143,7 @@ struct NewSessionPage {
   /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
+  @State composerPermissionPopupOpen: boolean = false;
   @State composerModelPopupOpen: boolean = false;
   /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
   private composerPopupRestoreFocus: boolean = false;
@@ -173,6 +178,7 @@ struct NewSessionPage {
   @State effortOptions: RuntimeChoiceOption[] = [];
   @State permissionOptions: RuntimeChoiceOption[] = [];
   @State fastModeCapability: boolean = false;
+  @State composerToolbarReady: boolean = false;
   @State creating: boolean = false;
   @State error: string = '';
   @State taskRevision: number = 0;
@@ -184,6 +190,8 @@ struct NewSessionPage {
   private unsubs: Array<() => void> = [];
   private routeDeviceId: string = '';
   private runtimeLoadGeneration: number = 0;
+  /** 防止设备列表推送在同一轮能力加载期间重复发起相同请求。 */
+  private runtimeToolbarLoadActive: boolean = false;
   /** 异步能力目录返回后，不得覆盖用户在加载窗口内已经选定的运行参数。 */
   private runtimeModelTouchedGeneration: number = -1;
   private runtimeEffortTouchedGeneration: number = -1;
@@ -257,6 +265,8 @@ struct NewSessionPage {
     this.keyboardHeight = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     this.runtimeLoadGeneration += 1;
+    this.runtimeToolbarLoadActive = false;
+    this.composerToolbarReady = false;
     if (!this.attachmentsHandedOff) this.disposeUnsentAttachments();
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
@@ -442,6 +452,10 @@ struct NewSessionPage {
         }
       }
       void this.loadRuntimeDefaults(nextDeviceId, this.selectedAgentKind);
+    } else if (nextDeviceId.length > 0
+      && !this.composerToolbarReady && !this.runtimeToolbarLoadActive) {
+      // 返回栈可能复用页面实例；离页时已失效旧请求，再进入后需要为同一设备重新加载。
+      void this.loadRuntimeDefaults(nextDeviceId, this.selectedAgentKind);
     }
   }
 
@@ -568,28 +582,33 @@ struct NewSessionPage {
     this.contextSheetOpen = true;
   }
 
-  private openComposerModelPopup(): void {
+  private openComposerControlPopup(page: string): void {
     if (this.creating || this.pickingImages) return;
     this.selectorOpen = '';
-    this.contextSheetPage = 'model';
+    this.contextSheetPage = page;
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
     this.composerPopupRestoreFocus = this.composerFocused || this.keyboardHeight > 0;
     this.getUIContext().getFocusController().clearFocus();
-    this.composerModelPopupOpen = true;
+    this.composerPermissionPopupOpen = page === 'permission';
+    this.composerModelPopupOpen = page === 'model';
   }
 
-  private dismissComposerModelPopup(): void {
-    this.composerModelPopupOpen = false;
-    this.modelEffortPickerKey = '';
+  private dismissComposerControlPopup(page: string): void {
+    if (page === 'permission') this.composerPermissionPopupOpen = false;
+    if (page === 'model') {
+      this.composerModelPopupOpen = false;
+      this.modelEffortPickerKey = '';
+    }
     if (!this.composerPopupRestoreFocus || !this.pageActive) return;
     this.composerPopupRestoreFocus = false;
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.composerFocused = true;
     setTimeout(() => {
-      if (!this.pageActive || this.composerModelPopupOpen) return;
+      if (!this.pageActive || this.composerPermissionPopupOpen
+        || this.composerModelPopupOpen) return;
       try {
         this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
       } catch (_err) {
@@ -608,16 +627,18 @@ struct NewSessionPage {
     const generation = ++this.composerBlurGeneration;
     setTimeout(() => {
       if (generation !== this.composerBlurGeneration || this.composerFocused
-        || this.contextSheetOpen || this.composerModelPopupOpen) return;
+        || this.contextSheetOpen || this.composerPermissionPopupOpen
+        || this.composerModelPopupOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0) return;
       this.composerSurfaceVisible = false;
     }, 0);
   }
 
   private returnToComposerAfterModelSheet(): void {
-    const popupWasOpen = this.composerModelPopupOpen;
+    const popupWasOpen = this.composerPermissionPopupOpen || this.composerModelPopupOpen;
     this.restoreComposerFocusOnSheetDisappear = !popupWasOpen;
     this.contextSheetOpen = false;
+    this.composerPermissionPopupOpen = false;
     this.composerModelPopupOpen = false;
     this.modelEffortPickerKey = '';
     this.composerBlurGeneration += 1;
@@ -1152,14 +1173,24 @@ struct NewSessionPage {
     return this.effort.length > 0 ? effortLevelLabel(this.effort, this.effort) : '选择推理强度';
   }
 
+  private currentPermissionModeLabel(): string {
+    return selectedPermissionModeLabel(this.permissionOptions, this.permissionMode);
+  }
+
   private currentModelSupportsFastMode(): boolean {
     const model = this.findModelOption(this.model, this.providerId);
     return this.fastModeCapability && model !== undefined && model.supportsFastMode;
   }
 
   private async loadRuntimeDefaults(deviceId: string, agent: NewAgentKind): Promise<void> {
-    if (deviceId.length === 0) return;
     const generation = ++this.runtimeLoadGeneration;
+    this.runtimeToolbarLoadActive = true;
+    this.composerToolbarReady = false;
+    if (deviceId.length === 0) {
+      this.runtimeToolbarLoadActive = false;
+      this.composerToolbarReady = true;
+      return;
+    }
     this.resetRuntimeDefaults(agent);
     // 编辑失败返回的新建草稿在能力目录加载期间也应保持可见，避免用户看到并操作到临时默认值。
     this.applyPendingEditRuntime(deviceId, agent, false);
@@ -1248,6 +1279,8 @@ struct NewSessionPage {
         } else {
           this.applyPendingEditRuntime(deviceId, agent, true);
         }
+        this.runtimeToolbarLoadActive = false;
+        this.composerToolbarReady = true;
       }
     }
   }
@@ -1910,6 +1943,7 @@ struct NewSessionPage {
             this.permissionMode = option.id;
             this.permissionModeBeforePlan = option.id;
             this.contextSheetOpen = false;
+            this.composerPermissionPopupOpen = false;
           },
         },
       });
@@ -1919,6 +1953,7 @@ struct NewSessionPage {
     this.permissionMode = option.id;
     this.permissionModeBeforePlan = option.id;
     this.contextSheetOpen = false;
+    this.composerPermissionPopupOpen = false;
     this.error = '';
   }
 
@@ -1997,17 +2032,23 @@ struct NewSessionPage {
   @Builder
   permissionContextView() {
     Scroll() {
-      Column() {
+      Column({ space: 2 }) {
         ForEach(this.permissionOptions, (option: RuntimeChoiceOption) => {
-          Row({ space: 12 }) {
-            this.contextRowIcon($r('sys.symbol.lock'))
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.lock'))
+              .fontSize(uiFontSize(16))
+              .fontColor([$r('app.color.text_secondary')])
+              .width(24)
             Column({ space: 2 }) {
               Text(option.label)
-                .fontSize(uiFontSize(16))
+                .fontSize(uiFontSize(14))
+                .fontWeight(option.id === this.permissionMode
+                  ? FontWeight.Medium : FontWeight.Normal)
                 .fontColor($r('app.color.text_primary'))
               if (option.description.length > 0) {
                 Text(option.description)
-                  .fontSize(uiFontSize(12))
+                  .fontSize(uiFontSize(11))
+                  .lineHeight(uiLineHeight(16))
                   .fontColor($r('app.color.text_tertiary'))
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2021,15 +2062,18 @@ struct NewSessionPage {
             }
           }
           .width('100%')
-          .constraintSize({ minHeight: 58 })
-          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .constraintSize({ minHeight: 52 })
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .backgroundColor(option.id === this.permissionMode
+            ? $r('app.color.bg_chip') : Color.Transparent)
+          .borderRadius(UI_RADIUS_CONTROL)
           .opacity(this.creating ? 0.55 : 1)
+          .clickEffect(UI_LIST_CLICK_EFFECT)
           .onClick(() => this.selectContextPermission(option))
-          Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
         }, (option: RuntimeChoiceOption) => option.id)
       }
       .width('100%')
-      .padding({ top: 8, bottom: 24 })
+      .padding({ left: 10, right: 10, top: 8, bottom: 14 })
     }
     .width('100%')
     .layoutWeight(1)
@@ -2251,12 +2295,15 @@ struct NewSessionPage {
         canSend: this.canSend(),
         composerEnabled: true,
         contextBusy: this.creating,
+        toolbarReady: this.composerToolbarReady,
         hasPermissionOptions: this.permissionOptions.length > 0,
         hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
         permissionMode: this.permissionMode,
+        permissionLabel: this.currentPermissionModeLabel(),
         planModeEnabled: this.planModeEnabled,
         modelLabel: this.currentModelLabel(),
         effortLabel: this.currentEffortLabel(),
+        permissionPopupVisible: this.composerPermissionPopupOpen,
         modelPopupVisible: this.composerModelPopupOpen,
         showAddButton: true,
         showStreamingStatus: false,
@@ -2271,10 +2318,16 @@ struct NewSessionPage {
           this.handleComposerFocusChange(focused);
         },
         onAdd: (): void => this.openContextSheet(),
-        onPermission: (): void => this.openContextSheet('permission'),
-        onModel: (): void => this.openComposerModelPopup(),
+        onPermission: (): void => this.openComposerControlPopup('permission'),
+        onModel: (): void => this.openComposerControlPopup('model'),
+        onPermissionPopupDismiss: (): void => {
+          this.dismissComposerControlPopup('permission');
+        },
         onModelPopupDismiss: (): void => {
-          this.dismissComposerModelPopup();
+          this.dismissComposerControlPopup('model');
+        },
+        permissionPopupContent: (): void => {
+          this.permissionContextView();
         },
         modelPopupContent: (): void => {
           this.modelContextView();

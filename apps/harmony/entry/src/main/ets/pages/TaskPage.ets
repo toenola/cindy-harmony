@@ -86,6 +86,7 @@ import {
   parseProviderModelOptions,
   permissionModeDescription,
   reconcileModelEffort,
+  selectedPermissionModeLabel,
 } from '../core/ComposerCatalog';
 import { SessionMetaPatch, unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteMessage, RemoteSession, readBool, readNum, readObj, readStr, recordOrEmpty } from '../core/tasks/TaskModels';
@@ -289,14 +290,6 @@ class PiTreeRow {
 }
 
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
-/** 与任务列表悬浮控件同高；收起态是会话详情右下角的玻璃入口。 */
-const COMPOSER_PREVIEW_BAR_HEIGHT = 52;
-const COMPOSER_PREVIEW_CONTENT_HEIGHT = 40;
-const COMPOSER_PREVIEW_LIST_INSET = 72;
-/** 单铅笔与“铅笔 + 停止”两种收起态分别固定浮栏宽度，避免运行中按钮溢出系统玻璃背板。 */
-const COMPOSER_PREVIEW_IDLE_BAR_WIDTH = 56;
-const COMPOSER_PREVIEW_RUNNING_BAR_WIDTH = 96;
-
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
   if (kind === 'codex') return 'Codex';
@@ -482,6 +475,7 @@ export struct TaskPageContent {
   @State contextSheetOpen: boolean = false;
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
   @State detailComposerSheetOpen: boolean = false;
+  @State composerPermissionPopupOpen: boolean = false;
   @State composerAgentPopupOpen: boolean = false;
   @State composerModelPopupOpen: boolean = false;
   /** 仅当打开选择器前键盘可见时，关闭 Popup 后才恢复输入焦点。 */
@@ -519,6 +513,7 @@ export struct TaskPageContent {
   private selectedLearnRoute: string = '';
   @State planModeSupported: boolean = false;
   @State planModeEnabled: boolean = false;
+  @State composerToolbarReady: boolean = false;
   @State permissionOptions: ComposerChoiceOption[] = [];
   @State modelOptions: ComposerModelOption[] = [];
   /** 被控端 provider:list 的真实目录；为空时才回退 capabilities.availableModels。 */
@@ -545,6 +540,7 @@ export struct TaskPageContent {
   private recentPickerOptions: PickerOptions = createRecentPickerOptions();
   @State recentPickerController: PickerController = new PickerController();
   private permissionModeBeforePlan: string = 'default';
+  private composerCapabilitiesGeneration: number = 0;
   private agentSwitchReadGeneration: number = 0;
   private agentSwitchWriteGeneration: number = 0;
   private agentSwitchConfirmed: boolean = false;
@@ -639,6 +635,8 @@ export struct TaskPageContent {
     this.pendingHistoryAnchorRestore = undefined;
     this.agentSwitchConfirmed = false;
     this.pendingAgentSwitchIntent = null;
+    this.composerCapabilitiesGeneration += 1;
+    this.composerToolbarReady = false;
     this.composerDocument = emptyComposerDocument();
     this.input = '';
     this.composerFocused = false;
@@ -712,6 +710,8 @@ export struct TaskPageContent {
     this.listTouchActive = false;
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
+    this.composerCapabilitiesGeneration += 1;
+    this.composerToolbarReady = false;
     this.initialScrollSettling = false;
     this.restoreComposerFocusOnSheetDisappear = false;
     this.closeContextSheet();
@@ -952,16 +952,23 @@ export struct TaskPageContent {
     return hint;
   }
 
-  private async loadProviderModelOptions(agent: string): Promise<void> {
+  private async loadProviderModelOptions(
+    agent: string,
+    capabilityGeneration: number = -1,
+  ): Promise<void> {
     try {
       const request = new ProviderListOptions();
       request.capabilities = ['provider-logo-kinds-v2'];
       const result = await this.invokeContextRpc('maker:provider:list', [request]);
+      if (capabilityGeneration >= 0
+        && capabilityGeneration !== this.composerCapabilitiesGeneration) return;
       this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
       this.providerModelOptions = parseProviderModelOptions(
         result, agent, this.modelVisibilityOverrides, this.currentModelSelectionHint());
       this.providerModelAgent = agent;
     } catch (e) {
+      if (capabilityGeneration >= 0
+        && capabilityGeneration !== this.composerCapabilitiesGeneration) return;
       // 旧被控端没有 provider:list 时保持 capabilities 扁平回退，不影响模型页其它能力。
       this.providerModelOptions = [];
       this.providerModelAgent = '';
@@ -970,14 +977,18 @@ export struct TaskPageContent {
 
   /** 新主机用 planMode.supported；旧主机以 permissionModes 含 plan 兼容。 */
   private async loadComposerCapabilities(): Promise<void> {
+    const generation = ++this.composerCapabilitiesGeneration;
+    this.composerToolbarReady = false;
     const session = this.session();
     if (session === undefined) {
+      if (generation === this.composerCapabilitiesGeneration) this.composerToolbarReady = true;
       return;
     }
     try {
       const result = await this.invokeContextRpc('maker:get-capabilities', [
         this.agentKindForCapability(session),
       ]);
+      if (generation !== this.composerCapabilitiesGeneration) return;
       if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
         return;
       }
@@ -986,7 +997,8 @@ export struct TaskPageContent {
       this.effortOptions = parseChoiceOptions(capabilities['effortLevels'], false);
       this.modelOptions = parseModelOptions(capabilities['availableModels']);
       this.fastModeCapability = readBool(capabilities, 'hasFastMode', false);
-      await this.loadProviderModelOptions(this.currentAgentTab());
+      await this.loadProviderModelOptions(this.currentAgentTab(), generation);
+      if (generation !== this.composerCapabilitiesGeneration) return;
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
       this.modelAgentTab = this.currentAgentTab();
       void this.loadPendingAgentSwitchIntent();
@@ -1013,6 +1025,7 @@ export struct TaskPageContent {
         || this.capabilityHasLegacyPlan(capabilities);
       this.syncComposerContextState();
     } catch (e) {
+      if (generation !== this.composerCapabilitiesGeneration) return;
       // 旧主机不支持 capabilities 时隐藏对应运行时控制；其它上下文能力仍可用。
       this.planModeSupported = false;
       this.permissionOptions = [];
@@ -1021,6 +1034,10 @@ export struct TaskPageContent {
       this.fastModeCapability = false;
       this.sessionAgentSwitchSupported = false;
       this.pendingAgentSwitchIntent = null;
+    } finally {
+      if (generation === this.composerCapabilitiesGeneration) {
+        this.composerToolbarReady = true;
+      }
     }
   }
 
@@ -1128,6 +1145,10 @@ export struct TaskPageContent {
       return '';
     }
     return session.permissionMode === 'plan' ? this.permissionModeBeforePlan : session.permissionMode;
+  }
+
+  private currentPermissionModeLabel(): string {
+    return selectedPermissionModeLabel(this.permissionOptions, this.effectivePermissionMode());
   }
 
   private currentAgentTab(): string {
@@ -1377,31 +1398,6 @@ export struct TaskPageContent {
     return this.visibleFastModeCapability() && model !== null && model.supportsFastMode;
   }
 
-  private openComposerControlSheet(page: string): void {
-    if (this.sending || this.contextRpcBusy || this.deviceDisabled
-      || this.isCreationBlockingRemoteOps()) {
-      return;
-    }
-    if (page === 'model' || page === 'agent') {
-      if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
-    }
-    if (page === 'model') {
-      const targetAgent = this.composerAgentKind();
-      if (this.providerModelAgent !== targetAgent) {
-        void this.loadProviderModelOptions(targetAgent);
-      }
-    }
-    this.contextSheetPage = page;
-    this.composerBlurGeneration += 1;
-    this.composerSurfaceVisible = true;
-    this.getUIContext().getFocusController().clearFocus();
-    if ((page === 'model' || page === 'agent') && this.isEmbeddedDetailPane()) {
-      this.detailComposerSheetOpen = true;
-      return;
-    }
-    this.contextSheetOpen = true;
-  }
-
   private isEmbeddedDetailPane(): boolean {
     return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
   }
@@ -1409,6 +1405,7 @@ export struct TaskPageContent {
   private closeContextSheet(): void {
     this.contextSheetOpen = false;
     this.detailComposerSheetOpen = false;
+    this.composerPermissionPopupOpen = false;
     this.composerAgentPopupOpen = false;
     this.composerModelPopupOpen = false;
     this.modelEffortPickerKey = '';
@@ -1424,16 +1421,17 @@ export struct TaskPageContent {
     }
     this.contextSheetPage = page;
     this.composerBlurGeneration += 1;
-    this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
     this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
-    // Popup 需要使用键盘占用的垂直空间；完整 Composer 由 surfaceVisible 保持，不会随清焦收起。
+    // Popup 需要使用键盘占用的垂直空间；已展开的 Composer 由 surfaceVisible 保持。
     this.getUIContext().getFocusController().clearFocus();
+    this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
   }
 
   private dismissComposerControlPopup(page: string): void {
+    if (page === 'permission') this.composerPermissionPopupOpen = false;
     if (page === 'agent') this.composerAgentPopupOpen = false;
     if (page === 'model') {
       this.composerModelPopupOpen = false;
@@ -1449,7 +1447,8 @@ export struct TaskPageContent {
     this.composerSurfaceVisible = true;
     this.composerFocused = true;
     setTimeout(() => {
-      if (this.leavingDetailPage || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
+      if (this.leavingDetailPage || this.composerPermissionPopupOpen
+        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       try {
         this.getUIContext().getFocusController().requestFocus('task-composer-input');
       } catch (_err) {
@@ -1459,9 +1458,16 @@ export struct TaskPageContent {
   }
 
   private returnToComposerAfterModelSheet(): void {
-    const popupWasOpen = this.composerAgentPopupOpen || this.composerModelPopupOpen;
+    const popupWasOpen = this.composerPermissionPopupOpen
+      || this.composerAgentPopupOpen || this.composerModelPopupOpen;
+    const surfaceWasExpanded = this.composerUsesExpandedSurface();
     const embedded = this.isEmbeddedDetailPane();
     this.closeContextSheet();
+    if (!surfaceWasExpanded) {
+      this.restoreComposerFocusOnSheetDisappear = false;
+      this.composerPopupRestoreFocus = false;
+      return;
+    }
     if (popupWasOpen) {
       this.composerBlurGeneration += 1;
       this.composerSurfaceVisible = true;
@@ -3165,32 +3171,13 @@ export struct TaskPageContent {
       || this.composerImages.length > 0 || this.composerFiles.length > 0;
   }
 
-  /**
-   * 真实 Composer 只在需要编辑或维护附件/atom 时出现；收起态仅保留右下角入口。
-   */
+  /** 完整输入卡与默认单行工具栏共用同一个 Composer，仅由内部形态区分。 */
   private composerUsesExpandedSurface(): boolean {
     return this.composerSurfaceVisible
       || this.composerImages.length > 0
       || this.composerFiles.length > 0
       || composerAtomPresentations(this.composerDocument).length > 0
       || this.composerPaletteMode.length > 0;
-  }
-
-  private shouldShowComposerPreview(): boolean {
-    return !this.deviceDisabled
-      && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions)
-      && !this.composerUsesExpandedSurface();
-  }
-
-  private composerPreviewBarWidth(): number {
-    return this.sending || this.sessionStreaming
-      ? COMPOSER_PREVIEW_RUNNING_BAR_WIDTH
-      : COMPOSER_PREVIEW_IDLE_BAR_WIDTH;
-  }
-
-  private openComposerFromPreview(): void {
-    if (!this.shouldShowComposerPreview()) return;
-    this.expandComposerForEditing(true);
   }
 
   /** 由消息操作、队列编辑等入口带入草稿时，也必须落到真实可编辑的 Composer。 */
@@ -3204,7 +3191,7 @@ export struct TaskPageContent {
     }
   }
 
-  /** 释放 TextArea 焦点并回到右下角收起态；离页前也必须同步执行，避免返回栈复用旧输入首帧。 */
+  /** 释放 TextArea 焦点并回到单行工具栏；离页前同步执行，避免返回栈复用旧输入首帧。 */
   private collapseComposerSurface(): void {
     this.getUIContext().getFocusController().clearFocus();
     this.composerBlurGeneration += 1;
@@ -3212,7 +3199,7 @@ export struct TaskPageContent {
     this.composerSurfaceVisible = false;
   }
 
-  /** 正常发送后立即释放 TextArea 焦点并回到右下角的收起态入口。 */
+  /** 正常发送后立即释放 TextArea 焦点并回到单行工具栏。 */
   private collapseComposerAfterSend(): void {
     this.collapseComposerSurface();
   }
@@ -3236,6 +3223,7 @@ export struct TaskPageContent {
     setTimeout(() => {
       if (generation !== this.composerBlurGeneration || this.composerFocused
         || this.contextSheetOpen || this.detailComposerSheetOpen
+        || this.composerPermissionPopupOpen
         || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       if (this.composerImages.length > 0 || this.composerFiles.length > 0
         || composerAtomPresentations(this.composerDocument).length > 0
@@ -3474,12 +3462,10 @@ export struct TaskPageContent {
           .border({ width: { top: 1 }, color: { top: $r('app.color.chat_header_divider') } })
       } else if (!pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
         // 只有 Mobile 本端可终结的 pending 接管 Composer；桌面专属/未知卡仅作提示。
-        if (this.composerUsesExpandedSurface()) {
-          if (this.composerPaletteMode.length > 0) {
-            this.composerPalettePanel()
-          }
-          this.composerBar()
+        if (this.composerPaletteMode.length > 0) {
+          this.composerPalettePanel()
         }
+        this.composerBar()
       }
 
       // 全屏图片预览层
@@ -3584,9 +3570,8 @@ export struct TaskPageContent {
   }
 
   build() {
-    Stack({ alignContent: Alignment.BottomEnd }) {
+    Stack() {
       this.taskPageBody()
-      this.composerPreviewFloatingEntry()
     }
     .width('100%')
     .height('100%')
@@ -4439,13 +4424,12 @@ export struct TaskPageContent {
         }
         .width('100%')
         .height('100%')
-        // 收起态悬浮入口会叠在内容上，尾部必须预留同一块阅读空间；
-        // 展开真实 Composer 时它重新参与 Column 布局，不再额外叠加留白。
+        // 单行工具栏与完整输入卡都参与 Column 布局，列表只保留基础阅读留白。
         .padding({
           left: 16,
           right: 16,
           top: 8,
-          bottom: this.shouldShowComposerPreview() ? COMPOSER_PREVIEW_LIST_INSET : 16,
+          bottom: 16,
         })
         .clip(false)
         .cachedCount(3, true)
@@ -4491,7 +4475,7 @@ export struct TaskPageContent {
         .border({ width: 1, color: $r('app.color.chat_fab_border') })
         .margin({
           right: 23,
-          bottom: this.shouldShowComposerPreview() ? COMPOSER_PREVIEW_LIST_INSET : 12,
+          bottom: 12,
         })
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .transition(uiRevealTransition())
@@ -4575,50 +4559,6 @@ export struct TaskPageContent {
   }
 
   @Builder
-  composerPreviewFloatingEntry() {
-    if (this.shouldShowComposerPreview()) {
-      Row({ space: 10 }) {
-        SymbolGlyph($r('sys.symbol.square_and_pencil'))
-          .fontSize(18)
-          .fontColor([$r('app.color.text_secondary')])
-        if (this.sending || this.sessionStreaming) {
-          Button() {
-            SymbolGlyph($r('sys.symbol.square'))
-              .fontSize(11)
-              .fontColor([$r('app.color.chat_cta_text')])
-          }
-          .type(ButtonType.Circle)
-          .width(32)
-          .height(32)
-          .padding(0)
-          .backgroundColor($r('app.color.chat_cta'))
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .accessibilityText('停止')
-          .onClick(() => this.abort())
-        }
-      }
-      .width('100%')
-      .height(COMPOSER_PREVIEW_CONTENT_HEIGHT)
-      .justifyContent(FlexAlign.Center)
-      .alignItems(VerticalAlign.Center)
-      // 单图标不再借用居中的 TabBar：它是会话详情右下角的独立悬浮入口。
-      .backgroundColor($r('app.color.chat_fab_surface'))
-      .backgroundBlurStyle(BlurStyle.COMPONENT_REGULAR, {}, {
-        disableSystemAdaptation: false,
-      })
-      .border({ width: 1, color: $r('app.color.chat_fab_border') })
-      .borderRadius(UI_RADIUS_PILL)
-      .clip(true)
-      .clickEffect(UI_LIST_CLICK_EFFECT)
-      .accessibilityText('继续输入')
-      .onClick(() => this.openComposerFromPreview())
-      .width(this.composerPreviewBarWidth())
-      .height(COMPOSER_PREVIEW_BAR_HEIGHT)
-      .margin({ right: 16, bottom: 16 })
-    }
-  }
-
-  @Builder
   composerBar() {
     ConversationComposer({
       input: this.input,
@@ -4636,19 +4576,23 @@ export struct TaskPageContent {
         && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions),
       pickingImages: this.pickingImages,
       contextBusy: this.contextRpcBusy,
+      toolbarReady: this.composerToolbarReady,
       hasPermissionOptions: this.permissionOptions.length > 0,
       hasAgentOptions: this.canSwitchSessionAgent(),
       hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
       permissionMode: this.effectivePermissionMode(),
+      permissionLabel: this.currentPermissionModeLabel(),
       planModeEnabled: this.planModeEnabled,
       agentLabel: modelAgentLabel(this.composerAgentKind()),
       modelLabel: this.currentModelLabel(),
       effortLabel: this.currentModelEffortLabel(),
+      permissionPopupVisible: this.composerPermissionPopupOpen,
       agentPopupVisible: this.composerAgentPopupOpen,
       modelPopupVisible: this.composerModelPopupOpen,
       showAddButton: true,
       showStreamingStatus: true,
       floatingGlass: true,
+      compactToolbar: true,
       floatingBottomInset: this.paneComposerBottomInset,
       inputId: 'task-composer-input',
       onInputChange: (value: string): void => {
@@ -4659,14 +4603,20 @@ export struct TaskPageContent {
         this.handleComposerFocusChange(focused);
       },
       onAdd: (): void => this.openContextSheet(),
-      onPermission: (): void => this.openComposerControlSheet('permission'),
+      onPermission: (): void => this.openComposerControlPopup('permission'),
       onAgent: (): void => this.openComposerControlPopup('agent'),
       onModel: (): void => this.openComposerControlPopup('model'),
+      onPermissionPopupDismiss: (): void => {
+        this.dismissComposerControlPopup('permission');
+      },
       onAgentPopupDismiss: (): void => {
         this.dismissComposerControlPopup('agent');
       },
       onModelPopupDismiss: (): void => {
         this.dismissComposerControlPopup('model');
+      },
+      permissionPopupContent: (): void => {
+        this.permissionContextView();
       },
       agentPopupContent: (): void => {
         this.agentContextView();
@@ -4677,6 +4627,7 @@ export struct TaskPageContent {
       onPlanToggle: (): void => {
         void this.togglePlanMode();
       },
+      onExpand: (): void => this.expandComposerForEditing(true),
       onSend: (): void => this.send(),
       onAbort: (): void => this.abort(),
       onPreviewImage: (image: ComposerImage): void => {
@@ -4891,19 +4842,24 @@ export struct TaskPageContent {
   @Builder
   permissionContextView() {
     Scroll() {
-      Column() {
+      Column({ space: 2 }) {
         ForEach(this.permissionOptions, (option: ComposerChoiceOption) => {
-          Row({ space: 12 }) {
-            this.contextRowIcon($r('sys.symbol.lock'))
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.lock'))
+              .fontSize(uiFontSize(16))
+              .fontColor([$r('app.color.text_secondary')])
+              .width(24)
             Column({ space: 2 }) {
               Text(option.label)
-                .fontSize(uiFontSize(16))
-                .lineHeight(uiLineHeight(22))
+                .fontSize(uiFontSize(14))
+                .lineHeight(uiLineHeight(20))
+                .fontWeight(option.id === this.effectivePermissionMode()
+                  ? FontWeight.Medium : FontWeight.Normal)
                 .fontColor($r('app.color.text_primary'))
               if (option.description.length > 0) {
                 Text(option.description)
-                  .fontSize(uiFontSize(12))
-                  .lineHeight(uiLineHeight(18))
+                  .fontSize(uiFontSize(11))
+                  .lineHeight(uiLineHeight(16))
                   .fontColor($r('app.color.text_tertiary'))
                   .maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -4918,16 +4874,18 @@ export struct TaskPageContent {
             }
           }
           .width('100%')
-          .constraintSize({ minHeight: 58 })
-          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .constraintSize({ minHeight: 52 })
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .backgroundColor(option.id === this.effectivePermissionMode()
+            ? $r('app.color.bg_chip') : Color.Transparent)
+          .borderRadius(UI_RADIUS_CONTROL)
           .opacity(this.contextRpcBusy ? 0.55 : 1)
           .clickEffect(UI_LIST_CLICK_EFFECT)
           .onClick(() => this.requestPermissionMode(option))
-          Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
         }, (option: ComposerChoiceOption) => option.id)
       }
       .width('100%')
-      .padding({ top: 8, bottom: 24 })
+      .padding({ left: 10, right: 10, top: 8, bottom: 14 })
     }
     .width('100%')
     .layoutWeight(1)
