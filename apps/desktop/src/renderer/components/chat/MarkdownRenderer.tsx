@@ -33,8 +33,9 @@ import remarkSessionLinks from './remarkSessionLinks';
 import { rehypeMathBlockMarker } from './rehypeMathBlockMarker';
 import { FENCED_CODE_PROP, rehypeFencedCodeMarker } from './rehypeFencedCodeMarker';
 import {
-  createWordFadeState,
+  getOrCreateWordFadeState,
   markSettledFromAnimationEnd,
+  releaseWordFadeState,
   rehypeStreamWordFade,
 } from './rehypeStreamWordFade';
 import { repairStreamingMarkdown } from './repairStreamingMarkdown';
@@ -227,7 +228,7 @@ const REMARK_PLUGINS_PRIVILEGED: PluggableList = [
 // rehypeKatex 必须排在 rehypeHighlight 之前:remark-math 产出的 hast 是
 // `<code class="language-math ...">`,先让 katex 消费掉,否则 highlight 会往
 // 里面塞 hljs span 破坏纯文本结构。strict:'ignore' 静默非致命 LaTeX 告警;
-// errorColor 走语义豁免 error token,解析失败的公式以错误色显示原文。
+// 解析失败的公式回落为正文色原文,避免模型格式错误把普通聊天染成错误红。
 // rehypeMathBlockMarker 紧随 rehypeKatex:把裸 `<span class="katex-display">`
 // 包进 `<div data-math-block>`,让下方 div 渲染器能挂「复制为图片」工具栏
 // (components 映射只认 tagName,认不了 class)。
@@ -236,7 +237,7 @@ const REMARK_PLUGINS_PRIVILEGED: PluggableList = [
 // 打 data-fenced-code 供下方 code 渲染器按结构(而非语言标注)分派。
 const REHYPE_PLUGINS: PluggableList = [
   rehypeSlug,
-  [rehypeKatex, { strict: 'ignore', errorColor: 'var(--error-fg)' }],
+  [rehypeKatex, { strict: 'ignore', errorColor: 'inherit' }],
   rehypeMathBlockMarker,
   rehypeHighlight,
   rehypeFencedCodeMarker,
@@ -317,6 +318,11 @@ interface MarkdownRendererProps {
    *  message never misses its last token. Default false (static content
    *  paths like TextLightbox bypass the throttle entirely). */
   isStreaming?: boolean;
+  /**
+   * Stable identity of the streaming message. Keeps the word-fade timeline
+   * across task-view remounts so already-rendered text cannot replay.
+   */
+  streamFadeKey?: string;
   /** Files uploaded in the session. Used to resolve model-authored links like
    *  `[doc.docx](doc.docx)` back to the original attachment path. */
   localFileRefs?: readonly KnownLocalFileRef[];
@@ -1620,6 +1626,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   workingDir,
   content,
   isStreaming = false,
+  streamFadeKey,
   localFileRefs,
   currentSessionId,
   currentSessionTitle,
@@ -1637,19 +1644,22 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   // parse 直接还原纯文本 —— 结构性 remount 也无从重播(双保险,详见插件头注释)。
   // isStreaming 翻 false 时整段回落到模块级常量 REHYPE_PLUGINS —— 终版渲染无
   // 任何 span 包装,插件、state 与监听一起被回收,静态路径零开销。
-  // 用户开关(Settings → 个性化 → 流式动效,默认关)与 reduced-motion 取 AND:
+  // 用户开关(Settings → 个性化 → 流式动效,默认开)与 reduced-motion 取 AND:
   // 系统级减弱动效永远优先,开关只在 motion 允许的前提下再做个人选择。
   const reducedMotion = useReducedMotion();
   const streamFadeEnabled = useStreamFadeEnabled();
   const streamFade = isStreaming && !reducedMotion && streamFadeEnabled;
   const wordFade = useMemo(() => {
     if (!streamFade) return null;
-    const state = createWordFadeState();
+    const state = getOrCreateWordFadeState(streamFadeKey);
     return {
       state,
       plugins: [...REHYPE_PLUGINS, [rehypeStreamWordFade, state]] as PluggableList,
     };
-  }, [streamFade]);
+  }, [streamFade, streamFadeKey]);
+  useEffect(() => {
+    if (!isStreaming) releaseWordFadeState(streamFadeKey);
+  }, [isStreaming, streamFadeKey]);
   const rehypePlugins = wordFade?.plugins ?? REHYPE_PLUGINS;
   const handleWordFadeAnimationEnd = useMemo(() => {
     if (!wordFade) return undefined;

@@ -40,7 +40,10 @@ export function PinnedPlanPanel({
 }: {
   sessionId: string | null;
   messages: readonly ChatMessage[];
-  /** 保留旧调用方的兼容参数;计划胶囊现在始终使用静态灰度进度环。 */
+  /**
+   * 会话是否真的在跑(调用方传 isStreaming)。胶囊上的进度环始终静态;该值只
+   * 透传给浮层里 in_progress 行的呼吸动画——空闲时静止,不谎报步骤仍在执行。
+   */
   animated: boolean;
   /** 与 composer 同宽(inputWidth),胶囊在该宽度内居中,浮层不超出。 */
   width: number;
@@ -130,10 +133,19 @@ export function PinnedPlanPanel({
     if (current?.identity === completionIdentity && current.deadlineMs >= completionDeadlineMs) return;
     deadlineFloorRef.current = { identity: completionIdentity, deadlineMs: completionDeadlineMs };
   }, [completionDeadlineMs, completionIdentity]);
+  const snapshotIdentity = insertion
+    ? JSON.stringify([
+        sessionId ?? 'unknown',
+        insertion.key,
+        insertion.updatedAtMs ?? insertion.createdAt ?? null,
+        insertion.todos.map((todo) => [todo.status, todo.content]),
+      ])
+    : null;
   const completedPlanExpired = Boolean(
     completionDeadlineMs !== null && completionDeadlineMs <= Date.now(),
   );
   const [hiddenInsertionKey, setHiddenInsertionKey] = useState<string | null>(null);
+  const [dismissedSnapshotIdentity, setDismissedSnapshotIdentity] = useState<string | null>(null);
 
   useEffect(() => {
     if (!insertion || !retired) {
@@ -169,7 +181,8 @@ export function PinnedPlanPanel({
     !insertion ||
     insertion.todos.length < 2 ||
     completedPlanExpired ||
-    hiddenInsertionKey === insertion.key
+    hiddenInsertionKey === insertion.key ||
+    dismissedSnapshotIdentity === snapshotIdentity
   )
     return null;
 
@@ -184,6 +197,7 @@ export function PinnedPlanPanel({
         todos={insertion.todos}
         animated={animated}
         maxWidth={width}
+        onDismiss={() => setDismissedSnapshotIdentity(snapshotIdentity)}
       />
     </div>
   );
