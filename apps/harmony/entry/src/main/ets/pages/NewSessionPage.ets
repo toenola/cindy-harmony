@@ -30,10 +30,13 @@ import {
 import { AppServices } from '../core/AppServices';
 import {
   ComposerChoiceOption as RuntimeChoiceOption,
+  ComposerModelGroup,
   ComposerModelOption as RuntimeModelOption,
   ProviderListOptions,
   composerModelKey,
   effortLevelLabel,
+  groupComposerModelOptions,
+  modelProviderKind,
   parseModelOptions,
   parseModelVisibilityOverrides,
   parseProviderModelOptions as parseComposerProviderModelOptions,
@@ -59,6 +62,10 @@ import {
 } from '../core/tasks/NewSessionCreationStore';
 import { normalizeAutoTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import {
+  ComposerModelOptionRow,
+  ComposerModelProviderHeader,
+} from '../components/ComposerModelOptionRow';
 import {
   ComposerDocument,
   composerDocumentProjectedText,
@@ -179,6 +186,8 @@ export struct NewSessionPageContent {
   @State composerModelPopupOpen: boolean = false;
   /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
   private composerPopupRestoreFocus: boolean = false;
+  /** 模型 Popup 关闭时暂存目标选项，由统一收口路径提交模型并销毁锚点。 */
+  private pendingPopupModelSelection: RuntimeModelOption | null = null;
   @State contextSheetPage: string = 'main';
   private restoreComposerFocusOnSheetDisappear: boolean = false;
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并应用。 */
@@ -567,6 +576,7 @@ export struct NewSessionPageContent {
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
+    if (page === 'model') this.pendingPopupModelSelection = null;
     this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
     this.getUIContext().getFocusController().clearFocus();
     this.composerPermissionPopupOpen = page === 'permission';
@@ -575,12 +585,17 @@ export struct NewSessionPageContent {
   }
 
   private dismissComposerControlPopup(page: string): void {
+    let pendingModelSelection: RuntimeModelOption | null = null;
     if (page === 'permission') this.composerPermissionPopupOpen = false;
     if (page === 'agent') this.composerAgentPopupOpen = false;
     if (page === 'model') {
       this.composerModelPopupOpen = false;
       this.modelEffortPickerKey = '';
+      pendingModelSelection = this.pendingPopupModelSelection;
+      this.pendingPopupModelSelection = null;
     }
+    // Popup 自动退场与模型行主动关闭共用同一条模型提交、焦点恢复路径。
+    if (pendingModelSelection !== null) this.selectModel(pendingModelSelection);
     if (!this.composerPopupRestoreFocus || !this.pageActive) return;
     this.composerPopupRestoreFocus = false;
     this.composerBlurGeneration += 1;
@@ -1053,6 +1068,10 @@ export struct NewSessionPageContent {
       return this.providerModelOptions;
     }
     return this.modelOptions;
+  }
+
+  private groupedModelOptions(): ComposerModelGroup[] {
+    return groupComposerModelOptions(this.visibleModelOptions());
   }
 
   private modelOptionKey(option: RuntimeModelOption): string {
@@ -2025,8 +2044,15 @@ export struct NewSessionPageContent {
   }
 
   private selectContextModel(option: RuntimeModelOption): void {
-    this.selectModel(option);
+    if (this.composerModelPopupOpen) {
+      // Popup 锚点会随 visible 分支切换被直接销毁，不再等待系统浮层自行消费 false。
+      this.pendingPopupModelSelection = option;
+      this.dismissComposerControlPopup('model');
+      return;
+    }
+    // Sheet 不依赖工具栏按钮作为锚点，可以在发起退场后直接更新本地草稿。
     this.returnToComposerAfterModelSheet();
+    this.selectModel(option);
   }
 
   @Builder
@@ -2148,114 +2174,56 @@ export struct NewSessionPageContent {
 
   @Builder
   contextModelRow(option: RuntimeModelOption) {
+    ComposerModelOptionRow({
+      label: option.label,
+      providerKind: modelProviderKind(option),
+      providerInitial: option.providerName.length > 0
+        ? option.providerName.charAt(0).toUpperCase() : 'S',
+      selected: this.modelOptionIsCurrent(option),
+      subscription: option.subscription,
+      disabled: this.creating,
+      effortIds: option.efforts,
+      selectedEffort: this.modelEffortForRow(option),
+      effortPickerOpen: this.modelEffortPickerKey === this.modelOptionKey(option),
+      fastModeVisible: this.fastModeCapability && option.supportsFastMode,
+      fastModeOn: this.modelFastForRow(option),
+      effortLabel: (effort: string): string => this.modelEffortLabel(option, effort),
+      onSelect: (): void => this.selectContextModel(option),
+      onToggleEffortPicker: (): void => {
+        const key = this.modelOptionKey(option);
+        this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
+      },
+      onSelectEffort: (effort: string): void => {
+        this.selectModelRowEffort(option, effort);
+        this.modelEffortPickerKey = '';
+      },
+      onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
+    })
+  }
+
+  @Builder
+  modelProviderGroup(group: ComposerModelGroup) {
     Column({ space: 2 }) {
-      Row({ space: 6 }) {
-        Stack() {
-          this.selectorIcon(agentMark(this.selectedAgentKind))
-        }
-        .onClick(() => this.selectContextModel(option))
+      ComposerModelProviderHeader({ name: group.name })
 
-        Column({ space: 1 }) {
-          Row({ space: 2 }) {
-            Text(option.label)
-              .fontSize(uiFontSize(14))
-              .fontColor($r('app.color.text_primary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .constraintSize({
-                maxWidth: this.fastModeCapability && option.supportsFastMode
-                  ? (option.efforts.length > 0 ? '48%' : '70%')
-                  : (option.efforts.length > 0 ? '70%' : '100%'),
-              })
-              .onClick(() => this.selectContextModel(option))
-            Blank().layoutWeight(1)
-          }
-          .width('100%')
-          if (option.providerName.length > 0 || option.description.length > 0) {
-            Text(option.providerName.length > 0 ? option.providerName : option.description)
-              .fontSize(uiFontSize(10))
-              .fontColor($r('app.color.text_secondary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .onClick(() => this.selectContextModel(option))
-          }
-        }
-        .layoutWeight(1)
-        .onClick(() => this.selectContextModel(option))
+      ForEach(group.options, (option: RuntimeModelOption) => {
+        this.contextModelRow(option)
+      }, (option: RuntimeModelOption) => this.modelOptionKey(option))
 
-        if (option.efforts.length > 0) {
-          Button() {
-            Row({ space: 3 }) {
-              Text(this.modelEffortLabel(option, this.modelEffortForRow(option)))
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_secondary'))
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(uiFontSize(9))
-                .fontColor([$r('app.color.text_tertiary')])
-            }
-          }
-          .height(28)
-          .padding({ left: 5, right: 5 })
-          .backgroundColor(Color.Transparent)
-          .enabled(!this.creating)
-          .accessibilityText(`${option.label}思考强度`)
-          .onClick(() => {
-            const key = this.modelOptionKey(option);
-            this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
-          })
-        }
-        if (this.fastModeCapability && option.supportsFastMode) {
-          Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-            .selectedColor($r('app.color.accent'))
-            .enabled(!this.creating)
-            .accessibilityText(`${option.label}快速模式`)
-            .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-        }
-        if (this.modelOptionIsCurrent(option)) {
-          SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(uiFontSize(17))
-            .fontColor([$r('app.color.chat_cta')])
-            .width(20)
-            .onClick(() => this.selectContextModel(option))
-        }
-      }
-      .width('100%')
-      .constraintSize({ minHeight: 40 })
-
-      if (this.modelEffortPickerKey === this.modelOptionKey(option)) {
-        Row({ space: 4 }) {
-          ForEach(option.efforts, (effort: string) => {
-            Button(this.modelEffortLabel(option, effort))
-              .height(26)
-              .fontSize(uiFontSize(11))
-              .fontColor(effort === this.modelEffortForRow(option)
-                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
-              .padding({ left: 9, right: 9 })
-              .backgroundColor(effort === this.modelEffortForRow(option)
-                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-              .borderRadius(13)
-              .onClick(() => {
-                this.selectModelRowEffort(option, effort);
-                this.modelEffortPickerKey = '';
-              })
-          }, (effort: string) => effort)
-        }
-        .width('100%')
-        .padding({ left: 28, right: 4, bottom: 4 })
-      }
+      Divider()
+        .strokeWidth(0.5)
+        .color($r('app.color.border'))
+        .margin({ left: 12, right: 12, top: 4, bottom: 4 })
     }
     .width('100%')
-    .padding({ left: 10, right: 8, top: 3, bottom: 3 })
-    .backgroundColor(this.modelOptionIsCurrent(option) ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(12)
   }
 
   @Builder
   modelContextView() {
     Column() {
       Scroll() {
-        Column({ space: 8 }) {
-          if (this.visibleModelOptions().length === 0) {
+        Column() {
+          if (this.groupedModelOptions().length === 0) {
             Text('当前电脑未提供模型列表')
               .fontSize(uiFontSize(14))
               .fontColor($r('app.color.text_secondary'))
@@ -2263,13 +2231,13 @@ export struct NewSessionPageContent {
               .textAlign(TextAlign.Center)
               .padding({ top: 28, bottom: 28 })
           } else {
-            ForEach(this.visibleModelOptions(), (option: RuntimeModelOption) => {
-              this.contextModelRow(option)
-            }, (option: RuntimeModelOption) => this.modelOptionKey(option))
+            ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
+              this.modelProviderGroup(group)
+            }, (group: ComposerModelGroup) => group.key)
           }
         }
         .width('100%')
-        .padding({ top: 8, bottom: 16 })
+        .padding({ top: 2, bottom: 12 })
       }
       .width('100%')
       .layoutWeight(1)

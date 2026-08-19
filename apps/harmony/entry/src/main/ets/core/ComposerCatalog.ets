@@ -29,6 +29,12 @@ export class ComposerModelOption {
   subscription: boolean = false;
 }
 
+export class ComposerModelGroup {
+  key: string = '';
+  name: string = '';
+  options: ComposerModelOption[] = [];
+}
+
 export class ProviderListOptions {
   capabilities: string[] = [];
 }
@@ -81,6 +87,34 @@ export function effortLevelLabel(id: string, fallback: string): string {
 
 export function composerModelKey(option: ComposerModelOption): string {
   return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
+}
+
+/** 新建任务与任务详情按同一供应商口径组织模型目录。 */
+export function groupComposerModelOptions(source: ComposerModelOption[]): ComposerModelGroup[] {
+  const groups: ComposerModelGroup[] = [];
+  for (let i = 0; i < source.length; i++) {
+    const option = source[i];
+    const providerId = option.providerId.trim();
+    const providerName = option.providerName.trim();
+    const key = providerId.length > 0
+      ? providerId : providerName.length > 0 ? providerName : 'default-provider';
+    let group: ComposerModelGroup | undefined = undefined;
+    for (let j = 0; j < groups.length; j++) {
+      if (groups[j].key === key) {
+        group = groups[j];
+        break;
+      }
+    }
+    if (group === undefined) {
+      group = new ComposerModelGroup();
+      group.key = key;
+      group.name = providerName.length > 0
+        ? providerName : providerId.length > 0 ? providerId : '默认供应商';
+      groups.push(group);
+    }
+    group.options.push(option);
+  }
+  return groups;
 }
 
 /** 与 Mobile 新建页同口径：切换模型后保留仍受支持的档位，否则回落模型默认档。 */

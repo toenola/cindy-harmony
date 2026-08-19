@@ -72,9 +72,9 @@ export struct ConversationComposer {
   @Prop modelLabel: string = '';
   @Prop effortLabel: string = '';
   /** Agent / 模型选择器由页面持有业务状态，Composer 只统一锚点、材质与尺寸。 */
-  @Prop permissionPopupVisible: boolean = false;
-  @Prop agentPopupVisible: boolean = false;
-  @Prop modelPopupVisible: boolean = false;
+  @Prop @Watch('syncPermissionPopupVisibility') permissionPopupVisible: boolean = false;
+  @Prop @Watch('syncAgentPopupVisibility') agentPopupVisible: boolean = false;
+  @Prop @Watch('syncModelPopupVisibility') modelPopupVisible: boolean = false;
   @Prop showAddButton: boolean = true;
   @Prop showStreamingStatus: boolean = true;
   /** 会话详情与新建任务共用华为官方浮动操作栏同款组件材质。 */
@@ -111,6 +111,10 @@ export struct ConversationComposer {
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam modelPopupContent: () => void = this.emptyPopupContent;
+  /** bindPopup 由组件自身的 State 驱动；直接绑定父级 Prop 会漏掉退场更新并留下孤儿浮层。 */
+  @State permissionPopupPresented: boolean = false;
+  @State agentPopupPresented: boolean = false;
+  @State modelPopupPresented: boolean = false;
   /** 状态更新时复用同一材质对象，避免模型切换重绘期间反复重建系统材质与交互手势。 */
   private readonly floatingGlassMaterial: uiMaterial.ImmersiveMaterial =
     new uiMaterial.ImmersiveMaterial({
@@ -119,10 +123,36 @@ export struct ConversationComposer {
       // 容器内有横向列表和多个按钮，交互反馈由子控件承担，整块背板不参与形变。
       interactive: false,
     });
+  /** Popup 内容刷新时保持材质实例稳定，避免模型状态变化反复重建系统材质。 */
+  private readonly popupGlassMaterial: uiMaterial.ImmersiveMaterial =
+    new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      colorInvert: true,
+      // Popup 内容保留系统材质交互命中；实际退场由下方锚点分支负责强制收口。
+      interactive: true,
+    });
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
   private resizeStartHeight: number = 120;
+
+  aboutToAppear(): void {
+    this.permissionPopupPresented = this.permissionPopupVisible;
+    this.agentPopupPresented = this.agentPopupVisible;
+    this.modelPopupPresented = this.modelPopupVisible;
+  }
+
+  private syncPermissionPopupVisibility(): void {
+    this.permissionPopupPresented = this.permissionPopupVisible;
+  }
+
+  private syncAgentPopupVisibility(): void {
+    this.agentPopupPresented = this.agentPopupVisible;
+  }
+
+  private syncModelPopupVisibility(): void {
+    this.modelPopupPresented = this.modelPopupVisible;
+  }
 
   private resizeInput(event: TouchEvent): void {
     if (event.type === TouchType.Cancel) {
@@ -367,7 +397,7 @@ export struct ConversationComposer {
     .opacity(this.composerEnabled && !this.sending && !this.contextBusy ? 1 : 0.4)
     .accessibilityText(`权限模式：${this.permissionLabel}`)
     .onClick(() => this.onPermission())
-    .bindPopup(this.permissionPopupVisible, {
+    .bindPopup(this.permissionPopupPresented, {
       builder: this.composerPermissionPopup,
       placement: Placement.Top,
       enableArrow: false,
@@ -382,12 +412,9 @@ export struct ConversationComposer {
       popupColor: Color.Transparent,
       radius: UI_RADIUS_CONTAINER,
       shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THIN,
-        colorInvert: true,
-        interactive: true,
-      }),
+      systemMaterial: this.popupGlassMaterial,
       onStateChange: (event) => {
+        this.permissionPopupPresented = event.isVisible;
         if (!event.isVisible) this.onPermissionPopupDismiss();
       },
     })
@@ -422,7 +449,7 @@ export struct ConversationComposer {
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
     .accessibilityText(`模型：${this.modelLabel}`)
     .onClick(() => this.onModel())
-    .bindPopup(this.modelPopupVisible, {
+    .bindPopup(this.modelPopupPresented, {
       builder: this.composerModelPopup,
       placement: Placement.Top,
       enableArrow: false,
@@ -437,12 +464,9 @@ export struct ConversationComposer {
       popupColor: Color.Transparent,
       radius: UI_RADIUS_CONTAINER,
       shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THIN,
-        colorInvert: true,
-        interactive: true,
-      }),
+      systemMaterial: this.popupGlassMaterial,
       onStateChange: (event) => {
+        this.modelPopupPresented = event.isVisible;
         if (!event.isVisible) this.onModelPopupDismiss();
       },
     })
@@ -475,7 +499,7 @@ export struct ConversationComposer {
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
     .accessibilityText(`Agent：${this.agentLabel}`)
     .onClick(() => this.onAgent())
-    .bindPopup(this.agentPopupVisible, {
+    .bindPopup(this.agentPopupPresented, {
       builder: this.composerAgentPopup,
       placement: Placement.Top,
       enableArrow: false,
@@ -490,12 +514,9 @@ export struct ConversationComposer {
       popupColor: Color.Transparent,
       radius: UI_RADIUS_CONTAINER,
       shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THIN,
-        colorInvert: true,
-        interactive: true,
-      }),
+      systemMaterial: this.popupGlassMaterial,
       onStateChange: (event) => {
+        this.agentPopupPresented = event.isVisible;
         if (!event.isVisible) this.onAgentPopupDismiss();
       },
     })
@@ -631,6 +652,29 @@ export struct ConversationComposer {
     .onClick(() => this.onAbort())
   }
 
+  /** 打开态与关闭态使用不同的 ArkUI 分支，关闭时直接销毁承载原生 Popup 的锚点节点。 */
+  @Builder
+  composerModelOpenToolbarItem() {
+    ListItem() {
+      Row() {
+        this.composerModelButton()
+      }
+      .height(40)
+      .alignItems(VerticalAlign.Center)
+    }
+  }
+
+  @Builder
+  composerModelClosedToolbarItem() {
+    ListItem() {
+      Row() {
+        this.composerModelButton()
+      }
+      .height(40)
+      .alignItems(VerticalAlign.Center)
+    }
+  }
+
   /** 工具栏左侧控制保持固定顺序；末尾主操作由外层 Row 独立固定到右侧。 */
   @Builder
   composerToolbarLeadingItems() {
@@ -691,12 +735,10 @@ export struct ConversationComposer {
     }
 
     if (this.hasModelChip()) {
-      ListItem() {
-        Row() {
-          this.composerModelButton()
-        }
-        .height(40)
-        .alignItems(VerticalAlign.Center)
+      if (this.modelPopupVisible) {
+        this.composerModelOpenToolbarItem()
+      } else {
+        this.composerModelClosedToolbarItem()
       }
     }
   }

@@ -170,6 +170,8 @@ import {
   isSafeUnsentDlError,
 } from '../main/ets/core/device-link/DlClient';
 import {
+  ComposerModelOption,
+  groupComposerModelOptions,
   parseChoiceOptions,
   parseModelOptions,
   parseModelVisibilityOverrides,
@@ -2832,6 +2834,29 @@ export default function localUnitTest() {
         { model: 'gpt-test', providerId: 'provider-a' });
       expect(selected.length).assertEqual(1);
       expect(selected[0].providerId).assertEqual('provider-a');
+    });
+
+    it('groupsNewAndExistingTaskModelsWithTheSameProviderOrder', 0, () => {
+      const first = new ComposerModelOption();
+      first.id = 'model-a';
+      first.providerId = 'provider-a';
+      first.providerName = 'Provider A';
+      const second = new ComposerModelOption();
+      second.id = 'model-b';
+      second.providerId = 'provider-b';
+      second.providerName = 'Provider B';
+      const third = new ComposerModelOption();
+      third.id = 'model-c';
+      third.providerId = 'provider-a';
+      third.providerName = 'Provider A';
+
+      const groups = groupComposerModelOptions([first, second, third]);
+      expect(groups.length).assertEqual(2);
+      expect(groups[0].key).assertEqual('provider-a');
+      expect(groups[0].name).assertEqual('Provider A');
+      expect(groups[0].options.length).assertEqual(2);
+      expect(groups[0].options[1].id).assertEqual('model-c');
+      expect(groups[1].key).assertEqual('provider-b');
     });
 
     it('backsOffTaskListAntiEntropyPerDeviceAndResetsAfterSuccess', 0, () => {

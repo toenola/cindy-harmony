@@ -57,6 +57,10 @@ import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
 import {
+  ComposerModelOptionRow,
+  ComposerModelProviderHeader,
+} from '../components/ComposerModelOptionRow';
+import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
@@ -74,11 +78,13 @@ import {
 } from '../components/UiKit';
 import {
   ComposerChoiceOption,
+  ComposerModelGroup,
   ComposerModelOption,
   ModelSelectionHint,
   ProviderListOptions,
   composerModelKey,
   effortLevelLabel,
+  groupComposerModelOptions,
   modelProviderKind,
   parseChoiceOptions,
   parseModelOptions,
@@ -276,12 +282,6 @@ class ComposerPaletteItem {
   name: string = '';
   description: string = '';
   relPath: string = '';
-}
-
-class ComposerModelGroup {
-  key: string = '';
-  name: string = '';
-  options: ComposerModelOption[] = [];
 }
 
 class PiTreeRow {
@@ -1179,33 +1179,7 @@ export struct TaskPageContent {
   }
 
   private groupedModelOptions(): ComposerModelGroup[] {
-    const groups: ComposerModelGroup[] = [];
-    const source = this.visibleModelOptions();
-    for (let i = 0; i < source.length; i++) {
-      const option = source[i];
-      const providerId = option.providerId.trim();
-      const providerName = option.providerName.trim();
-      const key = providerId.length > 0
-        ? providerId
-        : providerName.length > 0 ? providerName : 'default-provider';
-      let group: ComposerModelGroup | null = null;
-      for (let j = 0; j < groups.length; j++) {
-        if (groups[j].key === key) {
-          group = groups[j];
-          break;
-        }
-      }
-      if (group === null) {
-        group = new ComposerModelGroup();
-        group.key = key;
-        group.name = providerName.length > 0
-          ? providerName
-          : providerId.length > 0 ? providerId : '默认供应商';
-        groups.push(group);
-      }
-      group.options.push(option);
-    }
-    return groups;
+    return groupComposerModelOptions(this.visibleModelOptions());
   }
 
 
@@ -1301,6 +1275,16 @@ export struct TaskPageContent {
     this.modelEffortMemory = next;
   }
 
+  private setModelRowEffortById(option: ComposerModelOption, effortId: string): void {
+    const choices = this.modelEffortOptions(option);
+    for (let i = 0; i < choices.length; i++) {
+      if (choices[i].id !== effortId) continue;
+      this.setModelRowEffort(option, choices[i]);
+      this.modelEffortPickerKey = '';
+      return;
+    }
+  }
+
   private setModelRowFast(option: ComposerModelOption, enabled: boolean): void {
     if (this.contextRpcBusy || !this.visibleFastModeCapability() || !option.supportsFastMode) return;
     if (this.modelOptionIsCurrent(option)) {
@@ -1310,12 +1294,6 @@ export struct TaskPageContent {
     const next = new Map(this.modelFastMemory);
     next.set(this.modelRuntimeKey(option), enabled);
     this.modelFastMemory = next;
-  }
-
-  private modelEffortText(option: ComposerModelOption): string {
-    const effort = this.modelEffortForRow(option);
-    if (effort.length === 0) return '';
-    return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
   }
 
   private currentModelOption(): ComposerModelOption | null {
@@ -4941,44 +4919,6 @@ export struct TaskPageContent {
     }
   }
 
-  /** 模型列表使用紧凑标识；供应商标题只承担分组，不重复展示大图标。 */
-  @Builder
-  modelRowMark(option: ComposerModelOption) {
-    if (modelProviderKind(option) === 'claude') {
-      Text('♟')
-        .fontSize(uiFontSize(15))
-        .fontColor($r('app.color.text_secondary'))
-        .width(20)
-        .height(20)
-        .textAlign(TextAlign.Center)
-    } else if (modelProviderKind(option) === 'deepseek') {
-      Text('◉')
-        .fontSize(uiFontSize(15))
-        .fontColor($r('app.color.text_secondary'))
-        .width(20)
-        .height(20)
-        .textAlign(TextAlign.Center)
-    } else if (modelProviderKind(option) === 'openai') {
-      Text('✣')
-        .fontSize(uiFontSize(14))
-        .fontColor($r('app.color.text_secondary'))
-        .width(20)
-        .height(20)
-        .textAlign(TextAlign.Center)
-    } else {
-      Text(option.providerName.length > 0
-        ? option.providerName.charAt(0).toUpperCase() : 'S')
-        .fontSize(uiFontSize(11))
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_secondary'))
-        .width(20)
-        .height(20)
-        .textAlign(TextAlign.Center)
-        .border({ width: 1, color: $r('app.color.text_secondary') })
-        .borderRadius(10)
-    }
-  }
-
   @Builder
   agentContextView() {
     Scroll() {
@@ -5021,18 +4961,7 @@ export struct TaskPageContent {
   @Builder
   modelProviderGroup(group: ComposerModelGroup) {
     Column({ space: 2 }) {
-      Row() {
-        Text(group.name)
-          .fontSize(uiFontSize(12))
-          .fontWeight(FontWeight.Normal)
-          .fontColor($r('app.color.text_tertiary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-      }
-      .width('calc(100% - 36vp)')
-      .height(26)
-      .margin({ left: 18, right: 18, top: 4 })
+      ComposerModelProviderHeader({ name: group.name })
 
       ForEach(group.options, (option: ComposerModelOption) => {
         this.modelOptionRow(option)
@@ -5048,107 +4977,32 @@ export struct TaskPageContent {
 
   @Builder
   modelOptionRow(option: ComposerModelOption) {
-    Column({ space: 2 }) {
-      Row({ space: 6 }) {
-        Stack() {
-          this.modelRowMark(option)
-        }
-        .onClick(() => {
-          void this.selectComposerModel(option);
-        })
-
-        Text(option.label)
-          .fontSize(uiFontSize(14))
-          .lineHeight(uiLineHeight(20))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-          .onClick(() => {
-            void this.selectComposerModel(option);
-          })
-
-        if (option.efforts.length > 0) {
-          Button() {
-            Row({ space: 3 }) {
-              Text(this.modelEffortText(option))
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_secondary'))
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(uiFontSize(9))
-                .fontColor([$r('app.color.text_tertiary')])
-            }
-          }
-          .height(28)
-          .padding({ left: 5, right: 5 })
-          .backgroundColor(Color.Transparent)
-          .enabled(!this.contextRpcBusy)
-          .accessibilityText(`${option.label}思考强度`)
-          .onClick(() => {
-            const key = composerModelKey(option);
-            this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
-          })
-        }
-
-        if (this.visibleFastModeCapability() && option.supportsFastMode) {
-          Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-            .selectedColor($r('app.color.accent'))
-            .enabled(!this.contextRpcBusy)
-            .accessibilityText(`${option.label}快速模式`)
-            .onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-        }
-
-        if (this.modelOptionIsCurrent(option)) {
-          SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(uiFontSize(17))
-            .fontColor([$r('app.color.text_primary')])
-            .width(20)
-            .onClick(() => {
-              void this.selectComposerModel(option);
-            })
-        } else if (option.subscription) {
-          Text('订阅')
-            .fontSize(uiFontSize(10))
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor($r('app.color.bg_chip'))
-            .borderRadius(UI_RADIUS_CONTROL)
-            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-        }
-      }
-      .width('100%')
-      .constraintSize({ minHeight: 38 })
-
-      if (this.modelEffortPickerKey === composerModelKey(option)) {
-        Row({ space: 4 }) {
-          ForEach(this.modelEffortOptions(option), (effort: ComposerChoiceOption) => {
-            Button(effort.label)
-              .height(26)
-              .fontSize(uiFontSize(11))
-              .fontColor(effort.id === this.modelEffortForRow(option)
-                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
-              .padding({ left: 9, right: 9 })
-              .backgroundColor(effort.id === this.modelEffortForRow(option)
-                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-              .borderRadius(UI_RADIUS_PILL)
-              .onClick(() => {
-                this.setModelRowEffort(option, effort);
-                this.modelEffortPickerKey = '';
-              })
-          }, (effort: ComposerChoiceOption) => effort.id)
-        }
-        .width('100%')
-        .padding({ left: 26, right: 4, bottom: 4 })
-      }
-    }
-    .width('calc(100% - 24vp)')
-    .padding({ left: 9, right: 7, top: 3, bottom: 3 })
-    .margin({ left: 12, right: 12 })
-    .backgroundColor(this.modelOptionIsCurrent(option)
-      ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(UI_RADIUS_CONTROL)
-    .opacity(this.contextRpcBusy ? 0.6 : 1)
-    .enabled(!this.contextRpcBusy)
+    ComposerModelOptionRow({
+      label: option.label,
+      providerKind: modelProviderKind(option),
+      providerInitial: option.providerName.length > 0
+        ? option.providerName.charAt(0).toUpperCase() : 'S',
+      selected: this.modelOptionIsCurrent(option),
+      subscription: option.subscription,
+      disabled: this.contextRpcBusy,
+      effortIds: option.efforts,
+      selectedEffort: this.modelEffortForRow(option),
+      effortPickerOpen: this.modelEffortPickerKey === composerModelKey(option),
+      fastModeVisible: this.visibleFastModeCapability() && option.supportsFastMode,
+      fastModeOn: this.modelFastForRow(option),
+      effortLabel: (effort: string): string => {
+        return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
+      },
+      onSelect: (): void => {
+        void this.selectComposerModel(option);
+      },
+      onToggleEffortPicker: (): void => {
+        const key = composerModelKey(option);
+        this.modelEffortPickerKey = this.modelEffortPickerKey === key ? '' : key;
+      },
+      onSelectEffort: (effort: string): void => this.setModelRowEffortById(option, effort),
+      onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
+    })
   }
 
   @Builder
