@@ -1,7 +1,7 @@
 /**
  * Device Link 协议类型与常量（ArkTS 版）。
  *
- * 以 cindy-protocol/packages/device-link-protocol/src/protocol.ts 为唯一权威源，
+ * 以 packages/device-link-protocol/src/protocol.ts 为唯一权威源，
  * 本文件只承载鸿蒙端需要的子集：信封、连接层 payload、隧道层 payload 与
  * 业务 channel / topic 常量。任何协议改动必须先改权威源再同步本文件。
  */
@@ -22,16 +22,23 @@ export const HANDSHAKE_TIMEOUT_MS = 15_000;
 /** 重连退避：1s → 30s。 */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 30_000;
-/** hello-ack 后稳定在线该时长才清零退避。 */
+/** hello-ack 后稳定在线该时长才清零普通重连退避。 */
 export const RECONNECT_STABLE_RESET_MS = 10_000;
+/**
+ * 1013 拥塞历史需要更长的稳定期才清除。
+ *
+ * 短暂重连成功不代表 relay 已恢复：若与普通退避共用 10 秒窗，一次短连接就会抹掉
+ * 拥塞 streak，客户端立刻回到 1 秒级重试，形成 1013 高频抖动。拥塞期按连续成功
+ * 15 分钟结算，期内新的 1013 继续累计并延长冷却。
+ */
+export const RECONNECT_CONGESTION_STABLE_RESET_MS = 900_000;
 /** relay 1013 表示服务端拥塞；该信号使用独立的 5s→30s 冷却下限。 */
 export const RELAY_TRY_AGAIN_LATER_CLOSE_CODE = 1013;
 export const RECONNECT_CONGESTION_BASE_MS = 5_000;
 export const RECONNECT_CONGESTION_MAX_MS = 30_000;
 
 /** 普通指数退避与 1013 拥塞下限取较大值，再做 0.7x–1.0x 向下抖动。 */
-export function computeReconnectDelayMs(
-  attemptValue: number,
+export function computeReconnectDelayMs(  attemptValue: number,
   congestionStreakValue: number,
   randomValue: number,
 ): number {
@@ -44,6 +51,101 @@ export function computeReconnectDelayMs(
     ? Math.min(RECONNECT_CONGESTION_BASE_MS * Math.pow(2, streak - 1), RECONNECT_CONGESTION_MAX_MS)
     : 0;
   return Math.round(Math.max(normal, congestion) * (0.7 + random * 0.3));
+}
+
+/**
+ * 重连稳定性状态机（纯逻辑，便于测试计时语义与代次竞态）。
+ *
+ * 两条独立的稳定窗：
+ * - 普通退避：连续在线 10 秒后清零 attempt；
+ * - 1013 拥塞：连续在线 15 分钟后才清除 streak / cooldown。
+ *
+ * 每次断开都推进代次；旧代次的稳定窗结算一律作废，不得作用到新连接。
+ */
+export class ReconnectStability {
+  private attempt = 0;
+  private congestionStreak = 0;
+  private generation = 0;
+  /** 本次连接在线起始时刻；<0 表示当前不在线。 */
+  private onlineSinceMs = -1;
+  /** 进入在线时的代次，用于识别跨连接的过期结算。 */
+  private onlineGeneration = -1;
+
+  getAttempt(): number {
+    return this.attempt;
+  }
+
+  getCongestionStreak(): number {
+    return this.congestionStreak;
+  }
+
+  getGeneration(): number {
+    return this.generation;
+  }
+
+  /** 计划一次重连：返回本次应使用的延迟。 */
+  nextReconnectDelayMs(randomValue: number): number {
+    const delay = computeReconnectDelayMs(this.attempt, this.congestionStreak, randomValue);
+    this.attempt += 1;
+    return delay;
+  }
+
+  /** hello-ack：本次连接进入在线。 */
+  noteOnline(nowMs: number): void {
+    this.onlineSinceMs = nowMs;
+    this.onlineGeneration = this.generation;
+  }
+
+  /**
+   * 断开：推进代次并结束在线期。1013 关闭码累计拥塞 streak；
+   * 正常关闭、鉴权失败和网络切换不得伪装成 1013。
+   */
+  noteClosed(closeCode: number): void {
+    if (closeCode === RELAY_TRY_AGAIN_LATER_CLOSE_CODE) this.congestionStreak += 1;
+    this.onlineSinceMs = -1;
+    this.onlineGeneration = -1;
+    this.generation += 1;
+  }
+
+  /**
+   * 稳定窗结算。generation 为计时器登记时的代次；与当前代次不一致说明中间已断线，
+   * 结算作废。返回本次是否真的清除了对应状态。
+   */
+  settleNormalWindow(generation: number, nowMs: number): boolean {
+    if (!this.windowStillValid(generation, nowMs, RECONNECT_STABLE_RESET_MS)) return false;
+    this.attempt = 0;
+    return true;
+  }
+
+  settleCongestionWindow(generation: number, nowMs: number): boolean {
+    if (this.congestionStreak === 0) return false;
+    if (!this.windowStillValid(generation, nowMs, RECONNECT_CONGESTION_STABLE_RESET_MS)) return false;
+    this.congestionStreak = 0;
+    return true;
+  }
+
+  /** 显式重置（start / 用户主动清除冷却）。 */
+  reset(): void {
+    this.attempt = 0;
+    this.congestionStreak = 0;
+    this.onlineSinceMs = -1;
+    this.onlineGeneration = -1;
+    this.generation += 1;
+  }
+
+  /**
+   * 只清普通退避（用户主动发起连接时立即重试一次）。
+   * 拥塞历史必须保留：主动连接不代表 relay 已恢复。
+   */
+  resetNormalBackoff(): void {
+    this.attempt = 0;
+  }
+
+  private windowStillValid(generation: number, nowMs: number, requiredMs: number): boolean {
+    if (generation !== this.generation) return false;
+    if (this.onlineSinceMs < 0 || this.onlineGeneration !== this.generation) return false;
+    return nowMs - this.onlineSinceMs >= requiredMs;
+  }
 }
 
 // ─── 信封 ────────────────────────────────────────────────────────────────────

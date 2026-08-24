@@ -170,6 +170,25 @@ export class TaskStore {
   }
 
   /**
+   * 跨设备按 id 查任务快照。消息驻留策略用它读取权威 `source`；
+   * 快照尚未到达时返回 undefined，调用方按普通任务保守处理。
+   */
+  findSessionById(sessionId: string): RemoteSession | undefined {
+    if (sessionId.length === 0) return undefined;
+    let found: RemoteSession | undefined = undefined;
+    this.sessionsByDevice.forEach((sessions: RemoteSession[]) => {
+      if (found !== undefined) return;
+      for (let i = 0; i < sessions.length; i++) {
+        if (sessions[i].id === sessionId) {
+          found = sessions[i];
+          return;
+        }
+      }
+    });
+    return found;
+  }
+
+  /**
    * 冷启动先种入 last-known 列表；设备一律标离线，避免缓存伪造实时可用性。
    * REST / presence 到达后 mergeServerDevices / handlePresence 会完成权威对账。
    */

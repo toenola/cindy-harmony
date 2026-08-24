@@ -19,6 +19,22 @@ export const FOLLOW_LATEST_RETRY_DELAYS: number[] = [24, 80, 180];
 export const INITIAL_HISTORY_AUTOFILL_PAGES: number = 3;
 
 /**
+ * 尾部跟随是否应被接管。
+ *
+ * 用户主动发送被接受（`sendAccepted`）时必须无条件接管：即使当前正在阅读历史，
+ * 也要回到底部并持续跟随流式回复（对齐 Mobile 显式重锚语义）。
+ *
+ * 收到新 push 时**不得**无条件抢回阅读位置：只有本就贴底跟随才继续跟随，
+ * 否则保留用户当前位置并提示有新消息。
+ */
+export function shouldTakeOverTail(
+  sendAccepted: boolean,
+  followingLatest: boolean,
+): boolean {
+  return sendAccepted || followingLatest;
+}
+
+/**
  * 历史自动预取的电平判定。用户已明确回看时不受首屏预算限制；冷开只使用
  * 有界预算。同一首项已经尝试过则必须停止，避免空页、重复页或失败请求自旋。
  */

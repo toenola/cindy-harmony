@@ -104,6 +104,59 @@ export function pastedTextNode(text: string): ComposerNode {
   return node;
 }
 
+/**
+ * Pi 的运行时调用值是 `/skill:name`，展示层一律显示 `/name`。
+ *
+ * 语义对齐 packages/maker-shared/src/composerPalette.ts 的
+ * slashCommandDisplayLabel / projectSlashCommandsInText / restoreSlashCommandRuntimeAlias：
+ * 存储与发送保持内部值不变，只有展示、复制和编辑走投影。
+ */
+const PI_SKILL_RUNTIME_PREFIX = 'skill:';
+
+/** 把存储的 slash token（`/skill:git` 或 `/git`）投影成人话标签。 */
+export function slashCommandDisplayLabel(commandText: string): string {
+  if (!commandText.startsWith('/')) return commandText;
+  const body = commandText.slice(1);
+  if (body.length <= PI_SKILL_RUNTIME_PREFIX.length) return commandText;
+  if (body.slice(0, PI_SKILL_RUNTIME_PREFIX.length).toLowerCase() !== PI_SKILL_RUNTIME_PREFIX) {
+    return commandText;
+  }
+  const name = body.slice(PI_SKILL_RUNTIME_PREFIX.length);
+  // 运行时 token 不含空白；`/skill: foo` 这类正文不是命令，保持原样。
+  if (name.length === 0 || /\s/.test(name)) return commandText;
+  return `/${name}`;
+}
+
+/**
+ * 把正文里**已确认的** slash 区间投影成人话标签。没有区间就原样返回——
+ * 普通正文里的 `/skill:foo` 不是命令调用，不得改写。
+ *
+ * ranges 直接消费 wire / 落库的 `slashCommandRanges`（`{ start, end }` 记录数组）。
+ */
+export function projectSlashCommandsInText(text: string, ranges: Object[]): string {
+  if (ranges.length === 0) return text;
+  const ordered: Record<string, Object>[] = [];
+  for (let i = 0; i < ranges.length; i++) {
+    const raw = ranges[i];
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    ordered.push(raw as Record<string, Object>);
+  }
+  // 从后往前替换，前面的区间下标不受长度变化影响。
+  ordered.sort((a: Record<string, Object>, b: Record<string, Object>) =>
+    rangeNumber(b, 'start') - rangeNumber(a, 'start'));
+  let result = text;
+  for (let i = 0; i < ordered.length; i++) {
+    const start = rangeNumber(ordered[i], 'start');
+    const end = rangeNumber(ordered[i], 'end');
+    if (start < 0 || end > result.length || end <= start) continue;
+    const token = result.slice(start, end);
+    const display = slashCommandDisplayLabel(token);
+    if (display === token) continue;
+    result = `${result.slice(0, start)}${display}${result.slice(end)}`;
+  }
+  return result;
+}
+
 export function slashCommandNode(commandName: string): ComposerNode {
   const value = commandName.startsWith('/') ? commandName : `/${commandName}`;
   return textNode(value, value);

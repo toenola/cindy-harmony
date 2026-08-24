@@ -50,6 +50,7 @@ import {
   permissionCanAlwaysAllow,
   permissionRequestFingerprint,
   permissionRiskSummary,
+  permissionAutoReviewUnavailableNotice,
   sortPendingInteractions,
 } from '../core/interactions/InteractionPresentation';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
@@ -185,6 +186,25 @@ import {
   shouldAutoLoadEarlier,
 } from './TaskScrollState';
 import {
+  freezeShareProjection,
+  shareSegmentStartIndicesByHeight,
+  SHARE_MAX_SEGMENTS,
+  ShareProjectionItem,
+} from '../core/sharing/ConversationShareProjection';
+import {
+  ConversationShareService,
+  ShareImageFile,
+  SharePreparation,
+  ShareSegmentRequest,
+} from '../core/sharing/ConversationShareService';
+import {
+  SHARE_STAGE_FAILED,
+  SHARE_STAGE_IDLE,
+  SHARE_STAGE_PREVIEW,
+  SHARE_STAGE_RENDERING,
+  shareFlowBusy,
+} from '../core/sharing/ShareResourceLifecycle';
+import {
   ComposerDocument,
   ComposerAtomPresentation,
   ComposerNode,
@@ -290,6 +310,29 @@ class PiTreeRow {
 }
 
 const MODEL_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
+
+/**
+ * 队列操作的触控区下限（无障碍要求）与视觉高度分离。
+ *
+ * 视觉保持紧凑胶囊；触控区用 responseRegion 上下对称外扩到 44vp，
+ * 既满足最小点按尺寸，又不改变气泡布局与信息密度。
+ */
+const QUEUE_INLINE_ACTION_MIN_TOUCH_HEIGHT: number = 44;
+const QUEUE_INLINE_ACTION_VISUAL_HEIGHT: number = 36;
+const QUEUE_INLINE_ACTION_TOUCH_INSET: number =
+  (QUEUE_INLINE_ACTION_MIN_TOUCH_HEIGHT - QUEUE_INLINE_ACTION_VISUAL_HEIGHT) / 2;
+const QUEUE_BANNER_ACTION_VISUAL_HEIGHT: number = 30;
+const QUEUE_BANNER_ACTION_TOUCH_INSET: number =
+  (QUEUE_INLINE_ACTION_MIN_TOUCH_HEIGHT - QUEUE_BANNER_ACTION_VISUAL_HEIGHT) / 2;
+
+/** 消息区宽度尚未测量时的分享图兜底宽度（vp）。 */
+const SHARE_CONTENT_DEFAULT_WIDTH_VP: number = 360;
+/** 分享画布根节点与内容卡片的几何；测量与 builder 必须共用。 */
+const SHARE_CANVAS_PADDING_VP: number = 16;
+const SHARE_ITEM_GAP_VP: number = 12;
+const SHARE_CARD_PADDING_VP: number = 12;
+const SHARE_CARD_TEXT_GAP_VP: number = 4;
+const SHARE_OMITTED_CONTENT_LABEL: string = '仅包含当前展开的内容';
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
   if (kind === 'codex') return 'Codex';
@@ -402,6 +445,28 @@ export struct TaskPageContent {
   @State tailBannerBusy: boolean = false;
   /** thinking 展开的 key（默认折叠）。 */
   @State expandedThinking: string[] = [];
+  /**
+   * 会话分享：服务持有 PixelMap / 临时文件 / 面板订阅的账本，页面只驱动流程。
+   * 生成中、预览、失败重试都读 shareStage，退页与退后台统一走 release()。
+   */
+  private shareService: ConversationShareService = new ConversationShareService();
+  @State shareStage: string = SHARE_STAGE_IDLE;
+  @State shareError: string = '';
+  @State sharePreviewOpen: boolean = false;
+  @State shareOmittedCollapsed: boolean = false;
+  @State shareRequiresNarrowing: boolean = false;
+  /**
+   * 已冻结的分享投影。离屏 builder 只读这份快照，因此预览与最终文件必然一致，
+   * 期间会话继续流式更新也不会让导出内容半新半旧。
+   */
+  @State shareFrozenItems: ShareProjectionItem[] = [];
+  /** 每段导出包含的投影项区间（[start, end)），预览与截图共用同一份切分。 */
+  @State shareSegmentStarts: number[] = [];
+  /** 已生成的图片文件，供预览与系统分享复用。 */
+  private shareRenderedFiles: ShareImageFile[] = [];
+  private shareGeneration: number = -1;
+  /** 退后台释放回调的反注册函数。 */
+  private shareBackgroundRelease: (() => void) | undefined = undefined;
   /** tool_group 折叠的 key（默认展开）。 */
   /** work_group 展开的 key（默认折叠）。 */
   @State expandedWorkGroups: string[] = [];
@@ -569,6 +634,11 @@ export struct TaskPageContent {
 
   aboutToAppear(): void {
     this.stopWorkClock();
+    // 截图需要页面自己的 UIContext；离页时清空，避免服务持有已销毁的 UI 树。
+    this.shareService.attachUiContext(this.getUIContext());
+    // 退后台同样收口分享，避免位图与临时文件在后台继续占用。
+    this.shareBackgroundRelease = AppServices.instance.registerBackgroundRelease(
+      (): void => this.cancelConversationShare());
     this.imageQueue.onChanged = (images: ComposerImage[]): void => {
       this.composerImages = images;
     };
@@ -693,6 +763,14 @@ export struct TaskPageContent {
   }
 
   aboutToDisappear(): void {
+    // 页面销毁必须收口分享：释放 PixelMap、临时文件与面板订阅，并解绑 UIContext。
+    this.shareService.release();
+    this.shareService.attachUiContext(undefined);
+    this.sharePreviewOpen = false;
+    if (this.shareBackgroundRelease !== undefined) {
+      this.shareBackgroundRelease();
+      this.shareBackgroundRelease = undefined;
+    }
     // ArkUI 返回栈可能在下一次进入同一路由前短暂复用上一帧；离页时先同步收口
     // TextArea 的焦点与展开态，避免已发送文本随旧 Composer 节点闪现。
     this.collapseComposerSurface();
@@ -1723,7 +1801,7 @@ export struct TaskPageContent {
       this.setComposerDocument(emptyComposerDocument());
       this.closeContextSheet();
       this.contextSheetPage = 'main';
-      this.followLatestSoon();
+      this.takeOverTailAfterSend();
     } catch (e) {
       promptAction.showToast({ message: '目标启动失败，请重试' });
     } finally {
@@ -1851,7 +1929,7 @@ export struct TaskPageContent {
     if (deferForCreation) {
       AppServices.instance.inputQueue.deferDocument(
         this.deviceId, s, serialized, readyImages, readyFiles);
-      this.followLatestSoon();
+      this.takeOverTailAfterSend();
       return;
     }
     this.sending = true;
@@ -1859,7 +1937,7 @@ export struct TaskPageContent {
     AppServices.instance.inputQueue.enqueueDocument(
       this.deviceId, s, serialized, readyImages, readyFiles).then(() => {
       this.sending = false;
-      this.followLatestSoon();
+      this.takeOverTailAfterSend();
     }).catch((e: Error) => {
       this.sending = false;
       this.error = `消息未确认发送：${e.message}`;
@@ -1886,7 +1964,7 @@ export struct TaskPageContent {
       AppServices.instance.composerDrafts.clear(this.sessionId);
       this.selectedLearnRoute = '';
       AppServices.instance.messages.appendLocalSystemCard(this.sessionId, 'learn', data);
-      this.followLatestSoon();
+      this.takeOverTailAfterSend();
     }).catch((e: Error) => {
       const data: Record<string, Object> = {};
       data['error'] = e.message.indexOf('learn-busy') >= 0 ? 'learn-busy' : 'learn-failed';
@@ -2429,6 +2507,474 @@ export struct TaskPageContent {
       const isLast = i === FOLLOW_LATEST_RETRY_DELAYS.length - 1;
       setTimeout(() => scroll(isLast), FOLLOW_LATEST_RETRY_DELAYS[i]);
     }
+  }
+
+  /**
+   * 用户主动发送被本地接受后强制接管尾部。
+   *
+   * `followLatestSoon` 在 `followingLatest === false` 时直接返回，所以历史阅读态下
+   * 只请求滚动是无效的：用户自己发了消息，必须回到底部并持续跟随流式回复
+   * （对齐 Mobile scrollToBottom 的显式重锚：follow=true + 清 reading-older + 跳底）。
+   *
+   * 只在发送被接受后调用；未被接受的失败发送不改变阅读位置。用户之后主动上翻
+   * 仍是关闭跟随的来源，这里不做任何长期锁定。
+   */
+  private takeOverTailAfterSend(): void {
+    this.followingLatest = true;
+    this.hasNewMessages = false;
+    // 恢复默认尾窗：清掉回看意图与在途锚点恢复，避免刚跳底又被历史锚点拽回去。
+    this.historyReviewIntent = false;
+    this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
+    this.historyAnchorRestoreGeneration += 1;
+    if (this.pendingHistoryAnchorRestore !== undefined) {
+      this.pendingHistoryAnchorRestore = undefined;
+      this.loadingOlder = false;
+    }
+    this.followLatestSoon();
+  }
+
+  /**
+   * 分享当前可见会话为图片。
+   *
+   * 只导出用户此刻能看到的内容：折叠未展开的工作过程与思考不进图，长用户消息
+   * 按收起行数截断。开始前先冻结一次投影，避免流式更新导致预览与最终文件不一致。
+   */
+  private async shareConversationAsImage(): Promise<void> {
+    if (shareFlowBusy(this.shareStage)) return;
+    const expanded = new Set<string>();
+    for (let i = 0; i < this.expandedWorkGroups.length; i++) {
+      expanded.add(this.expandedWorkGroups[i]);
+    }
+    for (let i = 0; i < this.expandedThinking.length; i++) {
+      expanded.add(this.expandedThinking[i]);
+    }
+    // 收起行数按普通手打消息口径；自动化注入消息的更严阈值由 collapsedMessageLines
+    // 在渲染时逐条判定，这里只需要一个保守的可见上限。
+    const collapsedLimit = collapsedUserMessageLineLimit(false);
+    const projection = freezeShareProjection(
+      this.items, expanded, collapsedLimit, this.shareVisibleUserTextOverrides());
+    if (projection.items.length === 0) {
+      promptAction.showToast({ message: '当前没有可分享的内容' });
+      return;
+    }
+
+    const generation = this.shareService.begin();
+    this.shareGeneration = generation;
+    this.shareStage = this.shareService.currentStage();
+    this.shareError = '';
+    this.shareOmittedCollapsed = projection.omittedCollapsedContent;
+    this.shareRequiresNarrowing = false;
+    this.shareRenderedFiles = [];
+    this.shareFrozenItems = projection.items;
+
+    // 按真实文本测量高度规划分段；设备上限来自 API 26 getSizeLimitation，
+    // 不再用“项数 × 固定高度”猜测长正文尺寸。
+    const context = this.getUIContext();
+    const widthVp = this.shareContentWidthVp();
+    const widthPx = context.vp2px(widthVp);
+    const itemHeightsPx = this.measureShareItemHeightsPx(projection.items, widthVp);
+    const footerReservePx = this.measureShareFooterReservePx(widthVp);
+    const heightPx = this.shareContentHeightPx(itemHeightsPx) + footerReservePx;
+    const plan = this.shareService.plan(heightPx, widthPx);
+    if (plan.requiresNarrowing || plan.segments === 0) {
+      this.shareRequiresNarrowing = true;
+      this.shareService.fail(generation, '内容过长，请收起部分工作过程后再分享');
+      this.shareStage = this.shareService.currentStage();
+      this.shareError = this.shareService.lastError();
+      this.shareFrozenItems = [];
+      promptAction.showToast({ message: this.shareError });
+      return;
+    }
+
+    // 按逐项测量高度顺序装箱。单个卡片若已超过设备上限就明确失败，绝不靠
+    // 根节点 clip 静默丢正文；clip 只承担测量误差下的最后一道纹理边界防御。
+    const starts = shareSegmentStartIndicesByHeight(
+      itemHeightsPx,
+      plan.segmentHeightPx,
+      context.vp2px(SHARE_CANVAS_PADDING_VP),
+      context.vp2px(SHARE_ITEM_GAP_VP),
+      footerReservePx,
+    );
+    if (starts.length === 0 || starts.length > SHARE_MAX_SEGMENTS) {
+      this.shareRequiresNarrowing = true;
+      this.shareService.fail(generation, '单条内容过长，请缩小分享范围后重试');
+      this.syncShareStateFromService();
+      promptAction.showToast({ message: this.shareError });
+      return;
+    }
+    this.shareSegmentStarts = starts;
+
+    const requests: ShareSegmentRequest[] = [];
+    for (let i = 0; i < starts.length; i++) {
+      const request = new ShareSegmentRequest();
+      request.widthPx = widthPx;
+      // 装箱使用扣除余量后的 segmentHeightPx；根画布允许吃到设备物理上限，
+      // 给字体回退/舍入误差保留安全区，同时仍保证 PixelMap 不越界。
+      request.heightPx = plan.snapshotHeightLimitPx;
+      request.builder = (): void => {
+        // createFromBuilder 没有独立的尺寸参数，只会截取 builder 根组件自身区域。
+        // 把计划像素尺寸换回 ArkUI 布局单位并约束根画布，保证实际 PixelMap 不会
+        // 越过分段计划的纹理安全上限。
+        this.shareSegmentCanvas(
+          i,
+          context.px2vp(request.widthPx),
+          context.px2vp(request.heightPx),
+        );
+      };
+      requests.push(request);
+    }
+
+    let prepared: SharePreparation;
+    try {
+      prepared = await this.shareService.renderSegments(
+        this.getUIContext().getHostContext() as common.UIAbilityContext,
+        generation, requests, Date.now());
+    } catch (e) {
+      const message = e instanceof Error ? (e as Error).message : 'share-failed';
+      this.shareService.fail(generation, message);
+      this.syncShareStateFromService();
+      return;
+    }
+    // 代次校验：await 期间用户可能已取消或重新发起，过期结果一律丢弃。
+    if (!this.shareService.isCurrent(generation)) return;
+    if (!prepared.ok) {
+      if (prepared.error === 'cancelled') return;
+      this.shareService.fail(generation, prepared.error.length > 0
+        ? prepared.error : '生成分享图片失败');
+      this.syncShareStateFromService();
+      promptAction.showToast({ message: this.shareError });
+      return;
+    }
+
+    this.shareRenderedFiles = prepared.files;
+    if (!this.shareService.settlePreview(generation)) return;
+    this.shareStage = this.shareService.currentStage();
+    this.sharePreviewOpen = true;
+  }
+
+  /** 把服务端状态同步到 @State，供生成中 / 失败重试 UI 读取。 */
+  private syncShareStateFromService(): void {
+    this.shareStage = this.shareService.currentStage();
+    this.shareError = this.shareService.lastError();
+    this.sharePreviewOpen = false;
+    this.shareFrozenItems = [];
+    this.shareRenderedFiles = [];
+  }
+
+  /** 用户在预览中确认分享：拉起系统面板，结束后统一释放。 */
+  private async confirmConversationShare(): Promise<void> {
+    const generation = this.shareGeneration;
+    if (this.shareRenderedFiles.length === 0) return;
+    this.sharePreviewOpen = false;
+    await this.shareService.share(
+      this.getUIContext().getHostContext() as common.UIAbilityContext,
+      generation, this.shareRenderedFiles, (): void => {
+        this.shareStage = this.shareService.currentStage();
+        this.shareError = this.shareService.lastError();
+        this.shareFrozenItems = [];
+        this.shareRenderedFiles = [];
+      });
+    this.shareStage = this.shareService.currentStage();
+  }
+
+  /** 分享图宽度：用实际测量的消息区宽度，导出排版与屏幕一致。 */
+  private shareContentWidthVp(): number {
+    return this.messageAreaWidth > 0
+      ? this.messageAreaWidth : SHARE_CONTENT_DEFAULT_WIDTH_VP;
+  }
+
+  /** 冻结用户此刻真正可见的正文：视觉行折叠与粘贴 chip 展开态都必须一致。 */
+  private shareVisibleUserTextOverrides(): Map<string, string> {
+    const overrides = new Map<string, string>();
+    for (let i = 0; i < this.items.length; i++) {
+      const renderItem = this.items[i];
+      if (renderItem.type !== 'message') continue;
+      const item = renderItem as RenderMessageItem;
+      if (item.kind !== 'user') continue;
+      if (this.shouldCollapsePlainUserMessage(item) &&
+        !this.isIn(this.expandedTextBlocks, this.plainMessageExpandKey(item))) {
+        overrides.set(item.key, this.shareCollapsedUserText(item));
+        continue;
+      }
+      if (item.segments.length === 0) continue;
+      const visibleParts: string[] = [];
+      for (let segmentIndex = 0; segmentIndex < item.segments.length; segmentIndex++) {
+        const segment = item.segments[segmentIndex];
+        if (!segment.isPasted ||
+          this.isIn(this.expandedTextBlocks, `${item.key}-${segment.seq}`)) {
+          visibleParts.push(segment.text);
+        } else {
+          visibleParts.push(segment.display.length > 0
+            ? segment.display : `已粘贴文本（${segment.text.length} 字）`);
+        }
+      }
+      overrides.set(item.key, visibleParts.join('\n'));
+    }
+    return overrides;
+  }
+
+  /** 按屏幕气泡的真实宽度、字号和 maxLines 求出带省略号的可见前缀。 */
+  private shareCollapsedUserText(item: RenderMessageItem): string {
+    const context = this.getUIContext();
+    const measure = context.getMeasureUtils();
+    const constraintWidth = Math.max(1, this.userMessageBubbleMaxWidth() - 24);
+    const fontSize = uiFontSize(17);
+    const lineHeight = uiLineHeight(26);
+    const targetHeight = Number(measure.measureTextSize({
+      textContent: item.body,
+      constraintWidth,
+      fontSize,
+      lineHeight,
+      maxLines: this.collapsedMessageLines(item),
+    }).height);
+    const boundaries: number[] = [0];
+    let cursor = 0;
+    while (cursor < item.body.length) {
+      const first = item.body.charCodeAt(cursor);
+      cursor += this.isHighSurrogate(first) && cursor < item.body.length - 1 &&
+        this.isLowSurrogate(item.body.charCodeAt(cursor + 1)) ? 2 : 1;
+      boundaries.push(cursor);
+    }
+    let low = 0;
+    let high = boundaries.length - 1;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      const candidate = `${item.body.slice(0, boundaries[middle])}…`;
+      const size = measure.measureTextSize({
+        textContent: candidate,
+        constraintWidth,
+        fontSize,
+        lineHeight,
+      });
+      if (Number(size.height) <= targetHeight) low = middle;
+      else high = middle - 1;
+    }
+    const end = boundaries[low];
+    return end < item.body.length ? `${item.body.slice(0, end)}…` : item.body;
+  }
+
+  private isHighSurrogate(value: number): boolean {
+    return value >= 0xD800 && value <= 0xDBFF;
+  }
+
+  private isLowSurrogate(value: number): boolean {
+    return value >= 0xDC00 && value <= 0xDFFF;
+  }
+
+  /** 用与分享 builder 相同的字体、行高和水平内边距测量每张卡片。 */
+  private measureShareItemHeightsPx(items: ShareProjectionItem[], widthVp: number): number[] {
+    const context = this.getUIContext();
+    const measure = context.getMeasureUtils();
+    const textWidthVp = Math.max(1, widthVp -
+      (SHARE_CANVAS_PADDING_VP + SHARE_CARD_PADDING_VP) * 2);
+    const fixedHeightPx = context.vp2px(SHARE_CARD_PADDING_VP * 2 + SHARE_CARD_TEXT_GAP_VP);
+    const heights: number[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const roleSize = measure.measureTextSize({
+        textContent: this.shareItemRoleLabel(item.kind),
+        constraintWidth: textWidthVp,
+        fontSize: uiFontSize(11),
+      });
+      const bodySize = measure.measureTextSize({
+        textContent: item.text,
+        constraintWidth: textWidthVp,
+        fontSize: uiFontSize(13),
+        lineHeight: uiLineHeight(19),
+      });
+      heights.push(fixedHeightPx + Number(roleSize.height) + Number(bodySize.height));
+    }
+    return heights;
+  }
+
+  private shareContentHeightPx(itemHeightsPx: number[]): number {
+    const context = this.getUIContext();
+    let heightPx = context.vp2px(SHARE_CANVAS_PADDING_VP * 2);
+    for (let i = 0; i < itemHeightsPx.length; i++) {
+      heightPx += itemHeightsPx[i];
+      if (i > 0) heightPx += context.vp2px(SHARE_ITEM_GAP_VP);
+    }
+    return heightPx;
+  }
+
+  private measureShareFooterReservePx(widthVp: number): number {
+    if (!this.shareOmittedCollapsed) return 0;
+    const context = this.getUIContext();
+    const size = context.getMeasureUtils().measureTextSize({
+      textContent: SHARE_OMITTED_CONTENT_LABEL,
+      constraintWidth: Math.max(1, widthVp - SHARE_CANVAS_PADDING_VP * 2),
+      fontSize: uiFontSize(11),
+    });
+    return context.vp2px(SHARE_ITEM_GAP_VP) + Number(size.height);
+  }
+
+  /**
+   * 分享覆盖层：生成中 / 预览 / 失败重试。
+   *
+   * 只覆盖会话详情栏（与其它弹层一致），不遮住任务列表。取消、返回和退页都走
+   * cancelConversationShare，保证 PixelMap 与临时文件不泄漏。
+   */
+  @Builder
+  shareOverlayLayer() {
+    Stack() {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.overlay'))
+        .onClick(() => this.cancelConversationShare())
+
+      Column({ space: 14 }) {
+        if (this.shareStage === SHARE_STAGE_RENDERING) {
+          Row({ space: 10 }) {
+            LoadingProgress().width(20).height(20)
+            Text('正在生成分享图片…')
+              .fontSize(uiFontSize(14))
+              .fontColor($r('app.color.text_primary'))
+          }
+          .alignItems(VerticalAlign.Center)
+        } else if (this.shareStage === SHARE_STAGE_FAILED) {
+          Text('生成失败')
+            .fontSize(uiFontSize(15))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          Text(this.shareError.length > 0 ? this.shareError : '请稍后重试')
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(18))
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+        } else {
+          Text(this.shareRenderedFiles.length > 1
+            ? `已生成 ${this.shareRenderedFiles.length} 张图片`
+            : '分享预览')
+            .fontSize(uiFontSize(15))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          if (this.shareOmittedCollapsed) {
+            Text('仅包含当前展开的内容，折叠的工作过程不会被分享')
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(18))
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+          }
+          // 预览用已生成的真实文件，与最终分享内容完全一致。
+          Scroll() {
+            Column({ space: 8 }) {
+              ForEach(this.shareRenderedFiles, (file: ShareImageFile) => {
+                Image(file.uri)
+                  .width('100%')
+                  .objectFit(ImageFit.Contain)
+                  .borderRadius(UI_RADIUS_CONTROL)
+                  .border({ width: 1, color: $r('app.color.border') })
+              }, (file: ShareImageFile) => file.path)
+            }
+            .width('100%')
+          }
+          .constraintSize({ maxHeight: 360 })
+          .scrollBar(BarState.Off)
+        }
+
+        Row({ space: 8 }) {
+          this.interactionSecondaryButton('取消', true,
+            () => this.cancelConversationShare(), true)
+          Row().layoutWeight(1)
+          if (this.shareStage === SHARE_STAGE_FAILED) {
+            this.interactionPrimaryButton('重试',
+              () => void this.shareConversationAsImage(), true)
+          } else if (this.shareStage === SHARE_STAGE_PREVIEW) {
+            this.interactionPrimaryButton('分享',
+              () => void this.confirmConversationShare(), true)
+          }
+        }
+        .width('100%')
+      }
+      .width('86%')
+      .constraintSize({ maxWidth: 420 })
+      .padding(18)
+      .borderRadius(UI_RADIUS_CONTAINER)
+      .backgroundColor($r('app.color.bg_card'))
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  private cancelConversationShare(): void {
+    this.shareService.release();
+    this.shareStage = this.shareService.currentStage();
+    this.shareError = '';
+    this.sharePreviewOpen = false;
+    this.shareOmittedCollapsed = false;
+    this.shareRequiresNarrowing = false;
+    this.shareFrozenItems = [];
+    this.shareRenderedFiles = [];
+    this.shareSegmentStarts = [];
+  }
+
+  /** 第 index 段导出内容的项区间。 */
+  private shareSegmentRange(index: number): number[] {
+    const start = index < this.shareSegmentStarts.length ? this.shareSegmentStarts[index] : 0;
+    const end = index + 1 < this.shareSegmentStarts.length
+      ? this.shareSegmentStarts[index + 1] : this.shareFrozenItems.length;
+    return [start, end];
+  }
+
+  /**
+   * 离屏导出画布：只绘制冻结投影中属于本段的内容。
+   *
+   * 用 ArkUI 原生节点绘制（不走 SVG / WebView）；纯文本 + 语义 token，
+   * 因此 Light / Dark 自动成对，无需在此写主题判断。
+   */
+  @Builder
+  shareSegmentCanvas(index: number, widthVp: number, maxHeightVp: number) {
+    Column({ space: SHARE_ITEM_GAP_VP }) {
+      ForEach(this.shareSegmentItems(index), (item: ShareProjectionItem) => {
+        Column({ space: SHARE_CARD_TEXT_GAP_VP }) {
+          Text(this.shareItemRoleLabel(item.kind))
+            .fontSize(uiFontSize(11))
+            .fontColor($r('app.color.text_tertiary'))
+            .width('100%')
+          Text(item.text)
+            .fontSize(uiFontSize(13))
+            .lineHeight(uiLineHeight(19))
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+        .padding(SHARE_CARD_PADDING_VP)
+        .borderRadius(UI_RADIUS_CONTAINER)
+        .backgroundColor(item.kind === 'user'
+          ? $r('app.color.bg_chip') : $r('app.color.bg_card'))
+      }, (item: ShareProjectionItem) => item.key)
+      // 折叠内容未导出时明确标注，避免用户误以为分享了全部对话。
+      if (this.shareOmittedCollapsed && index === this.shareSegmentStarts.length - 1) {
+        Text(SHARE_OMITTED_CONTENT_LABEL)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.text_tertiary'))
+          .width('100%')
+      }
+    }
+    .width(widthVp)
+    .constraintSize({ maxHeight: maxHeightVp })
+    .clip(true)
+    .alignItems(HorizontalAlign.Start)
+    .padding(SHARE_CANVAS_PADDING_VP)
+    .backgroundColor($r('app.color.bg_page'))
+  }
+
+  private shareSegmentItems(index: number): ShareProjectionItem[] {
+    const range = this.shareSegmentRange(index);
+    return this.shareFrozenItems.slice(range[0], range[1]);
+  }
+
+  private shareItemRoleLabel(kind: string): string {
+    if (kind === 'user') return '我';
+    if (kind === 'assistant') return 'Cindy';
+    if (kind === 'work') return '工作过程';
+    if (kind === 'thinking') return '思考';
+    return '系统';
   }
 
   private jumpToLatest(): void {
@@ -3323,10 +3869,21 @@ export struct TaskPageContent {
       const session = this.session();
       if (mode === 'slash') {
         const agent = this.agentKindForCapability(session ?? new RemoteSession());
+        // roster 必须绑定当前任务：Pi 的 Skill 清单按 session 解析（项目级 Skill、
+        // 已加载运行时目录都随任务不同）。不传 sessionId 会把上一个任务的清单串到这里。
+        // 契约见 apps/mobile/src/__tests__/mobileMakerTransport.test.ts：
+        // ['maker:list-agent-commands', ['pi', { sessionId }]]
+        // ['maker:list-agent-skills', ['pi', { workingDir, sessionId }]]
+        const sessionId = session?.id ?? '';
+        const commandOptions: Record<string, Object> = {};
+        if (sessionId.length > 0) commandOptions['sessionId'] = sessionId;
         const options: Record<string, Object> = {};
         if ((session?.workingDir ?? '').length > 0) options['workingDir'] = session?.workingDir ?? '';
+        if (sessionId.length > 0) options['sessionId'] = sessionId;
         const results = await Promise.all([
-          this.invokeContextRpc('maker:list-agent-commands', [agent]).catch(() => undefined),
+          this.invokeContextRpc('maker:list-agent-commands',
+            Object.keys(commandOptions).length > 0 ? [agent, commandOptions] : [agent])
+            .catch(() => undefined),
           this.invokeContextRpc('maker:list-agent-skills', [agent, options]).catch(() => undefined),
           this.invokeContextRpc('maker:list-desktop-commands', []).catch(() => undefined),
         ]);
@@ -3481,6 +4038,9 @@ export struct TaskPageContent {
       }
       if (this.sessionActionOpen) {
         this.sessionActionLayer()
+      }
+      if (shareFlowBusy(this.shareStage) || this.shareStage === SHARE_STAGE_FAILED) {
+        this.shareOverlayLayer()
       }
       if (this.sessionTreeOpen) {
         this.sessionTreeLayer()
@@ -3648,6 +4208,12 @@ export struct TaskPageContent {
             this.sessionActionOption('复制任务链接', $r('sys.symbol.link'), false, () => {
               this.copyPlainText(`cindy://session/${encodeURIComponent(this.sessionId)}`, '已复制任务链接');
             })
+            if (this.items.length > 0) {
+              this.sessionActionOption('分享为图片', $r('sys.symbol.arrow_up'), false, () => {
+                this.closeSessionActions();
+                void this.shareConversationAsImage();
+              })
+            }
             if ((this.session()?.agentKind ?? '') === 'pi') {
               this.sessionActionOption('任务分支', $r('sys.symbol.split'), false,
                 () => this.openSessionTree())
@@ -4066,7 +4632,7 @@ export struct TaskPageContent {
       .alignItems(VerticalAlign.Center)
     }
       .type(ButtonType.Normal)
-      .height(36)
+      .height(QUEUE_INLINE_ACTION_VISUAL_HEIGHT)
       .padding({ left: 12, right: 12 })
       .backgroundColor(cta
         ? $r('app.color.chat_cta')
@@ -4079,6 +4645,14 @@ export struct TaskPageContent {
       .enabled(enabled)
       .opacity(enabled ? 1 : 0.42)
       .clickEffect(UI_CLICK_EFFECT)
+      // 视觉保持 36vp 紧凑胶囊，触控区上下各外扩到 44vp 无障碍下限。
+      // responseRegion 只改命中范围、不参与布局，因此不会把气泡撑高。
+      .responseRegion({
+        x: 0,
+        y: -QUEUE_INLINE_ACTION_TOUCH_INSET,
+        width: '100%',
+        height: QUEUE_INLINE_ACTION_MIN_TOUCH_HEIGHT,
+      })
       .onClick(action)
       .margin({ right: 6, bottom: 6 })
   }
@@ -4088,7 +4662,7 @@ export struct TaskPageContent {
   queueBannerAction(label: string, enabled: boolean, action: () => void) {
     Button(label)
       .type(ButtonType.Normal)
-      .height(30)
+      .height(QUEUE_BANNER_ACTION_VISUAL_HEIGHT)
       .padding({ left: 12, right: 12 })
       .fontSize(uiFontSize(12))
       .fontWeight(FontWeight.Medium)
@@ -4098,6 +4672,13 @@ export struct TaskPageContent {
       .enabled(enabled)
       .opacity(enabled ? 1 : 0.42)
       .clickEffect(UI_CLICK_EFFECT)
+      // 同样保持安静的视觉高度，触控区外扩到 44vp。
+      .responseRegion({
+        x: 0,
+        y: -QUEUE_BANNER_ACTION_TOUCH_INSET,
+        width: '100%',
+        height: QUEUE_INLINE_ACTION_MIN_TOUCH_HEIGHT,
+      })
       .onClick(action)
   }
 
@@ -6286,6 +6867,13 @@ export struct TaskPageContent {
   permissionCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.lock'), '权限请求')
+      if (this.permissionAutoReviewNoticeText(item).length > 0) {
+        Text(this.permissionAutoReviewNoticeText(item))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(17))
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+      }
       Text(this.permissionIsArmed(item) ? '确认高风险操作' : this.permissionToolName(item))
         .fontSize(uiFontSize(14))
         .fontColor($r('app.color.text_primary'))
@@ -8705,6 +9293,11 @@ export struct TaskPageContent {
 
   private permissionRiskText(item: PendingInteraction): string {
     return permissionRiskSummary(item.raw);
+  }
+
+  /** Auto-review 故障降级说明：让用户知道这张卡不是普通 Ask，也不是自己拒绝过。 */
+  private permissionAutoReviewNoticeText(item: PendingInteraction): string {
+    return permissionAutoReviewUnavailableNotice(item.raw);
   }
 
   private permissionIsArmed(item: PendingInteraction): boolean {

@@ -58,5 +58,5 @@
 - 一期明确不做的能力（语音 / 推送 / 视频上传等）不适用本对齐要求；
 - 若 Mobile 行为本身有 bug 或明显不适配鸿蒙（如依赖 iOS 私有能力），
   记录差异到 `decision-log.md` 再偏离；
-- 跨端协议层（Device Link / 认证）仍以 `cindy-protocol` 与
+- 跨端协议层（Device Link / 认证）仍以 `packages/device-link-protocol` 与
   `packages/device-link` 为权威，本文件只管客户端行为表现。

@@ -6,6 +6,7 @@ import {
   taskCompletedPushDataFromWant,
   taskSessionDeepLink,
 } from '../core/notifications/TaskCompletionPushModels';
+import { setSystemFontSizeScale } from '../components/UiKit';
 
 const DOMAIN = 0x0000;
 
@@ -21,6 +22,8 @@ export default class EntryAbility extends UIAbility {
       hilog.error(DOMAIN, 'CindyHarmony', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onCreate');
+    // 首帧前先记录系统字体缩放，避免放大字号下模型元信息一开始就被截断。
+    setSystemFontSizeScale(this.context.config.fontSizeScale);
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
@@ -70,11 +73,15 @@ export default class EntryAbility extends UIAbility {
     if (this.mainWindowStage !== null) {
       void this.applySystemBarAppearance(this.mainWindowStage);
     }
+    // 系统字体缩放变化后，随字号增长的容器上限要跟着更新，避免元信息被截断。
+    setSystemFontSizeScale(this.context.config.fontSizeScale);
   }
 
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onBackground');
+    // 退后台释放分享位图与临时文件，避免长会话分享图在后台继续占用内存。
+    AppServices.instance.onAppBackground();
   }
 
   private async applySystemBarAppearance(windowStage: window.WindowStage): Promise<void> {

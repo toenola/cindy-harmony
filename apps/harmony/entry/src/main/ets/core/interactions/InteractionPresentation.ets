@@ -189,8 +189,21 @@ export function permissionRiskSummary(request: Record<string, Object>): string {
   return '这个命令可能修改系统、仓库或外部服务状态。允许前请确认你信任当前任务和命令内容。';
 }
 
-export function permissionRequestFingerprint(
-  request: Record<string, Object>,
+/**
+ * Auto-review 故障降级说明；空串表示普通确认卡。
+ *
+ * 语义对齐 packages/maker-core/src/agents/shared/auto-review-decision.ts 的
+ * AUTO_REVIEW_UNAVAILABLE_METADATA_KEY，文案与 Desktop zh-CN 确认卡同句
+ * （apps/desktop/src/main/im/shared/autoReviewUnavailablePrompt.ts）：这张卡是
+ * 自动审批没跑完的降级结果，不是普通 Ask，也不代表用户拒绝过。
+ */
+export function permissionAutoReviewUnavailableNotice(request: Record<string, Object>): string {
+  if (readString(request, 'kind') !== 'permission') return '';
+  if (readRecord(request, 'metadata')['autoReviewUnavailable'] !== true) return '';
+  return '自动审批没完成，请确认要不要允许这次操作。';
+}
+
+export function permissionRequestFingerprint(  request: Record<string, Object>,
   action: string,
 ): string {
   return `${readString(request, 'requestId')}\u0000${action}\u0000${readString(request, 'toolName')}`

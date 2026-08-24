@@ -27,6 +27,7 @@ import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
+import { SecurityObservabilityAdapter } from './observability/SecurityObservabilityAdapter';
 import { InputQueueStore, isTerminalMakerInputEvent } from './messages/InputQueueStore';
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
@@ -61,6 +62,14 @@ export class AppServices {
     new TaskCompletionPushService(this.taskCompletionPushPreference);
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
+  /**
+   * 可选安全观测身份。默认 no-op：Harmony 侧真实 SDK 未提供，接入前需完成
+   * 隐私 / 区域 / 签名 / 冷启动评审（阶段 6 外部依赖）。缺 SDK 不影响登录与退出。
+   */
+  readonly securityObservability: SecurityObservabilityAdapter =
+    new SecurityObservabilityAdapter();
+  /** 退后台需要释放的前台重资源回调（当前只有会话分享）。 */
+  private backgroundReleaseHandlers: Array<() => void> = [];
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
   private readonly http: HarmonyHttp = new HarmonyHttp();
@@ -95,6 +104,8 @@ export class AppServices {
       ));
     });
     this.auth.setLogoutCleanup(async (): Promise<void> => {
+      // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
+      this.securityObservability.clearUser();
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
       this.tasks.clearAll();
@@ -104,6 +115,9 @@ export class AppServices {
     this.interactions.attach(this.client);
     this.goals.attach(this.client);
     this.messages.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    // 消息驻留分类只认任务快照的权威 `source` 字段，不用标题猜测 scheduler。
+    this.messages.setSessionSnapshotResolver(
+      (sessionId: string) => this.tasks.findSessionById(sessionId));
     this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.interactions.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
@@ -210,6 +224,27 @@ export class AppServices {
     if (this.auth.isLoggedIn) {
       this.client.connectNow('foreground', true);
     }
+  }
+
+  /**
+   * App 退到后台：释放只在前台有意义的重资源。
+   *
+   * 目前只有会话分享：截图位图与临时文件可能占用数十 MB，退后台后不该继续持有；
+   * 由页面注册回调，避免 core 反向依赖页面。
+   */
+  onAppBackground(): void {
+    for (let i = 0; i < this.backgroundReleaseHandlers.length; i++) {
+      this.backgroundReleaseHandlers[i]();
+    }
+  }
+
+  /** 注册退后台释放回调；返回反注册函数。 */
+  registerBackgroundRelease(handler: () => void): () => void {
+    this.backgroundReleaseHandlers.push(handler);
+    return (): void => {
+      const index = this.backgroundReleaseHandlers.indexOf(handler);
+      if (index >= 0) this.backgroundReleaseHandlers.splice(index, 1);
+    };
   }
 
   /**
@@ -430,6 +465,8 @@ export class AppServices {
     }
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
+    // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
+    this.securityObservability.bindUser(accountId);
     void this.loadDevices();
   }
 

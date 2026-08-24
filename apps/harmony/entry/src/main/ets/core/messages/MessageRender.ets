@@ -729,6 +729,8 @@ class TodoPlanSession {
   firstIndex: number = -1;
   lastIndex: number = -1;
   source: string = '';
+  /** 该 session 首条计划调用之前最近一条用户消息的下标（turn 所有权锚点）。 */
+  userBoundaryIndex: number = -1;
 }
 
 function planSource(toolName: string): string {
@@ -1077,8 +1079,13 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
     const continuesCompletedTask = source === 'task' && previousAllDone
       && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState);
     const previousSealed = previous !== undefined && planRowSealed(messages[previous.lastIndex]);
+    // 普通用户 turn 是所有权边界：用户开了新话题，旧的未完成计划不得把新计划吞成
+    // “续期”。锚点必须是 session 建立时固定的 userBoundaryIndex，不能用会随每次
+    // 计划更新前移的 lastIndex——否则旧计划在新用户消息后更新一次就抹掉了边界，
+    // 后续新计划全部串进上一轮。task source 例外：显式指向已有任务的操作仍是同一
+    // 份清单的合法续写，但不因此搬动 session 的所有权锚点。
     const crossesUserBoundary = previous !== undefined
-      && lastUserBoundaryIndex > previous.lastIndex
+      && lastUserBoundaryIndex > previous.userBoundaryIndex
       && !(source === 'task'
         && taskToolTargetsExistingTask(tool.toolName, input, resultText, taskState));
     const startsNew = previous === undefined || previousSealed
@@ -1099,6 +1106,7 @@ export function findTodoPlanInsertions(messages: RemoteMessage[]): Map<number, T
       session.firstIndex = i;
       session.lastIndex = i;
       session.source = source;
+      session.userBoundaryIndex = lastUserBoundaryIndex;
       sessions.push(session);
       lastBySource.set(source, session);
     }
@@ -2073,14 +2081,18 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
   let currentTurn: RenderItem[] = [];
   let prevEndMs = 0;
   let hasPrevEnd = false;
+  // 本轮用户消息时间：完成态工作过程的时长起点优先锚它，而不是段内首个 activity，
+  // 否则用户发送到首个动作之间的等待时间被吞掉（与共享投影 turnStartMs 同口径）。
+  let turnStartMs = 0;
   const flushTurn = (activeTail: boolean): void => {
     if (currentTurn.length === 0) return;
     if (activeTail && isSessionStreaming) {
-      const active = groupActiveWorkRuns(currentTurn);
+      const active = groupActiveWorkRuns(currentTurn, turnStartMs);
       for (let i = 0; i < active.length; i++) out.push(active[i]);
     } else {
-      const answered = groupAnsweredTurnItems(currentTurn);
-      const grouped = answered.handled ? answered.items : groupLegacyWorkRuns(currentTurn);
+      const answered = groupAnsweredTurnItems(currentTurn, turnStartMs);
+      const grouped = answered.handled ? answered.items
+        : groupLegacyWorkRuns(currentTurn, turnStartMs);
       for (let i = 0; i < grouped.length; i++) out.push(grouped[i]);
     }
     currentTurn = [];
@@ -2098,11 +2110,15 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
         prevEndMs = hasPrevEnd ? Math.max(prevEndMs, userEnd) : userEnd;
         hasPrevEnd = true;
       }
+      turnStartMs = itemStartTimestamp(item);
       continue;
     }
     const start = itemStartTimestamp(item);
     if (hasPrevEnd && start > 0 && start - prevEndMs > HISTORY_GAP_SPLIT_MS) {
       flushTurn(false);
+      // 空洞切开的新段没有已知 turn 开场边界：旧 user 行在空洞另一侧或未加载。
+      // 清零后与窗口截断同义，退回首个活动时间，避免把空洞计入时长。
+      turnStartMs = 0;
     }
     currentTurn.push(item);
     const end = itemEndTimestamp(item);
@@ -2115,7 +2131,7 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
   return out;
 }
 
-function groupAnsweredTurnItems(items: RenderItem[]): GroupedTurnResult {
+function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0): GroupedTurnResult {
   const result = new GroupedTurnResult();
   const sealed: boolean[] = [];
   let sealedCount = 0;
@@ -2188,9 +2204,10 @@ function groupAnsweredTurnItems(items: RenderItem[]): GroupedTurnResult {
 
   const out: RenderItem[] = [];
   let run: RenderItem[] = [];
+  let previousBoundaryMs = turnStartMs;
   const flushRun = (nextItem?: RenderItem): void => {
     if (run.length === 0) return;
-    out.push(createCompletedWorkGroup(run, nextItem));
+    out.push(createCompletedWorkGroup(run, nextItem, previousBoundaryMs));
     run = [];
   };
   for (let i = 0; i < items.length; i++) {
@@ -2200,6 +2217,7 @@ function groupAnsweredTurnItems(items: RenderItem[]): GroupedTurnResult {
     } else {
       flushRun(item);
       out.push(item);
+      previousBoundaryMs = boundaryTimestamp(item);
     }
   }
   flushRun();
@@ -2208,12 +2226,13 @@ function groupAnsweredTurnItems(items: RenderItem[]): GroupedTurnResult {
   return result;
 }
 
-function groupLegacyWorkRuns(items: RenderItem[]): RenderItem[] {
+function groupLegacyWorkRuns(items: RenderItem[], turnStartMs: number = 0): RenderItem[] {
   const out: RenderItem[] = [];
   let run: RenderItem[] = [];
+  let previousBoundaryMs = turnStartMs;
   const flushRun = (nextItem?: RenderItem): void => {
     if (run.length === 0) return;
-    out.push(createWorkGroup(run, nextItem));
+    out.push(createWorkGroup(run, nextItem, false, previousBoundaryMs));
     run = [];
   };
   for (let i = 0; i < items.length; i++) {
@@ -2221,6 +2240,7 @@ function groupLegacyWorkRuns(items: RenderItem[]): RenderItem[] {
     else {
       flushRun(items[i]);
       out.push(items[i]);
+      previousBoundaryMs = boundaryTimestamp(items[i]);
     }
   }
   flushRun();
@@ -2228,7 +2248,7 @@ function groupLegacyWorkRuns(items: RenderItem[]): RenderItem[] {
 }
 
 /** 流式尾部保留 assistant 正文，动作按连续段折叠，避免生成过程中跳动整屏。 */
-function groupActiveWorkRuns(items: RenderItem[]): RenderItem[] {
+function groupActiveWorkRuns(items: RenderItem[], turnStartMs: number = 0): RenderItem[] {
   let lastCompletedBoundaryIndex = -1;
   for (let i = 0; i < items.length; i++) {
     if (isAssistantAnswerCandidate(items[i]) || isCompactBoundaryItem(items[i])) {
@@ -2244,9 +2264,11 @@ function groupActiveWorkRuns(items: RenderItem[]): RenderItem[] {
   const out: RenderItem[] = [];
   let run: RenderItem[] = [];
   let runLastIndex = -1;
+  let previousBoundaryMs = turnStartMs;
   const flushRun = (nextItem?: RenderItem): void => {
     if (run.length === 0) return;
-    out.push(createWorkGroup(run, nextItem, runLastIndex > lastCompletedBoundaryIndex));
+    out.push(createWorkGroup(run, nextItem, runLastIndex > lastCompletedBoundaryIndex,
+      previousBoundaryMs));
     run = [];
     runLastIndex = -1;
   };
@@ -2258,6 +2280,7 @@ function groupActiveWorkRuns(items: RenderItem[]): RenderItem[] {
     else {
       flushRun(items[i]);
       out.push(items[i]);
+      previousBoundaryMs = boundaryTimestamp(items[i]);
     }
   }
   flushRun();
@@ -2307,13 +2330,29 @@ function isDeliveryProseItem(item: RenderItem): boolean {
   return listItems !== null && listItems.length >= 3;
 }
 
-function createWorkGroup(children: RenderItem[], nextItem?: RenderItem, isStreaming: boolean = false): RenderWorkGroupItem {
+/** 边界项（用户消息 / assistant 正文）的时间戳；非 message 卡片不作为时间边界。 */
+function boundaryTimestamp(item?: RenderItem): number {
+  if (item === undefined || item.type !== 'message') return 0;
+  return itemStartTimestamp(item);
+}
+
+function createWorkGroup(
+  children: RenderItem[],
+  nextItem?: RenderItem,
+  isStreaming: boolean = false,
+  previousBoundaryMs: number = 0,
+): RenderWorkGroupItem {
   const group = new RenderWorkGroupItem();
   group.type = 'work_group';
   group.key = `work-${workChildKey(children[0])}`;
   group.children = children.slice();
   group.isStreaming = isStreaming;
-  const start = itemStartTimestamp(children[0]);
+  const anchor = itemStartTimestamp(children[0]);
+  // 段起点优先锚上一个边界（本轮用户消息 / 上一句正文），与桌面活表口径一致；
+  // 边界缺失（窗口截断、历史空洞）或时序异常时退回段内首个动作时间。
+  const start = previousBoundaryMs > 0 && (anchor <= 0 || previousBoundaryMs <= anchor)
+    ? previousBoundaryMs
+    : anchor;
   if (start > 0) group.startedAtMs = start;
   const nextStart = nextItem === undefined ? 0 : itemStartTimestamp(nextItem);
   const end = nextStart > 0 ? nextStart : workRunFallbackEnd(children);
@@ -2321,18 +2360,23 @@ function createWorkGroup(children: RenderItem[], nextItem?: RenderItem, isStream
   return group;
 }
 
-function createCompletedWorkGroup(run: RenderItem[], nextItem?: RenderItem): RenderWorkGroupItem {
+function createCompletedWorkGroup(
+  run: RenderItem[],
+  nextItem?: RenderItem,
+  previousBoundaryMs: number = 0,
+): RenderWorkGroupItem {
   let hasAssistantText = false;
   for (let i = 0; i < run.length; i++) {
     if (isAssistantAnswerCandidate(run[i])) hasAssistantText = true;
   }
-  if (!hasAssistantText) return createWorkGroup(run, nextItem);
+  if (!hasAssistantText) return createWorkGroup(run, nextItem, false, previousBoundaryMs);
 
   const children: RenderItem[] = [];
   let activityRun: RenderItem[] = [];
+  let innerPreviousBoundaryMs = previousBoundaryMs;
   const flushActivityRun = (nextActivity?: RenderItem): void => {
     if (activityRun.length === 0) return;
-    children.push(createWorkGroup(activityRun, nextActivity));
+    children.push(createWorkGroup(activityRun, nextActivity, false, innerPreviousBoundaryMs));
     activityRun = [];
   };
   for (let i = 0; i < run.length; i++) {
@@ -2342,10 +2386,11 @@ function createCompletedWorkGroup(run: RenderItem[], nextItem?: RenderItem): Ren
     } else {
       flushActivityRun(item);
       children.push(item);
+      innerPreviousBoundaryMs = boundaryTimestamp(item);
     }
   }
   flushActivityRun(nextItem);
-  const outer = createWorkGroup(run, nextItem);
+  const outer = createWorkGroup(run, nextItem, false, previousBoundaryMs);
   outer.key = `work-summary-${workChildKey(run[0])}`;
   outer.children = children;
   outer.isStreaming = false;

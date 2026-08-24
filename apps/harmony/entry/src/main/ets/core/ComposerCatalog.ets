@@ -27,6 +27,13 @@ export class ComposerModelOption {
   providerLogoKind: string = '';
   modelIcon: string = '';
   subscription: boolean = false;
+  /**
+   * 该模型被远端标记为哪些 agent 的新任务默认种子（model-access v3 `newSessionDefault`）。
+   * 客户端不跨 agent 投影；缺省表示不作为默认。
+   */
+  newSessionDefaultAgents: string[] = [];
+  /** 远端陈列顺序；缺省用一个大值排到已标记项之后，保留稳定回退。 */
+  sortOrder: number = Number.MAX_SAFE_INTEGER;
 }
 
 export class ComposerModelGroup {
@@ -196,6 +203,7 @@ export function parseModelOptions(value: Object | undefined): ComposerModelOptio
       option.description = readStr(record, 'description');
       option.defaultEffort = readStr(record, 'defaultEffort');
       option.supportsFastMode = readBool(record, 'supportsFastMode', false);
+      readNewSessionDefaults(record, option);
       readEffortDisplayNames(record, option);
       const rawEfforts = record['efforts'];
       if (Array.isArray(rawEfforts)) {
@@ -210,8 +218,62 @@ export function parseModelOptions(value: Object | undefined): ComposerModelOptio
   return out;
 }
 
-function readEffortDisplayNames(record: Record<string, Object>, option: ComposerModelOption): void {
-  const displayNames = readObj(record, 'effortDisplayNames');
+/**
+ * 读取远端默认标记与陈列顺序。
+ *
+ * 语义对齐 packages/model-providers/src/types.ts 的 `newSessionDefault`：v3 显式标记
+ * 'claude-code' / 'codex' / 'pi'，客户端不跨 agent 投影，非法值整项忽略而不整表失败。
+ */
+function readNewSessionDefaults(record: Record<string, Object>, option: ComposerModelOption): void {
+  const order = record['sortOrder'];
+  if (typeof order === 'number' && Number.isFinite(order)) option.sortOrder = order as number;
+  // 显式停用的模型不参与默认种子（对齐 desktop 的 defaultEnabled !== false 过滤）。
+  if (!readBool(record, 'defaultEnabled', true)) return;
+  const raw = record['newSessionDefault'];
+  if (!Array.isArray(raw)) return;
+  const rows = raw as Object[];
+  for (let i = 0; i < rows.length; i++) {
+    if (typeof rows[i] === 'string') {
+      const agent = (rows[i] as string).trim();
+      if (agent.length > 0) option.newSessionDefaultAgents.push(agent);
+    }
+  }
+}
+
+/**
+ * 远端标记的新任务默认模型。
+ *
+ * 语义对齐 apps/desktop/src/renderer/features/cc-agent/deviceLinkDraftDefaults.ts：
+ * 只取被**当前 agent** 标记的候选，按 `sortOrder` 再按目录顺序取第一个；
+ * 保留候选原始 provider 身份，不按显示名跨 provider 合并。无标记时返回 null，
+ * 由调用方回退到当前稳定默认值——用户手动选择始终优先，目录刷新不得改回默认。
+ */
+export function resolveNewSessionDefaultModel(
+  options: ComposerModelOption[],
+  agent: string,
+): ComposerModelOption | null {
+  if (agent.length === 0) return null;
+  let best: ComposerModelOption | null = null;
+  let bestOrder = 0;
+  for (let i = 0; i < options.length; i++) {
+    const option = options[i];
+    if (!stringArrayHasAgent(option.newSessionDefaultAgents, agent)) continue;
+    if (best === null || option.sortOrder < bestOrder) {
+      best = option;
+      bestOrder = option.sortOrder;
+    }
+  }
+  return best;
+}
+
+function stringArrayHasAgent(values: string[], agent: string): boolean {
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] === agent) return true;
+  }
+  return false;
+}
+
+function readEffortDisplayNames(record: Record<string, Object>, option: ComposerModelOption): void {  const displayNames = readObj(record, 'effortDisplayNames');
   const keys = Object.keys(displayNames);
   for (let i = 0; i < keys.length; i++) {
     const label = readStr(displayNames, keys[i]);
@@ -274,6 +336,7 @@ export function parseProviderModelOptions(
       option.description = readStr(model, 'description');
       option.defaultEffort = readStr(model, 'defaultEffort');
       option.supportsFastMode = readBool(model, 'supportsFastMode', false);
+      readNewSessionDefaults(model, option);
       readEffortDisplayNames(model, option);
       option.providerId = providerId;
       option.providerName = providerName;

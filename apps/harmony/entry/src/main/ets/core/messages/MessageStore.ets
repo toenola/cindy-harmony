@@ -29,6 +29,15 @@ import {
 } from './MessageRender';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import {
+  classifySessionRetention,
+  estimateMessageRowsBytes,
+  hasProtectedMessageRow,
+  pushAuthorityAccepted,
+  RetentionCandidate,
+  selectRegularBudgetEvictions,
+  trimMessageWindow,
+} from './MessageRetentionPolicy';
+import {
   AgentTaskUpdate,
   applyAgentTaskUpdateEvent,
   isSameAgentTaskAlias,
@@ -224,6 +233,12 @@ export class MessageStore {
   /** 非活动会话进程内缓存的 LRU 顺序。 */
   private cacheAccessBySession: Map<string, number> = new Map();
   private cacheAccessSequence: number = 0;
+  /**
+   * 任务快照查询（AppServices 注入 TaskStore）。驻留分类只认权威 `source`，
+   * 未注入时全部按普通任务处理，宁可多驻留也不误回收。
+   */
+  private sessionSnapshotResolver: ((sessionId: string) => RemoteSession | undefined) | undefined =
+    undefined;
   /** 页面打开代次：关闭后的旧历史响应不得覆盖新 lease。 */
   private sessionLeaseRevisions: Map<string, number> = new Map();
   /** 同一会话的 subscribe / unsubscribe 串行，避免快速重进时旧退订撤销新订阅。 */
@@ -568,6 +583,44 @@ export class MessageStore {
       this.evictMemorySession(victim);
       ids = this.memoryCachedSessionIds();
     }
+    this.enforceRegularMessageBudget();
+  }
+
+  /**
+   * 普通任务全局预算（800 行 / 64 MiB，先达者为准）。
+   *
+   * 只淘汰内存对象；持久快照删除是独立决策，不在此处执行——重开仍可从最近一页
+   * 乐观恢复。订阅中的会话和含本地保护行（系统卡、乐观消息、流式行）的会话整窗跳过。
+   */
+  private enforceRegularMessageBudget(): void {
+    const candidates: RetentionCandidate[] = [];
+    this.messagesBySession.forEach((messages: RemoteMessage[], sessionId: string) => {
+      const candidate = new RetentionCandidate();
+      candidate.sessionId = sessionId;
+      candidate.retention = classifySessionRetention(this.sessionSnapshot(sessionId));
+      candidate.rowCount = messages.length;
+      candidate.bytes = estimateMessageRowsBytes(messages);
+      candidate.accessOrder = this.cacheAccessBySession.get(sessionId) ?? 0;
+      candidate.leased = this.subscribed.has(sessionId);
+      candidate.hasProtectedRows = hasProtectedMessageRow(messages);
+      candidates.push(candidate);
+    });
+    const victims = selectRegularBudgetEvictions(candidates);
+    for (let i = 0; i < victims.length; i++) this.evictMemorySession(victims[i]);
+  }
+
+  /** 自动化任务的驻留分类需要任务快照；缺失时按普通任务保守处理。 */
+  private sessionSnapshot(sessionId: string): RemoteSession | undefined {
+    return this.sessionSnapshotResolver === undefined
+      ? undefined : this.sessionSnapshotResolver(sessionId);
+  }
+
+  /**
+   * 注入任务快照查询（由 AppServices 用 TaskStore 提供）。
+   * 驻留分类只认权威 `source` 字段，禁止用标题猜测 scheduler。
+   */
+  setSessionSnapshotResolver(resolver: (sessionId: string) => RemoteSession | undefined): void {
+    this.sessionSnapshotResolver = resolver;
   }
 
   getMessages(sessionId: string): RemoteMessage[] {
@@ -826,8 +879,29 @@ export class MessageStore {
       }
     }
     await this.sessionMessageCache.flush();
+    this.compactSessionWindowOnLeave(sessionId);
     this.evictInactiveSessionCaches();
     this.notify();
+  }
+
+  /**
+   * 离开任务后压缩尾窗。
+   *
+   * 自动化任务只保留一个最新 80 行窗口（回收隐藏内容），普通任务同样压回默认尾窗，
+   * 之后按全局预算竞争。裁剪走软窗口：本地系统卡、乐观消息、流式行等无服务端副本
+   * 的行全部保留，保护行较多时允许略超上限。
+   *
+   * 这里只回收内存；持久快照已在上面 persist / flush 过，不在此删除。
+   */
+  private compactSessionWindowOnLeave(sessionId: string): void {
+    const current = this.messagesBySession.get(sessionId);
+    if (current === undefined || current.length <= HISTORY_PAGE_LIMIT) return;
+    const trimmed = trimMessageWindow(current, HISTORY_PAGE_LIMIT);
+    if (trimmed.length === current.length) return;
+    // 窗口被裁剪后覆盖范围不再连续，必须让 gap healing 重新判定。
+    this.historyCoverageBySession.delete(sessionId);
+    this.hasMoreBySession.set(sessionId, true);
+    this.messagesBySession.set(sessionId, trimmed);
   }
 
   /** 生成本端唯一的 transcript clientId；不依赖额外原生 UUID API。 */
@@ -1991,7 +2065,16 @@ export class MessageStore {
   handleSessionPush(deviceId: string, channel: string, payload: Object | undefined): void {
     if (payload !== undefined && typeof payload === 'object' && !Array.isArray(payload)) {
       const sessionId = readStr(payload as Record<string, Object>, 'sessionId');
-      if (sessionId.length > 0) this.rememberSessionDevice(sessionId, deviceId);
+      if (sessionId.length > 0) {
+        // authority fence：设备身份不符的实时帧一律丢弃，不更新窗口、缓存归属或订阅状态。
+        // 快速 A → B → A 切换时，B 的迟到 push 不得写进 A 的窗口。
+        if (!pushAuthorityAccepted(deviceId,
+          this.subscribed.get(sessionId) ?? '',
+          this.cachedDeviceBySession.get(sessionId) ?? '')) {
+          return;
+        }
+        this.rememberSessionDevice(sessionId, deviceId);
+      }
     }
     switch (channel) {
       case 'local-db:messages:created':

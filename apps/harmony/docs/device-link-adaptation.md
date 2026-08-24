@@ -13,7 +13,7 @@ Harmony 端继续使用当前 Cindy Device Link，不重新设计协议。
 - `apps/mobile/src/device-link/rnWebSocket.ts`
 - `apps/mobile/src/device-link/mobileMakerTransport.ts`
 - `apps/mobile/src/device-link/DeviceLinkContext.tsx`
-- `cindy-protocol/`
+- `packages/device-link-protocol/`
 
 ## 2. Harmony Host Adapter
 
@@ -75,7 +75,7 @@ onError
 
 1. 桌面端是否已有对应能力。
 2. `device-link` allowlist 是否允许。
-3. `cindy-protocol` 是否已有契约。
+3. `packages/device-link-protocol` 是否已有契约。
 4. 是否需要跨端兼容和测试 fixture。
 
 ## 5. 重连不变量

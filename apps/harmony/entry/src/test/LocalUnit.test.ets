@@ -93,8 +93,10 @@ import {
   sessionActivityElapsedMs,
 } from '../main/ets/core/messages/SessionActivityPresentation';
 import {
+  attachmentDisplayName,
   compareTaskListLabels,
   compareTaskSessionsForList,
+  deriveOptimisticSessionTitle,
   resolveTaskRightStatus,
   taskActivityAt,
   taskDisplayTitle,
@@ -146,7 +148,51 @@ import {
   parseQueuedInputItem,
 } from '../main/ets/core/messages/InputQueueStore';
 import { shouldApplyComposerDraftRead } from '../main/ets/core/messages/ComposerDraftStore';
-import { SerializedComposerDocument } from '../main/ets/core/messages/ComposerDocument';
+import {
+  freezeShareProjection,
+  isShareableMessageKind,
+  isShareableRenderType,
+  planShareSegments,
+  SHARE_IMAGE_SAFETY_MARGIN_PX,
+  SHARE_MAX_IMAGE_EDGE_PX,
+  SHARE_MAX_SEGMENTS,
+  shareImageFileName,
+  shareSegmentStartIndices,
+  shareSegmentStartIndicesByHeight,
+} from '../main/ets/core/sharing/ConversationShareProjection';
+import {
+  SHARE_STAGE_FAILED,
+  SHARE_STAGE_IDLE,
+  SHARE_STAGE_PREVIEW,
+  SHARE_STAGE_RENDERING,
+  SHARE_STAGE_SHARING,
+  ShareFlowState,
+  shareFlowBusy,
+} from '../main/ets/core/sharing/ShareResourceLifecycle';
+import {
+  SecurityObservabilityAdapter,
+  SecurityObservabilitySink,
+} from '../main/ets/core/observability/SecurityObservabilityAdapter';
+import {
+  getSystemFontSizeScale,
+  setSystemFontSizeScale,
+  uiScaledMaxWidth,
+} from '../main/ets/components/UiKit';
+import {
+  classifySessionRetention,
+  hasProtectedMessageRow,
+  isProtectedMessageRow,
+  pushAuthorityAccepted,
+  REGULAR_GLOBAL_MESSAGE_BYTES_BUDGET,
+  RetentionCandidate,
+  selectRegularBudgetEvictions,
+  trimMessageWindow,
+} from '../main/ets/core/messages/MessageRetentionPolicy';
+import {
+  projectSlashCommandsInText,
+  SerializedComposerDocument,
+  slashCommandDisplayLabel,
+} from '../main/ets/core/messages/ComposerDocument';
 import {
   extendCoverageEarlier,
   MessageWindowCoverage,
@@ -163,6 +209,9 @@ import {
   DlChannels,
   Envelope,
   expandMakerEventBatchPayload,
+  RECONNECT_CONGESTION_STABLE_RESET_MS,
+  RECONNECT_STABLE_RESET_MS,
+  ReconnectStability,
 } from '../main/ets/core/device-link/DlProtocol';
 import {
   assertInvokeSucceeded,
@@ -177,6 +226,7 @@ import {
   parseModelVisibilityOverrides,
   parseProviderModelOptions,
   reconcileModelEffort,
+  resolveNewSessionDefaultModel,
   selectedPermissionModeLabel,
 } from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
@@ -197,6 +247,7 @@ import {
   messageListItemPresentationState,
   messageListRenderNodeKey,
   shouldAutoLoadEarlier,
+  shouldTakeOverTail,
 } from '../main/ets/pages/TaskScrollState';
 import {
   decideNewSessionRecoveryAction,
@@ -211,6 +262,7 @@ import {
   isHighRiskShellCommand,
   permissionCanAlwaysAllow,
   permissionRiskSummary,
+  permissionAutoReviewUnavailableNotice,
   pendingInteractionsBlockRemoteComposer,
   sessionScopedPermissionSuggestions,
   sortPendingInteractions,
@@ -253,6 +305,24 @@ function planToolResult(id: string, useId: string, text: string): RemoteMessage 
   return message;
 }
 
+function budgetCandidate(
+  sessionId: string,
+  rowCount: number,
+  bytes: number,
+  accessOrder: number,
+  leased: boolean,
+  hasProtectedRows: boolean,
+): RetentionCandidate {
+  const candidate = new RetentionCandidate();
+  candidate.sessionId = sessionId;
+  candidate.rowCount = rowCount;
+  candidate.bytes = bytes;
+  candidate.accessOrder = accessOrder;
+  candidate.leased = leased;
+  candidate.hasProtectedRows = hasProtectedRows;
+  return candidate;
+}
+
 function userBoundary(id: string): RemoteMessage {
   const message = new RemoteMessage();
   message.id = id;
@@ -260,6 +330,31 @@ function userBoundary(id: string): RemoteMessage {
   message.role = 'user';
   message.content = id;
   return message;
+}
+
+/** 观测 sink 测试替身：ArkTS 不允许接口对象字面量，用具名类实现。 */
+class RecordingObservabilitySink implements SecurityObservabilitySink {
+  bound: string[] = [];
+  cleared: number = 0;
+
+  bindUser(userId: string): void {
+    this.bound.push(userId);
+  }
+
+  clearUser(): void {
+    this.cleared += 1;
+  }
+}
+
+/** 始终抛错的 sink：验证观测失败不会影响认证流程。 */
+class ThrowingObservabilitySink implements SecurityObservabilitySink {
+  bindUser(userId: string): void {
+    throw new Error('sdk-failure');
+  }
+
+  clearUser(): void {
+    throw new Error('sdk-failure');
+  }
 }
 
 export default function localUnitTest() {
@@ -299,8 +394,77 @@ export default function localUnitTest() {
       expect(permissionCanAlwaysAllow(request)).assertEqual(false);
     });
 
-    it('usesSessionScopedPermissionSuggestionsAndDecisionSchema', 0, () => {
-      const sessionSuggestion: Record<string, Object> = {};
+    it('projectsPiSkillSlashTokensForDisplayOnly', 0, () => {
+      // 展示 / 复制 / 编辑看到 `/git`，存储与发送保持 `/skill:git`。
+      expect(slashCommandDisplayLabel('/skill:git')).assertEqual('/git');
+      expect(slashCommandDisplayLabel('/SKILL:Git')).assertEqual('/Git');
+      // 普通 slash 命令与用户正文不得被改写。
+      expect(slashCommandDisplayLabel('/learn')).assertEqual('/learn');
+      expect(slashCommandDisplayLabel('/skill:')).assertEqual('/skill:');
+      expect(slashCommandDisplayLabel('/skill: git')).assertEqual('/skill: git');
+      expect(slashCommandDisplayLabel('skill:git')).assertEqual('skill:git');
+
+      // 没有确认区间时正文原样保留：普通散文里的 /skill:foo 不是命令调用。
+      expect(projectSlashCommandsInText('讨论 /skill:foo 的写法', []))
+        .assertEqual('讨论 /skill:foo 的写法');
+
+      // 有确认区间时只投影该区间。
+      const range: Record<string, Object> = {};
+      range['start'] = 0;
+      range['end'] = 10;
+      expect(projectSlashCommandsInText('/skill:git status', [range]))
+        .assertEqual('/git status');
+
+      // 多区间从后往前替换，前面的下标不被长度变化破坏。
+      const first: Record<string, Object> = {};
+      first['start'] = 0;
+      first['end'] = 10;
+      const second: Record<string, Object> = {};
+      second['start'] = 11;
+      second['end'] = 22;
+      expect(projectSlashCommandsInText('/skill:git\n/skill:test', [first, second]))
+        .assertEqual('/git\n/test');
+
+      // 越界与非法区间安全跳过，不抛异常也不截断正文。
+      const bad: Record<string, Object> = {};
+      bad['start'] = 5;
+      bad['end'] = 999;
+      expect(projectSlashCommandsInText('/skill:git', [bad])).assertEqual('/skill:git');
+    });
+
+    it('localizesAutoReviewUnavailablePermissionCardsOnly', 0, () => {
+      // metadata.autoReviewUnavailable 标记的 permission 卡是 Auto-review 故障降级；
+      // 普通 permission、缺标记和其他 kind 都不得出现这句提示。
+      const degraded: Record<string, Object> = {};
+      degraded['kind'] = 'permission';
+      degraded['toolName'] = 'Bash';
+      const metadata: Record<string, Object> = {};
+      metadata['autoReviewUnavailable'] = true;
+      degraded['metadata'] = metadata;
+      expect(permissionAutoReviewUnavailableNotice(degraded))
+        .assertEqual('自动审批没完成，请确认要不要允许这次操作。');
+
+      const ordinary: Record<string, Object> = {};
+      ordinary['kind'] = 'permission';
+      ordinary['toolName'] = 'Bash';
+      expect(permissionAutoReviewUnavailableNotice(ordinary)).assertEqual('');
+
+      // 非 true 的真值不算标记（对齐共享实现的 === true）。
+      const looseMetadata: Record<string, Object> = {};
+      looseMetadata['autoReviewUnavailable'] = 'yes';
+      const loose: Record<string, Object> = {};
+      loose['kind'] = 'permission';
+      loose['metadata'] = looseMetadata;
+      expect(permissionAutoReviewUnavailableNotice(loose)).assertEqual('');
+
+      // Ask User 带同名标记也不显示：这句只解释权限确认卡的来路。
+      const ask: Record<string, Object> = {};
+      ask['kind'] = 'ask_user_question';
+      ask['metadata'] = metadata;
+      expect(permissionAutoReviewUnavailableNotice(ask)).assertEqual('');
+    });
+
+    it('usesSessionScopedPermissionSuggestionsAndDecisionSchema', 0, () => {      const sessionSuggestion: Record<string, Object> = {};
       sessionSuggestion['destination'] = 'session';
       sessionSuggestion['type'] = 'addRules';
       const userSuggestion: Record<string, Object> = {};
@@ -1569,6 +1733,527 @@ export default function localUnitTest() {
       expect(reconciled[1].isStreaming).assertEqual(false);
     });
 
+    it('classifiesRetentionOnlyByAuthoritativeSourceField', 0, () => {
+      // 只认权威 source；标题前缀不得用于猜测 scheduler（对齐 Mobile sessionRetention.ts）。
+      const scheduler = new RemoteSession();
+      scheduler.id = 's-auto';
+      scheduler.source = 'scheduler';
+      expect(classifySessionRetention(scheduler)).assertEqual('schedule');
+
+      const titleOnly = new RemoteSession();
+      titleOnly.id = 's-title';
+      titleOnly.title = '[Schedule] 每日巡检';
+      expect(classifySessionRetention(titleOnly)).assertEqual('regular');
+
+      const manual = new RemoteSession();
+      manual.id = 's-manual';
+      manual.source = 'user';
+      expect(classifySessionRetention(manual)).assertEqual('regular');
+
+      // 快照缺失时保守按普通任务：宁可多驻留，也不能误回收用户任务。
+      expect(classifySessionRetention(undefined)).assertEqual('regular');
+    });
+
+    it('protectsLocalWorkRowsFromMemoryEviction', 0, () => {
+      const persisted = new RemoteMessage();
+      persisted.id = 'db-row-1';
+      expect(isProtectedMessageRow(persisted)).assertEqual(false);
+
+      // 乐观用户消息（尚无服务端 id）、本地系统卡、流式行都不可重取。
+      const optimistic = new RemoteMessage();
+      optimistic.clientId = 'local-1';
+      expect(isProtectedMessageRow(optimistic)).assertEqual(true);
+
+      const systemCard = new RemoteMessage();
+      systemCard.id = 'harmony-system-goal-1';
+      expect(isProtectedMessageRow(systemCard)).assertEqual(true);
+
+      const streaming = new RemoteMessage();
+      streaming.id = 'streaming-assistant-1';
+      expect(isProtectedMessageRow(streaming)).assertEqual(true);
+
+      const localOnly = new RemoteMessage();
+      localOnly.id = 'db-row-2';
+      localOnly.localOnly = true;
+      expect(isProtectedMessageRow(localOnly)).assertEqual(true);
+
+      expect(hasProtectedMessageRow([persisted])).assertEqual(false);
+      expect(hasProtectedMessageRow([persisted, optimistic])).assertEqual(true);
+    });
+
+    it('evictsRegularSessionsByLruOnlyWhenOverGlobalBudget', 0, () => {
+      // 预算内不淘汰任何会话。
+      const small = budgetCandidate('s-small', 100, 1000, 1, false, false);
+      expect(selectRegularBudgetEvictions([small]).length).assertEqual(0);
+
+      // 超行数预算：按 accessOrder 从最旧开始淘汰，直到回到预算内。
+      const oldest = budgetCandidate('s-old', 500, 1000, 1, false, false);
+      const newer = budgetCandidate('s-new', 500, 1000, 2, false, false);
+      const victims = selectRegularBudgetEvictions([newer, oldest]);
+      expect(victims.length).assertEqual(1);
+      expect(victims[0]).assertEqual('s-old');
+
+      // 订阅中（持有工作租约）和含本地保护行的会话整窗跳过，即使最旧。
+      const leased = budgetCandidate('s-leased', 500, 1000, 0, true, false);
+      const guarded = budgetCandidate('s-guarded', 500, 1000, 0, false, true);
+      const evictable = budgetCandidate('s-evictable', 500, 1000, 9, false, false);
+      const protectedVictims = selectRegularBudgetEvictions([leased, guarded, evictable]);
+      expect(protectedVictims.length).assertEqual(1);
+      expect(protectedVictims[0]).assertEqual('s-evictable');
+
+      // 自动化任务不参与普通任务全局预算。
+      const automation = budgetCandidate('s-auto', 5000, 1000, 0, false, false);
+      automation.retention = 'schedule';
+      expect(selectRegularBudgetEvictions([automation, small]).length).assertEqual(0);
+
+      // 字节预算独立生效：行数很少但体积超限时同样淘汰。
+      const heavy = budgetCandidate('s-heavy', 10, REGULAR_GLOBAL_MESSAGE_BYTES_BUDGET, 1, false, false);
+      const light = budgetCandidate('s-light', 10, 4096, 2, false, false);
+      const byteVictims = selectRegularBudgetEvictions([heavy, light]);
+      expect(byteVictims.length).assertEqual(1);
+      expect(byteVictims[0]).assertEqual('s-heavy');
+    });
+
+    it('keepsProtectedRowsWhenTrimmingTheTailWindowAndPreservesOrder', 0, () => {
+      const rows: RemoteMessage[] = [];
+      for (let i = 0; i < 5; i++) {
+        const row = new RemoteMessage();
+        row.id = `db-${i}`;
+        rows.push(row);
+      }
+      // 中间插一条乐观消息：裁剪后必须保留，且相对顺序不变。
+      const optimistic = new RemoteMessage();
+      optimistic.clientId = 'pending-send';
+      rows.splice(2, 0, optimistic);
+
+      const trimmed = trimMessageWindow(rows, 3);
+      expect(trimmed.length).assertEqual(3);
+      // 保护行保留 + 最新的两条服务端行。
+      expect(trimmed[0].clientId).assertEqual('pending-send');
+      expect(trimmed[1].id).assertEqual('db-3');
+      expect(trimmed[2].id).assertEqual('db-4');
+
+      // 未超限时原样返回副本。
+      expect(trimMessageWindow(rows, 99).length).assertEqual(rows.length);
+
+      // 保护行多于上限时允许略超：数据安全优先于精确条数。
+      const allProtected: RemoteMessage[] = [];
+      for (let i = 0; i < 4; i++) {
+        const row = new RemoteMessage();
+        row.id = `streaming-${i}`;
+        allProtected.push(row);
+      }
+      expect(trimMessageWindow(allProtected, 2).length).assertEqual(4);
+    });
+
+    it('rejectsRealtimePushFromAForeignDevice', 0, () => {
+      // 未归属会话的首个 push 可接受（push 可能早于历史加载）。
+      expect(pushAuthorityAccepted('device-a', '', '')).assertEqual(true);
+      // 订阅设备优先：迟到的 B 帧不得写进当前订阅 A 的窗口。
+      expect(pushAuthorityAccepted('device-a', 'device-a', 'device-a')).assertEqual(true);
+      expect(pushAuthorityAccepted('device-b', 'device-a', 'device-a')).assertEqual(false);
+      // 无订阅但有缓存归属：后台会话仍接收自己设备的更新，拒绝其它设备。
+      expect(pushAuthorityAccepted('device-a', '', 'device-a')).assertEqual(true);
+      expect(pushAuthorityAccepted('device-b', '', 'device-a')).assertEqual(false);
+      // 无法归因的帧一律丢弃。
+      expect(pushAuthorityAccepted('', 'device-a', 'device-a')).assertEqual(false);
+    });
+
+    it('dropsForeignDevicePushInsteadOfWritingTheCurrentWindow', 0, () => {
+      const store = new MessageStore();
+      const own: Record<string, Object> = {};
+      own['id'] = 'row-a';
+      own['clientId'] = 'row-a';
+      own['role'] = 'assistant';
+      own['content'] = 'A 设备的内容';
+      const ownPush: Record<string, Object> = {};
+      ownPush['sessionId'] = 'fence-session';
+      ownPush['message'] = own;
+      store.handleSessionPush('device-a', 'local-db:messages:created', ownPush);
+      expect(store.getMessages('fence-session').length).assertEqual(1);
+
+      // 另一台设备的帧携带同一 sessionId：必须被丢弃，不得进入窗口。
+      const foreign: Record<string, Object> = {};
+      foreign['id'] = 'row-b';
+      foreign['clientId'] = 'row-b';
+      foreign['role'] = 'assistant';
+      foreign['content'] = 'B 设备的内容';
+      const foreignPush: Record<string, Object> = {};
+      foreignPush['sessionId'] = 'fence-session';
+      foreignPush['message'] = foreign;
+      store.handleSessionPush('device-b', 'local-db:messages:created', foreignPush);
+
+      const rows = store.getMessages('fence-session');
+      expect(rows.length).assertEqual(1);
+      expect(rows[0].id).assertEqual('row-a');
+    });
+
+    it('compactsTheTailWindowOnLeaveWithoutDroppingLocalWork', 0, async () => {
+      const store = new MessageStore();
+      const sessionId = 'compact-session';
+      // 120 条已落库行 + 1 条乐观消息：离开后压回 80 行尾窗，乐观消息必须保留。
+      for (let i = 0; i < 120; i++) {
+        const row: Record<string, Object> = {};
+        row['id'] = `db-${i}`;
+        row['clientId'] = `db-${i}`;
+        row['role'] = 'assistant';
+        row['content'] = `第 ${i} 条`;
+        row['createdAt'] = `2026-08-20T10:${(i % 60).toString().padStart(2, '0')}:00.000Z`;
+        const push: Record<string, Object> = {};
+        push['sessionId'] = sessionId;
+        push['message'] = row;
+        store.handleSessionPush('device-a', 'local-db:messages:created', push);
+      }
+      expect(store.getMessages(sessionId).length).assertEqual(120);
+
+      await store.closeSession(sessionId);
+      const kept = store.getMessages(sessionId);
+      // 压回默认尾窗，不再保留全部已上翻历史。
+      expect(kept.length).assertEqual(80);
+      // 保留的是最新的一段，且仍可从权威历史继续回填。
+      expect(kept[kept.length - 1].id).assertEqual('db-119');
+      expect(store.hasMore(sessionId)).assertEqual(true);
+    });
+
+    it('degradesSecurityObservabilitySafelyAndNeverBlocksAuth', 0, () => {
+      const adapter = new SecurityObservabilityAdapter();
+      // 缺 SDK：所有调用都是安全 no-op，不抛异常、不阻断登录与退出。
+      expect(adapter.isActive()).assertEqual(false);
+      adapter.bindUser('user-1');
+      adapter.clearUser();
+      expect(adapter.isActive()).assertEqual(false);
+
+      const sink = new RecordingObservabilitySink();
+      const bound = sink.bound;
+
+      // SDK 存在但当前区域不启用：仍然不上报。
+      adapter.configure(sink, false);
+      expect(adapter.isActive()).assertEqual(false);
+      adapter.bindUser('user-1');
+      expect(bound.length).assertEqual(0);
+
+      // 启用后正常绑定；两端空白会被裁掉。
+      adapter.configure(sink, true);
+      expect(adapter.isActive()).assertEqual(true);
+      adapter.bindUser('  user-1  ');
+      expect(bound.length).assertEqual(1);
+      expect(bound[0]).assertEqual('user-1');
+
+      // 空 userId 等价于清空，避免把空串当合法身份写进去。
+      adapter.bindUser('   ');
+      expect(sink.cleared).assertEqual(1);
+      expect(bound.length).assertEqual(1);
+
+      // 登出清空。
+      adapter.clearUser();
+      expect(sink.cleared).assertEqual(2);
+
+      // sink 抛异常时必须吞掉：观测失败不能影响认证流程。
+      adapter.configure(new ThrowingObservabilitySink(), true);
+      adapter.bindUser('user-2');
+      adapter.clearUser();
+      expect(adapter.isActive()).assertEqual(true);
+    });
+
+    it('splitsShareSegmentsIdenticallyForPreviewAndExport', 0, () => {
+      // 单段：全部内容一张图。
+      expect(shareSegmentStartIndices(5, 1).length).assertEqual(1);
+      expect(shareSegmentStartIndices(5, 1)[0]).assertEqual(0);
+
+      // 均分：10 项分 2 段 → [0, 5]。
+      const two = shareSegmentStartIndices(10, 2);
+      expect(two.length).assertEqual(2);
+      expect(two[0]).assertEqual(0);
+      expect(two[1]).assertEqual(5);
+
+      // 不能整除时向上取整，最后一段更短，且不产生空段。
+      const three = shareSegmentStartIndices(7, 3);
+      expect(three.length).assertEqual(3);
+      expect(three[0]).assertEqual(0);
+      expect(three[1]).assertEqual(3);
+      expect(three[2]).assertEqual(6);
+
+      // 段数大于项数时不产生超出项数的起点（否则预览会多出空白图）。
+      const sparse = shareSegmentStartIndices(2, 5);
+      expect(sparse.length).assertEqual(2);
+      expect(sparse[1]).assertEqual(1);
+
+      // 边界输入安全返回空。
+      expect(shareSegmentStartIndices(0, 3).length).assertEqual(0);
+      expect(shareSegmentStartIndices(5, 0).length).assertEqual(0);
+    });
+
+    it('packsMeasuredShareItemsWithoutClippingLongCards', 0, () => {
+      // 每段 100px，垂直 padding 10px、项间距 5px：前两项刚好同段，第三项另起。
+      const starts = shareSegmentStartIndicesByHeight([30, 40, 45], 100, 10, 5);
+      expect(starts.length).assertEqual(2);
+      expect(starts[0]).assertEqual(0);
+      expect(starts[1]).assertEqual(2);
+
+      // 单卡连同上下 padding 已超过上限时必须显式失败，不能让 builder 静默裁正文。
+      expect(shareSegmentStartIndicesByHeight([81], 100, 10, 5).length).assertEqual(0);
+      // 尾部“仅包含当前展开内容”提示也必须计入最后一段预算。
+      expect(shareSegmentStartIndicesByHeight([70], 100, 10, 5, 11).length).assertEqual(0);
+      expect(shareSegmentStartIndicesByHeight([0], 100, 10, 5).length).assertEqual(0);
+    });
+
+    it('releasesShareResourcesOnEveryExitPathIdempotently', 0, () => {
+      const flow = new ShareFlowState();
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_IDLE);
+      expect(shareFlowBusy(SHARE_STAGE_IDLE)).assertEqual(false);
+
+      const generation = flow.begin();
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_RENDERING);
+      expect(shareFlowBusy(flow.currentStage())).assertEqual(true);
+      flow.resources().noteBitmap('bitmap-1');
+      flow.resources().noteFile('/cache/a.png');
+      flow.resources().notePanelSubscribed(true);
+      // 同一句柄重复登记不产生重复释放。
+      flow.resources().noteBitmap('bitmap-1');
+      expect(flow.resources().pendingBitmaps().length).assertEqual(1);
+
+      expect(flow.settlePreview(generation)).assertEqual(true);
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_PREVIEW);
+
+      // 取消：交出全部资源，并推进代次让在途结果作废。
+      const release = flow.finish();
+      expect(release.bitmaps.length).assertEqual(1);
+      expect(release.files[0]).assertEqual('/cache/a.png');
+      expect(release.unsubscribePanel).assertEqual(true);
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_IDLE);
+      expect(flow.isCurrent(generation)).assertEqual(false);
+
+      // 幂等：重复结束不再返回资源，也不会二次释放。
+      expect(flow.finish().isEmpty()).assertEqual(true);
+      expect(flow.resources().isEmpty()).assertEqual(true);
+
+      // 过期代次的异步结果不得推进状态。
+      expect(flow.settlePreview(generation)).assertEqual(false);
+      expect(flow.settleSharing(generation)).assertEqual(false);
+      expect(flow.fail(generation, 'stale').isEmpty()).assertEqual(true);
+    });
+
+    it('keepsShareErrorForRetryAndGuardsStageOrder', 0, () => {
+      const flow = new ShareFlowState();
+      const generation = flow.begin();
+      flow.resources().noteFile('/cache/partial.png');
+
+      // 失败：释放资源但保留错误信息供重试入口显示。
+      const release = flow.fail(generation, '截图尺寸超出设备上限');
+      expect(release.files.length).assertEqual(1);
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_FAILED);
+      expect(flow.error()).assertEqual('截图尺寸超出设备上限');
+      expect(shareFlowBusy(SHARE_STAGE_FAILED)).assertEqual(false);
+
+      // 重试是新一轮：代次推进、错误清空。
+      const retry = flow.begin();
+      expect(retry === generation).assertEqual(false);
+      expect(flow.error()).assertEqual('');
+
+      // 未经预览不得直接进入分享阶段。
+      expect(flow.settleSharing(retry)).assertEqual(false);
+      expect(flow.settlePreview(retry)).assertEqual(true);
+      expect(flow.settleSharing(retry)).assertEqual(true);
+      expect(flow.currentStage()).assertEqual(SHARE_STAGE_SHARING);
+      expect(shareFlowBusy(flow.currentStage())).assertEqual(true);
+    });
+
+    it('freezesShareProjectionToWhatTheUserCanActuallySee', 0, () => {
+      const user = new RenderMessageItem();
+      user.type = 'message';
+      user.key = 'm-user';
+      user.kind = 'user';
+      user.body = '第一行\n第二行\n第三行\n第四行';
+
+      const answer = new RenderMessageItem();
+      answer.type = 'message';
+      answer.key = 'm-answer';
+      answer.kind = 'assistant';
+      answer.body = '这是回复正文';
+
+      // 合成输入不进导出。
+      const hidden = new RenderMessageItem();
+      hidden.type = 'message';
+      hidden.key = 'm-hidden';
+      hidden.kind = 'user';
+      hidden.body = '合成触发';
+      hidden.hidden = true;
+
+      // 错误消息含内部详情，不导出。
+      const errorRow = new RenderMessageItem();
+      errorRow.type = 'message';
+      errorRow.key = 'm-error';
+      errorRow.kind = 'error';
+      errorRow.body = '/Users/someone/secret/path 失败';
+
+      const collapsedWork = new RenderWorkGroupItem();
+      collapsedWork.type = 'work_group';
+      collapsedWork.key = 'w-collapsed';
+
+      const expandedWork = new RenderWorkGroupItem();
+      expandedWork.type = 'work_group';
+      expandedWork.key = 'w-expanded';
+      const workChild = new RenderMessageItem();
+      workChild.type = 'message';
+      workChild.kind = 'assistant';
+      workChild.body = '已读取配置文件';
+      expandedWork.children = [workChild];
+
+      const expanded = new Set<string>();
+      expanded.add('w-expanded');
+      const projection = freezeShareProjection(
+        [user, answer, hidden, errorRow, collapsedWork, expandedWork], expanded, 2);
+
+      const keys: string[] = [];
+      for (let i = 0; i < projection.items.length; i++) keys.push(projection.items[i].key);
+      // 只保留可见的用户消息、正文和已展开的工作内容。
+      expect(keys.join(',')).assertEqual('m-user,m-answer,w-expanded');
+      // 折叠的用户正文按可见行截断，并标记有内容被省略。
+      expect(projection.items[0].text).assertEqual('第一行\n第二行');
+      expect(projection.omittedCollapsedContent).assertEqual(true);
+      expect(projection.items[2].text).assertEqual('已读取配置文件');
+
+      // 未折叠、未展开任何内容时不误报省略。
+      const clean = freezeShareProjection([answer], new Set<string>(), 10);
+      expect(clean.items.length).assertEqual(1);
+      expect(clean.omittedCollapsedContent).assertEqual(false);
+
+      // 页面传入的视觉行/粘贴 chip 可见投影优先，隐藏正文不得进入分享图。
+      const visibleOverrides = new Map<string, string>();
+      visibleOverrides.set('m-user', '第一行…');
+      const overridden = freezeShareProjection(
+        [user], new Set<string>(), 10, visibleOverrides);
+      expect(overridden.items[0].text).assertEqual('第一行…');
+      expect(overridden.omittedCollapsedContent).assertEqual(true);
+
+      const emptySystem = new RenderMessageItem();
+      emptySystem.type = 'message';
+      emptySystem.key = 'empty-system';
+      emptySystem.kind = 'system';
+      emptySystem.body = '   ';
+      expect(freezeShareProjection([emptySystem], new Set<string>(), 10).items.length)
+        .assertEqual(0);
+
+      // 交互类与队列类渲染项一律不可分享。
+      expect(isShareableRenderType('permission')).assertEqual(false);
+      expect(isShareableRenderType('todo')).assertEqual(false);
+      expect(isShareableRenderType('message')).assertEqual(true);
+      expect(isShareableMessageKind('error')).assertEqual(false);
+    });
+
+    it('plansShareSegmentsWithoutAnUnboundedCanvas', 0, () => {
+      const usable = SHARE_MAX_IMAGE_EDGE_PX - SHARE_IMAGE_SAFETY_MARGIN_PX;
+      // 短会话一张图。
+      const short = planShareSegments(1200, 1080);
+      expect(short.segments).assertEqual(1);
+      expect(short.requiresNarrowing).assertEqual(false);
+
+      // 刚好一段与略超一段的边界。
+      expect(planShareSegments(usable, 1080).segments).assertEqual(1);
+      expect(planShareSegments(usable + 1, 1080).segments).assertEqual(2);
+
+      // 超长会话分多图，但不得超过上限张数。
+      const long = planShareSegments(usable * SHARE_MAX_SEGMENTS, 1080);
+      expect(long.segments).assertEqual(SHARE_MAX_SEGMENTS);
+      expect(long.requiresNarrowing).assertEqual(false);
+
+      // 再长就必须提示用户缩小范围，绝不生成无上限画布。
+      const tooLong = planShareSegments(usable * SHARE_MAX_SEGMENTS + 1, 1080);
+      expect(tooLong.requiresNarrowing).assertEqual(true);
+      expect(tooLong.segments).assertEqual(0);
+
+      // 宽度本身超出纹理上限时无法靠分段解决。
+      const tooWide = planShareSegments(1000, SHARE_MAX_IMAGE_EDGE_PX + 1);
+      expect(tooWide.requiresNarrowing).assertEqual(true);
+      expect(tooWide.segments).assertEqual(0);
+
+      // 空内容不导出。
+      expect(planShareSegments(0, 1080).segments).assertEqual(0);
+
+      // API 26 返回的设备上限低于保守常量时，以真实设备限制规划。
+      const deviceLimited = planShareSegments(1800, 600, 2048, 1024);
+      expect(deviceLimited.segments).assertEqual(3);
+      expect(deviceLimited.segmentHeightPx).assertEqual(1024 - SHARE_IMAGE_SAFETY_MARGIN_PX);
+      expect(deviceLimited.snapshotHeightLimitPx).assertEqual(1024);
+    });
+
+    it('keepsSharedFileNamesFreeOfTitlesAndPaths', 0, () => {
+      const name = shareImageFileName(2, 1787220000000);
+      expect(name).assertEqual('cindy-conversation-1787220000000-2.png');
+      // 非法序号 / 时间戳安全兜底，且不含任何标题、目录或用户标识。
+      expect(shareImageFileName(0, 0)).assertEqual('cindy-conversation-0-1.png');
+      expect(name.indexOf('/')).assertEqual(-1);
+      expect(name.indexOf('Users')).assertEqual(-1);
+    });
+
+    it('growsModelMetaWidthWithSystemFontScaleWithinCap', 0, () => {
+      // 默认（未放大）保持既有布局上限。
+      setSystemFontSizeScale(1);
+      expect(uiScaledMaxWidth(176, 264)).assertEqual(176);
+      expect(getSystemFontSizeScale()).assertEqual(1);
+
+      // 放大字号时容器跟着长，避免模型名 / 强度被截成省略号。
+      setSystemFontSizeScale(1.3);
+      expect(uiScaledMaxWidth(176, 264)).assertEqual(229);
+
+      // 超大字号被 cap 兜住，不挤占同排其它控件。
+      setSystemFontSizeScale(3.2);
+      expect(uiScaledMaxWidth(176, 264)).assertEqual(264);
+
+      // 缩小字号不得让容器比基准更窄。
+      setSystemFontSizeScale(0.7);
+      expect(uiScaledMaxWidth(176, 264)).assertEqual(176);
+
+      // 非法值安全退回 1，不改变布局。
+      setSystemFontSizeScale(0);
+      expect(getSystemFontSizeScale()).assertEqual(1);
+      setSystemFontSizeScale(undefined);
+      expect(getSystemFontSizeScale()).assertEqual(1);
+      expect(uiScaledMaxWidth(176, 264)).assertEqual(176);
+    });
+
+    it('derivesOptimisticTitlesForAttachmentOnlyFirstMessages', 0, () => {
+      // 有文字时用原文归一化，附件不参与。
+      expect(deriveOptimisticSessionTitle('修一下登录问题', ['a.png'], true))
+        .assertEqual('修一下登录问题');
+      // 文字仅含空白视为无文字，退到附件展示名。
+      expect(deriveOptimisticSessionTitle('   \n  ', ['report.pdf'], false))
+        .assertEqual('report.pdf');
+
+      // 纯图片：使用第一张图片的展示名。
+      expect(deriveOptimisticSessionTitle('', ['screenshot.png'], true))
+        .assertEqual('screenshot.png');
+      // 纯文件：使用安全展示名，必须去掉任何路径前缀，不泄漏目录结构。
+      expect(deriveOptimisticSessionTitle('', ['/Users/someone/secret/报表.xlsx'], false))
+        .assertEqual('报表.xlsx');
+      expect(deriveOptimisticSessionTitle('', ['C:\\Users\\me\\notes.txt'], false))
+        .assertEqual('notes.txt');
+      expect(attachmentDisplayName('/a/b/c.png')).assertEqual('c.png');
+
+      // 附件没有可用文件名时退到本地化类别词。
+      expect(deriveOptimisticSessionTitle('', [], true)).assertEqual('图片消息');
+      expect(deriveOptimisticSessionTitle('', ['   '], false)).assertEqual('文件消息');
+
+      // 完全没有素材时返回空串，由 taskDisplayTitle 落到「未命名任务」。
+      expect(deriveOptimisticSessionTitle('', [], false)).assertEqual('');
+      const untitled = new RemoteSession();
+      untitled.title = '';
+      expect(taskDisplayTitle(untitled)).assertEqual('未命名任务');
+
+      // 超长文字按 40 字截断，与被控端自动起名逐字一致。
+      const long = 'あ'.repeat(60);
+      expect(deriveOptimisticSessionTitle(long, [], false).length).assertEqual(40);
+    });
+
+    it('takesOverTailOnAcceptedSendButNotOnPlainPush', 0, () => {
+      // 用户主动发送被接受：即使正在阅读历史也必须接管尾部回到底部。
+      expect(shouldTakeOverTail(true, false)).assertEqual(true);
+      expect(shouldTakeOverTail(true, true)).assertEqual(true);
+      // 收到新 push 不得无条件抢回阅读位置：只有本就贴底才继续跟随。
+      expect(shouldTakeOverTail(false, true)).assertEqual(true);
+      expect(shouldTakeOverTail(false, false)).assertEqual(false);
+    });
+
     it('formatsTheComposerActivityClockLikeIos', 0, () => {
       expect(sessionActivityElapsedMs(10_999, 10_000)).assertEqual(999);
       expect(sessionActivityElapsedMs(9_000, 10_000)).assertEqual(0);
@@ -1601,7 +2286,7 @@ export default function localUnitTest() {
       const push: Record<string, Object> = {};
       push['sessionId'] = 'persist-session';
       push['message'] = oldMessage;
-      store.handleSessionPush('', 'local-db:messages:created', push);
+      store.handleSessionPush('device-1', 'local-db:messages:created', push);
 
       const rows = store.getMessagesWithStreaming('persist-session');
       expect(rows.some((row: RemoteMessage) => row.id === 'persist-1'
@@ -1648,7 +2333,7 @@ export default function localUnitTest() {
       const push: Record<string, Object> = {};
       push['sessionId'] = 'same-session';
       push['message'] = persistedMessage;
-      store.handleSessionPush('', 'local-db:messages:created', push);
+      store.handleSessionPush('device-1', 'local-db:messages:created', push);
 
       const resultData: Record<string, Object> = {};
       resultData['toolUseId'] = 'same-use';
@@ -1727,7 +2412,7 @@ export default function localUnitTest() {
       const push: Record<string, Object> = {};
       push['sessionId'] = 'late-plan-session';
       push['message'] = staleMessage;
-      store.handleSessionPush('', 'local-db:messages:created', push);
+      store.handleSessionPush('device-1', 'local-db:messages:created', push);
 
       const rows = store.getMessages('late-plan-session');
       const planRow = rows.find((row: RemoteMessage) =>
@@ -1786,8 +2471,98 @@ export default function localUnitTest() {
       expect(insertions.get(3)?.todos[0].status).assertEqual('completed');
     });
 
-    it('keepsPlanOwnershipAcrossSteerAndSyntheticRows', 0, () => {
-      const step: Record<string, Object> = {};
+    it('anchorsCompletedWorkDurationToTheTurnUserMessage', 0, () => {
+      // 用户 10:00:00 发送，首个动作 10:00:08 才出现，正文 10:00:20 收口。
+      // 时长必须含发送后的 8 秒等待（20s），不能从首个动作起算（12s）。
+      const user = new RemoteMessage();
+      user.id = 'turn-user';
+      user.clientId = 'turn-user';
+      user.role = 'user';
+      user.content = '请修复登录问题';
+      user.createdAt = '2026-08-20T10:00:00.000Z';
+
+      const toolInput: Record<string, Object> = {};
+      toolInput['command'] = 'git status';
+      const tool = planToolMessage('turn-tool', 'Bash', toolInput, 'turn-tool-use');
+      tool.createdAt = '2026-08-20T10:00:08.000Z';
+
+      const answer = new RemoteMessage();
+      answer.id = 'turn-answer';
+      answer.clientId = 'turn-answer';
+      answer.role = 'assistant';
+      answer.content = '已经修复登录问题，原因是 token 过期未刷新。';
+      answer.createdAt = '2026-08-20T10:00:20.000Z';
+      answer.turnCompleted = true;
+
+      const items = buildRenderItems([user, tool, answer], false);
+      let work: RenderWorkGroupItem | undefined = undefined;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type === 'work_group') work = items[i] as RenderWorkGroupItem;
+      }
+      expect(work !== undefined).assertEqual(true);
+      expect(work?.startedAtMs).assertEqual(Date.parse('2026-08-20T10:00:00.000Z'));
+      expect(work?.durationMs).assertEqual(20000);
+    });
+
+    it('fallsBackToFirstActivityWhenTheTurnBoundaryIsMissing', 0, () => {
+      // 窗口截断：本轮用户消息不在窗口内，退回首个动作时间，不得凭空造出时长。
+      const toolInput: Record<string, Object> = {};
+      toolInput['command'] = 'git log';
+      const tool = planToolMessage('orphan-tool', 'Bash', toolInput, 'orphan-tool-use');
+      tool.createdAt = '2026-08-20T11:00:05.000Z';
+
+      const answer = new RemoteMessage();
+      answer.id = 'orphan-answer';
+      answer.clientId = 'orphan-answer';
+      answer.role = 'assistant';
+      answer.content = '这是窗口截断后的第一段正文，内容足够长以便作为交付正文。';
+      answer.createdAt = '2026-08-20T11:00:11.000Z';
+      answer.turnCompleted = true;
+
+      const items = buildRenderItems([tool, answer], false);
+      let work: RenderWorkGroupItem | undefined = undefined;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type === 'work_group') work = items[i] as RenderWorkGroupItem;
+      }
+      expect(work !== undefined).assertEqual(true);
+      expect(work?.startedAtMs).assertEqual(Date.parse('2026-08-20T11:00:05.000Z'));
+      expect(work?.durationMs).assertEqual(6000);
+    });
+
+    it('anchorsPlanOwnershipToTheSessionBoundaryNotItsMovingTail', 0, () => {
+      // 回归：TaskUpdate 命中已有任务是同一份清单的合法续写，会把 session 的 lastIndex
+      // 推到用户边界之后，但不得搬动所有权锚点。若用可变的 lastIndex 比较边界，
+      // 后续 TaskCreate 会被吞进上一轮，长期未完成项持续吸走跨阶段的新任务。
+      const createInput: Record<string, Object> = {};
+      createInput['taskId'] = '1';
+      createInput['subject'] = '上一轮长期任务';
+      const create = planToolMessage('task-create-old', 'TaskCreate', createInput, 'use-create-old');
+
+      const boundary = userBoundary('user-new-topic');
+
+      // 新用户消息之后更新旧任务：exception 命中，session 继续，lastIndex 越过边界。
+      const updateInput: Record<string, Object> = {};
+      updateInput['taskId'] = '1';
+      updateInput['status'] = 'in_progress';
+      const update = planToolMessage('task-update-old', 'TaskUpdate', updateInput, 'use-update-old');
+
+      // 新一轮的新任务：必须另起 session，不得续写上一轮。
+      const newCreateInput: Record<string, Object> = {};
+      newCreateInput['taskId'] = '2';
+      newCreateInput['subject'] = '新一轮任务';
+      const newCreate = planToolMessage('task-create-new', 'TaskCreate', newCreateInput, 'use-create-new');
+
+      const insertions = findTodoPlanInsertions([create, boundary, update, newCreate]);
+      expect(insertions.size).assertEqual(2);
+      // 上一轮 session 收在越过边界的那次合法续写上。
+      expect(insertions.get(2)?.key).assertEqual('todo-task-create-old');
+      // 新任务另起 session，且只含自己的条目，没有把旧任务拼进来。
+      expect(insertions.get(3)?.key).assertEqual('todo-task-create-new');
+      expect(insertions.get(3)?.todos.length).assertEqual(1);
+      expect(insertions.get(3)?.todos[0].content).assertEqual('新一轮任务');
+    });
+
+    it('keepsPlanOwnershipAcrossSteerAndSyntheticRows', 0, () => {      const step: Record<string, Object> = {};
       step['step'] = '继续执行';
       step['status'] = 'in_progress';
       const input: Record<string, Object> = {};
@@ -1990,6 +2765,79 @@ export default function localUnitTest() {
       const appended = appendAutoResumePendingMessage([second], pending);
       expect(appended.length).assertEqual(2);
       expect(appended[1].systemCardData['live']).assertEqual(true);
+    });
+
+    it('keepsCongestionCooldownAcrossShortReconnectsUntilTheLongStableWindow', 0, () => {
+      const s = new ReconnectStability();
+      const NORMAL = RECONNECT_STABLE_RESET_MS;
+      const CONGESTION = RECONNECT_CONGESTION_STABLE_RESET_MS;
+      expect(CONGESTION).assertEqual(900000);
+
+      // 首次 1013：streak 累计，退避走拥塞下限。
+      s.noteClosed(1013);
+      expect(s.getCongestionStreak()).assertEqual(1);
+      expect(s.nextReconnectDelayMs(1)).assertEqual(5000);
+
+      // 短暂连接成功（只稳定 12 秒）：清普通退避，但**不得**清拥塞历史。
+      s.noteOnline(0);
+      let generation = s.getGeneration();
+      expect(s.settleNormalWindow(generation, NORMAL)).assertEqual(true);
+      expect(s.getAttempt()).assertEqual(0);
+      expect(s.settleCongestionWindow(generation, 12000)).assertEqual(false);
+      expect(s.getCongestionStreak()).assertEqual(1);
+
+      // 再次 1013：按同一拥塞期继续累计并延长冷却。
+      s.noteClosed(1013);
+      expect(s.getCongestionStreak()).assertEqual(2);
+      expect(s.nextReconnectDelayMs(1)).assertEqual(10000);
+
+      // 连续稳定满 15 分钟后才清除 streak，随后不再吃拥塞下限。
+      s.noteOnline(100000);
+      generation = s.getGeneration();
+      expect(s.settleCongestionWindow(generation, 100000 + CONGESTION - 1)).assertEqual(false);
+      expect(s.settleCongestionWindow(generation, 100000 + CONGESTION)).assertEqual(true);
+      expect(s.getCongestionStreak()).assertEqual(0);
+      // 上一次成功只清了普通退避一次，attempt 此刻为 1 → 2^1 * 1000 = 2000，
+      // 已回到普通指数退避（不再是 5000/10000 的拥塞下限）。
+      expect(s.getAttempt()).assertEqual(1);
+      expect(s.nextReconnectDelayMs(1)).assertEqual(2000);
+      // 再稳定满普通窗即回到初始策略。
+      s.noteOnline(200000);
+      expect(s.settleNormalWindow(s.getGeneration(), 200000 + NORMAL)).assertEqual(true);
+      expect(s.nextReconnectDelayMs(1)).assertEqual(1000);
+    });
+
+    it('ignoresStaleStabilityWindowsAndNonCongestionCloses', 0, () => {
+      const s = new ReconnectStability();
+      const CONGESTION = RECONNECT_CONGESTION_STABLE_RESET_MS;
+
+      // 非 1013 关闭不得伪装成拥塞：正常关闭、鉴权失败、网络切换都只走普通退避。
+      s.noteClosed(1000);
+      s.noteClosed(1006);
+      s.noteClosed(4401);
+      expect(s.getCongestionStreak()).assertEqual(0);
+
+      // 计时器竞态：登记稳定窗后连接断开，旧代次的结算必须作废，
+      // 不能在新连接上清掉当前退避或拥塞状态。
+      s.noteClosed(1013);
+      s.noteOnline(0);
+      const staleGeneration = s.getGeneration();
+      s.noteClosed(1013);
+      expect(s.getCongestionStreak()).assertEqual(2);
+      expect(s.settleCongestionWindow(staleGeneration, CONGESTION * 10)).assertEqual(false);
+      expect(s.settleNormalWindow(staleGeneration, CONGESTION * 10)).assertEqual(false);
+      expect(s.getCongestionStreak()).assertEqual(2);
+
+      // 当前代次但尚未在线（仍在重连中）：稳定窗不得结算。
+      const current = s.getGeneration();
+      expect(s.settleCongestionWindow(current, CONGESTION * 10)).assertEqual(false);
+
+      // 显式重置推进代次并清空两项状态，旧计时器随之失效。
+      s.noteOnline(0);
+      const beforeReset = s.getGeneration();
+      s.reset();
+      expect(s.getCongestionStreak()).assertEqual(0);
+      expect(s.settleNormalWindow(beforeReset, CONGESTION)).assertEqual(false);
     });
 
     it('appliesCongestionBackoffAndExpandsMakerEventBatches', 0, () => {
@@ -2796,6 +3644,83 @@ export default function localUnitTest() {
       rawNoEffortModel['id'] = 'model-b';
       const noEffortModel = parseModelOptions([rawNoEffortModel])[0];
       expect(reconcileModelEffort(noEffortModel, 'high')).assertEqual('');
+    });
+
+    it('resolvesRemoteNewSessionDefaultModelPerAgentAndKeepsProviderIdentity', 0, () => {
+      // 远端 v3 标记：只认当前 agent 的标记，按 sortOrder 取第一个，
+      // 并保留候选原始 provider 身份（同名模型不得跨 provider 合并）。
+      const piModel: Record<string, Object> = {};
+      piModel['id'] = 'shared-model';
+      piModel['name'] = 'Shared Model';
+      piModel['newSessionDefault'] = ['pi'];
+      piModel['sortOrder'] = 20;
+      const piModels: Record<string, Object> = {};
+      piModels['pi'] = [piModel];
+      const piProvider: Record<string, Object> = {};
+      piProvider['id'] = 'provider-pi';
+      piProvider['name'] = 'Pi Provider';
+      piProvider['connected'] = true;
+      piProvider['agents'] = ['pi'];
+      piProvider['models'] = piModels;
+
+      // 同 id、更小 sortOrder，但只标记给 claude-code：不得被 pi 选中。
+      const ccModel: Record<string, Object> = {};
+      ccModel['id'] = 'shared-model';
+      ccModel['name'] = 'Shared Model';
+      ccModel['newSessionDefault'] = ['claude-code'];
+      ccModel['sortOrder'] = 1;
+      const ccModels: Record<string, Object> = {};
+      ccModels['pi'] = [ccModel];
+      const ccProvider: Record<string, Object> = {};
+      ccProvider['id'] = 'provider-cc';
+      ccProvider['name'] = 'CC Provider';
+      ccProvider['connected'] = true;
+      ccProvider['agents'] = ['pi'];
+      ccProvider['models'] = ccModels;
+
+      const response: Record<string, Object> = {};
+      response['providers'] = [ccProvider, piProvider];
+      const options = parseProviderModelOptions(
+        response, 'pi', new Map<string, boolean>(), undefined);
+      expect(options.length).assertEqual(2);
+
+      const resolved = resolveNewSessionDefaultModel(options, 'pi');
+      expect(resolved !== null).assertEqual(true);
+      expect(resolved?.id).assertEqual('shared-model');
+      // 保留 provider 身份：选中的是标了 pi 的那一行，而不是 sortOrder 更小的 cc 行。
+      expect(resolved?.providerId).assertEqual('provider-pi');
+
+      // 没有任何标记时返回 null，由调用方保留当前稳定默认值。
+      expect(resolveNewSessionDefaultModel(options, 'codex')).assertEqual(null);
+      expect(resolveNewSessionDefaultModel(options, '')).assertEqual(null);
+    });
+
+    it('ignoresDisabledAndMalformedNewSessionDefaultMarkers', 0, () => {
+      // defaultEnabled=false 的模型不作为默认种子；非法标记整项忽略但不整表失败。
+      const disabled: Record<string, Object> = {};
+      disabled['id'] = 'disabled-default';
+      disabled['newSessionDefault'] = ['pi'];
+      disabled['defaultEnabled'] = false;
+      const malformed: Record<string, Object> = {};
+      malformed['id'] = 'malformed-default';
+      malformed['newSessionDefault'] = 'pi';
+      const numeric: Record<string, Object> = {};
+      numeric['id'] = 'numeric-default';
+      numeric['newSessionDefault'] = [7];
+
+      const parsed = parseModelOptions([disabled, malformed, numeric]);
+      expect(parsed.length).assertEqual(3);
+      expect(resolveNewSessionDefaultModel(parsed, 'pi')).assertEqual(null);
+
+      // 缺省 sortOrder 的已标记模型仍可被选中，并按目录顺序取第一个。
+      const first: Record<string, Object> = {};
+      first['id'] = 'first-marked';
+      first['newSessionDefault'] = ['pi'];
+      const second: Record<string, Object> = {};
+      second['id'] = 'second-marked';
+      second['newSessionDefault'] = ['pi'];
+      const marked = parseModelOptions([first, second]);
+      expect(resolveNewSessionDefaultModel(marked, 'pi')?.id).assertEqual('first-marked');
     });
 
     it('parsesSharedComposerModelsForNewAndExistingTasks', 0, () => {

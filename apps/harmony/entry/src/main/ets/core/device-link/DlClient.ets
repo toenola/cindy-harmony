@@ -16,8 +16,9 @@ import {
   Envelope, EnvelopeKind, HelloPayload, HelloAckPayload, LinkOpenPayload,
   PresenceSnapshot, LinkClosePayload, PresenceSetPayload,
   PROTOCOL_VERSION, PING_INTERVAL_MS, PONG_MISS_LIMIT, REQUEST_TIMEOUT_MS,
-  HANDSHAKE_TIMEOUT_MS, RECONNECT_STABLE_RESET_MS, RELAY_TRY_AGAIN_LATER_CLOSE_CODE,
-  CONTROLLER_CAPABILITIES, computeReconnectDelayMs, encodeEnvelope, decodeEnvelope,
+  HANDSHAKE_TIMEOUT_MS, RECONNECT_STABLE_RESET_MS,
+  RECONNECT_CONGESTION_STABLE_RESET_MS, ReconnectStability,
+  CONTROLLER_CAPABILITIES, encodeEnvelope, decodeEnvelope,
 } from './DlProtocol';
 
 const DOMAIN = 0x0000;
@@ -159,13 +160,18 @@ export class DlClient {
   private wsCallbacks: WsCallbacks = new WsCallbacks();
   private status: string = 'stopped'; // 'stopped' | 'connecting' | 'online'
   private stopped = true;
-  private reconnectAttempt = 0;
-  /** 连续 1013 只在稳定在线 10s 后清零，防止重连洪峰反复打穿 relay。 */
-  private congestionCloseStreak = 0;
+  /**
+   * 重连退避与 1013 拥塞稳定性状态（纯逻辑，单测覆盖计时语义与代次竞态）。
+   * 普通退避连续在线 10 秒清零；1013 拥塞历史必须连续在线 15 分钟才清除——
+   * 短暂重连成功不代表 relay 已恢复，提前清零会让客户端回到秒级重试打穿 relay。
+   */
+  private stability: ReconnectStability = new ReconnectStability();
   private reconnectTimer: number = -1;
   private handshakeTimer: number = -1;
   private heartbeatTimer: number = -1;
   private stableTimer: number = -1;
+  /** 1013 拥塞期的独立稳定窗计时器，与普通退避窗互不影响。 */
+  private congestionStableTimer: number = -1;
   private pongMiss = 0;
   private helloAcked = false;
   private requestSeq = (Date.now() % 1000000) + Math.floor(Math.random() * 1000);
@@ -203,8 +209,7 @@ export class DlClient {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    this.reconnectAttempt = 0;
-    this.congestionCloseStreak = 0;
+    this.stability.reset();
     void this.connect('start');
   }
 
@@ -212,15 +217,15 @@ export class DlClient {
   connectNow(reason: string, overrideCongestionCooldown: boolean = false): void {
     if (this.status === 'online') return;
     if (this.stopped) {
-      this.congestionCloseStreak = 0;
-    } else if (this.congestionCloseStreak > 0 && this.reconnectTimer >= 0
+      this.stability.reset();
+    } else if (this.stability.getCongestionStreak() > 0 && this.reconnectTimer >= 0
       && !overrideCongestionCooldown) {
       hilog.info(DOMAIN, TAG, 'connectNow parked by congestion cooldown streak=%{public}d',
-        this.congestionCloseStreak);
+        this.stability.getCongestionStreak());
       return;
     }
     this.stopped = false;
-    this.reconnectAttempt = 0;
+    this.stability.resetNormalBackoff();
     this.clearTimer(this.reconnectTimer);
     this.reconnectTimer = -1;
     void this.connect(reason);
@@ -311,12 +316,16 @@ export class DlClient {
       this.clearTimer(this.heartbeatTimer);
       this.clearTimer(this.stableTimer);
       this.stableTimer = -1;
+      this.clearTimer(this.congestionStableTimer);
+      this.congestionStableTimer = -1;
+      // 断线即中断稳定期并推进代次：拥塞 streak 必须等下一次连接重新累计满 15 分钟
+      // 才清除，旧计时器的结算在新连接上一律作废。
+      this.stability.noteClosed(code);
       // 握手前断开且带 401/unauthorized 特征 → 触发 token 刷新重连。
       if (!this.helloAcked && !this.stopped && /\b401\b|unauthorized/i.test(`${code} ${reason}`)) {
         this.opts.events.onAuthFailed();
       }
       if (!this.stopped) {
-        if (code === RELAY_TRY_AGAIN_LATER_CLOSE_CODE) this.congestionCloseStreak += 1;
         this.scheduleReconnect(`close-${code}`);
       }
     };
@@ -335,6 +344,10 @@ export class DlClient {
         this.clearTimer(this.heartbeatTimer);
         this.clearTimer(this.stableTimer);
         this.stableTimer = -1;
+        this.clearTimer(this.congestionStableTimer);
+        this.congestionStableTimer = -1;
+        // ws error 不是 relay 拥塞信号：只推进代次，不累计 1013 streak。
+        this.stability.noteClosed(0);
         this.scheduleReconnect('ws-error');
       }
     };
@@ -397,14 +410,27 @@ export class DlClient {
     this.clearTimer(this.handshakeTimer);
     this.setStatus('online');
     this.startHeartbeat();
-    // 稳定在线后清零退避
+    // 稳定在线后清零普通退避；1013 拥塞历史走独立的更长稳定窗。
+    const onlineAtMs = Date.now();
+    this.stability.noteOnline(onlineAtMs);
+    const generation = this.stability.getGeneration();
     this.clearTimer(this.stableTimer);
     this.stableTimer = setTimeout(() => {
       this.stableTimer = -1;
       if (this.stopped || this.status !== 'online') return;
-      this.reconnectAttempt = 0;
-      this.congestionCloseStreak = 0;
+      this.stability.settleNormalWindow(generation, Date.now());
     }, RECONNECT_STABLE_RESET_MS);
+    // 拥塞窗只在本次连接持续在线满 15 分钟后清除 streak：中途断线会推进代次让本次
+    // 结算作废，期内新的 1013 继续累计。已在计时中则不重建，避免顺延窗口。
+    if (this.stability.getCongestionStreak() > 0 && this.congestionStableTimer < 0) {
+      this.congestionStableTimer = setTimeout(() => {
+        this.congestionStableTimer = -1;
+        if (this.stopped || this.status !== 'online') return;
+        if (this.stability.settleCongestionWindow(generation, Date.now())) {
+          hilog.info(DOMAIN, TAG, 'congestion cooldown cleared after stable window');
+        }
+      }, RECONNECT_CONGESTION_STABLE_RESET_MS);
+    }
     this.opts.events.onHelloAck(ack);
   }
 
@@ -641,6 +667,13 @@ export class DlClient {
         this.failAllPending(new DlError('NOT_CONNECTED', 'heartbeat dead'));
         this.ws?.terminate();
         this.ws = undefined;
+        // 心跳判死同样中断稳定期，旧计时器不得在新连接上清掉拥塞状态。
+        this.clearTimer(this.stableTimer);
+        this.stableTimer = -1;
+        this.clearTimer(this.congestionStableTimer);
+        this.congestionStableTimer = -1;
+        // 心跳判死不是 relay 拥塞信号：只推进代次，不累计 1013 streak。
+        this.stability.noteClosed(0);
         if (!this.stopped) this.scheduleReconnect('heartbeat-dead');
       }
     }, PING_INTERVAL_MS);
@@ -649,13 +682,11 @@ export class DlClient {
   private scheduleReconnect(reason: string): void {
     if (this.stopped) return;
     if (this.reconnectTimer >= 0) return;
-    const delay = computeReconnectDelayMs(
-      this.reconnectAttempt, this.congestionCloseStreak, Math.random());
-    this.reconnectAttempt += 1;
+    const delay = this.stability.nextReconnectDelayMs(Math.random());
     this.setStatus('connecting');
     hilog.info(DOMAIN, TAG,
       'reconnect in %{public}d ms (reason=%{public}s congestion=%{public}d)',
-      delay, reason, this.congestionCloseStreak);
+      delay, reason, this.stability.getCongestionStreak());
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = -1;
       void this.connect(reason);
@@ -692,6 +723,10 @@ export class DlClient {
     this.heartbeatTimer = -1;
     this.clearTimer(this.stableTimer);
     this.stableTimer = -1;
+    this.clearTimer(this.congestionStableTimer);
+    this.congestionStableTimer = -1;
+    // 显式停止时完整回收：推进代次让所有在途稳定窗结算作废。
+    this.stability.noteClosed(0);
   }
 
   private payloadObj(env: Envelope): Record<string, Object> {

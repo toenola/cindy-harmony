@@ -100,6 +100,43 @@ export function normalizeAutoTitle(text: string): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, 40).trimEnd();
 }
 
+/** 附件展示名：只取最后一段，去掉任何路径前缀，不把目录结构泄漏到标题里。 */
+export function attachmentDisplayName(name: string): string {
+  const parts = name.split(/[\\/]/);
+  return parts.length > 0 ? parts[parts.length - 1] : '';
+}
+
+/**
+ * 新建任务第一帧该显示的乐观标题。
+ *
+ * 语义对齐 `packages/maker-shared/src/sessionTitle.ts` 的 `deriveOptimisticSessionTitle`：
+ * 有用户文字就用原文截断；没有文字时依次用第一个附件的**展示名**（去路径）、
+ * 图片类别词、文件类别词。算不出任何素材时返回空串，由调用方落到
+ * `taskDisplayTitle` 的「未命名任务」兜底。
+ *
+ * 远端权威标题一旦到达即覆盖本地预览，之后不得反向覆盖。
+ */
+export function deriveOptimisticSessionTitle(
+  text: string,
+  fileNames: string[],
+  firstFileIsImage: boolean,
+): string {
+  const fromText = normalizeAutoTitle(text);
+  if (fromText.length > 0) return fromText;
+  for (let i = 0; i < fileNames.length; i++) {
+    const fromFile = normalizeAutoTitle(attachmentDisplayName(fileNames[i]));
+    if (fromFile.length > 0) return fromFile;
+  }
+  // 附件没有可用文件名时用类别词，仍然比空标题可读。
+  if (firstFileIsImage) return OPTIMISTIC_IMAGE_TITLE;
+  if (fileNames.length > 0) return OPTIMISTIC_FILE_TITLE;
+  return '';
+}
+
+/** 纯图片 / 纯文件首条消息在没有可用文件名时的本地化类别标题。 */
+const OPTIMISTIC_IMAGE_TITLE = '图片消息';
+const OPTIMISTIC_FILE_TITLE = '文件消息';
+
 export function taskPreviewText(preview: string): string {
   return preview.replace(/\s+/g, ' ').trim();
 }

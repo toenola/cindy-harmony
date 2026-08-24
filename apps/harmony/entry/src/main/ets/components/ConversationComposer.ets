@@ -18,6 +18,7 @@ import {
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
   uiFontSize,
+  uiScaledMaxWidth,
   uiLineHeight,
   uiRevealTransition,
 } from './UiKit';
@@ -432,7 +433,8 @@ export struct ConversationComposer {
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 176 })
+          // 上限随系统字号放大，避免放大字体后模型名 / 强度被截成省略号。
+          .constraintSize({ maxWidth: uiScaledMaxWidth(176, 264) })
         SymbolGlyph($r('sys.symbol.chevron_down'))
           .fontSize(11)
           .fontColor([$r('app.color.text_tertiary')])
@@ -441,13 +443,16 @@ export struct ConversationComposer {
     }
     .type(ButtonType.Normal)
     .height(30)
-    .constraintSize({ maxWidth: 208 })
+    .constraintSize({ maxWidth: uiScaledMaxWidth(208, 300) })
     .padding({ left: 12, right: 10 })
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
-    .accessibilityText(`模型：${this.modelLabel}`)
+    // 读屏播报完整元信息：视觉可能省略，但强度不能只靠看。
+    .accessibilityText(this.effortLabel.length > 0
+      ? `模型：${this.modelLabel}，思考强度：${this.effortLabel}`
+      : `模型：${this.modelLabel}`)
     .onClick(() => this.onModel())
     .bindPopup(this.modelPopupPresented, {
       builder: this.composerModelPopup,

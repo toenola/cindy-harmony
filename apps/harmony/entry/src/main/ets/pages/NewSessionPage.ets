@@ -43,6 +43,7 @@ import {
   permissionModeDescription,
   permissionModeLabel,
   reconcileModelEffort,
+  resolveNewSessionDefaultModel,
   selectedPermissionModeLabel,
 } from '../core/ComposerCatalog';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
@@ -60,7 +61,7 @@ import {
   NewSessionCreationParams,
   NewSessionEditDraft,
 } from '../core/tasks/NewSessionCreationStore';
-import { normalizeAutoTitle } from './TaskListPresentation';
+import { deriveOptimisticSessionTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
 import {
   ComposerModelOptionRow,
@@ -1250,6 +1251,13 @@ export struct NewSessionPageContent {
         if (recent !== undefined && recent.model.length > 0) {
           selectedModel = this.findModelOption(recent.model, recent.providerId);
         }
+        // 用户没选过时才用远端默认标记（model-access v3 newSessionDefault）：
+        // 它优先于写死的 fallbackModel，但不得覆盖用户最近的显式选择，
+        // 也不得因目录刷新把手动选择改回默认（由 modelTouched 保护）。
+        if (selectedModel === undefined) {
+          const marked = resolveNewSessionDefaultModel(source, agent);
+          if (marked !== null) selectedModel = marked;
+        }
         if (selectedModel === undefined) {
           const fallback = fallbackModel(agent);
           selectedModel = this.findModelOption(fallback);
@@ -1390,7 +1398,12 @@ export struct NewSessionPageContent {
     return options;
   }
 
-  private buildOptimisticSession(sessionId: string, text: string): RemoteSession {
+  private buildOptimisticSession(
+    sessionId: string,
+    text: string,
+    images: RemoteImageRef[] = [],
+    files: RemoteSerializedAttachment[] = [],
+  ): RemoteSession {
     const session = new RemoteSession();
     session.id = sessionId;
     session.workspaceKind = this.workspaceKind;
@@ -1404,8 +1417,21 @@ export struct NewSessionPageContent {
     session.agentKind = this.selectedAgentKind === 'claude-code' ? 'cc' : this.selectedAgentKind;
     session.status = 'active';
     session.pendingLocalCreation = true;
+    // 纯图片 / 纯文件首条消息也要立即有可读标题：文字优先，其次第一个附件的
+    // 展示名（去路径），再退到类别词。远端权威标题到达后覆盖本地预览。
+    const attachmentNames: string[] = [];
+    for (let i = 0; i < images.length; i++) {
+      const name = images[i].originalName || images[i].name;
+      if (name.length > 0) attachmentNames.push(name);
+    }
+    for (let i = 0; i < files.length; i++) {
+      const name = files[i].originalName || files[i].name;
+      if (name.length > 0) attachmentNames.push(name);
+    }
+    const optimisticTitle = deriveOptimisticSessionTitle(
+      text, attachmentNames, images.length > 0);
+    if (optimisticTitle.length > 0) session.title = optimisticTitle;
     if (text.length > 0) {
-      session.title = normalizeAutoTitle(text);
       session.preview = text;
     }
     const now = new Date().toISOString();
@@ -1450,7 +1476,7 @@ export struct NewSessionPageContent {
     const firstMessageClientId = util.generateRandomUUID();
     const params = new NewSessionCreationParams();
     params.deviceId = this.selectedDeviceId;
-    params.session = this.buildOptimisticSession(sessionId, text);
+    params.session = this.buildOptimisticSession(sessionId, text, readyImages, readyFiles);
     params.createOptions = this.createOptions(sessionId);
     params.firstMessageClientId = firstMessageClientId;
     params.firstMessageText = text;

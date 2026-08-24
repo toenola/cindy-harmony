@@ -20,6 +20,33 @@ export function uiLineHeight(base: number): number {
   return Math.max(UI_MIN_LINE_HEIGHT, Math.round(base * UI_FONT_SCALE));
 }
 
+/**
+ * 系统字体缩放倍数。由 EntryAbility 在启动和 onConfigurationUpdate 时写入
+ * （`UIAbilityContext.config.fontSizeScale`），供随字号增长的容器上限使用。
+ * 读不到时保持 1，不改变既有布局。
+ */
+let systemFontSizeScale = 1;
+
+export function setSystemFontSizeScale(scale: number | undefined): void {
+  systemFontSizeScale = typeof scale === 'number' && Number.isFinite(scale) && scale > 0
+    ? scale : 1;
+}
+
+export function getSystemFontSizeScale(): number {
+  return systemFontSizeScale;
+}
+
+/**
+ * 随系统字体缩放的文本容器上限。
+ *
+ * 固定像素上限在系统字体放大时会把文字挤成省略号（模型名 / 强度这类元信息会直接
+ * 读不出来）。这里按系统 `fontSizeScale` 放大上限让容器跟着长，同时用 `cap`
+ * 兜住，避免超大字号下挤占同排其它控件。
+ */
+export function uiScaledMaxWidth(base: number, cap: number): number {
+  return Math.round(Math.min(cap, Math.max(base, base * systemFontSizeScale)));
+}
+
 /** 三档圆角（DESIGN.md §5）：内部控件 / 容器 / 胶囊。 */
 export const UI_RADIUS_CONTROL = 8;
 export const UI_RADIUS_CONTAINER = 12;

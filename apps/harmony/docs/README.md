@@ -18,6 +18,11 @@
 - [UI 设计](./ui-design.md)：Harmony 原生 UI 与 Cindy 设计系统的落地边界
 - [验证计划](./verification-plan.md)：协议、真机、断线、历史消息和交互验收
 - [决策记录](./decision-log.md)：重要技术选择及其原因
+- [版本开发资料](./version/README.md)：每个版本的开发计划、差异评估、技术设计和验收记录
+
+## 当前版本计划
+
+- [v1.1.0](./version/v1.1.0/README.md)：跟进 Mobile 新能力并完成 HarmonyOS 原生适配，明确排除 CAPTCHA
 
 ## 文档状态
 

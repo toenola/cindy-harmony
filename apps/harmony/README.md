@@ -32,4 +32,4 @@ HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 Har
 - `packages/device-link/`
 - `packages/maker-shared/`
 - `packages/auth-client/`
-- `cindy-protocol/`
+- `packages/device-link-protocol/`

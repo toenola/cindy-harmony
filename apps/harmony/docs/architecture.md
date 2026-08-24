@@ -103,7 +103,7 @@ Store 负责：
 
 当前不强行把整个 TypeScript workspace 编译进 ArkTS：
 
-- `cindy-protocol` 是 wire protocol 权威源。
+- `packages/device-link-protocol` 是 wire protocol 权威源。
 - `packages/device-link` 是 Device Link 行为和兼容性参考。
 - `packages/maker-shared` 是消息、任务和交互模型参考。
 - `packages/auth-client` 是认证 API 和错误语义参考。
