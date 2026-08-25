@@ -64,9 +64,14 @@ import {
 import { syncCanaryChannelAfterAuth } from '@/auth/canaryChannelSync';
 import { ensureDeviceId, hasStoredDeviceId } from '@/auth/deviceId';
 import { decodeJwtOrgSlug, isAccessTokenExpiring } from '@/auth/jwt';
-import { maybeEnableXdOrgBetaDefault } from '@/auth/xdOrgBetaDefault';
+import {
+  maybeEnableNonXdOrgBetaDefault,
+  maybeEnableXdOrgBetaDefault,
+  shouldAttemptOrgBetaDefault,
+} from '@/auth/xdOrgBetaDefault';
 import { getAuthLocale, getLoginLanguage } from '@/auth/loginMessages';
 import { acquireNativeSocialCredential } from '@/auth/nativeSocial';
+import { rememberSsoOrgIdentifier } from '@/auth/ssoOrgHistory';
 import {
   matchesOAuthCallbackUrl,
   parseOAuthCallbackUrl,
@@ -329,28 +334,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setDeferredSessionRecovery(false);
   }, []);
 
-  /** 登录态落地后异步刷新灰度标记；失败保留旧值，迟到响应按 auth generation 丢弃。 */
-  const scheduleCanaryChannelSync = useCallback(
-    (token: string, expectedAuthGeneration: number) => {
-      // EAS/TestFlight 仍走 Expo 官方更新通道，不参与自建线 canary flag 请求；
-      // 这样自建灰度新增的状态机不会改变 EAS 登录/发版流程。
-      if (!IS_OTA_SELFHOST) return;
-      void syncCanaryChannelAfterAuth(
-        { token, expectedAuthGeneration },
-        {
-          fetchFeatureFlags: (accessToken) =>
-            apiFetchRaw('/api/user/feature-flags', {
-              baseUrl: OAUTH_BROKER_API_BASE_URL,
-              token: accessToken,
-            }),
-          readCurrentAuthGeneration: () => authGenerationRef.current,
-          persistFlag: syncCanaryChannel,
-        },
-      ).catch(() => undefined);
-    },
-    [],
-  );
-
   const prepareBetaChannelForCurrentDevice = useCallback((): Promise<string> => {
     const existing = betaChannelPreparationRef.current;
     if (existing) return existing;
@@ -372,6 +355,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return run;
   }, []);
 
+  const orgBetaDefaultDeps = useCallback(
+    (expectedAuthGeneration: number, expectedUserId: string) => ({
+      readCurrentAuthIdentity: () => ({
+        authGeneration: authGenerationRef.current,
+        userId: userRef.current?.id ?? null,
+      }),
+      readChannelState: readBetaChannelState,
+      probeBetaManifest: () =>
+        probeBetaChannel(Platform.OS === 'android' ? 'android' : 'ios'),
+      enableBeta: () =>
+        enableUncustomizedBetaChannel(
+          () =>
+            authGenerationRef.current === expectedAuthGeneration &&
+            userRef.current?.id === expectedUserId,
+        ),
+    }),
+    [],
+  );
+
   /** 登录态落地后为 xd 组织尝试打开设备级 beta；不阻塞主界面。 */
   const scheduleXdOrgBetaDefault = useCallback(
     (token: string, expectedAuthGeneration: number) => {
@@ -391,25 +393,80 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               orgName: currentUser.orgName,
             },
           },
-          {
-            readCurrentAuthIdentity: () => ({
-              authGeneration: authGenerationRef.current,
-              userId: userRef.current?.id ?? null,
-            }),
-            readChannelState: readBetaChannelState,
-            probeBetaManifest: () =>
-              probeBetaChannel(Platform.OS === 'android' ? 'android' : 'ios'),
-            enableBeta: () =>
-              enableUncustomizedBetaChannel(
-                () =>
-                  authGenerationRef.current === expectedAuthGeneration &&
-                  userRef.current?.id === expectedUserId,
-              ),
-          },
+          orgBetaDefaultDeps(expectedAuthGeneration, expectedUserId),
         );
       })().catch(() => undefined);
     },
-    [prepareBetaChannelForCurrentDevice],
+    [orgBetaDefaultDeps, prepareBetaChannelForCurrentDevice],
+  );
+
+  /** feature-flags 返回后，仅为非 xd 组织尝试打开设备级 beta。 */
+  const scheduleNonXdOrgBetaDefault = useCallback(
+    (
+      token: string,
+      expectedAuthGeneration: number,
+      defaultEnableBeta?: boolean,
+    ) => {
+      if (!IS_OTA_SELFHOST || defaultEnableBeta !== true) return;
+      const currentUser = userRef.current;
+      if (!currentUser) return;
+      const expectedUserId = currentUser.id;
+      const request = {
+        expectedAuthGeneration,
+        expectedUserId,
+        user: {
+          membershipKind: currentUser.membershipKind,
+          orgSlug: decodeJwtOrgSlug(token),
+          orgName: currentUser.orgName,
+        },
+      } as const;
+      if (
+        shouldAttemptOrgBetaDefault({
+          user: request.user,
+          defaultEnableBeta,
+        }) !== 'flag-enable'
+      ) {
+        return;
+      }
+      void (async () => {
+        await prepareBetaChannelForCurrentDevice();
+        await maybeEnableNonXdOrgBetaDefault(
+          request,
+          orgBetaDefaultDeps(expectedAuthGeneration, expectedUserId),
+        );
+      })().catch(() => undefined);
+    },
+    [orgBetaDefaultDeps, prepareBetaChannelForCurrentDevice],
+  );
+
+  /** 登录态落地后异步刷新灰度标记；失败保留旧值，迟到响应按 auth generation 丢弃。 */
+  const scheduleCanaryChannelSync = useCallback(
+    (token: string, expectedAuthGeneration: number) => {
+      // EAS/TestFlight 仍走 Expo 官方更新通道，不参与自建线 canary flag 请求；
+      // 这样自建灰度新增的状态机不会改变 EAS 登录/发版流程。
+      if (!IS_OTA_SELFHOST) return;
+      void syncCanaryChannelAfterAuth(
+        { token, expectedAuthGeneration },
+        {
+          fetchFeatureFlags: (accessToken) =>
+            apiFetchRaw('/api/user/feature-flags', {
+              baseUrl: OAUTH_BROKER_API_BASE_URL,
+              token: accessToken,
+            }),
+          readCurrentAuthGeneration: () => authGenerationRef.current,
+          persistFlag: syncCanaryChannel,
+        },
+      )
+        .then((outcome) => {
+          scheduleNonXdOrgBetaDefault(
+            token,
+            expectedAuthGeneration,
+            outcome.defaultEnableBeta,
+          );
+        })
+        .catch(() => undefined);
+    },
+    [scheduleNonXdOrgBetaDefault],
   );
 
   const serializeRefreshTokenMutation = useCallback(
@@ -1337,6 +1394,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               ).discoverSsoOrg(org);
             }
             const methods = ssoOrgDiscoveryToMethods(discovery);
+            // A sole same-region connection auto-starts browser authorization
+            // below. Persist the successful discovery first so cancel/timeout
+            // does not lose a valid organization identifier.
+            await rememberSsoOrgIdentifier(action.org);
             const currentState = loginStateRef.current;
             if (discovery.region !== BUILD_AUTH_REGION) {
               if (currentState?.step !== 'identifier') {
