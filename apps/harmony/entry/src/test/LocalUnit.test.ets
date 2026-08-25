@@ -131,6 +131,7 @@ import {
 
 import {
   groupInlineTokens,
+  groupMarkdownSelectableBlocks,
   parseMarkdown,
   tokenizeInline,
 } from '../main/ets/core/messages/MarkdownParser';
@@ -242,6 +243,7 @@ import {
 import {
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
+  historyGestureAllowsLoad,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   messageListBottomIndex,
   messageListItemPresentationState,
@@ -249,6 +251,10 @@ import {
   shouldAutoLoadEarlier,
   shouldTakeOverTail,
 } from '../main/ets/pages/TaskScrollState';
+import {
+  isTextFileReference,
+  splitFileReferenceLocation,
+} from '../main/ets/core/files/FileReference';
 import {
   decideNewSessionRecoveryAction,
   exactNewSessionRecord,
@@ -738,6 +744,46 @@ export default function localUnitTest() {
         if (currency[i].kind === 'math') mathCount += 1;
       }
       expect(mathCount).assertEqual(0);
+    });
+
+    it('groupsBoundedSelectableMarkdownTextRunsAroundComplexBlocks', 0, () => {
+      const blocks = parseMarkdown(
+        '# 标题\n\n第一段\n\n- 第一项\n- 第二项\n\n```ts\nconst ready = true;\n```\n\n最后一段');
+      const groups = groupMarkdownSelectableBlocks(blocks);
+      expect(groups.length).assertEqual(3);
+      expect(groups[0].type).assertEqual('text_run');
+      expect(groups[0].textBlocks.length).assertEqual(4);
+      expect(groups[0].textBlocks[0].type).assertEqual('heading');
+      expect(groups[0].textBlocks[2].type).assertEqual('list_item');
+      expect(groups[0].textBlocks[3].marker).assertEqual('-');
+      expect(groups[1].type).assertEqual('single');
+      expect(groups[1].block?.type).assertEqual('code');
+      expect(groups[2].type).assertEqual('text_run');
+      expect(groups[2].textBlocks[0].inlineTokens[0].value).assertEqual('最后一段');
+    });
+
+    it('splitsSelectableMarkdownRunsByBlockAndTextLimits', 0, () => {
+      const blocks = parseMarkdown('一二三\n\n四五六\n\n七八九');
+      const byBlocks = groupMarkdownSelectableBlocks(blocks, 2, 1800);
+      expect(byBlocks.length).assertEqual(2);
+      expect(byBlocks[0].textBlocks.length).assertEqual(2);
+      expect(byBlocks[1].textBlocks.length).assertEqual(1);
+
+      const byLength = groupMarkdownSelectableBlocks(blocks, 12, 7);
+      expect(byLength.length).assertEqual(3);
+      expect(byLength[0].textBlocks.length).assertEqual(1);
+      expect(byLength[1].textBlocks.length).assertEqual(1);
+      expect(byLength[2].textBlocks.length).assertEqual(1);
+    });
+
+    it('keepsMarkdownImagesOutsideSelectableTextRuns', 0, () => {
+      const blocks = parseMarkdown('前文\n\n图片 ![图](https://example.com/a.png) 后文\n\n尾文');
+      const groups = groupMarkdownSelectableBlocks(blocks);
+      expect(groups.length).assertEqual(3);
+      expect(groups[0].type).assertEqual('text_run');
+      expect(groups[1].type).assertEqual('single');
+      expect(groups[1].block?.type).assertEqual('paragraph');
+      expect(groups[2].type).assertEqual('text_run');
     });
 
     it('reusesStableMarkdownBlocksWhileStreamingTailGrows', 0, () => {
@@ -3108,6 +3154,36 @@ export default function localUnitTest() {
       expect(shouldAutoLoadEarlier(
         true, 0, false, true, false, true, true, true, 2, 'first-3', '',
       )).assertEqual(false);
+      expect(historyGestureAllowsLoad(false, false, false)).assertEqual(true);
+      expect(historyGestureAllowsLoad(true, false, false)).assertEqual(false);
+      expect(historyGestureAllowsLoad(true, true, false)).assertEqual(true);
+      expect(historyGestureAllowsLoad(true, true, true)).assertEqual(false);
+    });
+
+    it('stripsEditorLocationsBeforeReadingGeneratedFiles', 0, () => {
+      const line = splitFileReferenceLocation('/tmp/服务商服务-Web对接指南.md:39');
+      expect(line.path).assertEqual('/tmp/服务商服务-Web对接指南.md');
+      expect(line.line).assertEqual(39);
+      expect(line.column).assertEqual(0);
+
+      const column = splitFileReferenceLocation('C:\\work\\src\\main.ts:12:3');
+      expect(column.path).assertEqual('C:\\work\\src\\main.ts');
+      expect(column.line).assertEqual(12);
+      expect(column.column).assertEqual(3);
+
+      const range = splitFileReferenceLocation('src/main.ets:10-20');
+      expect(range.path).assertEqual('src/main.ets');
+      expect(range.line).assertEqual(10);
+
+      const ordinary = splitFileReferenceLocation('/tmp/report-2026.md');
+      expect(ordinary.path).assertEqual('/tmp/report-2026.md');
+      expect(ordinary.line).assertEqual(0);
+
+      const remoteUrl = splitFileReferenceLocation('https://127.0.0.1:8080/report.md');
+      expect(remoteUrl.path).assertEqual('https://127.0.0.1:8080/report.md');
+      expect(remoteUrl.line).assertEqual(0);
+      expect(isTextFileReference('/tmp/服务商服务-Web对接指南.md:32')).assertTrue();
+      expect(isTextFileReference('/tmp/archive.zip:32')).assertFalse();
     });
 
     it('rejectsUnknownImageSchemesAndNormalizesSupportedCase', 0, () => {
@@ -3327,10 +3403,9 @@ export default function localUnitTest() {
       expect(isWideTaskLayout(1200, 900, 0)).assertEqual(false);
       expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
       expect(taskListPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
-      expect(taskDetailPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(580);
-      expect(taskDetailPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(320);
+      expect(taskDetailPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(600);
+      expect(taskDetailPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(340);
       expect(taskListPaneWidth(1200, 0.4)
-        + 20
         + taskDetailPaneWidth(1200, 0.4)).assertEqual(1200);
       expect(taskDetailKeyboardInset(639, 400, -1, 320)).assertEqual(0);
       expect(taskDetailKeyboardInset(900, 600, -1, 320)).assertEqual(320);

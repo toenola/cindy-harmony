@@ -343,6 +343,129 @@ export class MdBlock {
   rowTokens: InlineToken[][][] = [];
 }
 
+/**
+ * 可进入同一个原生 Text 的 Markdown 文本单元。
+ *
+ * 列表在 MdBlock 中按整组保存；这里拆成逐项单元，才能在不创建巨型 Text 的前提下
+ * 让选择手柄跨越相邻列表项，并按块数 / 字符数设置上限。
+ */
+export class MdSelectableTextBlock {
+  key: string = '';
+  type: string = ''; // paragraph | heading | list_item
+  level: number = 0;
+  inlineTokens: InlineToken[] = [];
+  marker: string = '';
+  ordered: boolean = false;
+  checked: number = -1;
+}
+
+/** 连续文本组或必须保持原结构的单个复杂 Markdown 块。 */
+export class MdSelectableBlockGroup {
+  key: string = '';
+  type: string = ''; // text_run | single
+  textBlocks: MdSelectableTextBlock[] = [];
+  block: MdBlock | null = null;
+}
+
+function markdownTokensHaveImage(tokens: InlineToken[]): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].kind === 'image') return true;
+  }
+  return false;
+}
+
+function markdownInlineTextLength(tokens: InlineToken[]): number {
+  let total = 0;
+  for (let i = 0; i < tokens.length; i++) total += tokens[i].value.length;
+  return total;
+}
+
+function markdownSelectableBlockLength(block: MdSelectableTextBlock): number {
+  let total = markdownInlineTextLength(block.inlineTokens);
+  if (block.type !== 'list_item') return total;
+  if (block.checked >= 0) return total + 2;
+  return total + (block.ordered ? block.marker.length + 1 : 2);
+}
+
+function selectableTextBlocksFor(block: MdBlock): MdSelectableTextBlock[] | null {
+  if (block.type === 'paragraph' || block.type === 'heading') {
+    if (markdownTokensHaveImage(block.inlineTokens)) return null;
+    const textBlock = new MdSelectableTextBlock();
+    textBlock.key = `${block.seq}`;
+    textBlock.type = block.type;
+    textBlock.level = block.level;
+    textBlock.inlineTokens = block.inlineTokens;
+    return [textBlock];
+  }
+  if (block.type !== 'list') return null;
+  for (let i = 0; i < block.itemTokens.length; i++) {
+    if (markdownTokensHaveImage(block.itemTokens[i])) return null;
+  }
+  const items: MdSelectableTextBlock[] = [];
+  for (let i = 0; i < block.items.length; i++) {
+    const textBlock = new MdSelectableTextBlock();
+    textBlock.key = `${block.seq}:${i}`;
+    textBlock.type = 'list_item';
+    textBlock.inlineTokens = block.itemTokens[i] ?? [];
+    textBlock.marker = block.itemMarkers[i] ?? `${i + 1}.`;
+    textBlock.ordered = block.itemOrdered[i] ?? block.ordered;
+    textBlock.checked = block.itemChecked[i] ?? -1;
+    items.push(textBlock);
+  }
+  return items;
+}
+
+/**
+ * 对齐 Mobile：连续段落、标题和列表项共享一个原生选择面；代码、表格、引用、图片等
+ * 保持独立。每组同时限制文本单元数和 UTF-16 字符数，避免超长 selectable Text 影响测高。
+ */
+export function groupMarkdownSelectableBlocks(
+  blocks: MdBlock[], maxTextBlocks: number = 12, maxUtf16Length: number = 1800,
+): MdSelectableBlockGroup[] {
+  const groups: MdSelectableBlockGroup[] = [];
+  let run: MdSelectableTextBlock[] = [];
+  let runLength = 0;
+
+  const flushRun = (): void => {
+    if (run.length === 0) return;
+    const group = new MdSelectableBlockGroup();
+    group.key = `run:${run[0].key}`;
+    group.type = 'text_run';
+    group.textBlocks = run;
+    groups.push(group);
+    run = [];
+    runLength = 0;
+  };
+
+  const appendTextBlock = (textBlock: MdSelectableTextBlock): void => {
+    const blockLength = markdownSelectableBlockLength(textBlock);
+    const separatorLength = run.length > 0 ? 2 : 0;
+    if (run.length > 0
+      && (run.length >= maxTextBlocks || runLength + separatorLength + blockLength > maxUtf16Length)) {
+      flushRun();
+    }
+    run.push(textBlock);
+    runLength += (run.length > 1 ? 2 : 0) + blockLength;
+  };
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    const textBlocks = selectableTextBlocksFor(block);
+    if (textBlocks !== null && textBlocks.length > 0) {
+      for (let j = 0; j < textBlocks.length; j++) appendTextBlock(textBlocks[j]);
+      continue;
+    }
+    flushRun();
+    const group = new MdSelectableBlockGroup();
+    group.key = `single:${block.type}:${block.seq}`;
+    group.type = 'single';
+    group.block = block;
+    groups.push(group);
+  }
+  flushRun();
+  return groups;
+}
+
 function isTableSeparator(line: string): boolean {
   const trimmed = line.trim();
   if (trimmed.length === 0) {

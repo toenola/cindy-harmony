@@ -323,6 +323,8 @@ export class DlChannels {
 
   /** 从被控桌面取回历史消息里的本地媒体。 */
   static readonly MEDIA_FETCH = 'device-link:media:fetch';
+  /** 读取被控端生成的文本 / 代码文件预览。 */
+  static readonly TEXT_FILE_READ_PREVIEW = 'text-file:read-preview';
 
   /** 会话列表级 push channel（归 sessions topic）。 */
   static readonly SESSIONS_CREATED = 'local-db:sessions:created';

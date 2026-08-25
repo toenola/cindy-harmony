@@ -1,9 +1,9 @@
 /**
  * 任务页宽屏双栏布局的纯计算。
  *
- * 640vp 是左右栏内容下限之和：列表栏 300vp + 分隔条 20vp + 详情栏 320vp。
+ * 640vp 是展开横屏双栏的产品断点；左右内容栏下限分别为 300vp / 320vp。
  * 只有展开态横屏才使用主从双栏，竖屏、盒盖态和半折叠态都回到单页导航。
- * 比例只约束列表宽度，分隔条和详情最小宽度固定留出触控与阅读空间。
+ * 比例只约束列表宽度；分隔条是跨在真实交界线两侧的透明命中区，不占布局宽度。
  */
 
 export const WIDE_TASK_LAYOUT_MIN_WIDTH = 640;
@@ -71,7 +71,7 @@ export function clampTaskSplitRatio(ratio: number): number {
 
 export function taskListPaneWidth(viewportWidth: number, ratio: number): number {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 0;
-  const availableWidth = Math.max(0, viewportWidth - TASK_SPLIT_DIVIDER_WIDTH);
+  const availableWidth = viewportWidth;
   const minListWidth = Math.min(TASK_SPLIT_MIN_LIST_WIDTH, availableWidth);
   const maxListWidth = Math.max(minListWidth, availableWidth - TASK_SPLIT_MIN_DETAIL_WIDTH);
   const requestedWidth = Math.round(availableWidth * clampTaskSplitRatio(ratio));
@@ -79,7 +79,7 @@ export function taskListPaneWidth(viewportWidth: number, ratio: number): number 
 }
 
 /**
- * 详情栏必须显式吃满列表栏和分隔条以外的全部宽度。
+ * 详情栏必须显式吃满列表栏以外的全部宽度。
  * HdsNavigation 嵌套在 Row 的 layoutWeight 子节点时可能回退到内容固有宽度，
  * 因此不能只依赖权重分配，否则大屏右侧会残留一块空白窗口背景。
  */
@@ -87,7 +87,7 @@ export function taskDetailPaneWidth(viewportWidth: number, ratio: number): numbe
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 0;
   return Math.max(
     0,
-    viewportWidth - taskListPaneWidth(viewportWidth, ratio) - TASK_SPLIT_DIVIDER_WIDTH,
+    viewportWidth - taskListPaneWidth(viewportWidth, ratio),
   );
 }
 
@@ -96,10 +96,10 @@ export function taskSplitRatioForDrag(
   startRatio: number,
   deltaX: number,
 ): number {
-  if (!Number.isFinite(viewportWidth) || viewportWidth <= TASK_SPLIT_DIVIDER_WIDTH) {
+  if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
     return clampTaskSplitRatio(startRatio);
   }
-  const availableWidth = viewportWidth - TASK_SPLIT_DIVIDER_WIDTH;
+  const availableWidth = viewportWidth;
   const nextWidth = taskListPaneWidth(viewportWidth, startRatio) + deltaX;
   return clampTaskSplitRatio(nextWidth / availableWidth);
 }

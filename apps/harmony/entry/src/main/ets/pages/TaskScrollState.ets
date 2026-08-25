@@ -18,6 +18,15 @@ export const FOLLOW_LATEST_RETRY_DELAYS: number[] = [24, 80, 180];
 /** 与 Mobile/iOS 一致：短首屏在没有用户手势时最多再补三页。 */
 export const INITIAL_HISTORY_AUTOFILL_PAGES: number = 3;
 
+/** 回看历史时，一次触摸手势只允许触发一页；冷开自动补窗不受此门禁影响。 */
+export function historyGestureAllowsLoad(
+  userReviewIntent: boolean,
+  touchActive: boolean,
+  loadTriggered: boolean,
+): boolean {
+  return !userReviewIntent || (touchActive && !loadTriggered);
+}
+
 /**
  * 尾部跟随是否应被接管。
  *

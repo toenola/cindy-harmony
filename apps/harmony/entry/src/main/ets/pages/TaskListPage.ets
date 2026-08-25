@@ -86,10 +86,18 @@ const LIST_INSET = 16;
 const FLOATING_BAR_BOTTOM_MARGIN = 0;
 const FLOATING_BAR_HEIGHT = 52;
 const FLOATING_BAR_CONTENT_INSET = 72;
-const FLOATING_BAR_SHOW_OFFSET = 0.5;
-const FLOATING_BAR_HIDE_VELOCITY = 600;
+/** 累计一小段明确的浏览位移再切换浮栏，避免单帧抖动造成忽隐忽现。 */
+const FLOATING_BAR_HIDE_DISTANCE = 10;
+const FLOATING_BAR_SHOW_DISTANCE = 8;
+const FLOATING_BAR_FLING_VELOCITY = 240;
+const FLOATING_BAR_SCROLL_NOISE = 0.25;
 /** 两侧 HdsNavigation 的 MINI 标题栏共用 56vp 内容高；分割线从其下方开始。 */
 const SPLIT_HEADER_HEIGHT = 56;
+/** 微信式分割提示：视觉紧凑，透明命中区仍保持可拖拽。 */
+const SPLIT_HANDLE_WIDTH = 16;
+const SPLIT_HANDLE_HEIGHT = 56;
+const SPLIT_HANDLE_MARK_WIDTH = 2;
+const SPLIT_HANDLE_MARK_HEIGHT = 24;
 /** 左侧标题栏不向列表内容额外延伸，避免首条会话落入标题栏的磨砂蒙层。 */
 const LIST_HEADER_MASK_EXTRA_HEIGHT = 0;
 /** 项目组内联展示的任务数上限，超出后由「查看全部」展开。 */
@@ -162,9 +170,9 @@ struct TaskListPage {
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
-    // 输入法出现时 ArkUI 可能按当前焦点重新应用页面级避让。展开分栏必须继续保持
-    // 全窗口不偏移，只由右侧详情栏消费一次键盘高度，左侧列表留在原位并由键盘覆盖。
-    if (this.splitLayoutEnabled()) {
+    // 输入法出现时 ArkUI 可能按当前焦点重新应用页面级避让。展开分栏与窄屏新建草稿
+    // 都由业务内容消费一次键盘高度，避免系统 OFFSET 只托起光标却遮住 Composer 工具栏。
+    if (this.splitLayoutEnabled() || this.newSessionDraftOpen) {
       this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
     }
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
@@ -175,6 +183,8 @@ struct TaskListPage {
   private automationsScroller: Scroller = new Scroller();
   private listTabsAppeared: boolean = false;
   private floatingBarHidden: boolean = false;
+  /** 正数表示向列表末尾浏览，负数表示回看上方；方向改变时重新累计。 */
+  private floatingBarScrollIntent: number = 0;
   private initialListTabIndex: number = 0;
   private foldStatusListener: (status: number) => void = (status: number): void => {
     const wasSplit = this.splitLayoutEnabled();
@@ -277,6 +287,7 @@ struct TaskListPage {
     }
     if (this.newSessionDraftOpen) {
       this.newSessionDraftOpen = false;
+      this.updateKeyboardAvoidance();
       this.ensureWideSelection();
       return true;
     }
@@ -460,7 +471,7 @@ struct TaskListPage {
   }
 
   private updateKeyboardAvoidance(): void {
-    if (this.splitLayoutEnabled()) {
+    if (this.splitLayoutEnabled() || this.newSessionDraftOpen) {
       this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
       void this.observeKeyboardHeight();
       return;
@@ -481,7 +492,7 @@ struct TaskListPage {
       this.keyboardHeightListening = true;
     } catch (_err) {
       // 监听不可用时宁可回退为全页避让，也不能让输入框被键盘遮住。
-      if (this.pageActive && this.splitLayoutEnabled()) {
+      if (this.pageActive && (this.splitLayoutEnabled() || this.newSessionDraftOpen)) {
         this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
       }
     }
@@ -520,6 +531,12 @@ struct TaskListPage {
     );
   }
 
+  private newSessionKeyboardInset(): number {
+    // 宽屏继续只抬右栏；窄屏草稿覆盖整页时直接消费实际键盘高度，
+    // 确保正文、工具栏和发送按钮作为完整 Composer 一起停在键盘上方。
+    return this.splitLayoutEnabled() ? this.detailKeyboardInset() : this.keyboardHeight;
+  }
+
   private listPaneWidth(): number {
     return taskListPaneWidth(this.viewportWidth, this.listPaneRatio);
   }
@@ -545,6 +562,7 @@ struct TaskListPage {
 
   private selectSession(entry: TaskListEntry): void {
     this.newSessionDraftOpen = false;
+    this.updateKeyboardAvoidance();
     this.selectedSessionDeviceId = entry.deviceId;
     this.selectedSessionId = entry.session.id;
     this.selectedMessageClientId = '';
@@ -621,6 +639,7 @@ struct TaskListPage {
     this.listTabController.changeIndex(this.listTabIndex(this.activeListTab));
     // HdsTabsController 会保留上一次动画状态；每次进入页面都明确恢复默认显示态。
     this.floatingBarHidden = false;
+    this.floatingBarScrollIntent = 0;
     this.listTabController.applyShowAnimation(HdsAnimationMode.SCROLL_ANIMATION);
   }
 
@@ -631,15 +650,37 @@ struct TaskListPage {
   }
 
   private handleTaskListScroll(scrollOffset: number, scrollState: ScrollState): void {
-    // 只响应手指拖动，忽略惯性回弹，避免快速下滑到底后因 Spring 回弹又把浮岛唤回。
-    if (scrollState === ScrollState.Scroll && scrollOffset <= -FLOATING_BAR_SHOW_OFFSET) {
+    // 只响应手指拖动；惯性与边缘反馈均为 Fling，不能反向改写用户刚表达的浏览意图。
+    if (scrollState !== ScrollState.Scroll) {
+      this.floatingBarScrollIntent = 0;
+      return;
+    }
+    if (Math.abs(scrollOffset) < FLOATING_BAR_SCROLL_NOISE) return;
+
+    // 官方语义：内容向上（用户向列表末尾浏览）为正，内容向下（回看上方）为负。
+    if (scrollOffset > 0) {
+      if (this.floatingBarScrollIntent < 0) this.floatingBarScrollIntent = 0;
+      this.floatingBarScrollIntent += scrollOffset;
+      if (this.floatingBarScrollIntent >= FLOATING_BAR_HIDE_DISTANCE) {
+        this.hideFloatingBar();
+        this.floatingBarScrollIntent = 0;
+      }
+      return;
+    }
+
+    if (this.floatingBarScrollIntent > 0) this.floatingBarScrollIntent = 0;
+    this.floatingBarScrollIntent += scrollOffset;
+    if (this.floatingBarScrollIntent <= -FLOATING_BAR_SHOW_DISTANCE) {
       this.showFloatingBar();
+      this.floatingBarScrollIntent = 0;
     }
   }
 
   private handleTaskListDragRelease(velocity: number): void {
-    // ArkUI 定义内容向上滚动为正速度；只有明显的快速向下浏览才收起浮岛。
-    if (velocity >= FLOATING_BAR_HIDE_VELOCITY) this.hideFloatingBar();
+    // 短距离快速甩动可能来不及累计位移，用较克制的速度门槛补齐同一方向语义。
+    if (velocity >= FLOATING_BAR_FLING_VELOCITY) this.hideFloatingBar();
+    else if (velocity <= -FLOATING_BAR_FLING_VELOCITY) this.showFloatingBar();
+    this.floatingBarScrollIntent = 0;
   }
 
   private hideFloatingBar(): void {
@@ -700,6 +741,7 @@ struct TaskListPage {
   private openNewSession(): void {
     this.newSessionDraftDeviceId = this.selectedDeviceId;
     this.newSessionDraftOpen = true;
+    this.updateKeyboardAvoidance();
   }
 
   /** 菜单开合统一走轻量可见性动效，保证浮层进退场完整播放。 */
@@ -1280,8 +1322,7 @@ struct TaskListPage {
           Column() {
             this.detailPane()
           }
-          // 分隔区覆盖在详情栏左缘，避免把顶部玻璃材质切成两个横向区域。
-          .width(this.detailPaneWidth() + TASK_SPLIT_DIVIDER_WIDTH)
+          .width(this.detailPaneWidth())
           .height('100%')
         }
       }
@@ -1293,15 +1334,17 @@ struct TaskListPage {
       if (this.newSessionDraftOpen) {
         NewSessionPageContent({
           paneDeviceId: this.newSessionDraftDeviceId,
-          paneKeyboardInset: this.detailKeyboardInset(),
+          paneKeyboardInset: this.newSessionKeyboardInset(),
           paneComposerBottomInset: this.detailComposerBottomInset(),
           embedded: this.splitLayoutEnabled(),
           onClose: (): void => {
             this.newSessionDraftOpen = false;
+            this.updateKeyboardAvoidance();
             this.ensureWideSelection();
           },
           onSessionStarted: (deviceId: string, sessionId: string): void => {
             this.newSessionDraftOpen = false;
+            this.updateKeyboardAvoidance();
             this.selectedSessionDeviceId = deviceId;
             this.selectedSessionId = sessionId;
             this.selectedMessageClientId = '';
@@ -1314,7 +1357,7 @@ struct TaskListPage {
           },
         })
           .width(this.splitLayoutEnabled()
-            ? this.detailPaneWidth() + TASK_SPLIT_DIVIDER_WIDTH : '100%')
+            ? this.detailPaneWidth() : '100%')
           .height('100%')
           .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() : 0, y: 0 })
           .transition(uiRevealTransition())
@@ -1364,6 +1407,9 @@ struct TaskListPage {
         TabContent() {
           this.taskListTabPage('projects')
         }
+        // HdsTabs 内部使用 Swiper 承载 TabContent；允许当前列表延伸至
+        // HdsNavigation 标题栏后方，标题材质才能采样到真实列表内容。
+        .clip(false)
         .tabBar(this.taskListTabBarStyle(
           '项目',
           $r('sys.symbol.folder'),
@@ -1372,6 +1418,7 @@ struct TaskListPage {
         TabContent() {
           this.taskListTabPage('dialogues')
         }
+        .clip(false)
         .tabBar(this.taskListTabBarStyle(
           '对话',
           $r('sys.symbol.ellipsis_message'),
@@ -1380,6 +1427,7 @@ struct TaskListPage {
         TabContent() {
           this.taskListTabPage('automations')
         }
+        .clip(false)
         .tabBar(this.taskListTabBarStyle(
           '自动化',
           $r('sys.symbol.bolt'),
@@ -1410,6 +1458,7 @@ struct TaskListPage {
       .onChange((index: number) => this.handleListTabChange(index))
       .layoutWeight(1)
       .width('100%')
+      .clip(false)
       .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
       .onAppear(() => this.handleListTabsAppear())
       }
@@ -1419,7 +1468,22 @@ struct TaskListPage {
     }
     .titleBar({
       enableComponentSafeArea: true,
-      style: {
+      style: this.splitLayoutEnabled() ? {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          // 展开双栏与右侧详情使用同一种标题栏材质；可见差异由后方内容决定，
+          // 不再用另一套渐变参数模拟相似效果。
+          scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
+          blurEffectiveStartOffset: LengthMetrics.vp(0),
+          blurEffectiveEndOffset: LengthMetrics.vp(20),
+        },
+        blurStrategy: BlurStrategy.ADAPTIVE,
+        thermoCtrl: true,
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      } : {
         scrollEffectOpts: {
           enableScrollEffect: true,
           scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR,
@@ -1454,11 +1518,9 @@ struct TaskListPage {
     // 否则它会把当前列表当成 navBar，并在右侧生成一块没有 NavDestination 的空内容区。
     .mode(NavigationMode.Stack)
     .titleMode(HdsNavigationTitleMode.MINI)
-    .bindToScrollable([
-      this.projectsScroller,
-      this.dialoguesScroller,
-      this.automationsScroller,
-    ])
+    // HdsNavigation 嵌套 HdsTabs 时只能绑定当前可见页的 Scroller；同时绑定
+    // 三个隐藏页会让标题栏读取到错误的滚动/模糊状态。
+    .bindToScrollable([this.scrollerForCategory(this.activeListTab)])
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
@@ -1516,16 +1578,36 @@ struct TaskListPage {
 
   @Builder
   splitDivider() {
-    Stack({ alignContent: Alignment.Bottom }) {
-      Row()
-        .width(1)
-        .height(`calc(100% - ${SPLIT_HEADER_HEIGHT}vp)`)
-        .backgroundColor($r('app.color.border'))
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Blank()
+          .height(SPLIT_HEADER_HEIGHT)
+        Row()
+          .width(1)
+          .layoutWeight(1)
+          .backgroundColor($r('app.color.border'))
+      }
+      .width(1)
+      .height('100%')
+
+      Row() {
+        Row()
+          .width(SPLIT_HANDLE_MARK_WIDTH)
+          .height(SPLIT_HANDLE_MARK_HEIGHT)
+          .backgroundColor($r('app.color.text_tertiary'))
+          .borderRadius(UI_RADIUS_PILL)
+      }
+      .justifyContent(FlexAlign.Center)
+      .width(SPLIT_HANDLE_WIDTH)
+      .height(SPLIT_HANDLE_HEIGHT)
+      .backgroundColor($r('app.color.bg_chip'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_PILL)
     }
-    .width(20)
+    .width(TASK_SPLIT_DIVIDER_WIDTH)
     .height('100%')
-    .position({ x: this.listPaneWidth(), y: 0 })
-    // 20vp 只作为拖拽命中区，视觉上不铺底、不加玻璃层，只保留中央 1px 分隔线。
+    .position({ x: this.listPaneWidth() - TASK_SPLIT_DIVIDER_WIDTH / 2, y: 0 })
+    // 命中区跨在交界线两侧；只有中部指示符可见，整列不铺底。
     .backgroundColor(Color.Transparent)
     .onTouch((event: TouchEvent) => {
       this.handleDividerTouch(event);
@@ -1865,7 +1947,8 @@ struct TaskListPage {
     .clip(false)
     .cachedCount(3, true)
     .scrollBar(BarState.Off)
-    .edgeEffect(EdgeEffect.Spring)
+    // Spring 无强度参数；Fade 保留触底反馈，但不会把整列内容明显拉离边界。
+    .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
       this.handleTaskListScroll(scrollOffset, scrollState);
     })

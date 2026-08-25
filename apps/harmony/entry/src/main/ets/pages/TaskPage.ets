@@ -12,6 +12,7 @@
  */
 
 import { display, KeyboardAvoidMode, LengthMetrics, router, promptAction, window } from '@kit.ArkUI';
+import { LevelMode } from '@kit.ArkUI';
 import {
   BlurStrategy,
   HdsNavigation,
@@ -20,10 +21,14 @@ import {
   hdsMaterial,
 } from '@kit.UIDesignKit';
 import { common } from '@kit.AbilityKit';
+import { util } from '@kit.ArkTS';
 import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import { HarmonyHttp } from '../network/HarmonyHttp';
+import { isTextFileReference, splitFileReferenceLocation } from '../core/files/FileReference';
+import { RemoteFileService } from '../core/files/RemoteFileService';
 import { presignGet } from '../core/attachments/AttachmentUpload';
 import {
   RemoteImageRef,
@@ -130,7 +135,8 @@ import {
   RenderMediaPayload,
 } from '../core/messages/MessagePayload';
 import {
-  MdBlock, InlineToken, InlineTokenGroup, groupInlineTokens,
+  MdBlock, InlineToken, InlineTokenGroup, MdSelectableBlockGroup, MdSelectableTextBlock,
+  groupInlineTokens, groupMarkdownSelectableBlocks,
 } from '../core/messages/MarkdownParser';
 import { ThinkingTextToken, tokenizeThinkingText } from '../core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
@@ -179,6 +185,7 @@ import {
 import {
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
+  historyGestureAllowsLoad,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   messageListBottomIndex,
   messageListItemPresentationState,
@@ -333,6 +340,8 @@ const SHARE_ITEM_GAP_VP: number = 12;
 const SHARE_CARD_PADDING_VP: number = 12;
 const SHARE_CARD_TEXT_GAP_VP: number = 4;
 const SHARE_OMITTED_CONTENT_LABEL: string = '仅包含当前展开的内容';
+/** 与 Desktop 会话 Git 上下文的周期重解析节奏一致。 */
+const GIT_BRANCH_REFRESH_INTERVAL_MS: number = 60_000;
 function modelAgentLabel(kind: string): string {
   if (kind === 'claude-code' || kind === 'cc') return 'Claude';
   if (kind === 'codex') return 'Codex';
@@ -371,6 +380,53 @@ function isImageMimeType(value: string): boolean {
   return value.toLowerCase().startsWith('image/');
 }
 
+function fileTitleOf(value: string): string {
+  const normalized = splitFileReferenceLocation(value).path.replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  const title = slash >= 0 ? normalized.slice(slash + 1) : normalized;
+  return title.length > 0 ? title : '文件';
+}
+
+class RenderItemDataSource implements IDataSource {
+  private rows: RenderItem[] = [];
+  private listeners: DataChangeListener[] = [];
+
+  totalCount(): number {
+    return this.rows.length;
+  }
+
+  getData(index: number): RenderItem {
+    return this.rows[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) this.listeners.push(listener);
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const index = this.listeners.indexOf(listener);
+    if (index >= 0) this.listeners.splice(index, 1);
+  }
+
+  replace(next: RenderItem[], prependCount: number): void {
+    if (prependCount > 0 && this.rows.length > 0) {
+      // 从后向前逐条插入，最终顺序与 next 的前缀一致；LazyForEach 因此能把每次
+      // 变化识别为显示区上方插入，而不是整表 reload。
+      for (let i = prependCount - 1; i >= 0; i--) {
+        this.rows.splice(0, 0, next[i]);
+        for (let j = 0; j < this.listeners.length; j++) this.listeners[j].onDataAdd(0);
+      }
+      // 只替换权威投影，不 reload，也不能 onDataChange 旧首项。用户触发分页时
+      // 旧首项正是可见锚点；重建它会让 maintainVisibleContentPosition 失去锚点，
+      // 继而跳到本次新增历史的最前面。页边界节点离开缓存区后会按 next 重建。
+      this.rows = next;
+      return;
+    }
+    this.rows = next;
+    for (let i = 0; i < this.listeners.length; i++) this.listeners[i].onDataReloaded();
+  }
+}
+
 
 @Component
 export struct TaskPageContent {
@@ -386,6 +442,7 @@ export struct TaskPageContent {
    */
   @Prop paneKeyboardInset: number = 0;
   @State items: RenderItem[] = [];
+  private messageDataSource: RenderItemDataSource = new RenderItemDataSource();
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
   private composerDocument: ComposerDocument = new ComposerDocument();
@@ -424,6 +481,8 @@ export struct TaskPageContent {
   /** 真实消息区宽度；折叠双栏下不能拿整块屏幕宽度估算 Markdown 表格。 */
   @State messageAreaWidth: number = 0;
   private tableColumnWidthCache: Map<MdBlock, number[]> = new Map();
+  /** 完成态 Markdown 数组身份稳定；缓存连续文本组，避免页面状态刷新时重复线性分组。 */
+  private markdownSelectableGroupCache: Map<MdBlock[], MdSelectableBlockGroup[]> = new Map();
   /** 用户是否仍明确跟随消息尾部。 */
   @State followingLatest: boolean = true;
   /** 离底期间收到尾部更新时，在回到底部浮标上显示提示点。 */
@@ -478,6 +537,11 @@ export struct TaskPageContent {
   @State expandedTextBlocks: string[] = [];
   private deviceId: string = '';
   private sessionId: string = '';
+  /** 标题栏只展示可信的 branch HEAD；非 Git / detached HEAD 均保持为空。 */
+  @State gitBranchName: string = '';
+  private gitBranchContextKey: string = '';
+  private gitBranchGeneration: number = 0;
+  private gitBranchRefreshTimer: number = -1;
   private unsubs: Array<() => void> = [];
   private listScroller: Scroller = new Scroller();
   private initialScrolled: boolean = false;
@@ -516,12 +580,11 @@ export struct TaskPageContent {
   /** 冷开短窗口的剩余自动补页次数；真实上翻后不再受此预算限制。 */
   private initialHistoryAutofillRemaining: number = INITIAL_HISTORY_AUTOFILL_PAGES;
   private historyLastAttemptFirstKey: string = '';
+  /** 用户历史分页按可见业务锚点最终校准；mVCP 只负责减少投影落地时的瞬时位移。 */
+  private historyAnchorRestoreGeneration: number = 0;
+  private pendingHistoryAnchorRestore: (() => void) | undefined = undefined;
   /** 最新 Task 计划缺历史上下文时只定向补页，不占用普通冷开补窗预算。 */
   private taskPlanBackfillPending: boolean = false;
-  /** 新手势、跳尾或离页会作废尚未执行的历史锚点恢复。 */
-  private historyAnchorRestoreGeneration: number = 0;
-  /** 快速响应撞上手指仍按住时，等 Touch Up 再恢复，不丢弃整页锚点。 */
-  private pendingHistoryAnchorRestore: (() => void) | undefined = undefined;
   /** 待发送图片（上传状态，由共享队列同步镜像）。 */
   @State composerImages: ComposerImage[] = [];
   @State pickingImages: boolean = false;
@@ -556,6 +619,8 @@ export struct TaskPageContent {
   @State contextSelectedUris: string[] = [];
   /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
   @State sessionActionOpen: boolean = false;
+  /** 主操作与低频会话信息分层展示，避免展开屏菜单被元信息撑成近全屏面板。 */
+  @State sessionActionInfoMode: boolean = false;
   @State sessionRenameMode: boolean = false;
   @State sessionRenameDraft: string = '';
   @State sessionActionBusy: boolean = false;
@@ -616,6 +681,17 @@ export struct TaskPageContent {
   private ossUrlCache: Map<string, string> = new Map();
   /** 全屏预览中的图片 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
+  @State filePreviewOpen: boolean = false;
+  @State filePreviewTitle: string = '';
+  @State filePreviewPath: string = '';
+  @State filePreviewDownloadRaw: string = '';
+  @State filePreviewMimeType: string = '';
+  @State filePreviewText: string = '';
+  @State filePreviewStatus: string = 'idle';
+  @State filePreviewError: string = '';
+  @State fileShareBusy: boolean = false;
+  private filePreviewGeneration: number = 0;
+  private remoteFileService: RemoteFileService = new RemoteFileService();
   /** 挂起的交互请求（Permission / Ask User / Plan Review）。 */
   @State pendingInteractions: PendingInteraction[] = [];
   /** Ask User 草稿的页面级响应式快照；Store 的普通 Map 本身不会触发 ArkUI 局部重绘。 */
@@ -744,6 +820,7 @@ export struct TaskPageContent {
       this.deviceDisabled = this.checkDeviceDisabled();
       this.syncMessageCount();
       this.syncComposerContextState();
+      this.refreshGitBranch();
     }));
     this.deviceDisabled = this.checkDeviceDisabled();
     this.syncMessageCount();
@@ -760,6 +837,8 @@ export struct TaskPageContent {
       this.refreshNewSessionCreation();
     }));
     this.refreshNewSessionCreation();
+    this.refreshGitBranch(true);
+    this.startGitBranchRefresh();
   }
 
   aboutToDisappear(): void {
@@ -767,6 +846,7 @@ export struct TaskPageContent {
     this.shareService.release();
     this.shareService.attachUiContext(undefined);
     this.sharePreviewOpen = false;
+    this.remoteFileService.release();
     if (this.shareBackgroundRelease !== undefined) {
       this.shareBackgroundRelease();
       this.shareBackgroundRelease = undefined;
@@ -789,6 +869,10 @@ export struct TaskPageContent {
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.composerCapabilitiesGeneration += 1;
+    this.stopGitBranchRefresh();
+    this.gitBranchGeneration += 1;
+    this.gitBranchContextKey = '';
+    this.gitBranchName = '';
     this.composerToolbarReady = false;
     this.initialScrollSettling = false;
     this.restoreComposerFocusOnSheetDisappear = false;
@@ -1174,6 +1258,66 @@ export struct TaskPageContent {
     options.args = args;
     const envelope = await AppServices.instance.client.invoke(this.deviceId, options);
     return unwrapInvokeResult(envelope);
+  }
+
+  /**
+   * 按会话解析真实 Git HEAD。返回的 workdir 可能来自 agent 遥测、
+   * live worktree 或 SSH 主机，因此不在 Harmony 端自行对 workingDir 做本地探测。
+   */
+  private gitBranchRequestKeyFor(session: RemoteSession): string {
+    return `${session.id}\n${session.workingDir}\n${session.worktreePath}\n${session.remoteHostId}`;
+  }
+
+  private refreshGitBranch(force: boolean = false): void {
+    const session = this.session();
+    if (session === undefined || session.workspaceKind !== 'project'
+      || this.isCreationBlockingRemoteOps()) {
+      this.gitBranchGeneration += 1;
+      this.gitBranchContextKey = '';
+      this.gitBranchName = '';
+      return;
+    }
+
+    const requestKey = this.gitBranchRequestKeyFor(session);
+    if (!force && requestKey === this.gitBranchContextKey) return;
+
+    this.gitBranchContextKey = requestKey;
+    this.gitBranchName = '';
+    const generation = ++this.gitBranchGeneration;
+    const request: Record<string, Object> = {};
+    request['sessionId'] = session.id;
+    request['workingDir'] = session.workingDir;
+    request['worktreePath'] = session.worktreePath;
+    if (session.remoteHostId.length > 0) request['remoteHostId'] = session.remoteHostId;
+
+    void this.invokeContextRpc('git-context:get-for-session', [request])
+      .then((result: Object | undefined) => {
+        if (generation !== this.gitBranchGeneration
+          || requestKey !== this.gitBranchContextKey) return;
+        const head = readObj(recordOrEmpty(result), 'head');
+        const branch = readStr(head, 'kind') === 'branch' ? readStr(head, 'branch').trim() : '';
+        this.gitBranchName = branch;
+      })
+      .catch(() => {
+        if (generation === this.gitBranchGeneration
+          && requestKey === this.gitBranchContextKey) {
+          this.gitBranchName = '';
+        }
+      });
+  }
+
+  private startGitBranchRefresh(): void {
+    this.stopGitBranchRefresh();
+    this.gitBranchRefreshTimer = setInterval(() => {
+      this.refreshGitBranch(true);
+    }, GIT_BRANCH_REFRESH_INTERVAL_MS);
+  }
+
+  private stopGitBranchRefresh(): void {
+    if (this.gitBranchRefreshTimer >= 0) {
+      clearInterval(this.gitBranchRefreshTimer);
+      this.gitBranchRefreshTimer = -1;
+    }
   }
 
   private async togglePlanMode(): Promise<void> {
@@ -2256,8 +2400,6 @@ export struct TaskPageContent {
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
     this.historyLastAttemptFirstKey = '';
-    this.historyAnchorRestoreGeneration += 1;
-    this.pendingHistoryAnchorRestore = undefined;
     this.syncMessageCount();
     this.beginInitialLoad();
   }
@@ -2276,6 +2418,7 @@ export struct TaskPageContent {
   /** 历史 + 流式统一进入同一个渲染模型，并把会话是否正在流式传入聚合层。 */
   private refreshItems(): void {
     this.syncMessageCount();
+    const previousItems = this.items;
     const previousTailToken = this.renderTailToken(this.items);
     const projection = AppServices.instance.inputQueue.getProjection(this.sessionId);
     const messages = appendAutoResumePendingMessage(
@@ -2310,7 +2453,10 @@ export struct TaskPageContent {
     this.syncWorkClock(streaming);
     // 仅宽度变化才会让表格列宽缓存失效；消息增量不能把整窗表格重算一遍。
     this.reconcileCollapsedTodoCards(this.items, nextItems);
+    const prependCount = this.loadingOlder
+      ? this.historyRenderPrependCount(previousItems, nextItems) : 0;
     this.items = nextItems;
+    this.messageDataSource.replace(nextItems, prependCount);
     this.backfillIncompleteTaskPlan(messages);
     this.reconcileSearchSelection();
     this.loadFailed = AppServices.instance.messages.loadFailed(this.sessionId);
@@ -2326,6 +2472,16 @@ export struct TaskPageContent {
     } else {
       this.hasNewMessages = true;
     }
+  }
+
+  private historyRenderPrependCount(previous: RenderItem[], next: RenderItem[]): number {
+    if (previous.length === 0 || next.length <= previous.length) return 0;
+    const anchor = this.renderAnchorKey(previous[0], previous);
+    if (anchor.length === 0) return 0;
+    for (let i = 0; i < next.length; i++) {
+      if (this.renderItemContainsAnchor(next[i], anchor)) return i;
+    }
+    return 0;
   }
 
   private backfillIncompleteTaskPlan(messages: RemoteMessage[]): void {
@@ -2522,14 +2678,12 @@ export struct TaskPageContent {
   private takeOverTailAfterSend(): void {
     this.followingLatest = true;
     this.hasNewMessages = false;
-    // 恢复默认尾窗：清掉回看意图与在途锚点恢复，避免刚跳底又被历史锚点拽回去。
+    // 恢复默认尾窗，用户自己的新消息重新接管列表跟随意图。
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
     this.historyAnchorRestoreGeneration += 1;
-    if (this.pendingHistoryAnchorRestore !== undefined) {
-      this.pendingHistoryAnchorRestore = undefined;
-      this.loadingOlder = false;
-    }
+    this.pendingHistoryAnchorRestore = undefined;
+    this.loadingOlder = false;
     this.followLatestSoon();
   }
 
@@ -2981,10 +3135,8 @@ export struct TaskPageContent {
     this.followingLatest = true;
     this.hasNewMessages = false;
     this.historyAnchorRestoreGeneration += 1;
-    if (this.pendingHistoryAnchorRestore !== undefined) {
-      this.pendingHistoryAnchorRestore = undefined;
-      this.loadingOlder = false;
-    }
+    this.pendingHistoryAnchorRestore = undefined;
+    this.loadingOlder = false;
     this.followScrollGeneration += 1;
     this.followScrollScheduled = false;
     this.followScrollTrailingRequested = false;
@@ -3190,8 +3342,8 @@ export struct TaskPageContent {
   }
 
   /**
-   * 加载一页更早历史。真实上翻保持旧首项锚点；冷开自动补窗则继续贴住尾部，
-   * 避免后台 prepend 把用户从最新消息带到历史位置。
+   * 加载一页更早历史。真实上翻由 LazyForEach + maintainVisibleContentPosition
+   * 原生保持可见内容；冷开自动补窗则继续贴住尾部。
    */
   private loadOlder(
     continueSearch: boolean = false,
@@ -3219,32 +3371,35 @@ export struct TaskPageContent {
       this.followScrollTrailingRequested = false;
       this.historyReviewIntent = true;
     }
-    // 不能用“新增原始消息数”作为 List index：多个 thinking/tool 行会被渲染模型
-    // 合成一个 work_group，原始消息下标与可见 ListItem 下标并不相等。
-    const previousVisibleRenderIndex = firstVisibleMessageRenderIndex(
-      hadOlderMessages,
-      this.visibleStartIndex,
-      this.items.length,
-    );
-    const previousVisibleRenderAnchor = previousVisibleRenderIndex >= 0
-      ? this.renderAnchorKey(this.items[previousVisibleRenderIndex], this.items) : '';
-    let previousVisibleOffsetY = 0;
-    if (previousVisibleRenderIndex >= 0) {
-      try {
-        const rect = this.listScroller.getItemRect(
-          this.renderListIndex(previousVisibleRenderIndex));
-        if (Number.isFinite(rect.y)) previousVisibleOffsetY = rect.y;
-      } catch (e) {
-        // 极短列表或布局切换瞬间可能尚未绑定可见 item；稳定 key 仍可兜底。
-      }
-    }
     const requestFirstKey = this.items.length > 0
       ? this.renderAnchorKey(this.items[0], this.items) : '';
     this.historyLastAttemptFirstKey = requestFirstKey;
-    const previousRenderCount = this.items.length;
-    const anchorRestoreGeneration = ++this.historyAnchorRestoreGeneration;
     this.loadingOlder = true;
     AppServices.instance.messages.loadOlder(this.deviceId, this.sessionId).then((added: number) => {
+      // 网络等待期间用户仍可能滚动；必须在响应落地、刷新投影前采集此刻的阅读点，
+      // 不能用发请求时的旧位置把用户拉回去。
+      const previousVisibleRenderIndex = firstVisibleMessageRenderIndex(
+        hadOlderMessages,
+        this.visibleStartIndex,
+        this.items.length,
+      );
+      const previousVisibleRenderAnchor = previousVisibleRenderIndex >= 0
+        ? this.renderAnchorKey(this.items[previousVisibleRenderIndex], this.items) : '';
+      let previousVisibleOffsetY = 0;
+      if (previousVisibleRenderIndex >= 0) {
+        try {
+          const rect = this.listScroller.getItemRect(
+            this.renderListIndex(previousVisibleRenderIndex));
+          if (Number.isFinite(rect.y)) previousVisibleOffsetY = rect.y;
+        } catch (_) {
+        }
+      }
+      const anchorRestoreGeneration = ++this.historyAnchorRestoreGeneration;
+      // MessageStore 的通知按帧合并；分页 Promise 可能先于页面订阅回调返回。
+      // 这里先同步生成新投影，锚点查找与新增可见项数量都必须基于 prepend 后的数据。
+      this.itemsRefreshGeneration += 1;
+      this.itemsRefreshScheduled = false;
+      this.refreshItems();
       const historyHeaderChanged = hadOlderMessages !== this.hasOlderMessages;
       if (added > 0 || historyHeaderChanged) {
         const stillFollowingLatest = keepFollowingLatest
@@ -3254,48 +3409,43 @@ export struct TaskPageContent {
           // 冷开补窗只向上扩充数据，不改变“正在看最新消息”的意图。
           this.followLatestSoon();
         } else {
-          // 新加载的更早消息插在头部：回到 prepend 前的首个可见渲染项，保持阅读点。
-          // 这是桌面/Mobile 的 mVCP 语义在 ArkUI List 上的稳定 key 版本。
-          setTimeout(() => {
+          // List 内同时有历史入口、尾部状态和队列节点，且页边界可能重聚合。
+          // 即使 mVCP 接收到了 onDataAdd，也不能据此认定可见位置已保持；真实用户
+          // 分页始终按业务锚点校准一次，目标仍是采集时的同一屏幕 Y。
+          const needsAnchorFallback = added > 0 && previousVisibleRenderAnchor.length > 0;
+          if (needsAnchorFallback) {
             const restoreAnchor = (): void => {
               this.loadingOlder = false;
-              if (anchorRestoreGeneration !== this.historyAnchorRestoreGeneration) {
-                setTimeout(() => this.attemptAutoLoadEarlier(), 60);
-                return;
+              if (anchorRestoreGeneration !== this.historyAnchorRestoreGeneration) return;
+              const anchorIndex = this.renderItemIndexContainingAnchor(previousVisibleRenderAnchor);
+              if (anchorIndex >= 0) {
+                this.listScroller.scrollToIndex(
+                  this.renderListIndex(anchorIndex),
+                  false,
+                  ScrollAlign.START,
+                  { extraOffset: LengthMetrics.vp(-previousVisibleOffsetY) },
+                );
               }
               if (continueSearch && this.searchOpen && this.searchQuery.trim().length > 0) {
                 this.reconcileSearchSelection();
                 const hits = this.searchHits();
                 if (hits.length > 0) this.focusSearchHit(hits[this.searchActiveIndex]);
-              } else {
-                const anchorIndex = this.renderItemIndexContainingAnchor(previousVisibleRenderAnchor);
-                if (anchorIndex >= 0) {
-                  this.listScroller.scrollToIndex(
-                    this.renderListIndex(anchorIndex),
-                    false,
-                    ScrollAlign.START,
-                    { extraOffset: LengthMetrics.vp(-previousVisibleOffsetY) },
-                  );
-                } else {
-                  // fallback 也只能使用可见 render item 数，不能混用原始 DB 行数。
-                  const visibleAdded = Math.max(0, this.items.length - previousRenderCount);
-                  const fallbackIndex = Math.min(
-                    Math.max(0, previousVisibleRenderIndex) + visibleAdded,
-                    Math.max(0, this.items.length - 1),
-                  );
-                  this.listScroller.scrollToIndex(this.renderListIndex(fallbackIndex), false);
-                }
               }
               setTimeout(() => this.attemptAutoLoadEarlier(), 60);
             };
-            if (this.listTouchActive) {
-              // ArkUI 不保证活动手势中的 prepend 自动维持内容；等抬手后再执行
-              // 同一锚点，且 loadingOlder 保持 true，避免期间又发起下一页。
-              this.pendingHistoryAnchorRestore = restoreAnchor;
-            } else {
-              restoreAnchor();
-            }
-          }, 50);
+            setTimeout(() => {
+              if (this.listTouchActive) this.pendingHistoryAnchorRestore = restoreAnchor;
+              else restoreAnchor();
+            }, 16);
+            return;
+          }
+          this.loadingOlder = false;
+          if (continueSearch && this.searchOpen && this.searchQuery.trim().length > 0) {
+            this.reconcileSearchSelection();
+            const hits = this.searchHits();
+            if (hits.length > 0) this.focusSearchHit(hits[this.searchActiveIndex]);
+          }
+          setTimeout(() => this.attemptAutoLoadEarlier(), 60);
           return;
         }
       } else {
@@ -3313,6 +3463,10 @@ export struct TaskPageContent {
   }
 
   private attemptAutoLoadEarlier(): void {
+    // 用户回看历史时，一次按下/拖动手势最多加载一页。onReachStart、onScrollIndex
+    // 与 prepend 后的几何回调可能连续到达，不能把它们解释成新的用户意图。
+    if (!historyGestureAllowsLoad(
+      this.historyReviewIntent, this.listTouchActive, this.listTouchLoadTriggered)) return;
     const firstKey = this.items.length > 0
       ? this.renderAnchorKey(this.items[0], this.items) : '';
     if (this.routeMessageClientId.length > 0 || !shouldAutoLoadEarlier(
@@ -4033,11 +4187,118 @@ export struct TaskPageContent {
         .onClick(() => this.closeImagePreview())
       }
 
+      if (this.filePreviewOpen) {
+        Stack({ alignContent: Alignment.Center }) {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor($r('app.color.overlay'))
+            .onClick(() => this.closeFilePreview())
+          Column({ space: 10 }) {
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.doc_text'))
+                .fontSize(uiFontSize(18))
+                .fontColor([$r('app.color.text_secondary')])
+              Column({ space: 1 }) {
+                Text(this.filePreviewTitle)
+                  .fontSize(uiFontSize(16))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                Text(this.filePreviewPath)
+                  .fontSize(uiFontSize(11))
+                  .fontColor($r('app.color.text_tertiary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Button() {
+                SymbolGlyph($r('sys.symbol.xmark'))
+                  .fontSize(uiFontSize(14))
+                  .fontColor([$r('app.color.text_secondary')])
+              }
+              .type(ButtonType.Circle)
+              .width(36)
+              .height(36)
+              .padding(0)
+              .backgroundColor($r('app.color.bg_chip'))
+              .onClick(() => this.closeFilePreview())
+            }
+            .width('100%')
+
+            if (this.filePreviewStatus === 'loading') {
+              Row({ space: 8 }) {
+                LoadingProgress().width(16).height(16).color($r('app.color.text_tertiary'))
+                Text('正在读取文件')
+                  .fontSize(uiFontSize(13))
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .justifyContent(FlexAlign.Center)
+            } else if (this.filePreviewStatus === 'ready') {
+              Scroll() {
+                Text(this.filePreviewText)
+                  .fontSize(uiFontSize(13))
+                  .fontFamily('monospace')
+                  .lineHeight(uiLineHeight(20))
+                  .fontColor($r('app.color.code_text'))
+                  .copyOption(CopyOptions.LocalDevice)
+                  .width('100%')
+                  .padding(12)
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .backgroundColor($r('app.color.bg_code'))
+              .border({ width: 1, color: $r('app.color.border') })
+              .borderRadius(UI_RADIUS_CONTROL)
+            } else {
+              Column({ space: 6 }) {
+                Text(this.filePreviewStatus === 'error'
+                  ? this.filePreviewError : '此文件可通过系统分享交给其他应用打开')
+                  .fontSize(uiFontSize(13))
+                  .lineHeight(uiLineHeight(20))
+                  .fontColor(this.filePreviewStatus === 'error'
+                    ? $r('app.color.danger') : $r('app.color.text_secondary'))
+                  .textAlign(TextAlign.Center)
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .justifyContent(FlexAlign.Center)
+            }
+
+            Button(this.fileShareBusy ? '正在准备…' : '分享给其他应用')
+              .fontSize(uiFontSize(14))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.chat_cta_text'))
+              .width('100%')
+              .height(44)
+              .enabled(!this.fileShareBusy)
+              .backgroundColor($r('app.color.chat_cta'))
+              .borderRadius(UI_RADIUS_CONTROL)
+              .onClick(() => void this.sharePreviewFile())
+          }
+          .width('calc(100% - 24vp)')
+          .height('82%')
+          .constraintSize({ maxWidth: 760 })
+          .padding(14)
+          .backgroundColor($r('app.color.bg_card'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTAINER)
+        }
+        .width('100%')
+        .height('100%')
+        .position({ x: 0, y: 0 })
+        .zIndex(100)
+        .transition(uiOverlayTransition())
+      }
+
       if (this.messageActionItemKey.length > 0) {
         this.messageActionLayer()
-      }
-      if (this.sessionActionOpen) {
-        this.sessionActionLayer()
       }
       if (shareFlowBusy(this.shareStage) || this.shareStage === SHARE_STAGE_FAILED) {
         this.shareOverlayLayer()
@@ -4129,46 +4390,72 @@ export struct TaskPageContent {
 
   @Builder
   sessionActionLayer() {
-    Stack({ alignContent: Alignment.Bottom }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.task_list_overlay'))
-        .onClick(() => this.closeSessionActions())
-
-      Scroll() {
-        Column({ space: 8 }) {
+    Scroll() {
+      Column({ space: 8 }) {
           Row({ space: 10 }) {
+            if (this.sessionActionInfoMode) {
+              Button() {
+                SymbolGlyph($r('sys.symbol.chevron_left'))
+                  .fontSize(uiFontSize(16))
+                  .fontColor([$r('app.color.text_secondary')])
+              }
+              .type(ButtonType.Circle)
+              .width(40)
+              .height(40)
+              .padding(0)
+              .backgroundColor(Color.Transparent)
+              .clickEffect(UI_ICON_CLICK_EFFECT)
+              .accessibilityText('返回任务操作')
+              .onClick(() => this.sessionActionInfoMode = false)
+            }
             Column({ space: 2 }) {
-              Text(this.sessionTitle())
+              Text(this.sessionActionInfoMode ? '会话信息' : this.sessionTitle())
                 .fontSize(uiFontSize(16))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text(`${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.session()?.model || '默认模型'}`)
+              Text(this.sessionActionInfoMode
+                ? this.sessionTitle()
+                : `${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.session()?.model || '默认模型'}`)
                 .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_secondary'))
                 .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start)
-            Button() {
-              SymbolGlyph($r('sys.symbol.xmark'))
-                .fontSize(uiFontSize(14))
-                .fontColor([$r('app.color.text_secondary')])
-            }
-            .type(ButtonType.Circle)
-            .width(36)
-            .height(36)
-            .padding(0)
-            .backgroundColor($r('app.color.bg_chip'))
-            .onClick(() => this.closeSessionActions())
           }
           .width('100%')
           .padding({ bottom: 4 })
 
-          if (this.sessionRenameMode) {
+          if (this.sessionActionInfoMode) {
+            if ((this.session()?.workingDir ?? '').length > 0) {
+              this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
+                this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
+              })
+            }
+            if ((this.session()?.worktreePath ?? '').length > 0) {
+              this.sessionMetadataRow('Worktree', this.session()?.worktreePath ?? '', () => {
+                this.copyPlainText(this.session()?.worktreePath ?? '', '已复制 Worktree 路径');
+              })
+            }
+            if (this.contextUsageLabel().length > 0) {
+              this.sessionMetadataRow('上下文用量', this.contextUsageLabel(), () => {})
+            }
+            ForEach(this.session()?.extraDirs ?? [], (path: string, index: number) => {
+              this.sessionMetadataRow(index === 0 ? '附加目录' : '', path,
+                () => this.copyPlainText(path, '已复制附加目录'))
+            }, (path: string, index: number) => `${index}-${path}`)
+            if ((this.session()?.parentSessionId ?? '').length > 0) {
+              this.sessionMetadataRow('父任务', this.session()?.parentSessionId ?? '', () => {
+                this.copyPlainText(this.session()?.parentSessionId ?? '', '已复制父任务 ID');
+              })
+            }
+            if ((this.session()?.orcaRole ?? '').length > 0) {
+              this.sessionMetadataRow('协作分支', this.session()?.orcaRole ?? '', () => {})
+            }
+          } else if (this.sessionRenameMode) {
             TextInput({ placeholder: '任务名称', text: this.sessionRenameDraft })
               .fontSize(uiFontSize(15))
               .fontColor($r('app.color.text_primary'))
@@ -4223,51 +4510,20 @@ export struct TaskPageContent {
             this.sessionActionOption(this.session()?.status === 'archived' ? '恢复任务' : '归档任务',
               $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
 
-            if ((this.session()?.workingDir ?? '').length > 0) {
-              this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
-                this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
-              })
-            }
-            if ((this.session()?.worktreePath ?? '').length > 0) {
-              this.sessionMetadataRow('Worktree', this.session()?.worktreePath ?? '', () => {
-                this.copyPlainText(this.session()?.worktreePath ?? '', '已复制 Worktree 路径');
-              })
-            }
-            if (this.contextUsageLabel().length > 0) {
-              this.sessionMetadataRow('上下文用量', this.contextUsageLabel(), () => {})
-            }
-            ForEach(this.session()?.extraDirs ?? [], (path: string, index: number) => {
-              this.sessionMetadataRow(index === 0 ? '附加目录' : '', path,
-                () => this.copyPlainText(path, '已复制附加目录'))
-            }, (path: string, index: number) => `${index}-${path}`)
-            if ((this.session()?.parentSessionId ?? '').length > 0) {
-              this.sessionMetadataRow('父任务', this.session()?.parentSessionId ?? '', () => {
-                this.copyPlainText(this.session()?.parentSessionId ?? '', '已复制父任务 ID');
-              })
-            }
-            if ((this.session()?.orcaRole ?? '').length > 0) {
-              this.sessionMetadataRow('协作分支', this.session()?.orcaRole ?? '', () => {})
-            }
+            this.sessionActionOption('会话信息', $r('sys.symbol.doc_text'), false,
+              () => this.sessionActionInfoMode = true)
 
             this.sessionActionOption('删除任务', $r('sys.symbol.trash'), true,
               () => this.confirmDeleteSession())
           }
-        }
-        .width('100%')
-        .padding(16)
       }
-      .width('calc(100% - 24vp)')
-      .constraintSize({ maxWidth: 620, maxHeight: '82%' })
-      .margin({ left: 12, right: 12, bottom: 12 })
-      .backgroundColor($r('app.color.task_list_menu_surface'))
-      .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayTransition())
+      .width('100%')
+      .padding(12)
     }
-    .width('100%')
-    .height('100%')
-    .position({ x: 0, y: 0 })
-    .zIndex(98)
+    .width(this.isEmbedded() ? 360 : 320)
+    .constraintSize({ maxHeight: this.isEmbedded() ? 520 : 480 })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clip(true)
   }
 
   @Builder
@@ -4445,7 +4701,69 @@ export struct TaskPageContent {
     .onClick(action)
   }
 
-  /** iOS 同层级会话 Header：50vp 内容高、44vp 返回热区与 40vp 动作槽。 */
+  /** Git 分支只做标题栏辅助信息，限宽后不参与项目菜单交互。 */
+  @Builder
+  gitBranchBadge() {
+    Row({ space: 4 }) {
+      SymbolGlyph($r('sys.symbol.split'))
+        .fontSize(uiFontSize(14))
+        .fontColor([$r('app.color.text_secondary')])
+      Text(this.gitBranchName)
+        .fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .constraintSize({ maxWidth: 92 })
+    }
+    .height(28)
+    .constraintSize({ maxWidth: 128 })
+    .padding({ left: 8, right: 8 })
+    .backgroundColor($r('app.color.bg_chip'))
+    .borderRadius(UI_RADIUS_PILL)
+  }
+
+  /** 会话菜单直接锚定标题栏按钮；Popup 自己处理避让，不再用全屏遮罩和固定 margin 猜位置。 */
+  @Builder
+  sessionActionButton() {
+    Button() {
+      SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+        .fontSize(uiFontSize(20))
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .type(ButtonType.Circle)
+    .width(40)
+    .height(40)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .enabled(!this.isCreationBlockingRemoteOps())
+    .opacity(this.isCreationBlockingRemoteOps() ? 0.4 : 1)
+    .accessibilityText('任务操作')
+    .onClick(() => this.showSessionActions())
+    .bindPopup(this.sessionActionOpen, {
+      builder: this.sessionActionLayer,
+      placement: Placement.BottomRight,
+      enableArrow: false,
+      targetSpace: 4,
+      autoCancel: true,
+      mask: false,
+      showInSubWindow: false,
+      followTransformOfTarget: true,
+      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
+      levelMode: LevelMode.EMBEDDED,
+      radius: UI_RADIUS_CONTAINER,
+      shadow: ShadowStyle.OUTER_DEFAULT_XS,
+      onStateChange: (event) => {
+        this.sessionActionOpen = event.isVisible;
+        if (!event.isVisible) {
+          this.sessionActionInfoMode = false;
+          this.sessionRenameMode = false;
+        }
+      },
+    })
+  }
+
+  /** 双栏两侧 Header 统一为 44vp 内容高；保留 40vp 动作槽，避免详情侧雾化下沿额外下探。 */
   @Builder
   taskHeader() {
     Row({ space: 4 }) {
@@ -4478,25 +4796,20 @@ export struct TaskPageContent {
       .alignItems(HorizontalAlign.Start)
       .padding({ left: 4 })
 
+      if (this.gitBranchName.length > 0) {
+        this.gitBranchBadge()
+      }
+
       if ((this.session()?.workingDir ?? '').length > 0) {
         this.taskIconButton($r('sys.symbol.folder'), 40, false,
           !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
       }
 
-      if (this.items.length > 0) {
-        this.taskIconButton($r('sys.symbol.magnifyingglass'), 40, this.searchOpen, true, () => {
-          if (this.searchOpen) this.closeSearch();
-          else this.openSearch();
-        })
-      }
-
-      this.taskIconButton($r('sys.symbol.ellipsis_circle'), 40, false,
-        !this.isCreationBlockingRemoteOps(),
-        () => this.showSessionActions())
+      this.sessionActionButton()
     }
     .width('100%')
-    .constraintSize({ minHeight: 50 })
-    .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+    .height(44)
+    .padding({ left: 8, right: 8, top: 2, bottom: 2 })
     .backgroundColor(Color.Transparent)
   }
 
@@ -4935,20 +5248,36 @@ export struct TaskPageContent {
         List({ space: 16, scroller: this.listScroller }) {
           if (this.hasOlderMessages) {
             ListItem() {
-              Button(this.loadingOlder ? '加载中' : '加载更早消息')
-                .fontSize(uiFontSize(12))
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.text_tertiary'))
-                .height(32)
-                .padding({ left: 12, right: 12 })
-                .borderRadius(UI_RADIUS_PILL)
-                .backgroundColor(Color.Transparent)
-                .enabled(!this.loadingOlder)
-                .clickEffect(UI_CLICK_EFFECT)
-                .onClick(() => this.loadOlder())
+              Row({ space: 6 }) {
+                if (this.loadingOlder) {
+                  LoadingProgress()
+                    .width(14)
+                    .height(14)
+                    .color($r('app.color.text_tertiary'))
+                  Text('正在加载')
+                    .fontSize(uiFontSize(12))
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_tertiary'))
+                } else {
+                  Button('加载更早消息')
+                    .fontSize(uiFontSize(12))
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_tertiary'))
+                    .height(32)
+                    .padding({ left: 12, right: 12 })
+                    .borderRadius(UI_RADIUS_PILL)
+                    .backgroundColor(Color.Transparent)
+                    .clickEffect(UI_CLICK_EFFECT)
+                    .onClick(() => this.loadOlder())
+                }
+              }
+              .width('100%')
+              .height(32)
+              .justifyContent(FlexAlign.Center)
+              .alignItems(VerticalAlign.Center)
             }
           }
-          ForEach(this.items, (item: RenderItem) => {
+          LazyForEach(this.messageDataSource, (item: RenderItem) => {
             ListItem() {
               this.renderItem(item)
             }
@@ -4970,8 +5299,15 @@ export struct TaskPageContent {
           }
           ForEach(this.queueBubbles, (item: PendingQueueBubble) => {
             ListItem() {
-              this.pendingQueueBubble(item)
+              // ListItem 不是 Flex 容器，气泡自身的 alignSelf(End) 在这里不会稳定生效。
+              // 待发送队列本质上仍是用户消息，显式用全宽行把它推到消息区右侧。
+              Row() {
+                this.pendingQueueBubble(item)
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.End)
             }
+            .width('100%')
           }, (item: PendingQueueBubble) => pendingQueueBubbleRenderKey(item))
           // 稳定尾锚不能复用正在流式增高的消息节点，否则 ArkUI 重测同一项时会
           // 把 scrollToIndex 的旧几何解释成历史位置，造成每次新内容都反向跳动。
@@ -4992,6 +5328,7 @@ export struct TaskPageContent {
         })
         .clip(false)
         .cachedCount(3, true)
+        .maintainVisibleContentPosition(true)
         .onScrollIndex((start: number, end: number, _center: number) => {
           this.visibleStartIndex = start;
           this.visibleEndIndex = end;
@@ -6065,6 +6402,28 @@ export struct TaskPageContent {
               .fontSize(uiFontSize(11))
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
+          }
+          if (item.update !== null && item.update.outputFile.length > 0) {
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.doc_text'))
+                .fontSize(uiFontSize(14))
+                .fontColor([$r('app.color.text_secondary')])
+              Text(fileTitleOf(item.update.outputFile))
+                .fontSize(uiFontSize(12))
+                .fontFamily('monospace')
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+              this.disclosureChevron(false, $r('app.color.text_tertiary'))
+            }
+            .width('100%')
+            .constraintSize({ minHeight: 40 })
+            .padding({ left: 10, right: 8 })
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
+            .clickEffect(UI_LIST_CLICK_EFFECT)
+            .onClick(() => void this.openGeneratedFile(item.update?.outputFile ?? ''))
           }
         }
         .width('100%')
@@ -7240,13 +7599,100 @@ export struct TaskPageContent {
   }
 
   private async openMessageFile(file: RemoteSerializedAttachment): Promise<void> {
-    const raw = file.url.length > 0 ? file.url : file.path;
-    const url = await this.resolveDownloadableUrl(raw, file.mimeType, false);
-    if (url.length === 0) {
-      promptAction.showToast({ message: '暂时无法预览这个文件' });
-      return;
+    const raw = file.path.length > 0 ? file.path : file.url;
+    await this.openGeneratedFile(raw, this.attachmentTitle(file), file.mimeType, file.url);
+  }
+
+  private absoluteRemoteFilePath(raw: string): string {
+    const normalized = this.normalizeMarkdownImageUrl(raw);
+    if (!normalized.startsWith('xdt-file://')) return '';
+    const query = normalized.indexOf('?');
+    return query >= 0 ? queryValue(normalized.slice(query + 1), 'path') : '';
+  }
+
+  private async openGeneratedFile(
+    raw: string,
+    title: string = '',
+    mimeType: string = '',
+    downloadableRaw: string = '',
+  ): Promise<void> {
+    const generation = ++this.filePreviewGeneration;
+    this.filePreviewOpen = true;
+    this.filePreviewTitle = title.length > 0 ? title : fileTitleOf(raw);
+    this.filePreviewPath = raw;
+    this.filePreviewDownloadRaw = downloadableRaw;
+    this.filePreviewMimeType = mimeType;
+    this.filePreviewText = '';
+    this.filePreviewError = '';
+    const remotePath = this.absoluteRemoteFilePath(raw);
+    const textPreviewable = isTextFileReference(remotePath)
+      || isTextFileReference(raw) || isTextFileReference(this.filePreviewTitle);
+    this.filePreviewStatus = textPreviewable ? 'loading' : 'unsupported';
+    if (!textPreviewable) return;
+
+    const session = this.session();
+    const canUseDirectTextRead = remotePath.length > 0
+      && (session?.remoteHostId ?? '').length === 0;
+    try {
+      if (canUseDirectTextRead) {
+        const result = await AppServices.instance.messages.readTextFilePreview(this.deviceId, remotePath);
+        if (generation !== this.filePreviewGeneration) return;
+        if (readBool(result, 'success', false) && typeof result['data'] === 'string') {
+          this.filePreviewText = result['data'] as string;
+          this.filePreviewStatus = 'ready';
+          return;
+        }
+        this.filePreviewError = readStr(result, 'error').length > 0
+          ? readStr(result, 'error') : '文件暂时无法读取';
+        this.filePreviewStatus = 'error';
+        return;
+      }
+      // SSH 文件必须保留 sessionId / remoteHostId / workdir，让 Desktop 在远端主机
+      // 上读取；绝不能把相同路径降级为 Desktop 本机文件。
+      const source = remotePath.length > 0
+        ? this.normalizeMarkdownImageUrl(raw)
+        : (downloadableRaw.length > 0 ? downloadableRaw : raw);
+      const url = await this.resolveDownloadableUrl(source, mimeType, false);
+      if (url.length === 0) throw new Error('文件暂时无法读取');
+      const bytes = await new HarmonyHttp().downloadBytes(url);
+      if (generation !== this.filePreviewGeneration) return;
+      if (bytes.byteLength > 4 * 1024 * 1024) throw new Error('文件超过 4MB，请使用分享打开');
+      this.filePreviewText = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(bytes));
+      this.filePreviewStatus = 'ready';
+    } catch (e) {
+      if (generation !== this.filePreviewGeneration) return;
+      this.filePreviewError = e instanceof Error ? e.message : '文件暂时无法读取';
+      this.filePreviewStatus = 'error';
     }
-    this.openUrl(url);
+  }
+
+  private closeFilePreview(): void {
+    this.filePreviewGeneration += 1;
+    this.filePreviewOpen = false;
+    this.filePreviewStatus = 'idle';
+    this.filePreviewText = '';
+    this.filePreviewError = '';
+  }
+
+  private async sharePreviewFile(): Promise<void> {
+    if (this.fileShareBusy) return;
+    this.fileShareBusy = true;
+    try {
+      const source = this.filePreviewDownloadRaw.length > 0
+        ? this.filePreviewDownloadRaw : this.filePreviewPath;
+      const normalized = this.absoluteRemoteFilePath(source).length > 0
+        ? this.normalizeMarkdownImageUrl(source) : source;
+      const url = await this.resolveDownloadableUrl(normalized, this.filePreviewMimeType, true);
+      if (url.length === 0) throw new Error('文件暂时无法下载');
+      const context = getContext(this) as common.UIAbilityContext;
+      await this.remoteFileService.shareUrl(context, url, this.filePreviewTitle);
+    } catch (e) {
+      promptAction.showToast({
+        message: e instanceof Error ? e.message : '分享失败，请稍后重试',
+      });
+    } finally {
+      this.fileShareBusy = false;
+    }
   }
 
   private async openToolMedia(payload: RenderMediaPayload): Promise<void> {
@@ -7367,6 +7813,7 @@ export struct TaskPageContent {
     Text(item.body)
       .fontSize(uiFontSize(17))
       .lineHeight(uiLineHeight(26))
+      .copyOption(CopyOptions.LocalDevice)
       .maxLines(this.collapsedMessageLines(item))
       .textOverflow({ overflow: TextOverflow.Ellipsis })
       .width('100%')
@@ -7419,30 +7866,24 @@ export struct TaskPageContent {
 
       // iOS 把附件放在文字气泡外；纯附件消息不会留下空白气泡。
       if (item.images.length > 0) {
-        List({ space: 6 }) {
+        Column({ space: 6 }) {
           ForEach(item.images, (ref: RemoteImageRef) => {
-            ListItem() {
-              this.imageThumb(ref)
-            }
+            this.imageThumb(ref)
           }, (ref: RemoteImageRef) => ref.url)
         }
-        .listDirection(Axis.Horizontal)
-        .height(88)
         .width(item.kind === 'user' ? '86%' : '100%')
+        .alignItems(item.kind === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
       }
 
       if (item.files.length > 0) {
-        List({ space: 6 }) {
+        Column({ space: 6 }) {
           ForEach(item.files, (file: RemoteSerializedAttachment) => {
-            ListItem() {
-              this.messageFileChip(file)
-            }
+            this.messageFileChip(file)
           }, (file: RemoteSerializedAttachment) => `${item.key}-${file.path}-${file.name}`)
         }
-        .listDirection(Axis.Horizontal)
-        .height(58)
         .width(item.kind === 'user' ? '86%' : '100%')
+        .alignItems(item.kind === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
       }
 
@@ -7475,7 +7916,8 @@ export struct TaskPageContent {
           } else if (item.kind === 'user' && item.segments.length > 0 && item.segments[0].isPasted) {
             this.pastedBlock(item, item.segments[0])
           } else if (item.mdBlocks.length > 0) {
-            this.mdBlocks(item.mdBlocks)
+            this.mdBlocks(item.mdBlocks,
+              item.message === undefined || item.message.isStreaming !== true)
           }
 
           if (this.shouldCollapsePlainUserMessage(item)
@@ -7660,6 +8102,7 @@ export struct TaskPageContent {
         Text(seg.text)
           .fontSize(uiFontSize(17))
           .lineHeight(uiLineHeight(26))
+          .copyOption(CopyOptions.LocalDevice)
           .maxLines(this.collapsedMessageLines(item))
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
@@ -7715,6 +8158,7 @@ export struct TaskPageContent {
           }
             .fontSize(uiFontSize(12))
             .lineHeight(uiLineHeight(18))
+            .copyOption(CopyOptions.LocalDevice)
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.chat_text_secondary'))
             .width('100%')
@@ -7825,6 +8269,7 @@ export struct TaskPageContent {
             Text(action.detail)
               .fontSize(uiFontSize(12))
               .fontFamily('monospace')
+              .copyOption(CopyOptions.LocalDevice)
               .fontColor($r('app.color.chat_text_secondary'))
               .lineHeight(uiLineHeight(18))
               .width('100%')
@@ -7833,6 +8278,7 @@ export struct TaskPageContent {
             Text(t.resultText)
               .fontSize(uiFontSize(12))
               .fontFamily('monospace')
+              .copyOption(CopyOptions.LocalDevice)
               .fontColor($r('app.color.chat_text_secondary'))
               .lineHeight(uiLineHeight(18))
               .width('100%')
@@ -7887,6 +8333,7 @@ export struct TaskPageContent {
           Text(this.diffLines(segment.oldString, '− '))
             .fontSize(uiFontSize(11))
             .fontFamily('monospace')
+            .copyOption(CopyOptions.LocalDevice)
             .fontColor($r('app.color.danger'))
             .lineHeight(uiLineHeight(17))
             .maxLines(12)
@@ -7900,6 +8347,7 @@ export struct TaskPageContent {
           Text(this.diffLines(segment.newString, '+ '))
             .fontSize(uiFontSize(11))
             .fontFamily('monospace')
+            .copyOption(CopyOptions.LocalDevice)
             .fontColor($r('app.color.success'))
             .lineHeight(uiLineHeight(17))
             .maxLines(12)
@@ -8092,10 +8540,121 @@ export struct TaskPageContent {
   }
 
   @Builder
-  mdBlocks(blocks: MdBlock[]) {
-    ForEach(blocks, (b: MdBlock) => {
-      this.mdBlock(b)
-    }, (b: MdBlock) => `${b.type}-${b.seq}`)
+  mdBlocks(blocks: MdBlock[], selectable: boolean = true) {
+    ForEach(this.markdownSelectableGroups(blocks), (group: MdSelectableBlockGroup) => {
+      if (group.type === 'text_run') {
+        this.selectableMarkdownTextRun(group.textBlocks, selectable)
+      } else if (group.block !== null) {
+        this.mdBlock(group.block)
+      }
+    }, (group: MdSelectableBlockGroup) => group.key)
+  }
+
+  private markdownSelectableGroups(blocks: MdBlock[]): MdSelectableBlockGroup[] {
+    const cached = this.markdownSelectableGroupCache.get(blocks);
+    if (cached !== undefined) return cached;
+    // 流式尾段会产生新数组身份；设置硬上限，防止长会话持续积累已失效投影。
+    if (this.markdownSelectableGroupCache.size >= 512) this.markdownSelectableGroupCache.clear();
+    const groups = groupMarkdownSelectableBlocks(blocks);
+    this.markdownSelectableGroupCache.set(blocks, groups);
+    return groups;
+  }
+
+  @Builder
+  selectableMarkdownTextRun(blocks: MdSelectableTextBlock[], selectable: boolean) {
+    Text() {
+      ForEach(blocks, (block: MdSelectableTextBlock, index?: number) => {
+        this.selectableMarkdownTextBlock(block, index ?? 0)
+      }, (block: MdSelectableTextBlock) => block.key)
+    }
+    .fontSize(uiFontSize(17))
+    .lineHeight(uiLineHeight(26))
+    .copyOption(selectable ? CopyOptions.LocalDevice : CopyOptions.None)
+    .fontWeight(FontWeight.Regular)
+    .fontColor($r('app.color.text_primary'))
+    .textAlign(TextAlign.Start)
+    .alignSelf(ItemAlign.Stretch)
+  }
+
+  @Builder
+  selectableMarkdownTextBlock(block: MdSelectableTextBlock, index: number) {
+    if (index > 0) {
+      // 两个换行保留 Markdown 块间距，但把空白行压到 4vp，避免合并后正文突然变松。
+      Span('\n\n')
+        .fontSize(uiFontSize(4))
+        .lineHeight(uiLineHeight(4))
+    }
+    if (block.type === 'list_item') {
+      Span(block.checked >= 0
+        ? (block.checked === 1 ? '☑ ' : '☐ ')
+        : (block.ordered ? `${block.marker} ` : '• '))
+        .fontSize(uiFontSize(17))
+        .lineHeight(uiLineHeight(26))
+        .fontWeight(FontWeight.Regular)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    this.selectableInlineTokenSpans(
+      block.inlineTokens,
+      block.type === 'heading' ? (block.level <= 1 ? 20 : (block.level === 2 ? 18 : 17)) : 17,
+      block.type === 'heading' ? (block.level <= 2 ? 28 : 26) : 26,
+      block.type === 'heading',
+    )
+  }
+
+  @Builder
+  selectableInlineTokenSpans(
+    tokens: InlineToken[], fontSize: number, lineHeight: number, heading: boolean,
+  ) {
+    ForEach(tokens, (t: InlineToken) => {
+      if (t.kind === 'code') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontFamily('monospace').fontColor($r('app.color.code_text'))
+          .textBackgroundStyle({ color: $r('app.color.bg_chip') })
+      } else if (t.kind === 'strong') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+      } else if (t.kind === 'emphasis') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontStyle(FontStyle.Italic).fontColor($r('app.color.text_primary'))
+      } else if (t.kind === 'strikethrough') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontColor($r('app.color.text_primary'))
+          .decoration({ type: TextDecorationType.LineThrough })
+      } else if (t.kind === 'math') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontFamily('serif').fontStyle(FontStyle.Italic)
+          .fontColor($r('app.color.code_text'))
+      } else if (t.kind === 'link' && this.isLocalReference(t.url)) {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontFamily('monospace').fontColor($r('app.color.code_text'))
+          .textBackgroundStyle({ color: $r('app.color.bg_chip') })
+          .decoration({ type: TextDecorationType.Underline })
+          .onClick(() => void this.openGeneratedFile(t.url, t.value))
+      } else if (t.kind === 'link') {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontColor($r('app.color.text_primary'))
+          .decoration({ type: TextDecorationType.Underline })
+          .onClick(() => this.openUrl(t.url))
+      } else {
+        Span(t.value)
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontColor($r('app.color.text_primary'))
+      }
+    }, (t: InlineToken) => `${t.seq}`)
   }
 
   @Builder
@@ -8173,6 +8732,7 @@ export struct TaskPageContent {
         Text(b.code)
           .fontSize(uiFontSize(12))
           .fontFamily('monospace')
+          .copyOption(CopyOptions.LocalDevice)
           .fontColor($r('app.color.code_text'))
           .lineHeight(uiLineHeight(18))
           .padding(10)
@@ -8233,6 +8793,7 @@ export struct TaskPageContent {
       Text(source)
         .fontSize(uiFontSize(kind === 'math' || kind === 'latex' || kind === 'tex' ? 14 : 12))
         .fontFamily(kind === 'math' || kind === 'latex' || kind === 'tex' ? 'serif' : 'monospace')
+        .copyOption(CopyOptions.LocalDevice)
         .fontColor($r('app.color.code_text')).lineHeight(uiLineHeight(19))
         .maxLines(24).textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%').padding(10).backgroundColor($r('app.color.bg_code'))
@@ -8378,7 +8939,7 @@ export struct TaskPageContent {
             .fontColor($r('app.color.code_text'))
             .textBackgroundStyle({ color: $r('app.color.bg_chip') })
             .decoration({ type: TextDecorationType.Underline })
-            .onClick(() => this.openUrl(t.url))
+            .onClick(() => void this.openGeneratedFile(t.url, t.value))
         } else if (t.kind === 'link') {
           Span(t.value)
             .fontColor($r('app.color.text_primary'))
@@ -8391,6 +8952,7 @@ export struct TaskPageContent {
     }
     .fontSize(uiFontSize(fontSize))
     .lineHeight(uiLineHeight(lineHeight))
+    .copyOption(CopyOptions.LocalDevice)
     .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
     .fontColor(secondary ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
     .textAlign(TextAlign.Start)
@@ -8523,6 +9085,7 @@ export struct TaskPageContent {
   private showSessionActions(): void {
     if (this.isCreationBlockingRemoteOps()) return;
     this.sessionRenameDraft = this.sessionTitle();
+    this.sessionActionInfoMode = false;
     this.sessionRenameMode = false;
     uiAnimateState(this.getUIContext(), () => {
       this.sessionActionOpen = true;
@@ -8533,6 +9096,7 @@ export struct TaskPageContent {
     if (this.sessionActionBusy) return;
     uiAnimateFastState(this.getUIContext(), () => {
       this.sessionActionOpen = false;
+      this.sessionActionInfoMode = false;
       this.sessionRenameMode = false;
     });
   }
@@ -9094,6 +9658,8 @@ export struct TaskPageContent {
         return '';
       }
     }
+    // `foo.md:39` / `foo.ts:12:3` 的尾段是编辑器定位，不是文件名。
+    path = splitFileReferenceLocation(path).path;
     if (!isAbsoluteMediaPath(path)) {
       if (workingDir.length === 0) return '';
       const relative = path.startsWith('./') ? path.slice(2) : path;

@@ -2247,6 +2247,23 @@ export class MessageStore {
     }
   }
 
+  /** 读取被控端绝对路径的文本预览；与 Mobile 的公开通道同源。 */
+  async readTextFilePreview(deviceId: string, filePath: string): Promise<Record<string, Object>> {
+    const client = this.client;
+    if (!client) return Promise.reject(new Error('client not attached'));
+    const request: Record<string, Object> = {};
+    request['filePath'] = filePath;
+    const opts = new DlInvokeOptions();
+    opts.channel = DlChannels.TEXT_FILE_READ_PREVIEW;
+    opts.args = [request];
+    const env = await client.invoke(deviceId, opts);
+    const result = unwrapInvokeResult(env);
+    if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
+      throw new Error('text-file:read-preview returned an invalid result');
+    }
+    return result as Record<string, Object>;
+  }
+
   /** 发送文本（可带图片引用）。images 为已上传的 RemoteImageRef[]（chatMessage.images）。 */
   async sendText(
     deviceId: string,

@@ -132,4 +132,33 @@ export class HarmonyHttp {
       });
     });
   }
+
+  /** 下载二进制内容（远端文件预览 / 系统分享临时文件）。 */
+  downloadBytes(url: string, timeoutMs?: number): Promise<ArrayBuffer> {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      const req = http.createHttp();
+      const options: http.HttpRequestOptions = {
+        method: http.RequestMethod.GET,
+        connectTimeout: timeoutMs ?? 15000,
+        readTimeout: timeoutMs ?? 120000,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+      };
+      req.request(url, options, (err: BusinessError, data: http.HttpResponse) => {
+        req.destroy();
+        if (err) {
+          reject(new Error(`download failed: ${err.message}`));
+          return;
+        }
+        if (data.responseCode < 200 || data.responseCode >= 300) {
+          reject(new Error(`download failed: HTTP ${data.responseCode}`));
+          return;
+        }
+        if (!(data.result instanceof ArrayBuffer)) {
+          reject(new Error('download failed: invalid response'));
+          return;
+        }
+        resolve(data.result);
+      });
+    });
+  }
 }
