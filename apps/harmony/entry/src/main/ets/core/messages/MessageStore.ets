@@ -19,7 +19,7 @@ import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
 import {
   RemoteMessage, RemoteSession, parseMessage, parseSession, sortMessagesAsc,
-  readStr, readObj, readBool, readNum,
+  readStr, readObj, readBool, readNum, mergeAgentTaskTerminalStatus, safeErrorMessage,
 } from '../tasks/TaskModels';
 import { RemoteImageRef, RemoteMediaFetchResult } from '../attachments/AttachmentModels';
 import {
@@ -72,6 +72,11 @@ import {
   MAX_CACHED_MESSAGE_SESSIONS,
   SessionMessageCacheStore,
 } from './SessionMessageCacheStore';
+import {
+  applyGenerationStatusEvent,
+  resetGenerationMetricsForNewTurn,
+  SessionGenerationStatus,
+} from './GenerationStatus';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -211,6 +216,8 @@ export class MessageStore {
   private runningStateRevisions: Map<string, number> = new Map();
   /** maker status 的真实 turn 边界；孤儿 Agent 卡只能在本边界内显示。 */
   private makerTurnRunningBySession: Map<string, boolean> = new Map();
+  /** maker status 的输出 token / 生成时长；实时速率只认服务端可靠字段。 */
+  private generationStatusBySession: Map<string, SessionGenerationStatus> = new Map();
   private taskUpdatesBySession: Map<string, Map<string, AgentTaskUpdate>> = new Map();
   private parkedTaskUpdatesBySession: Map<string, Map<string, AgentTaskUpdate>> = new Map();
   /** 历史加载失败标记（TaskPage 显示重试入口）。 */
@@ -237,12 +244,19 @@ export class MessageStore {
    * 任务快照查询（AppServices 注入 TaskStore）。驻留分类只认权威 `source`，
    * 未注入时全部按普通任务处理，宁可多驻留也不误回收。
    */
-  private sessionSnapshotResolver: ((sessionId: string) => RemoteSession | undefined) | undefined =
+  private sessionSnapshotResolver: ((sessionId: string, deviceId: string) => RemoteSession | undefined) | undefined =
     undefined;
   /** 页面打开代次：关闭后的旧历史响应不得覆盖新 lease。 */
   private sessionLeaseRevisions: Map<string, number> = new Map();
   /** 同一会话的 subscribe / unsubscribe 串行，避免快速重进时旧退订撤销新订阅。 */
   private subscriptionOperations: Map<string, Promise<void>> = new Map();
+  /** 同一会话的断线恢复 single-flight；新连接代次会主动清掉旧操作。 */
+  private resubscribeOperations: Map<string, Promise<void>> = new Map();
+  /** 同一设备的 active 快照 single-flight；避免在线事件与设备刷新重复探针。 */
+  private activeHydrationOperations: Map<string, Promise<void>> = new Map();
+  /** 同一会话的运行态探针 single-flight。 */
+  private runningStateOperations: Map<string, Promise<void>> = new Map();
+  private recoveryGeneration: number = 0;
   /** 空历史到达时若仍有 live 投影，先延迟清窗；终态探针收口后再应用该权威空窗。 */
   private deferredAuthoritativeEmptySessions: AuthoritativeEmptyDeferrals =
     new AuthoritativeEmptyDeferrals();
@@ -264,6 +278,9 @@ export class MessageStore {
 
   /** 登出/切换账号：本地消息、运行投影和落盘快照必须一起失效。 */
   async clearAllCachedSessions(): Promise<void> {
+    // 先推进恢复代次，再等待旧订阅的 best-effort 退订；等待期间若仍有旧回包，
+    // 不能把已经清空的账号状态重新种回内存。
+    this.recoveryGeneration += 1;
     const subscribedSessionIds: string[] = [];
     const subscribedDeviceIds: string[] = [];
     this.subscribed.forEach((deviceId: string, sessionId: string) => {
@@ -298,6 +315,7 @@ export class MessageStore {
     this.runningBySession.clear();
     this.runStartedAtBySession.clear();
     this.makerTurnRunningBySession.clear();
+    this.generationStatusBySession.clear();
     this.taskUpdatesBySession.clear();
     this.parkedTaskUpdatesBySession.clear();
     this.loadFailedBySession.clear();
@@ -311,6 +329,9 @@ export class MessageStore {
     this.historyHealGenerations.clear();
     this.sessionLeaseRevisions.clear();
     this.subscriptionOperations.clear();
+    this.resubscribeOperations.clear();
+    this.activeHydrationOperations.clear();
+    this.runningStateOperations.clear();
     this.deferredAuthoritativeEmptySessions.clear();
     this.pendingStreamingProjectionKeysBySession.clear();
     this.authoritativeMessageRevisions.clear();
@@ -397,8 +418,88 @@ export class MessageStore {
 
   private rememberSessionDevice(sessionId: string, deviceId: string): void {
     if (sessionId.length === 0 || deviceId.length === 0) return;
+    const previousDeviceId = this.cachedDeviceBySession.get(sessionId)
+      ?? this.subscribed.get(sessionId) ?? '';
+    if (previousDeviceId.length > 0 && previousDeviceId !== deviceId) {
+      // MessageStore 当前只持有一个 session lease；切换到另一台设备前，
+      // 先把旧设备稳定窗口写回其缓存，再清掉消息、运行态和历史代次，
+      // 避免同名 session 在新设备首个历史响应前短暂串出旧内容。
+      this.persistSessionMessages(sessionId);
+      this.clearSessionProjectionForDeviceSwitch(sessionId);
+    }
     this.cachedDeviceBySession.set(sessionId, deviceId);
     this.touchSessionCache(sessionId);
+  }
+
+  /**
+   * 详情页读取也必须带设备边界。
+   *
+   * MessageStore 内部仍按 sessionId 保存当前打开的一份投影，但同一个 id
+   * 可能同时存在于多台 Desktop。写入侧已经由 pushAuthorityAccepted 拦截
+   * 外来事件；读取侧若继续无条件返回旧 Map，切换设备的首帧就会短暂显示
+   * 上一台电脑的历史、工作步骤或生成指标。
+   */
+  private sessionReadAllowed(sessionId: string, deviceId: string): boolean {
+    if (deviceId.length === 0) return true;
+    const owner = this.cachedDeviceBySession.get(sessionId)
+      ?? this.subscribed.get(sessionId) ?? '';
+    return owner.length === 0 || owner === deviceId;
+  }
+
+  private clearSessionProjectionForDeviceSwitch(sessionId: string): void {
+    const previousSubscribedDeviceId = this.subscribed.get(sessionId);
+    this.nextSessionLease(sessionId);
+    // 同一个 sessionId 在另一台 Desktop 上重新打开时，先撤销旧设备的 relay 订阅。
+    // 退订必须进入同一条串行队列，保证随后新设备的 subscribe 不会被旧退订覆盖。
+    this.subscribed.delete(sessionId);
+    this.subscriptionAckedSessions.delete(sessionId);
+    const client = this.client;
+    if (previousSubscribedDeviceId !== undefined && client !== undefined) {
+      void this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+        try {
+          await client.unsubscribe(previousSubscribedDeviceId, [sessionTopic(sessionId)]);
+        } catch (e) {
+          // 切换仍继续；断链后的旧订阅会由 relay 自身释放。
+        }
+      });
+    }
+    this.consumePendingTextDeltaNotification(sessionId);
+    this.messagesBySession.delete(sessionId);
+    this.livePlanSnapshotsBySession.delete(sessionId);
+    this.hasMoreBySession.delete(sessionId);
+    this.messageCountBySession.delete(sessionId);
+    this.streamingBySession.delete(sessionId);
+    this.runningBySession.delete(sessionId);
+    this.runStartedAtBySession.delete(sessionId);
+    this.makerTurnRunningBySession.delete(sessionId);
+    this.generationStatusBySession.delete(sessionId);
+    this.taskUpdatesBySession.delete(sessionId);
+    this.parkedTaskUpdatesBySession.delete(sessionId);
+    this.loadFailedBySession.delete(sessionId);
+    this.consideredHistoryGaps.delete(sessionId);
+    this.historyCoverageBySession.delete(sessionId);
+    this.resubscribeOperations.delete(sessionId);
+    this.runningStateOperations.delete(sessionId);
+    this.bumpRunningStateRevision(sessionId);
+    this.historyHealGenerations.set(sessionId,
+      (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
+    this.deferredAuthoritativeEmptySessions.cancel(sessionId);
+    this.pendingStreamingProjectionKeysBySession.delete(sessionId);
+    this.authoritativeMessageRevisions.delete(sessionId);
+    this.cachedDeviceBySession.delete(sessionId);
+    this.cacheAccessBySession.delete(sessionId);
+  }
+
+  /** maker/session push 也必须经过与 messages:created 相同的设备归属围栏。 */
+  private acceptDeviceScopedSessionEvent(sessionId: string, deviceId: string): boolean {
+    if (deviceId.length === 0) return true;
+    if (!pushAuthorityAccepted(deviceId,
+      this.subscribed.get(sessionId) ?? '',
+      this.cachedDeviceBySession.get(sessionId) ?? '')) {
+      return false;
+    }
+    this.rememberSessionDevice(sessionId, deviceId);
+    return true;
   }
 
   private persistSessionMessages(sessionId: string): void {
@@ -548,6 +649,7 @@ export class MessageStore {
     this.streamingBySession.delete(sessionId);
     this.markSessionRunning(sessionId, false);
     this.makerTurnRunningBySession.delete(sessionId);
+    this.generationStatusBySession.delete(sessionId);
     this.taskUpdatesBySession.delete(sessionId);
     this.parkedTaskUpdatesBySession.delete(sessionId);
     this.runningStateRevisions.delete(sessionId);
@@ -611,25 +713,30 @@ export class MessageStore {
 
   /** 自动化任务的驻留分类需要任务快照；缺失时按普通任务保守处理。 */
   private sessionSnapshot(sessionId: string): RemoteSession | undefined {
+    const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
     return this.sessionSnapshotResolver === undefined
-      ? undefined : this.sessionSnapshotResolver(sessionId);
+      ? undefined : this.sessionSnapshotResolver(sessionId, deviceId);
   }
 
   /**
    * 注入任务快照查询（由 AppServices 用 TaskStore 提供）。
    * 驻留分类只认权威 `source` 字段，禁止用标题猜测 scheduler。
    */
-  setSessionSnapshotResolver(resolver: (sessionId: string) => RemoteSession | undefined): void {
+  setSessionSnapshotResolver(
+    resolver: (sessionId: string, deviceId: string) => RemoteSession | undefined,
+  ): void {
     this.sessionSnapshotResolver = resolver;
   }
 
-  getMessages(sessionId: string): RemoteMessage[] {
+  getMessages(sessionId: string, deviceId: string = ''): RemoteMessage[] {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return [];
     this.touchSessionCache(sessionId);
     return this.messagesBySession.get(sessionId) ?? [];
   }
 
-  hasMessageClientId(sessionId: string, clientId: string): boolean {
+  hasMessageClientId(sessionId: string, clientId: string, deviceId: string = ''): boolean {
     if (clientId.length === 0) return false;
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     const messages = this.messagesBySession.get(sessionId) ?? [];
     return messages.some((message: RemoteMessage) =>
       message.clientId === clientId || message.id === clientId);
@@ -639,7 +746,9 @@ export class MessageStore {
     sessionId: string,
     type: string,
     data: Record<string, Object>,
+    deviceId: string = '',
   ): void {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return;
     const message = new RemoteMessage();
     const key = `harmony-local-${type}-${Date.now()}-${++this.sendSequence}`;
     message.id = key;
@@ -666,13 +775,23 @@ export class MessageStore {
   ): Promise<boolean> {
     const client = this.client;
     if (!client || clientId.length === 0) return false;
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
+    // 同一 sessionId 可能在 A → B → A 间快速切换；仅比较当前 deviceId
+    // 无法区分第一台 A 的迟到回包与第二台 A 的新页面。around 只服务当前打开的
+    // 会话，因此固定本次订阅 lease，回包只能写回发起时的那一代。
+    const expectedLease = this.currentSessionLease(deviceId, sessionId);
+    if (expectedLease < 0) return false;
     if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) return false;
     const options: Record<string, Object> = {};
     options['radius'] = Math.max(1, Math.min(100, Math.floor(radius)));
     const invoke = new DlInvokeOptions();
     invoke.channel = 'local-db:messages:around-client-id';
     invoke.args = [sessionId, clientId, options];
     const env = await client.invoke(deviceId, invoke);
+    // 定位请求可能跨越会话切换；旧设备返回后再次确认 owner，禁止把旧窗口
+    // 的 around 结果合并到当前设备的同名任务；同一设备重新打开也必须拒绝旧 lease。
+    if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) return false;
     const result = unwrapInvokeResult(env);
     const rows: RemoteMessage[] = [];
     if (Array.isArray(result)) {
@@ -690,7 +809,7 @@ export class MessageStore {
       this.setSessionMessages(sessionId, merged);
       this.notify();
     }
-    return this.hasMessageClientId(sessionId, clientId);
+    return this.hasMessageClientId(sessionId, clientId, deviceId);
   }
 
   /**
@@ -703,11 +822,13 @@ export class MessageStore {
     clientId: string,
     limit: number = 200,
   ): Promise<string> {
-    const local = this.messagesBySession.get(sessionId) ?? [];
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return 'unknown';
+    const local = this.getMessages(sessionId, deviceId);
     if (local.some((message: RemoteMessage) =>
       message.clientId === clientId || message.id === clientId)) return 'applied';
     try {
       const page = await this.requestMessagesList(deviceId, sessionId, limit, '');
+      if (!this.sessionReadAllowed(sessionId, deviceId)) return 'unknown';
       if (page.items.some((message: RemoteMessage) =>
         message.clientId === clientId || message.id === clientId)) return 'applied';
       if (page.hasMore || page.items.length >= limit) return 'unknown';
@@ -717,26 +838,49 @@ export class MessageStore {
     }
   }
 
-  getTaskUpdates(sessionId: string): Map<string, AgentTaskUpdate> {
+  getTaskUpdates(sessionId: string, deviceId: string = ''): Map<string, AgentTaskUpdate> {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) {
+      return new Map<string, AgentTaskUpdate>();
+    }
     return this.taskUpdatesBySession.get(sessionId) ?? new Map<string, AgentTaskUpdate>();
   }
 
-  isMakerTurnRunning(sessionId: string): boolean {
+  isMakerTurnRunning(sessionId: string, deviceId: string = ''): boolean {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     return this.makerTurnRunningBySession.get(sessionId) === true;
   }
 
   /** 当前产品 turn 的运行事实，供列表状态覆盖可能迟到的 completed 未读态。 */
-  isSessionRunning(sessionId: string): boolean {
+  isSessionRunning(sessionId: string, deviceId: string = ''): boolean {
+    // 任务列表可以同时投影多个设备；没有当前打开会话的订阅归属时，
+    // 不让旧的全局 running 投影越过设备边界，只把它作为详情页 fallback。
+    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== deviceId) return false;
     return this.runningBySession.get(sessionId) === true;
   }
 
   /** 底部活动条的独立计时起点；0 表示当前没有运行中的产品 turn。 */
-  getSessionRunStartedAt(sessionId: string): number {
+  getSessionRunStartedAt(sessionId: string, deviceId: string = ''): number {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return 0;
     return this.runStartedAtBySession.get(sessionId) ?? 0;
   }
 
+  /** 当前产品 turn 的服务端生成指标；返回副本，避免页面意外改写 Store。 */
+  getGenerationStatus(sessionId: string, deviceId: string = ''): SessionGenerationStatus {
+    const status = new SessionGenerationStatus();
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return status;
+    const source = this.generationStatusBySession.get(sessionId) ?? new SessionGenerationStatus();
+    status.isRunning = this.runningBySession.get(sessionId) === true;
+    status.status = source.status;
+    status.outputTokens = source.outputTokens;
+    status.generationDurationMs = source.generationDurationMs;
+    status.generationActive = source.generationActive;
+    status.generationReliable = source.generationReliable;
+    return status;
+  }
+
   /** 当前会话是否仍在执行；maker 运行态优先于历史投影。 */
-  isSessionStreaming(sessionId: string): boolean {
+  isSessionStreaming(sessionId: string, deviceId: string = ''): boolean {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     if (this.runningBySession.get(sessionId) === true) return true;
     const s = this.streamingBySession.get(sessionId);
     if (s !== undefined && !s.finished && (s.text.length > 0 || s.tools.length > 0)) return true;
@@ -751,7 +895,8 @@ export class MessageStore {
     return false;
   }
 
-  hasMore(sessionId: string): boolean {
+  hasMore(sessionId: string, deviceId: string = ''): boolean {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     return this.hasMoreBySession.get(sessionId) ?? false;
   }
 
@@ -759,7 +904,8 @@ export class MessageStore {
    * 写入任务列表的服务端消息总数。只在分页尚未给出结论时用于乐观推断；
    * 真实分页已经返回后不能再覆盖它，否则尾部新增会被误判为顶部还有历史。
    */
-  setMessageCount(sessionId: string, count: number): void {
+  setMessageCount(sessionId: string, count: number, deviceId: string = ''): void {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return;
     if (count <= 0) {
       this.messageCountBySession.delete(sessionId);
       return;
@@ -774,14 +920,16 @@ export class MessageStore {
   }
 
   /** 该会话历史是否加载失败（页面据此显示重试）。 */
-  loadFailed(sessionId: string): boolean {
+  loadFailed(sessionId: string, deviceId: string = ''): boolean {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     return this.loadFailedBySession.get(sessionId) ?? false;
   }
 
   // ─── 打开 / 关闭 ────────────────────────────────────────────────────────────
 
   /** 打开会话：确保控制链路 → 拉历史（优先）→ 订阅实时流（并行，失败不阻塞）。 */
-  isSessionOpen(sessionId: string): boolean {
+  isSessionOpen(sessionId: string, deviceId: string = ''): boolean {
+    if (deviceId.length > 0) return this.subscribed.get(sessionId) === deviceId;
     return this.subscribed.has(sessionId);
   }
 
@@ -852,32 +1000,38 @@ export class MessageStore {
    * 页面离开只停用实时订阅，保留历史、分页与当前运行投影用于快速重进。
    * 真正内存回收由 LRU 负责；落盘只保留稳定消息的最近一页。
    */
-  async closeSession(sessionId: string): Promise<void> {
+  async closeSession(sessionId: string, deviceId: string = ''): Promise<void> {
+    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== deviceId) return;
     this.consumePendingTextDeltaNotification(sessionId);
-    const deviceId = this.subscribed.get(sessionId);
+    const subscribedDeviceId = this.subscribed.get(sessionId);
     this.nextSessionLease(sessionId);
     this.subscribed.delete(sessionId);
     this.touchSessionCache(sessionId);
     this.persistSessionMessages(sessionId);
     // 让关闭前发出的运行探针失效；缓存中的 running 状态留给重进后的新探针裁定。
     this.bumpRunningStateRevision(sessionId);
+    this.resubscribeOperations.delete(sessionId);
+    this.runningStateOperations.delete(sessionId);
+    this.clearGenerationMetrics(sessionId);
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.subscriptionAckedSessions.delete(sessionId);
     const coverage = this.historyCoverageBySession.get(sessionId);
     if (coverage !== undefined) coverage.liveTailTrusted = false;
-    if (deviceId !== undefined) {
+    if (subscribedDeviceId !== undefined) {
       const client = this.client;
       if (client) {
         await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
           try {
-            await client.unsubscribe(deviceId, [sessionTopic(sessionId)]);
+            await client.unsubscribe(subscribedDeviceId, [sessionTopic(sessionId)]);
           } catch (e) {
             // 退订失败不影响本地停用；重连时 registry 会重建。
           }
         });
       }
     }
+    // 退订等待期间可能已在同一页面重新打开 B；旧的 close 不能再压缩或淘汰 B 的投影。
+    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== undefined) return;
     await this.sessionMessageCache.flush();
     this.compactSessionWindowOnLeave(sessionId);
     this.evictInactiveSessionCaches();
@@ -920,32 +1074,56 @@ export class MessageStore {
    * 拉最新窗口与现有合并去重——保留早于窗口的本地缓存，补上断线缺口。
    */
   async resubscribeAndHeal(deviceId: string, sessionId: string): Promise<void> {
+    const existing = this.resubscribeOperations.get(sessionId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const operation = this.resubscribeAndHealOnce(deviceId, sessionId);
+    this.resubscribeOperations.set(sessionId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.resubscribeOperations.get(sessionId) === operation) {
+        this.resubscribeOperations.delete(sessionId);
+      }
+    }
+  }
+
+  private async resubscribeAndHealOnce(deviceId: string, sessionId: string): Promise<void> {
     const client = this.client;
     if (!client) {
       return;
     }
+    const recoveryGeneration = this.recoveryGeneration;
     const lease = this.sessionLeaseRevisions.get(sessionId) ?? 0;
-    if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+    if (recoveryGeneration !== this.recoveryGeneration
+      || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
     // relay 新连接后旧订阅失效，需重新 subscribe。
     this.subscriptionAckedSessions.delete(sessionId);
     const previousCoverage = this.historyCoverageBySession.get(sessionId);
     if (previousCoverage !== undefined) previousCoverage.liveTailTrusted = false;
     try {
       await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
-        if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+        if (recoveryGeneration !== this.recoveryGeneration
+          || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
         await client.subscribe(deviceId, [sessionTopic(sessionId)]);
       });
-      if (this.sessionLeaseCurrent(sessionId, deviceId, lease)) {
+      if (recoveryGeneration === this.recoveryGeneration
+        && this.sessionLeaseCurrent(sessionId, deviceId, lease)) {
         this.subscriptionAckedSessions.add(sessionId);
       }
     } catch (e) {
       // 订阅失败不阻断 healing
     }
+    if (recoveryGeneration !== this.recoveryGeneration
+      || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
     const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     try {
       const page = await this.requestMessagesList(
         deviceId, sessionId, RECONNECT_MESSAGE_WINDOW_LIMIT, '');
-      if (!this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
+      if (recoveryGeneration !== this.recoveryGeneration
+        || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
       page.items.sort(sortMessagesAsc);
       const streaming = this.streamingBySession.get(sessionId);
       this.deferredAuthoritativeEmptySessions.update(sessionId,
@@ -1068,7 +1246,7 @@ export class MessageStore {
       }
       return 'budget';
     } catch (e) {
-      const message = e instanceof Error ? e.message : JSON.stringify(e);
+      const message = safeErrorMessage(e);
       hilog.warn(DOMAIN, TAG, 'history gap heal failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), message);
       return 'failed';
@@ -1089,21 +1267,63 @@ export class MessageStore {
 
   /** socket 断线会同时撤销实时尾部背书与订阅 ACK。 */
   invalidateLiveTailTrust(): void {
+    this.recoveryGeneration += 1;
+    this.resubscribeOperations.clear();
+    this.activeHydrationOperations.clear();
+    this.runningStateOperations.clear();
     this.subscriptionAckedSessions.clear();
     this.historyCoverageBySession.forEach((coverage: MessageWindowCoverage) => {
       coverage.liveTailTrusted = false;
     });
+    let generationChanged = false;
+    this.generationStatusBySession.forEach((status: SessionGenerationStatus) => {
+      if (status.outputTokens === 0 && status.generationDurationMs === 0
+        && !status.generationActive && status.generationReliable) return;
+      status.outputTokens = 0;
+      status.generationDurationMs = 0;
+      status.generationActive = false;
+      status.generationReliable = true;
+      generationChanged = true;
+    });
+    if (generationChanged) this.notify();
   }
 
   /** 从被控端 active 快照恢复已存在的运行态；终态清理仍由显式 session 探针负责。 */
   async hydrateActiveSessions(deviceId: string): Promise<void> {
+    const existing = this.activeHydrationOperations.get(deviceId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const operation = this.hydrateActiveSessionsOnce(deviceId);
+    this.activeHydrationOperations.set(deviceId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.activeHydrationOperations.get(deviceId) === operation) {
+        this.activeHydrationOperations.delete(deviceId);
+      }
+    }
+  }
+
+  private async hydrateActiveSessionsOnce(deviceId: string): Promise<void> {
     const client = this.client;
     if (!client) return;
+    const recoveryGeneration = this.recoveryGeneration;
+    // 设备级 active 快照可能经历 A→B→A 的快速切换；仅比较当前
+    // subscribed[sessionId] 会把第一台 A 的迟到结果误认成第二台 A 的结果。
+    // 为本次请求固定每个已打开会话的 lease，回包只能写回发起时那一代页面。
+    const sessionLeases: Map<string, number> = new Map();
+    this.subscribed.forEach((ownerDeviceId: string, sessionId: string) => {
+      if (ownerDeviceId !== deviceId) return;
+      sessionLeases.set(sessionId, this.sessionLeaseRevisions.get(sessionId) ?? -1);
+    });
     const opts = new DlInvokeOptions();
     opts.channel = DlChannels.MAKER_LIST_ACTIVE;
     opts.args = [];
     try {
       const env = await client.invoke(deviceId, opts);
+      if (recoveryGeneration !== this.recoveryGeneration) return;
       const result = unwrapInvokeResult(env);
       if (!Array.isArray(result)) return;
       let changed = false;
@@ -1114,6 +1334,10 @@ export class MessageStore {
         const record = row as Record<string, Object>;
         const sessionId = readStr(record, 'sessionId');
         if (sessionId.length === 0 || !readBool(record, 'isTurnRunning', false)) continue;
+        // active 快照是设备级返回值，只能恢复当前仍归属于该设备的打开会话。
+        // 同名 sessionId 在切换设备、关闭页面或迟到回包时不能污染另一份投影。
+        if (this.subscribed.get(sessionId) !== deviceId
+          || this.sessionLeaseRevisions.get(sessionId) !== sessionLeases.get(sessionId)) continue;
         this.bumpRunningStateRevision(sessionId);
         if (this.runningBySession.get(sessionId) !== true) {
           this.markSessionRunning(sessionId, true);
@@ -1192,10 +1416,16 @@ export class MessageStore {
   }
 
   /** maker:event 处理：运行态按终态语义收口，流式正文保留到持久化行回流。 */
-  handleMakerEvent(sessionId: string, event: Object | undefined, persistId: string = ''): void {
+  handleMakerEvent(
+    sessionId: string,
+    event: Object | undefined,
+    persistId: string = '',
+    deviceId: string = '',
+  ): void {
     if (event === undefined || typeof event !== 'object') {
       return;
     }
+    if (!this.acceptDeviceScopedSessionEvent(sessionId, deviceId)) return;
     const ev = event as Record<string, Object>;
     const type = readStr(ev, 'type');
     const data = readObj(ev, 'data');
@@ -1311,16 +1541,20 @@ export class MessageStore {
         ? data['isRunning'] as boolean
         : undefined;
       if (isRunning === true) {
-        if (this.makerTurnRunningBySession.get(sessionId) !== true) {
+        const isTurnStart = this.makerTurnRunningBySession.get(sessionId) !== true;
+        if (isTurnStart) {
           this.sweepTaskUpdatesAtTurnStart(sessionId);
         }
         this.makerTurnRunningBySession.set(sessionId, true);
         this.markSessionRunning(sessionId, true);
+        this.applyGenerationStatus(sessionId, data, true, isTurnStart, false);
       } else if (isRunning === false) {
         if (hasTurnContinuation(ev)) {
           // provider segment ends, but the product turn continues.
           this.markSessionRunning(sessionId, true);
+          this.applyGenerationStatus(sessionId, data, false, false, true);
         } else {
+          this.applyGenerationStatus(sessionId, data, false, false, false);
           this.makerTurnRunningBySession.delete(sessionId);
           this.finalizeSessionStreaming(sessionId);
         }
@@ -1524,14 +1758,49 @@ export class MessageStore {
     const wasRunning = this.runningBySession.get(sessionId) === true;
     if (running) {
       this.runningBySession.set(sessionId, true);
+      let generation = this.generationStatusBySession.get(sessionId);
+      if (!wasRunning) {
+        generation = resetGenerationMetricsForNewTurn(generation ?? new SessionGenerationStatus());
+        generation.isRunning = true;
+        this.generationStatusBySession.set(sessionId, generation);
+      } else if (generation !== undefined) {
+        generation.isRunning = true;
+      }
       if (!this.runStartedAtBySession.has(sessionId)) {
         this.runStartedAtBySession.set(sessionId, Date.now());
       }
     } else {
       this.runningBySession.delete(sessionId);
       this.runStartedAtBySession.delete(sessionId);
+      const generation = this.generationStatusBySession.get(sessionId);
+      if (generation !== undefined) {
+        generation.isRunning = false;
+        generation.generationActive = false;
+      }
     }
     if (wasRunning !== running) this.notifyRunningStateChanged();
+  }
+
+  private applyGenerationStatus(
+    sessionId: string,
+    data: Record<string, Object>,
+    isRunning: boolean,
+    isTurnStart: boolean,
+    hasTurnContinuation: boolean,
+  ): void {
+    const current = this.generationStatusBySession.get(sessionId) ?? new SessionGenerationStatus();
+    const next = applyGenerationStatusEvent(
+      current, data, isRunning, isTurnStart, hasTurnContinuation);
+    this.generationStatusBySession.set(sessionId, next);
+  }
+
+  private clearGenerationMetrics(sessionId: string): void {
+    const current = this.generationStatusBySession.get(sessionId);
+    if (current === undefined) return;
+    current.outputTokens = 0;
+    current.generationDurationMs = 0;
+    current.generationActive = false;
+    current.generationReliable = true;
   }
 
   /** 终态收口：保留临时正文用于最终渲染，但去掉所有运行标记。 */
@@ -1602,11 +1871,12 @@ export class MessageStore {
   }
 
   /** maker session status push：closed 是 session 生命周期终态，也要收口本地运行投影。 */
-  handleMakerStatusChanged(payload: Object | undefined): void {
+  handleMakerStatusChanged(payload: Object | undefined, deviceId: string = ''): void {
     if (payload === undefined || typeof payload !== 'object') return;
     const p = payload as Record<string, Object>;
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0 || readStr(p, 'status') !== 'closed') return;
+    if (!this.acceptDeviceScopedSessionEvent(sessionId, deviceId)) return;
     this.consumePendingTextDeltaNotification(sessionId);
     this.bumpRunningStateRevision(sessionId);
     this.makerTurnRunningBySession.delete(sessionId);
@@ -1615,11 +1885,12 @@ export class MessageStore {
   }
 
   /** maker:event 之外的 sessions 活动态是漏终态时的第二条收口路径。 */
-  handleSessionActivity(payload: Object | undefined): void {
+  handleSessionActivity(payload: Object | undefined, deviceId: string = ''): void {
     if (payload === undefined || typeof payload !== 'object') return;
     const p = payload as Record<string, Object>;
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
+    if (!this.acceptDeviceScopedSessionEvent(sessionId, deviceId)) return;
     this.consumePendingTextDeltaNotification(sessionId);
     const phase = readStr(p, 'phase');
     const rawRunning = p['isRunning'];
@@ -1651,14 +1922,37 @@ export class MessageStore {
     sessionId: string,
     expectedLease: number,
   ): Promise<void> {
+    const existing = this.runningStateOperations.get(sessionId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const operation = this.refreshSessionRunningStateOnce(deviceId, sessionId, expectedLease);
+    this.runningStateOperations.set(sessionId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.runningStateOperations.get(sessionId) === operation) {
+        this.runningStateOperations.delete(sessionId);
+      }
+    }
+  }
+
+  private async refreshSessionRunningStateOnce(
+    deviceId: string,
+    sessionId: string,
+    expectedLease: number,
+  ): Promise<void> {
     const client = this.client;
     if (!client) return;
+    const recoveryGeneration = this.recoveryGeneration;
     const revision = this.runningStateRevisions.get(sessionId) ?? 0;
     const opts = new DlInvokeOptions();
     opts.channel = DlChannels.MAKER_SESSION_IN_TURN;
     opts.args = [sessionId];
     try {
       const env = await client.invoke(deviceId, opts);
+      if (recoveryGeneration !== this.recoveryGeneration) return;
       if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) return;
       if ((this.runningStateRevisions.get(sessionId) ?? 0) !== revision) return;
       const result = unwrapInvokeResult(env);
@@ -1716,7 +2010,8 @@ export class MessageStore {
   }
 
   /** 当前流式消息（无则 undefined）。 */
-  getStreaming(sessionId: string): StreamingMessage | undefined {
+  getStreaming(sessionId: string, deviceId: string = ''): StreamingMessage | undefined {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return undefined;
     return this.streamingBySession.get(sessionId);
   }
 
@@ -1726,7 +2021,8 @@ export class MessageStore {
    * 流式正文走 assistant 角色 → 与历史消息同路径，thinking/tool 组由
    * work_group 聚合规则收进折叠面板。
    */
-  getMessagesWithStreaming(sessionId: string): RemoteMessage[] {
+  getMessagesWithStreaming(sessionId: string, deviceId: string = ''): RemoteMessage[] {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return [];
     this.touchSessionCache(sessionId);
     const base = this.messagesBySession.get(sessionId) ?? [];
     const s = this.streamingBySession.get(sessionId);
@@ -1847,7 +2143,7 @@ export class MessageStore {
         return false;
       }
       // 加载失败：标记失败（页面提供重试），不保持空列表假装成功。
-      const msg = e instanceof Error ? e.message : JSON.stringify(e);
+      const msg = safeErrorMessage(e);
       hilog.warn(DOMAIN, TAG, 'loadInitial failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), msg);
       this.loadFailedBySession.set(sessionId, true);
@@ -1858,7 +2154,9 @@ export class MessageStore {
 
   /** 破坏性消息操作完成后重拉当前整窗，避免旧分页与服务端截断结果混合。 */
   async reloadSession(deviceId: string, sessionId: string): Promise<boolean> {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     const lease = this.currentSessionLease(deviceId, sessionId);
+    if (lease < 0) return false;
     this.historyHealGenerations.set(sessionId,
       (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     this.consideredHistoryGaps.delete(sessionId);
@@ -1866,15 +2164,12 @@ export class MessageStore {
     this.removeSessionMessages(sessionId, true);
     this.deferredAuthoritativeEmptySessions.cancel(sessionId);
     this.pendingStreamingProjectionKeysBySession.delete(sessionId);
-    if (lease < 0) {
-      this.notify();
-      return false;
-    }
     return this.loadInitial(deviceId, sessionId, lease);
   }
 
   /** Pi 分支切换后的权威替换；旧分支消息不能与新窗口 merge。 */
   async replaceSessionWindow(deviceId: string, sessionId: string): Promise<boolean> {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
     this.historyHealGenerations.set(sessionId, generation);
     this.consideredHistoryGaps.delete(sessionId);
@@ -1911,7 +2206,8 @@ export class MessageStore {
   async loadOlder(deviceId: string, sessionId: string): Promise<number> {
     const client = this.client;
     if (!client) return 0;
-    if (!this.hasMore(sessionId)) return 0;
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return 0;
+    if (!this.hasMore(sessionId, deviceId)) return 0;
     const generation = this.historyHealGenerations.get(sessionId) ?? 0;
     const current = this.messagesBySession.get(sessionId) ?? [];
     const before = oldestMessageCursor(current);
@@ -1939,11 +2235,11 @@ export class MessageStore {
       hilog.info(DOMAIN, TAG,
         'history page merged fetched=%{public}d added=%{public}d hasMore=%{public}s',
         page.items.length, added,
-        this.hasMore(sessionId) ? 'true' : 'false');
+        this.hasMore(sessionId, deviceId) ? 'true' : 'false');
       this.notify();
       return added;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : JSON.stringify(e);
+      const msg = safeErrorMessage(e);
       hilog.warn(DOMAIN, TAG, 'history older failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), msg);
       throw (e instanceof Error ? e : new Error(msg));
@@ -1992,7 +2288,7 @@ export class MessageStore {
         if (page.reducedByPayloadTooLarge) page.hasMore = true;
         return page;
       } catch (e) {
-        lastError = e instanceof Error ? e : new Error(JSON.stringify(e));
+        lastError = e instanceof Error ? e : new Error(safeErrorMessage(e));
         if (!isPayloadTooLargeError(lastError) || i === limits.length - 1) throw lastError;
       }
     }
@@ -2032,7 +2328,7 @@ export class MessageStore {
             items.push(parseMessage(raw as Record<string, Object>));
           } catch (e) {
             // 单条消息解析失败不拖垮整个会话历史（跳过并记录）。
-            const msg = e instanceof Error ? e.message : JSON.stringify(e);
+            const msg = safeErrorMessage(e);
             hilog.warn(DOMAIN, TAG, 'skip unparsable message row=%{public}d err=%{public}s', i, msg);
           }
         }
@@ -2052,11 +2348,11 @@ export class MessageStore {
       }
       out.hasMore = items.length >= limit || remoteRowsTrimmed;
       return out;
-    }).catch((e: Error) => {
+    }).catch((e: Object | undefined) => {
       // invoke 失败（网络 / 桌面端 IPC 错误）：记录确切原因供排查。
       hilog.warn(DOMAIN, TAG, 'messages:list failed session=%{public}s err=%{public}s',
-        sessionId.slice(0, 8), e.message);
-      throw e;
+        sessionId.slice(0, 8), safeErrorMessage(e));
+      throw e instanceof Error ? e : new Error(safeErrorMessage(e));
     });
   }
 
@@ -2068,12 +2364,7 @@ export class MessageStore {
       if (sessionId.length > 0) {
         // authority fence：设备身份不符的实时帧一律丢弃，不更新窗口、缓存归属或订阅状态。
         // 快速 A → B → A 切换时，B 的迟到 push 不得写进 A 的窗口。
-        if (!pushAuthorityAccepted(deviceId,
-          this.subscribed.get(sessionId) ?? '',
-          this.cachedDeviceBySession.get(sessionId) ?? '')) {
-          return;
-        }
-        this.rememberSessionDevice(sessionId, deviceId);
+        if (!this.acceptDeviceScopedSessionEvent(sessionId, deviceId)) return;
       }
     }
     switch (channel) {
@@ -2094,7 +2385,7 @@ export class MessageStore {
         break;
       }
       case 'local-db:sessions:activity':
-        this.handleSessionActivity(payload);
+        this.handleSessionActivity(payload, deviceId);
         break;
       default:
         break;
@@ -2107,7 +2398,17 @@ export class MessageStore {
     const sessionId = readStr(p, 'sessionId');
     const rawMessage = readObj(p, 'message');
     if (sessionId.length === 0 || Object.keys(rawMessage).length === 0) return;
-    const message = parseMessage(rawMessage);
+    let message: RemoteMessage;
+    try {
+      message = parseMessage(rawMessage);
+    } catch (e) {
+      // 单条异常 push 不能中断同一连接上的其它消息；历史列表也采用同样的
+      // best-effort 解析语义。
+      const error = safeErrorMessage(e);
+      hilog.warn(DOMAIN, TAG, 'skip unparsable created message session=%{public}s err=%{public}s',
+        sessionId.slice(0, 8), error);
+      return;
+    }
     if (message.id.length === 0) return;
     this.consumePendingTextDeltaNotification(sessionId);
     this.authoritativeMessageRevisions.set(sessionId,
@@ -2138,8 +2439,15 @@ export class MessageStore {
     if (existingIndex >= 0) {
       let changed = false;
       if (preferIncomingCreatedMessage(list[existingIndex], message)) {
+        mergeAgentTaskTerminalStatus(list[existingIndex], message, true);
         list[existingIndex] = message;
         list.sort(sortMessagesAsc);
+        this.setSessionMessages(sessionId, list);
+        changed = true;
+      } else if (list[existingIndex].agentTaskStatus.length === 0
+        && message.agentTaskStatus.length > 0) {
+        list[existingIndex].agentTaskStatus = message.agentTaskStatus;
+        list[existingIndex].agentMeta['agentTaskStatus'] = message.agentTaskStatus;
         this.setSessionMessages(sessionId, list);
         changed = true;
       }
@@ -2237,7 +2545,7 @@ export class MessageStore {
       }
       return out;
     } catch (e) {
-      const message = e instanceof Error ? e.message : JSON.stringify(e);
+      const message = safeErrorMessage(e);
       const scheme = url.split('://')[0];
       hilog.warn(DOMAIN, TAG, 'media fetch failed scheme=%{public}s err=%{public}s', scheme, message);
       if (e instanceof Error) {
@@ -2326,6 +2634,7 @@ export class MessageStore {
   async dismissErrorMessage(deviceId: string, sessionId: string, clientId: string): Promise<void> {
     const client = this.client;
     if (!client) return;
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return;
     const messages = this.messagesBySession.get(sessionId) ?? [];
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].clientId !== clientId && messages[i].id !== clientId) continue;
@@ -2424,6 +2733,7 @@ export class MessageStore {
     opts.channel = 'maker:message:delete';
     opts.args = [sessionId, clientId];
     const result = unwrapInvokeResult(await client.invoke(deviceId, opts)) as Record<string, Object>;
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return [];
     const deleted: string[] = [];
     const rawIds = result['clientIds'];
     if (Array.isArray(rawIds)) {
@@ -2461,7 +2771,17 @@ export class MessageStore {
     }
     for (const m of older) {
       const key = messageIdentity(m);
-      if (!byId.has(key)) byId.set(key, m);
+      const current = byId.get(key);
+      if (current === undefined) {
+        byId.set(key, m);
+      } else {
+        const beforeStatus = current.agentTaskStatus;
+        mergeAgentTaskTerminalStatus(current, m, false);
+        if (beforeStatus.length === 0 && m.agentTaskStatus.length > 0) {
+          current.agentTaskStatus = m.agentTaskStatus;
+          current.agentMeta['agentTaskStatus'] = m.agentTaskStatus;
+        }
+      }
     }
     const out: RemoteMessage[] = [];
     byId.forEach((m: RemoteMessage) => {

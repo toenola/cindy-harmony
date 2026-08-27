@@ -328,6 +328,8 @@ export class RenderToolItem {
   diff: RenderDiffPayload | null = null;
   /** 调用发起时间 ISO（work_group 时长计算用）。 */
   createdAt: string = '';
+  /** originating tool_use 上的 Desktop 持久终态。 */
+  agentTaskStatus: string = '';
 }
 
 /** 连续工具调用聚合块。 */
@@ -1587,6 +1589,7 @@ function buildLinearRenderItems(
         task.inputRaw = tool.inputRaw;
         task.inputText = tool.inputText;
         task.createdAt = m.createdAt;
+        task.agentTaskStatus = m.agentTaskStatus;
         if (task.toolUseId.length > 0 && settledUseIds.has(task.toolUseId)) {
           task.resultText = resultByUseId.get(task.toolUseId) ?? '';
           task.hasResult = true;
@@ -1986,7 +1989,8 @@ function buildSubagentGroup(
   group.update = findAgentTaskUpdate(
     taskUpdates, id, message.clientId.length > 0 ? message.clientId : message.id) ?? null;
   group.status = deriveAgentTaskStatus(
-    group.update?.status ?? '', tool.toolName, tool.inputRaw, result?.summary ?? '');
+    group.update?.status ?? '', tool.toolName, tool.inputRaw, result?.summary ?? '',
+    message.agentTaskStatus);
   const start = Date.parse(message.createdAt);
   if (result !== undefined && Number.isFinite(start) && result.createdAtMs >= start) {
     group.durationMs = result.createdAtMs - start;
@@ -2312,6 +2316,7 @@ function isWorkActivityItem(item: RenderItem): boolean {
       tool?.toolName ?? '',
       tool?.inputRaw ?? '',
       tool?.resultText ?? '',
+      tool?.agentTaskStatus ?? '',
     ) !== 'running';
   }
   return item.type === 'thinking' || item.type === 'tool_group';

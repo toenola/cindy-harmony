@@ -34,6 +34,9 @@ export class ComposerFileQueue {
   /** 图片与文件共用每条消息 20 个的上限。 */
   occupiedByOtherAttachments: () => number = () => 0;
 
+  /** 页面退场时使系统文件选择器的迟到回包失效；不能依赖系统 picker 可取消。 */
+  private pickerGeneration: number = 0;
+
   private emit(): void { this.onChanged(this.files.slice()); }
 
   remainingSlots(): number {
@@ -105,25 +108,43 @@ export class ComposerFileQueue {
       promptAction.showToast({ message: `每条消息最多添加 ${MAX_COMPOSER_ATTACHMENTS} 个附件` });
       return;
     }
+    const generation = ++this.pickerGeneration;
     this.picking = true;
     this.onPickingChanged(true);
     setTimeout(() => {
+      if (generation !== this.pickerGeneration || this.isBusy()) {
+        if (generation === this.pickerGeneration) {
+          this.picking = false;
+          this.onPickingChanged(false);
+        }
+        return;
+      }
       const documentPicker = new picker.DocumentViewPicker(context);
       const options = new picker.DocumentSelectOptions();
       options.maxSelectNumber = remaining;
       options.selectMode = picker.DocumentSelectMode.FILE;
       documentPicker.select(options).then((uris: string[]) => {
+        if (generation !== this.pickerGeneration) return;
         this.picking = false;
         this.onPickingChanged(false);
-        this.enqueue(uris);
+        if (!this.isBusy()) this.enqueue(uris);
       }).catch(() => {
+        if (generation !== this.pickerGeneration) return;
         this.picking = false;
         this.onPickingChanged(false);
       });
     }, 160);
   }
 
+  cancelPicking(): void {
+    this.pickerGeneration += 1;
+    if (!this.picking) return;
+    this.picking = false;
+    this.onPickingChanged(false);
+  }
+
   enqueue(uris: string[]): void {
+    if (this.isBusy()) return;
     const max = this.remainingSlots();
     let accepted = 0;
     for (let i = 0; i < uris.length && accepted < max; i++) {
@@ -204,10 +225,20 @@ export class ComposerFileQueue {
     this.startUpload(file);
   }
 
-  removeSent(sent: ComposerFile[]): void {
+  /**
+   * 从发送成功的文件 ID 集合中移除已发送项。
+   *
+   * 附件会经过 @Prop 镜像和异步上传，不能用对象引用判断“这一批”是否仍在
+   * 队列中；父页面传回稳定 localId 后再由队列定位真实对象。
+   */
+  removeSent(sentLocalIds: string[]): void {
+    const sent = new Set<string>();
+    for (let i = 0; i < sentLocalIds.length; i++) {
+      if (sentLocalIds[i].length > 0) sent.add(sentLocalIds[i]);
+    }
     const remaining: ComposerFile[] = [];
     for (let i = 0; i < this.files.length; i++) {
-      if (sent.indexOf(this.files[i]) < 0) {
+      if (!sent.has(this.files[i].localId)) {
         remaining.push(this.files[i]);
       } else {
         this.files[i].removed = true;

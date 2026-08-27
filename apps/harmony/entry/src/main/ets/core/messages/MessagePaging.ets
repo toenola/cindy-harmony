@@ -1,10 +1,12 @@
+import { safeErrorMessage } from '../tasks/TaskModels';
+
 /** 仅帧体过大时降页；连接、权限等错误必须立即交给 UI。 */
-export function isPayloadTooLargeError(error: Object): boolean {
+export function isPayloadTooLargeError(error: Object | undefined): boolean {
   if (error !== null && typeof error === 'object') {
     const record = error as Record<string, Object>;
     if (record['code'] === 'PAYLOAD_TOO_LARGE') return true;
   }
-  const message = error instanceof Error ? error.message : JSON.stringify(error);
+  const message = safeErrorMessage(error);
   return message.indexOf('PAYLOAD_TOO_LARGE') >= 0 || /frame exceeds \d+ bytes/i.test(message);
 }
 

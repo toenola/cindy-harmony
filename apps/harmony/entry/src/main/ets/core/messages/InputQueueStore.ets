@@ -7,12 +7,13 @@
  */
 import { DlClient, DlError, DlInvokeOptions, isSafeUnsentDlError } from '../device-link/DlClient';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
-import { RemoteSession, readBool, readObj, readStr } from '../tasks/TaskModels';
+import { RemoteSession, readBool, readObj, readStr, safeErrorMessage } from '../tasks/TaskModels';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { buildPersistedUserContent } from './MessageStore';
 import { SerializedComposerDocument } from './ComposerDocument';
 
 const SETTLING_WINDOW_MS = 10000;
+const REMOTE_EVIDENCE_LIMIT = 256;
 
 export class QueuedInputItem {
   clientId: string = '';
@@ -247,13 +248,24 @@ export class InputQueueStore {
   /** 新任务尚未完成 create + 首条 enqueue 时，本地承接后续消息的 FIFO outbox。 */
   private deferredBySession: Map<string, QueuedInputItem[]> = new Map();
   private deferredDispatchTargets: Map<string, DeferredDispatchTarget> = new Map();
-  private deferredPumps: Set<string> = new Set();
+  /**
+   * pump 不能只用 sessionId 做一个布尔锁：旧页面清理后，同名任务可能很快重新
+   * 建立新的 pump。用 token 保护 finally，避免旧 pump 把新 pump 的锁误删。
+   */
+  private deferredPumps: Map<string, number> = new Map();
+  /** 删除当前派发项后，等旧 pump 释放锁再续发剩余 deferred 项。 */
+  private deferredPumpRestartSessions: Set<string> = new Set();
+  private connectionPumps: Map<string, number> = new Map();
+  /** clear/device switch 后，旧 pump 即使完成 await 也不能继续消费新任务的数据。 */
+  private dispatchEpochs: Map<string, number> = new Map();
+  private nextDispatchEpoch: number = 0;
+  private dispatchEpochFloor: number = 0;
+  private nextPumpToken: number = 0;
   /** 已从 deferred 移入本地 projection、但尚未被 Desktop 确认接收的条目。 */
   private deferredDispatchClientIds: Set<string> = new Set();
   /** 能证明尚未发出的断线消息；恢复投影成功后才按 FIFO 自动续发。 */
   private connectionWaitingBySession: Map<string, QueuedInputItem[]> = new Map();
   private connectionDispatchTargets: Map<string, ConnectionDispatchTarget> = new Map();
-  private connectionPumps: Set<string> = new Set();
   /** 用户主动删除的条目不能被队列 diff 误判为“派发中”。 */
   private locallyRemovedClientIds: Set<string> = new Set();
   /** 删除回包与补拉都失败时，等待下一份权威投影裁决是否真的删除。 */
@@ -262,10 +274,22 @@ export class InputQueueStore {
   private authorityEpochs: Map<string, number> = new Map();
   private nextAuthorityEpoch: number = 0;
   private authorityEpochFloor: number = 0;
+  /**
+   * Desktop 已经见过的输入 clientId 证据。正值表示仍出现在远端投影，负值表示
+   * 已被正式消息/删除结果消费；仅本地乐观写入绝不进入此账本。
+   */
+  private remoteEvidenceEpochs: Map<string, number> = new Map();
+  private remoteEvidenceBySession: Map<string, Map<string, number>> = new Map();
+  private nextRemoteEvidenceEpoch: number = 0;
+  private remoteEvidenceEpochFloor: number = 0;
   /** 当前页面真正打开的任务；重连后只补这些投影，避免全量重放。 */
   private activeTargets: Map<string, ActiveInputTarget> = new Map();
   /** 投影所属桌面设备；用于 presence 离线/移除时精准失权。 */
   private sessionDevices: Map<string, string> = new Map();
+  /** 设备失权后，迟到的 projection push 不能重新夺回已清空的 session。 */
+  private unavailableDevices: Set<string> = new Set();
+  /** 同一任务的恢复拉取 single-flight；authority epoch 负责隔离清理后的旧结果。 */
+  private refreshOperations: Map<string, Promise<boolean>> = new Map();
   private sendSequence: number = 0;
 
   attach(client: DlClient): void {
@@ -288,7 +312,12 @@ export class InputQueueStore {
     for (let i = 0; i < this.listeners.length; i++) this.listeners[i]();
   }
 
-  getProjection(sessionId: string): InputProjectionState {
+  getProjection(sessionId: string, deviceId: string = ''): InputProjectionState {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) {
+      const empty = new InputProjectionState();
+      empty.sessionId = sessionId;
+      return empty;
+    }
     return this.projections.get(sessionId) ?? new InputProjectionState();
   }
 
@@ -297,7 +326,10 @@ export class InputQueueStore {
   }
 
   /** ACK 丢失后由消息历史确认已应用，移除仅供本地重试的失败气泡。 */
-  resolveAppliedDelivery(sessionId: string, clientId: string): void {
+  resolveAppliedDelivery(sessionId: string, clientId: string, deviceId: string = ''): void {
+    if (sessionId.length === 0 || clientId.length === 0) return;
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.recordRemoteEvidence(sessionId, [clientId], true);
     let changed = false;
     const projection = this.projections.get(sessionId);
     if (projection !== undefined) {
@@ -314,6 +346,7 @@ export class InputQueueStore {
     if (settling !== undefined) {
       const next = settling.filter((item: QueuedInputItem) => item.clientId !== clientId);
       if (next.length !== settling.length) {
+        this.clearSettlingClock(clientId);
         if (next.length > 0) this.settlingBySession.set(sessionId, next);
         else this.settlingBySession.delete(sessionId);
         changed = true;
@@ -344,9 +377,15 @@ export class InputQueueStore {
     this.notify();
   }
 
-  markLocalFailure(sessionId: string, clientId: string, message: string): void {
+  markLocalFailure(
+    sessionId: string,
+    clientId: string,
+    message: string,
+    deviceId: string = '',
+  ): void {
     if (sessionId.length === 0 || clientId.length === 0) return;
-    this.restoreFailedQueueItem(sessionId, clientId, message, null);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.restoreFailedQueueItem(deviceId, sessionId, clientId, message, null);
   }
 
   /** 新任务同步段先落乐观气泡，随后后台创建与 enqueue 复用同一 clientId。 */
@@ -361,7 +400,8 @@ export class InputQueueStore {
   ): void {
     if (session.id.length === 0 || stableClientId.length === 0) return;
     this.rememberSessionDevice(deviceId, session.id);
-    const existing = this.findItem(session.id, stableClientId);
+    if (!this.sessionDeviceMatches(session.id, deviceId)) return;
+    const existing = this.findItem(session.id, stableClientId, deviceId);
     if (existing !== null && !replaceExisting) {
       this.failedByClientId.delete(stableClientId);
       this.notify();
@@ -370,7 +410,7 @@ export class InputQueueStore {
     const serialized = new SerializedComposerDocument();
     serialized.text = text.trim();
     const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
-    const projection = this.getProjection(session.id);
+    const projection = this.getProjection(session.id, deviceId);
     projection.sessionId = session.id;
     if (existing !== null) {
       projection.pendingQueue = projection.pendingQueue.map((queued: QueuedInputItem) =>
@@ -396,6 +436,7 @@ export class InputQueueStore {
     files: RemoteSerializedAttachment[],
   ): string {
     this.rememberSessionDevice(deviceId, session.id);
+    if (!this.sessionDeviceMatches(session.id, deviceId)) return '';
     const item = this.buildQueuedMessage(session, serialized, images, files);
     const current = this.deferredBySession.get(session.id) ?? [];
     this.deferredBySession.set(session.id, current.concat([item]));
@@ -415,6 +456,8 @@ export class InputQueueStore {
   /** 首条消息确认后解除 outbox 派发门；循环本身保证同一任务只存在一个 pump。 */
   enableDeferredDispatch(deviceId: string, session: RemoteSession): void {
     if (session.id.length === 0) return;
+    this.rememberSessionDevice(deviceId, session.id);
+    if (!this.sessionDeviceMatches(session.id, deviceId)) return;
     const target = new DeferredDispatchTarget();
     target.deviceId = deviceId;
     target.session = session;
@@ -429,8 +472,9 @@ export class InputQueueStore {
       || (this.deferredBySession.get(sessionId)?.length ?? 0) > 0;
   }
 
-  getBubbles(sessionId: string): PendingQueueBubble[] {
-    const projection = this.getProjection(sessionId);
+  getBubbles(sessionId: string, deviceId: string = ''): PendingQueueBubble[] {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return [];
+    const projection = this.getProjection(sessionId, deviceId);
     const bubbles: PendingQueueBubble[] = [];
     const settling = this.settlingBySession.get(sessionId) ?? [];
     for (let i = 0; i < settling.length; i++) {
@@ -487,30 +531,98 @@ export class InputQueueStore {
     return bubbles;
   }
 
-  handleProjectionPush(payload: Object | undefined): void {
+  handleProjectionPush(payload: Object | undefined, deviceId: string = ''): void {
     const projection = parseInputProjection(payload, '');
     if (projection.sessionId.length === 0) return;
+    let sourceDeviceId = deviceId;
+    if (sourceDeviceId.length === 0 && payload !== undefined && typeof payload === 'object'
+      && !Array.isArray(payload)) {
+      sourceDeviceId = readStr(payload as Record<string, Object>, 'deviceId');
+    }
+    if (!this.sessionDeviceMatches(projection.sessionId, sourceDeviceId)) return;
+    if (sourceDeviceId.length > 0) this.rememberSessionDevice(sourceDeviceId, projection.sessionId);
     this.bumpAuthorityEpoch(projection.sessionId);
-    this.applyProjectionState(projection.sessionId, projection);
+    this.applyProjectionState(projection.sessionId, projection, sourceDeviceId);
     this.reconcileTransientState(projection);
+    this.recordRemoteEvidence(
+      projection.sessionId,
+      projection.pendingQueue.map((item: QueuedInputItem) => item.clientId),
+      false,
+    );
     this.notify();
   }
 
-  /** 正式消息回流后移除 settling 气泡，实现同 clientId 原位落定。 */
-  setDeliveredClientIds(sessionId: string, clientIds: Set<string>): void {
-    let changed = this.releaseConfirmedDeferredClients(sessionId, clientIds);
+  /**
+   * 正式消息回流后移除所有本地过渡层，实现同 clientId 原位落定。
+   * 页面每次刷新会带来完整历史窗口，因此这里只记账当前仍被本地队列追踪的 id，
+   * 不会因为历史消息重复刷新而不断推进整个队列代次。
+   */
+  setDeliveredClientIds(sessionId: string, clientIds: Set<string>, deviceId: string = ''): void {
+    if (sessionId.length === 0 || clientIds.size === 0) return;
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const tracked = new Set<string>();
+    const projection = this.getProjection(sessionId, deviceId);
+    if (projection !== undefined) {
+      for (let i = 0; i < projection.pendingQueue.length; i++) {
+        const id = projection.pendingQueue[i].clientId;
+        if (clientIds.has(id)) tracked.add(id);
+      }
+    }
     const settling = this.settlingBySession.get(sessionId);
+    if (settling !== undefined) {
+      for (let i = 0; i < settling.length; i++) {
+        const id = settling[i].clientId;
+        if (clientIds.has(id)) tracked.add(id);
+      }
+    }
+    const connectionWaiting = this.connectionWaitingBySession.get(sessionId);
+    if (connectionWaiting !== undefined) {
+      for (let i = 0; i < connectionWaiting.length; i++) {
+        const id = connectionWaiting[i].clientId;
+        if (clientIds.has(id)) tracked.add(id);
+      }
+    }
+    this.deferredDispatchClientIds.forEach((clientId: string) => {
+      if (clientIds.has(clientId)) tracked.add(clientId);
+    });
+    if (tracked.size === 0) return;
+    const delivered: string[] = [];
+    tracked.forEach((clientId: string) => delivered.push(clientId));
+    this.recordRemoteEvidence(sessionId, delivered, true);
+    let changed = false;
+    if (projection !== undefined) {
+      const nextPending = projection.pendingQueue.filter(
+        (item: QueuedInputItem) => !tracked.has(item.clientId));
+      if (nextPending.length !== projection.pendingQueue.length) {
+        projection.pendingQueue = nextPending;
+        this.projections.set(sessionId, projection);
+        changed = true;
+      }
+    }
     if (settling !== undefined && settling.length > 0) {
-      const next = settling.filter((item: QueuedInputItem) => !clientIds.has(item.clientId));
+      const next = settling.filter((item: QueuedInputItem) => !tracked.has(item.clientId));
       if (next.length !== settling.length) {
         for (let i = 0; i < settling.length; i++) {
-          if (clientIds.has(settling[i].clientId)) this.clearSettlingClock(settling[i].clientId);
+          if (tracked.has(settling[i].clientId)) this.clearSettlingClock(settling[i].clientId);
         }
         if (next.length > 0) this.settlingBySession.set(sessionId, next);
         else this.settlingBySession.delete(sessionId);
         changed = true;
       }
     }
+    if (connectionWaiting !== undefined) {
+      const next = connectionWaiting.filter((item: QueuedInputItem) => !tracked.has(item.clientId));
+      if (next.length !== connectionWaiting.length) {
+        if (next.length > 0) this.connectionWaitingBySession.set(sessionId, next);
+        else {
+          this.connectionWaitingBySession.delete(sessionId);
+          this.connectionDispatchTargets.delete(sessionId);
+        }
+        changed = true;
+      }
+    }
+    tracked.forEach((clientId: string) => this.clearTransientClient(clientId));
+    if (this.releaseConfirmedDeferredClients(sessionId, tracked)) changed = true;
     if (changed) {
       this.notify();
       void this.pumpDeferred(sessionId);
@@ -518,7 +630,11 @@ export class InputQueueStore {
     }
   }
 
-  private applyProjectionState(sessionId: string, next: InputProjectionState): void {
+  private applyProjectionState(
+    sessionId: string,
+    next: InputProjectionState,
+    deviceId: string = '',
+  ): void {
     const previous = this.projections.get(sessionId);
     if (previous !== undefined && previous.pendingQueue.length > 0) {
       const nextIds = new Set<string>();
@@ -544,7 +660,7 @@ export class InputQueueStore {
         for (let i = 0; i < vanished.length; i++) {
           if (!merged.some((item: QueuedInputItem) => item.clientId === vanished[i].clientId)) {
             merged.push(vanished[i]);
-            this.noteSettlingAdded(sessionId, vanished[i].clientId);
+            this.noteSettlingAdded(deviceId, sessionId, vanished[i].clientId);
           }
         }
         this.settlingBySession.set(sessionId, merged);
@@ -602,33 +718,84 @@ export class InputQueueStore {
     return changed;
   }
 
-  async refresh(deviceId: string, sessionId: string): Promise<boolean> {
+  async refresh(
+    deviceId: string,
+    sessionId: string,
+    expectedDispatchEpoch: number = -1,
+  ): Promise<boolean> {
+    if (expectedDispatchEpoch >= 0
+      && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
     this.rememberSessionDevice(deviceId, sessionId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return false;
+    const operationKey = inputQueueScopeKey(deviceId, sessionId);
+    const existing = this.refreshOperations.get(operationKey);
+    if (existing !== undefined) {
+      return await existing;
+    }
+    const operation = this.refreshOnce(deviceId, sessionId, expectedDispatchEpoch);
+    this.refreshOperations.set(operationKey, operation);
     try {
+      return await operation;
+    } finally {
+      if (this.refreshOperations.get(operationKey) === operation) {
+        this.refreshOperations.delete(operationKey);
+      }
+    }
+  }
+
+  private async refreshOnce(
+    deviceId: string,
+    sessionId: string,
+    expectedDispatchEpoch: number = -1,
+  ): Promise<boolean> {
+    try {
+      if (expectedDispatchEpoch >= 0
+        && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
       const expectedEpoch = this.captureAuthorityEpoch(sessionId);
       const result = await this.invoke(deviceId, 'maker:input:get-projection', [sessionId]);
+      if (expectedDispatchEpoch >= 0
+        && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
       const projection = parseInputProjection(result, sessionId);
-      if (this.applyProjectionIfCurrent(sessionId, projection, expectedEpoch)) {
+      const accepted = this.applyProjectionIfCurrent(
+        sessionId, projection, expectedEpoch, deviceId);
+      if (accepted) {
         this.notify();
       }
-      return true;
+      return accepted;
     } catch (e) {
       return false;
     }
   }
 
-  clearSession(sessionId: string): void {
+  clearSession(sessionId: string, deviceId: string = ''): void {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     // 保留 per-session tombstone；clear 前启动的旧请求不得在同 id 重建后复活。
     this.bumpAuthorityEpoch(sessionId);
+    this.bumpDispatchEpoch(sessionId);
+    this.deferredPumpRestartSessions.delete(sessionId);
     this.dropProjection(sessionId);
-    this.connectionWaitingBySession.delete(sessionId);
-    this.connectionDispatchTargets.delete(sessionId);
+    this.clearConnectionWaiting(sessionId);
+    // clearSession 是页面/本地创建失败的终点；若保留 active target，下一次 relay
+    // 恢复会把已离开的任务重新加入补拉集合，并重新建立已清掉的设备归属。
+    this.activeTargets.delete(sessionId);
     this.sessionDevices.delete(sessionId);
+    this.clearRemoteEvidence(sessionId);
+    const refreshSuffix = '\u0000' + sessionId;
+    this.refreshOperations.forEach((_operation: Promise<boolean>, key: string) => {
+      if (deviceId.length === 0
+        ? key.endsWith(refreshSuffix)
+        : key === inputQueueScopeKey(deviceId, sessionId)) {
+        this.refreshOperations.delete(key);
+      }
+    });
     this.notify();
   }
 
   /** 创建失败/不确定发送只清投影，保留活动页面的设备归属供后续补拉。 */
-  discardProjection(sessionId: string): void {
+  discardProjection(sessionId: string, deviceId: string = ''): void {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.bumpDispatchEpoch(sessionId);
+    this.deferredPumpRestartSessions.delete(sessionId);
     this.dropProjection(sessionId);
     this.bumpAuthorityEpoch(sessionId);
     this.notify();
@@ -638,6 +805,7 @@ export class InputQueueStore {
   activateSession(deviceId: string, sessionId: string): void {
     if (deviceId.length === 0 || sessionId.length === 0) return;
     this.rememberSessionDevice(deviceId, sessionId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     const target = this.activeTargets.get(sessionId) ?? new ActiveInputTarget();
     target.deviceId = deviceId;
     target.references += 1;
@@ -661,6 +829,7 @@ export class InputQueueStore {
   }
 
   async resyncDevice(deviceId: string): Promise<void> {
+    this.unavailableDevices.delete(deviceId);
     const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInputTarget, sessionId: string) => {
       if (target.deviceId === deviceId) {
@@ -677,14 +846,24 @@ export class InputQueueStore {
 
   /** 目标桌面离线、撤权或从权威设备快照移除：旧投影立即删除并 fence 在途 RPC。 */
   invalidateDevice(deviceId: string): void {
+    if (deviceId.length > 0) this.unavailableDevices.add(deviceId);
     let changed = false;
     const sessionIds: string[] = [];
     this.sessionDevices.forEach((ownerDeviceId: string, sessionId: string) => {
       if (ownerDeviceId === deviceId) sessionIds.push(sessionId);
     });
     for (let i = 0; i < sessionIds.length; i++) {
-      this.dropProjection(sessionIds[i]);
-      this.bumpAuthorityEpoch(sessionIds[i]);
+      const sessionId = sessionIds[i];
+      this.dropProjection(sessionId);
+      this.clearConnectionWaiting(sessionId);
+      this.deferredPumpRestartSessions.delete(sessionId);
+      this.sessionDevices.delete(sessionId);
+      const active = this.activeTargets.get(sessionId);
+      if (active !== undefined && active.deviceId === deviceId) {
+        this.activeTargets.delete(sessionId);
+      }
+      this.bumpAuthorityEpoch(sessionId);
+      this.bumpDispatchEpoch(sessionId);
       changed = true;
     }
     if (changed) this.notify();
@@ -708,6 +887,7 @@ export class InputQueueStore {
   invalidateActiveAuthorities(): void {
     this.activeTargets.forEach((_target: ActiveInputTarget, sessionId: string) => {
       this.bumpAuthorityEpoch(sessionId);
+      this.bumpDispatchEpoch(sessionId);
     });
   }
 
@@ -715,15 +895,17 @@ export class InputQueueStore {
     return this.authorityEpochs.get(sessionId) ?? this.authorityEpochFloor;
   }
 
-  invalidateAuthority(sessionId: string): void {
+  invalidateAuthority(sessionId: string, deviceId: string = ''): void {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     this.bumpAuthorityEpoch(sessionId);
   }
 
   /** maker 终态是 continuation owner 的权威 fence；即使 clear push 丢失也要收口。 */
-  noteTurnTerminal(sessionId: string): void {
+  noteTurnTerminal(sessionId: string, deviceId: string = ''): void {
     if (sessionId.length === 0) return;
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     this.bumpAuthorityEpoch(sessionId);
-    const current = this.projections.get(sessionId);
+    const current = this.getProjection(sessionId, deviceId);
     if (current !== undefined && current.continuationTurnClientId.length > 0) {
       current.continuationTurnClientId = '';
       this.projections.set(sessionId, current);
@@ -741,7 +923,17 @@ export class InputQueueStore {
     this.deferredBySession.clear();
     this.deferredDispatchTargets.clear();
     this.deferredPumps.clear();
+    this.deferredPumpRestartSessions.clear();
     this.deferredDispatchClientIds.clear();
+    // 先复制 key，再清理每个等待队列；不要在 Map.forEach 中删除当前 Map 项，
+    // ArkTS/JS 对这种边遍历边修改的行为没有跨运行时一致保证，可能漏清尾项。
+    const waitingSessionIds: string[] = [];
+    this.connectionWaitingBySession.forEach((_items: QueuedInputItem[], sessionId: string) => {
+      waitingSessionIds.push(sessionId);
+    });
+    for (let i = 0; i < waitingSessionIds.length; i++) {
+      this.clearConnectionWaiting(waitingSessionIds[i]);
+    }
     this.connectionWaitingBySession.clear();
     this.connectionDispatchTargets.clear();
     this.connectionPumps.clear();
@@ -751,8 +943,15 @@ export class InputQueueStore {
     this.uncertainRemovalClientIds.clear();
     this.activeTargets.clear();
     this.sessionDevices.clear();
+    this.unavailableDevices.clear();
+    this.refreshOperations.clear();
     this.authorityEpochFloor = ++this.nextAuthorityEpoch;
     this.authorityEpochs.clear();
+    this.dispatchEpochFloor = ++this.nextDispatchEpoch;
+    this.dispatchEpochs.clear();
+    this.remoteEvidenceBySession.clear();
+    this.remoteEvidenceEpochs.clear();
+    this.remoteEvidenceEpochFloor = ++this.nextRemoteEvidenceEpoch;
     this.notify();
   }
 
@@ -778,8 +977,9 @@ export class InputQueueStore {
     planModeOverride: boolean | null = null,
   ): Promise<string> {
     this.rememberSessionDevice(deviceId, session.id);
+    if (!this.sessionDeviceMatches(session.id, deviceId)) return '';
     if (stableClientId.length > 0) {
-      const existing = this.findItem(session.id, stableClientId);
+      const existing = this.findItem(session.id, stableClientId, deviceId);
       if (existing !== null) {
         await this.retry(deviceId, session.id, stableClientId);
         return stableClientId;
@@ -787,13 +987,15 @@ export class InputQueueStore {
     }
     const item = this.buildQueuedMessage(
       session, serialized, images, files, stableClientId, planModeOverride);
+    const remoteEvidenceAtRequestStart = this.captureRemoteEvidenceEpoch(session.id);
+    const dispatchEpoch = this.captureDispatchEpoch(session.id);
     if (this.client?.getStatus() !== 'online'
       || (this.connectionWaitingBySession.get(session.id)?.length ?? 0) > 0
       || this.connectionPumps.has(session.id)) {
       this.parkForConnection(deviceId, session, item);
       return item.clientId;
     }
-    const projection = this.getProjection(session.id);
+    const projection = this.getProjection(session.id, deviceId);
     projection.sessionId = session.id;
     projection.pendingQueue = projection.pendingQueue.concat([item]);
     this.bumpAuthorityEpoch(session.id);
@@ -807,38 +1009,55 @@ export class InputQueueStore {
     try {
       const expectedEpoch = this.captureAuthorityEpoch(session.id);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [session.id, item.raw, sendOptions]);
-      this.applyProjectionResultIfCurrent(session.id, result, expectedEpoch);
+      if (!this.dispatchEpochIsCurrent(session.id, dispatchEpoch)) {
+        this.releaseEnqueueingForItemIfCurrent(session.id, item);
+        return item.clientId;
+      }
+      this.applyProjectionResultIfCurrent(
+        session.id, result, expectedEpoch, item.clientId, deviceId);
       this.enqueueingClientIds.delete(item.clientId);
       this.failedByClientId.delete(item.clientId);
       this.notify();
       return item.clientId;
     } catch (e) {
       if (isSafeUnsentDlError(e)) {
-        this.removeLocalProjectionItem(session.id, item.clientId);
+        if (!this.dispatchEpochIsCurrent(session.id, dispatchEpoch)) {
+          this.releaseEnqueueingForItemIfCurrent(session.id, item);
+          return item.clientId;
+        }
+        this.removeLocalProjectionItem(deviceId, session.id, item.clientId);
         this.parkForConnection(deviceId, session, item);
         return item.clientId;
       }
       // NOT_CONNECTED 可能发生在 host 已接收之后；先权威对账再决定是否标失败。
-      const applied = await this.refresh(deviceId, session.id);
-      if (applied && this.findItem(session.id, item.clientId) !== null) {
+        const applied = await this.refresh(deviceId, session.id, dispatchEpoch);
+      if (!this.dispatchEpochIsCurrent(session.id, dispatchEpoch)) {
+        this.releaseEnqueueingForItemIfCurrent(session.id, item);
+        return item.clientId;
+      }
+      if ((applied && this.findItem(session.id, item.clientId, deviceId) !== null)
+        || this.hasRemoteEvidenceSince(session.id, item.clientId, remoteEvidenceAtRequestStart)) {
         this.enqueueingClientIds.delete(item.clientId);
         this.failedByClientId.delete(item.clientId);
         this.notify();
         return item.clientId;
       }
-      const message = e instanceof Error ? e.message : JSON.stringify(e);
+      const message = safeErrorMessage(e);
       // 空权威投影会先把乐观项移到 settling；恢复失败入口前必须清掉同 id
       // 的 settling，否则 UI 会同时出现“同步中 + 发送失败”两张气泡。
-      this.restoreFailedQueueItem(session.id, item.clientId, message, item);
+      this.restoreFailedQueueItem(deviceId, session.id, item.clientId, message, item);
       throw new Error(message);
     }
   }
 
   async retry(deviceId: string, sessionId: string, clientId: string): Promise<void> {
-    const item = this.findItem(sessionId, clientId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const item = this.findItem(sessionId, clientId, deviceId);
     if (item === null || this.enqueueingClientIds.has(clientId)) return;
     this.enqueueingClientIds.add(clientId);
     this.failedByClientId.delete(clientId);
+    const remoteEvidenceAtRequestStart = this.captureRemoteEvidenceEpoch(sessionId);
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const deferredDispatch = this.deferredDispatchClientIds.has(clientId);
     this.notify();
     const sendOptions: Record<string, Object> = {};
@@ -846,13 +1065,21 @@ export class InputQueueStore {
     try {
       const expectedEpoch = this.captureAuthorityEpoch(sessionId);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [sessionId, item.raw, sendOptions]);
-      this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+      if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
+        this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+        return;
+      }
+      this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, clientId, deviceId);
       this.enqueueingClientIds.delete(clientId);
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
       void this.pumpConnectionWaiting(sessionId);
     } catch (e) {
+      if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
+        this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+        return;
+      }
       if (deferredDispatch && !this.deferredDispatchClientIds.has(clientId)) {
         this.enqueueingClientIds.delete(clientId);
         this.failedByClientId.delete(clientId);
@@ -860,13 +1087,33 @@ export class InputQueueStore {
         void this.pumpDeferred(sessionId);
         return;
       }
-      const message = e instanceof Error ? e.message : JSON.stringify(e);
-      this.restoreFailedQueueItem(sessionId, clientId, message, item);
+      if (!isSafeUnsentDlError(e)) {
+        const applied = await this.refresh(deviceId, sessionId, dispatchEpoch);
+        if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
+          this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+          return;
+        }
+        if ((applied && this.findItem(sessionId, clientId, deviceId) !== null)
+          || this.hasRemoteEvidenceSince(sessionId, clientId, remoteEvidenceAtRequestStart)) {
+          this.enqueueingClientIds.delete(clientId);
+          this.failedByClientId.delete(clientId);
+          this.notify();
+          void this.pumpDeferred(sessionId);
+          void this.pumpConnectionWaiting(sessionId);
+          return;
+        }
+      }
+      const message = safeErrorMessage(e);
+      this.restoreFailedQueueItem(deviceId, sessionId, clientId, message, item);
       throw new Error(message);
     }
   }
 
   async remove(deviceId: string, sessionId: string, clientId: string): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    // 删除同时取消该任务上尚未完成的自动派发；旧 enqueue/pump 回包不得在删除后
+    // 重新把同一条消息送到 Desktop。
+    const dispatchEpoch = this.bumpDispatchEpoch(sessionId);
     const connectionWaiting = this.connectionWaitingBySession.get(sessionId) ?? [];
     if (connectionWaiting.some((item: QueuedInputItem) => item.clientId === clientId)) {
       const next = connectionWaiting.filter((item: QueuedInputItem) => item.clientId !== clientId);
@@ -886,12 +1133,15 @@ export class InputQueueStore {
       const next = deferred.filter((item: QueuedInputItem) => item.clientId !== clientId);
       if (next.length > 0) this.deferredBySession.set(sessionId, next);
       else this.deferredBySession.delete(sessionId);
+      if ((next.length > 0) && this.deferredDispatchTargets.has(sessionId)) {
+        this.deferredPumpRestartSessions.add(sessionId);
+      }
       this.clearTransientClient(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
       return;
     }
-    const projection = this.getProjection(sessionId);
+    const projection = this.getProjection(sessionId, deviceId);
     const index = projection.pendingQueue.findIndex((item: QueuedInputItem) => item.clientId === clientId);
     const removed = index >= 0 ? projection.pendingQueue[index] : undefined;
     const removedFailure = this.failedByClientId.get(clientId) ?? '';
@@ -899,16 +1149,24 @@ export class InputQueueStore {
     this.locallyRemovedClientIds.add(clientId);
     this.uncertainRemovalClientIds.delete(clientId);
     if (index >= 0) projection.pendingQueue.splice(index, 1);
+    if ((this.deferredBySession.get(sessionId)?.length ?? 0) > 0
+      && this.deferredDispatchTargets.has(sessionId)) {
+      // 该 projection 项可能正由 deferred pump 在途发送；删除会取消旧代次，
+      // 但后续 outbox 仍应在旧 pump 退出后继续排队。
+      this.deferredPumpRestartSessions.add(sessionId);
+    }
     this.failedByClientId.delete(clientId);
     this.notify();
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     try {
       const result = await this.invoke(deviceId, 'maker:input:remove', [sessionId, clientId]);
-      this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+      if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+      this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
     } catch (e) {
+      if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       if ((e instanceof DlError && e.code === 'NOT_FOUND')
         || (e instanceof Error && e.message.indexOf('[NOT_FOUND]') >= 0)) {
         this.clearTransientClient(clientId);
@@ -918,20 +1176,21 @@ export class InputQueueStore {
       }
       // Desktop 可能已先 emit 删除后的 projection、仅 RPC ACK 丢失。先权威补拉，
       // 缺席即按成功收口；只有仍无法裁决时才把本地条目恢复为可操作状态。
-      await this.refresh(deviceId, sessionId);
+      await this.refresh(deviceId, sessionId, dispatchEpoch);
+      if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       if (!this.locallyRemovedClientIds.has(clientId)
-        && this.findItem(sessionId, clientId) === null) {
+        && this.findItem(sessionId, clientId, deviceId) === null) {
         this.clearTransientClient(clientId);
         this.notify();
         void this.pumpDeferred(sessionId);
         return;
       }
-      if (this.findItem(sessionId, clientId) !== null) {
+      if (this.findItem(sessionId, clientId, deviceId) !== null) {
         this.locallyRemovedClientIds.delete(clientId);
         this.uncertainRemovalClientIds.delete(clientId);
       }
-      if (removed !== undefined && this.findItem(sessionId, clientId) === null) {
-        const current = this.getProjection(sessionId);
+      if (removed !== undefined && this.findItem(sessionId, clientId, deviceId) === null) {
+        const current = this.getProjection(sessionId, deviceId);
         this.bumpAuthorityEpoch(sessionId);
         current.pendingQueue.splice(Math.min(index, current.pendingQueue.length), 0, removed);
         this.projections.set(sessionId, current);
@@ -939,7 +1198,7 @@ export class InputQueueStore {
         if (removedFailure.length > 0) this.failedByClientId.set(clientId, removedFailure);
       }
       this.notify();
-      const message = e instanceof Error ? e.message : JSON.stringify(e);
+      const message = safeErrorMessage(e);
       throw new Error(message);
     }
   }
@@ -950,9 +1209,12 @@ export class InputQueueStore {
     clientId: string,
     targetIndex: number,
   ): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:move', [sessionId, clientId, targetIndex]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
@@ -962,10 +1224,13 @@ export class InputQueueStore {
     clientId: string,
     locked: boolean,
   ): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:set-edit-lock',
       [sessionId, clientId, locked]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
@@ -975,13 +1240,16 @@ export class InputQueueStore {
     clientId: string,
     text: string,
   ): Promise<void> {
-    const item = this.findItem(sessionId, clientId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const item = this.findItem(sessionId, clientId, deviceId);
     if (item === null) return;
     const next = this.cloneItemWithText(item, text);
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:update-content',
       [sessionId, clientId, next.raw]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
@@ -991,28 +1259,35 @@ export class InputQueueStore {
     clientId: string,
     serialized: SerializedComposerDocument,
   ): Promise<void> {
-    const item = this.findItem(sessionId, clientId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const item = this.findItem(sessionId, clientId, deviceId);
     if (item === null) return;
     const next = this.cloneItemWithDocument(item, serialized);
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:update-content',
       [sessionId, clientId, next.raw]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
   async steer(deviceId: string, sessionId: string, clientId: string): Promise<void> {
-    const item = this.findItem(sessionId, clientId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const item = this.findItem(sessionId, clientId, deviceId);
     if (item === null) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const options: Record<string, Object> = {};
     options['removeFromQueue'] = true;
     options['touchUserSend'] = true;
     await this.invoke(deviceId, 'maker:input:steer', [sessionId, item.raw, options]);
-    await this.refresh(deviceId, sessionId);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    await this.refresh(deviceId, sessionId, dispatchEpoch);
   }
 
   async stop(deviceId: string, sessionId: string): Promise<void> {
-    const projection = this.getProjection(sessionId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const projection = this.getProjection(sessionId, deviceId);
     const args: Object[] = [sessionId];
     if (projection.pendingQueue.length > 0) {
       const options: Record<string, Object> = {};
@@ -1021,30 +1296,42 @@ export class InputQueueStore {
       args.push(options);
     }
     // Stop 是终态写：先立新代次屏障，旧 refresh / 队列写即使先返回也不得覆盖它。
+    const dispatchEpoch = this.bumpDispatchEpoch(sessionId);
+    this.deferredPumpRestartSessions.delete(sessionId);
     const expectedEpoch = this.bumpAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:stop', args);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
   async resume(deviceId: string, sessionId: string): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:resume', [sessionId]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
   async retryLastError(deviceId: string, sessionId: string): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:retry-last-error', [sessionId]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
   async clearError(deviceId: string, sessionId: string): Promise<void> {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
     const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     const result = await this.invoke(deviceId, 'maker:input:clear-error', [sessionId]);
-    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+    if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
+    this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
     this.notify();
   }
 
@@ -1052,21 +1339,36 @@ export class InputQueueStore {
     sessionId: string,
     result: Object | undefined,
     expectedEpoch: number,
+    acceptedClientId: string = '',
+    deviceId: string = '',
   ): boolean {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return false;
     if (result === undefined || typeof result !== 'object' || Array.isArray(result)) return false;
     const projection = parseInputProjection(result, sessionId);
-    return this.applyProjectionIfCurrent(sessionId, projection, expectedEpoch);
+    const accepted = this.applyProjectionIfCurrent(sessionId, projection, expectedEpoch, deviceId);
+    if (!accepted && acceptedClientId.length > 0) {
+      // 回包本身仍是远端已处理的证据，但不能越过更新的投影覆盖本地状态。
+      this.recordRemoteEvidence(sessionId, [acceptedClientId], false);
+    }
+    return accepted;
   }
 
   private applyProjectionIfCurrent(
     sessionId: string,
     projection: InputProjectionState,
     expectedEpoch: number,
+    deviceId: string = '',
   ): boolean {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return false;
     if (this.captureAuthorityEpoch(sessionId) !== expectedEpoch) return false;
     this.bumpAuthorityEpoch(sessionId);
-    this.applyProjectionState(sessionId, projection);
+    this.applyProjectionState(sessionId, projection, deviceId);
     this.reconcileTransientState(projection);
+    this.recordRemoteEvidence(
+      sessionId,
+      projection.pendingQueue.map((item: QueuedInputItem) => item.clientId),
+      false,
+    );
     return true;
   }
 
@@ -1076,8 +1378,90 @@ export class InputQueueStore {
     return next;
   }
 
+  private bumpDispatchEpoch(sessionId: string): number {
+    const next = ++this.nextDispatchEpoch;
+    this.dispatchEpochs.set(sessionId, next);
+    return next;
+  }
+
+  private captureDispatchEpoch(sessionId: string): number {
+    return this.dispatchEpochs.get(sessionId) ?? this.dispatchEpochFloor;
+  }
+
+  private dispatchEpochIsCurrent(sessionId: string, expectedEpoch: number): boolean {
+    return this.captureDispatchEpoch(sessionId) === expectedEpoch;
+  }
+
+  captureRemoteEvidenceEpoch(sessionId: string): number {
+    return this.remoteEvidenceEpochs.get(sessionId) ?? this.remoteEvidenceEpochFloor;
+  }
+
+  hasRemoteEvidenceSince(sessionId: string, clientId: string, expectedEpoch: number): boolean {
+    if (clientId.length === 0) return false;
+    const evidence = this.remoteEvidenceBySession.get(sessionId)?.get(clientId) ?? 0;
+    return Math.abs(evidence) > expectedEpoch;
+  }
+
+  private recordRemoteEvidence(
+    sessionId: string,
+    clientIds: string[],
+    settled: boolean,
+  ): void {
+    const epoch = ++this.nextRemoteEvidenceEpoch;
+    this.remoteEvidenceEpochs.set(sessionId, epoch);
+    let evidence = this.remoteEvidenceBySession.get(sessionId);
+    if (evidence === undefined) {
+      evidence = new Map<string, number>();
+      this.remoteEvidenceBySession.set(sessionId, evidence);
+    }
+    for (let i = 0; i < clientIds.length; i++) {
+      if (clientIds[i].length === 0) continue;
+      evidence.delete(clientIds[i]);
+      evidence.set(clientIds[i], settled ? -epoch : epoch);
+    }
+    while (evidence.size > REMOTE_EVIDENCE_LIMIT) {
+      let oldest = '';
+      evidence.forEach((_value: number, key: string) => {
+        if (oldest.length === 0) oldest = key;
+      });
+      if (oldest.length === 0) break;
+      evidence.delete(oldest);
+    }
+    // Remote evidence also invalidates every in-flight local snapshot. This keeps the
+    // single authority fence useful even when the evidence came from a message row
+    // instead of an input projection.
+    this.bumpAuthorityEpoch(sessionId);
+  }
+
+  private clearRemoteEvidence(sessionId: string): void {
+    this.remoteEvidenceBySession.delete(sessionId);
+    this.remoteEvidenceEpochs.delete(sessionId);
+  }
+
+  private sessionDeviceMatches(sessionId: string, deviceId: string): boolean {
+    if (deviceId.length === 0) return true;
+    if (this.unavailableDevices.has(deviceId)) return false;
+    const owner = this.sessionDevices.get(sessionId) ?? '';
+    return owner.length === 0 || owner === deviceId;
+  }
+
   private rememberSessionDevice(deviceId: string, sessionId: string): void {
-    if (deviceId.length > 0 && sessionId.length > 0) this.sessionDevices.set(sessionId, deviceId);
+    if (deviceId.length === 0 || sessionId.length === 0) return;
+    if (this.unavailableDevices.has(deviceId)) return;
+    const previousDeviceId = this.sessionDevices.get(sessionId) ?? '';
+    if (previousDeviceId.length > 0 && previousDeviceId !== deviceId) {
+      // Input projection 同样只有一个当前页面 lease；切换设备前清掉旧桌面的
+      // pending、失败、待派发与代次状态，避免同名任务把旧队列带到新桌面。
+      this.dropProjection(sessionId);
+      this.clearConnectionWaiting(sessionId);
+      const active = this.activeTargets.get(sessionId);
+      if (active !== undefined && active.deviceId !== deviceId) {
+        this.activeTargets.delete(sessionId);
+      }
+      this.bumpAuthorityEpoch(sessionId);
+      this.bumpDispatchEpoch(sessionId);
+    }
+    this.sessionDevices.set(sessionId, deviceId);
   }
 
   private dropProjection(sessionId: string): void {
@@ -1100,9 +1484,24 @@ export class InputQueueStore {
     }
     this.deferredBySession.delete(sessionId);
     this.deferredDispatchTargets.delete(sessionId);
+    this.clearRemoteEvidence(sessionId);
   }
 
-  private removeLocalProjectionItem(sessionId: string, clientId: string): void {
+  private clearConnectionWaiting(sessionId: string): void {
+    const waiting = this.connectionWaitingBySession.get(sessionId) ?? [];
+    for (let i = 0; i < waiting.length; i++) {
+      this.clearTransientClient(waiting[i].clientId);
+    }
+    this.connectionWaitingBySession.delete(sessionId);
+    this.connectionDispatchTargets.delete(sessionId);
+  }
+
+  private removeLocalProjectionItem(
+    deviceId: string,
+    sessionId: string,
+    clientId: string,
+  ): void {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     const projection = this.projections.get(sessionId);
     if (projection !== undefined) {
       projection.pendingQueue = projection.pendingQueue.filter(
@@ -1126,6 +1525,7 @@ export class InputQueueStore {
     session: RemoteSession,
     item: QueuedInputItem,
   ): void {
+    if (!this.sessionDeviceMatches(session.id, deviceId)) return;
     const target = new ConnectionDispatchTarget();
     target.deviceId = deviceId;
     target.session = session;
@@ -1161,10 +1561,15 @@ export class InputQueueStore {
     if (this.connectionPumps.has(sessionId)) return;
     const active = this.activeTargets.get(sessionId);
     const target = this.connectionDispatchTargets.get(sessionId);
-    if (active === undefined || target === undefined || active.deviceId !== target.deviceId) return;
-    this.connectionPumps.add(sessionId);
+    if (active === undefined || target === undefined || active.deviceId !== target.deviceId
+      || !this.sessionDeviceMatches(sessionId, target.deviceId)) return;
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
+    const pumpToken = ++this.nextPumpToken;
+    this.connectionPumps.set(sessionId, pumpToken);
     try {
       for (;;) {
+        if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+          || this.connectionPumps.get(sessionId) !== pumpToken) return;
         const waiting = this.connectionWaitingBySession.get(sessionId) ?? [];
         const currentTarget = this.connectionDispatchTargets.get(sessionId);
         if (waiting.length === 0 || currentTarget === undefined) {
@@ -1172,42 +1577,66 @@ export class InputQueueStore {
           this.connectionDispatchTargets.delete(sessionId);
           return;
         }
+        if (!this.sessionDeviceMatches(sessionId, currentTarget.deviceId)) return;
         const item = waiting[0];
         this.applySessionContextToQueuedItem(item, currentTarget.session);
         this.enqueueingClientIds.add(item.clientId);
         this.notify();
         const sendOptions: Record<string, Object> = {};
         sendOptions['sendAtMs'] = Date.now();
+        const remoteEvidenceAtRequestStart = this.captureRemoteEvidenceEpoch(sessionId);
         try {
           const expectedEpoch = this.captureAuthorityEpoch(sessionId);
           const result = await this.invoke(currentTarget.deviceId,
             'maker:input:enqueue', [sessionId, item.raw, sendOptions]);
-          this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch);
+          if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+            || this.connectionPumps.get(sessionId) !== pumpToken) {
+            this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+            return;
+          }
+          this.applyProjectionResultIfCurrent(
+            sessionId, result, expectedEpoch, item.clientId, currentTarget.deviceId);
           this.consumeConnectionWaitingHead(sessionId, item.clientId);
           this.enqueueingClientIds.delete(item.clientId);
           this.failedByClientId.delete(item.clientId);
           this.notify();
         } catch (e) {
+          if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+            || this.connectionPumps.get(sessionId) !== pumpToken) {
+            this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+            return;
+          }
           this.enqueueingClientIds.delete(item.clientId);
           if (isSafeUnsentDlError(e)) {
             this.notify();
             return;
           }
           // 已发出但 ACK 不确定：只做一次权威对账；无法确认时转人工失败，绝不自动重放。
-          const applied = await this.refresh(currentTarget.deviceId, sessionId);
-          if (applied && this.findItem(sessionId, item.clientId) !== null) {
+          const applied = await this.refresh(
+            currentTarget.deviceId, sessionId, dispatchEpoch);
+          if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+            || this.connectionPumps.get(sessionId) !== pumpToken) {
+            this.releaseEnqueueingForItemIfCurrent(sessionId, item);
+            return;
+          }
+          if ((applied && this.findItem(
+            sessionId, item.clientId, currentTarget.deviceId) !== null)
+            || this.hasRemoteEvidenceSince(sessionId, item.clientId, remoteEvidenceAtRequestStart)) {
             this.consumeConnectionWaitingHead(sessionId, item.clientId);
             this.notify();
             continue;
           }
           if (!this.consumeConnectionWaitingHead(sessionId, item.clientId)) return;
-          const message = e instanceof Error ? e.message : JSON.stringify(e);
-          this.restoreFailedQueueItem(sessionId, item.clientId, message, item);
+          const message = safeErrorMessage(e);
+          this.restoreFailedQueueItem(
+            currentTarget.deviceId, sessionId, item.clientId, message, item);
           return;
         }
       }
     } finally {
-      this.connectionPumps.delete(sessionId);
+      if (this.connectionPumps.get(sessionId) === pumpToken) {
+        this.connectionPumps.delete(sessionId);
+      }
     }
   }
 
@@ -1216,16 +1645,22 @@ export class InputQueueStore {
     if (this.deferredPumps.has(sessionId)) return;
     const target = this.deferredDispatchTargets.get(sessionId);
     if (target === undefined) return;
-    this.deferredPumps.add(sessionId);
+    this.deferredPumpRestartSessions.delete(sessionId);
+    const dispatchEpoch = this.captureDispatchEpoch(sessionId);
+    const pumpToken = ++this.nextPumpToken;
+    this.deferredPumps.set(sessionId, pumpToken);
     try {
       for (;;) {
+        if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+          || this.deferredPumps.get(sessionId) !== pumpToken) return;
         const currentTarget = this.deferredDispatchTargets.get(sessionId);
         const deferred = this.deferredBySession.get(sessionId) ?? [];
         if (currentTarget === undefined || deferred.length === 0) {
           if (deferred.length === 0) this.deferredDispatchTargets.delete(sessionId);
           return;
         }
-        const projectionBeforeDispatch = this.getProjection(sessionId);
+        if (!this.sessionDeviceMatches(sessionId, currentTarget.deviceId)) return;
+        const projectionBeforeDispatch = this.getProjection(sessionId, currentTarget.deviceId);
         let failedBarrier = false;
         this.deferredDispatchClientIds.forEach((clientId: string) => {
           if (projectionBeforeDispatch.pendingQueue.some(
@@ -1236,7 +1671,7 @@ export class InputQueueStore {
         this.applySessionContextToQueuedItem(item, currentTarget.session);
         if (deferred.length > 1) this.deferredBySession.set(sessionId, deferred.slice(1));
         else this.deferredBySession.delete(sessionId);
-        const projection = this.getProjection(sessionId);
+        const projection = this.getProjection(sessionId, currentTarget.deviceId);
         projection.sessionId = sessionId;
         projection.pendingQueue = projection.pendingQueue.concat([item]);
         this.bumpAuthorityEpoch(sessionId);
@@ -1245,13 +1680,27 @@ export class InputQueueStore {
         this.notify();
         try {
           await this.retry(currentTarget.deviceId, sessionId, item.clientId);
+          if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
+            || this.deferredPumps.get(sessionId) !== pumpToken) return;
         } catch (e) {
           // 失败条目已由 retry 标成可见失败气泡；保留剩余 outbox，避免后发消息超车。
           return;
         }
       }
     } finally {
-      this.deferredPumps.delete(sessionId);
+      if (this.deferredPumps.get(sessionId) === pumpToken) {
+        this.deferredPumps.delete(sessionId);
+        // 删除当前派发项会推进 dispatch 代次并终止旧 pump。只有该明确的
+        // 删除重启标记才允许续发；停止、断线或全局清理不能自动绕过暂停。
+        if (this.deferredPumpRestartSessions.has(sessionId)
+          && this.deferredDispatchTargets.has(sessionId)
+          && (this.deferredBySession.get(sessionId)?.length ?? 0) > 0) {
+          this.deferredPumpRestartSessions.delete(sessionId);
+          void this.pumpDeferred(sessionId);
+        } else if ((this.deferredBySession.get(sessionId)?.length ?? 0) === 0) {
+          this.deferredPumpRestartSessions.delete(sessionId);
+        }
+      }
     }
   }
 
@@ -1285,13 +1734,35 @@ export class InputQueueStore {
     this.deferredDispatchClientIds.delete(clientId);
   }
 
-  private noteSettlingAdded(sessionId: string, clientId: string): void {
+  /**
+   * 旧 pump 被清理/换设备围栏拦截时，只能清理它仍然拥有的那一个对象。
+   * 同名任务可能已用同一 clientId 重建，按 id 直接删除会误伤新队列的发送态。
+   */
+  private releaseEnqueueingForItemIfCurrent(sessionId: string, item: QueuedInputItem): void {
+    let owned = false;
+    const projection = this.projections.get(sessionId);
+    if (projection !== undefined && projection.pendingQueue.some(
+      (candidate: QueuedInputItem) => candidate === item)) owned = true;
+    const waiting = this.connectionWaitingBySession.get(sessionId) ?? [];
+    if (!owned && waiting.some((candidate: QueuedInputItem) => candidate === item)) owned = true;
+    const deferred = this.deferredBySession.get(sessionId) ?? [];
+    if (!owned && deferred.some((candidate: QueuedInputItem) => candidate === item)) owned = true;
+    if (!owned) return;
+    this.enqueueingClientIds.delete(item.clientId);
+    this.notify();
+  }
+
+  private noteSettlingAdded(deviceId: string, sessionId: string, clientId: string): void {
     if (clientId.length === 0 || this.settlingAddedAtByClientId.has(clientId)) return;
     this.settlingAddedAtByClientId.set(clientId, Date.now());
     const timer = setTimeout(() => {
       this.settlingExpiryTimers.delete(clientId);
       const addedAt = this.settlingAddedAtByClientId.get(clientId) ?? 0;
       if (addedAt === 0 || Date.now() - addedAt < SETTLING_WINDOW_MS) return;
+      if (deviceId.length > 0 && !this.sessionDeviceMatches(sessionId, deviceId)) {
+        this.clearSettlingClock(clientId);
+        return;
+      }
       const settling = this.settlingBySession.get(sessionId) ?? [];
       const next = settling.filter((item: QueuedInputItem) => item.clientId !== clientId);
       if (next.length === settling.length) {
@@ -1315,11 +1786,13 @@ export class InputQueueStore {
 
   /** settling 与 pending 必须互斥；失败时恢复唯一、可操作的 pending 气泡。 */
   private restoreFailedQueueItem(
+    deviceId: string,
     sessionId: string,
     clientId: string,
     message: string,
     fallback: QueuedInputItem | null,
   ): void {
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     let recovered = fallback;
     const settling = this.settlingBySession.get(sessionId);
     if (settling !== undefined) {
@@ -1335,7 +1808,7 @@ export class InputQueueStore {
       if (next.length > 0) this.settlingBySession.set(sessionId, next);
       else this.settlingBySession.delete(sessionId);
     }
-    const projection = this.getProjection(sessionId);
+    const projection = this.getProjection(sessionId, deviceId);
     if (recovered !== null && !projection.pendingQueue.some(
       (item: QueuedInputItem) => item.clientId === clientId)) {
       projection.sessionId = sessionId;
@@ -1348,8 +1821,12 @@ export class InputQueueStore {
     this.notify();
   }
 
-  private findItem(sessionId: string, clientId: string): QueuedInputItem | null {
-    const queue = this.getProjection(sessionId).pendingQueue;
+  private findItem(
+    sessionId: string,
+    clientId: string,
+    deviceId: string = '',
+  ): QueuedInputItem | null {
+    const queue = this.getProjection(sessionId, deviceId).pendingQueue;
     for (let i = 0; i < queue.length; i++) {
       if (queue[i].clientId === clientId) return queue[i];
     }
@@ -1534,7 +2011,7 @@ export class InputQueueStore {
       } catch (e) {
         // link-open 自身即使 ACK 不确定，本次 maker:input 调用也还没有开始发送。
         if (e instanceof DlError) throw new DlError(e.code, e.message, false);
-        const message = e instanceof Error ? e.message : JSON.stringify(e);
+        const message = safeErrorMessage(e);
         throw new DlError('LINK_NOT_OPEN', message, false);
       }
     }
@@ -1553,4 +2030,8 @@ function imageExtension(name: string, mimeType: string): string {
   if (mimeType === 'image/webp') return 'webp';
   if (mimeType === 'image/gif') return 'gif';
   return 'jpg';
+}
+
+function inputQueueScopeKey(deviceId: string, sessionId: string): string {
+  return deviceId + '\u0000' + sessionId;
 }

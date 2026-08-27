@@ -40,7 +40,7 @@ export class AppConfig {
    * 必须与 `AppScope/app.json5` 的 `versionName` 保持一致：设置页展示与
    * Device Link 上报共用这一个值，漂移会让被控端看到错误的客户端版本。
    */
-  static readonly appVersion: string = '1.1.0';
+  static readonly appVersion: string = '1.2.0';
 }
 
 /** Global 区域端点（换区时把上面的 region/authApiBaseUrl/... 换成这些值）。 */

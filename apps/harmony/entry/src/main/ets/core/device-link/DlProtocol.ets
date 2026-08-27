@@ -294,6 +294,8 @@ export class DlChannels {
   /** 会话列表读模型。 */
   static readonly SESSIONS_LIST = 'local-db:sessions:list';
   static readonly SESSIONS_GET = 'local-db:sessions:get';
+  /** 标题 + 消息正文的只读索引搜索；旧被控端由调用方回退到 sessions:list。 */
+  static readonly CONVERSATIONS_SEARCH = 'local-db:conversations:search';
   /** 新建任务与远端项目目录浏览（沿用 Device Link 既有 allowlist 契约）。 */
   static readonly MAKER_CREATE_SESSION = 'maker:create-session';
   static readonly FS_LIST_DIR = 'fs:list-dir';

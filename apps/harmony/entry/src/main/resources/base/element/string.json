@@ -11,6 +11,398 @@
     {
       "name": "EntryAbility_label",
       "value": "Cindy"
+    },
+    {
+      "name": "v12_search_placeholder",
+      "value": "搜索标题或内容…"
+    },
+    {
+      "name": "v12_search_filter",
+      "value": "搜索筛选"
+    },
+    {
+      "name": "v12_searching_tasks",
+      "value": "正在搜索任务…"
+    },
+    {
+      "name": "v12_cached_search_only",
+      "value": "仅搜索已缓存任务"
+    },
+    {
+      "name": "v12_device",
+      "value": "设备"
+    },
+    {
+      "name": "v12_automation",
+      "value": "自动化"
+    },
+    {
+      "name": "v12_dialogue",
+      "value": "对话"
+    },
+    {
+      "name": "v12_search_sort",
+      "value": "排序"
+    },
+    {
+      "name": "v12_search_relevance",
+      "value": "相关度"
+    },
+    {
+      "name": "v12_search_recent_activity",
+      "value": "最近活跃"
+    },
+    {
+      "name": "v12_search_earliest_activity",
+      "value": "最早活跃"
+    },
+    {
+      "name": "v12_search_status",
+      "value": "状态"
+    },
+    {
+      "name": "v12_search_all_status",
+      "value": "全部状态"
+    },
+    {
+      "name": "v12_search_active",
+      "value": "活跃"
+    },
+    {
+      "name": "v12_search_archived",
+      "value": "已归档"
+    },
+    {
+      "name": "v12_search_all_agents",
+      "value": "全部 Agent"
+    },
+    {
+      "name": "v12_search_agent_claude_code",
+      "value": "Claude Code"
+    },
+    {
+      "name": "v12_search_agent_codex",
+      "value": "Codex"
+    },
+    {
+      "name": "v12_search_agent_pi",
+      "value": "PI"
+    },
+    {
+      "name": "v12_search_time",
+      "value": "最近活跃"
+    },
+    {
+      "name": "v12_search_any_time",
+      "value": "不限时间"
+    },
+    {
+      "name": "v12_search_past_one_day",
+      "value": "过去一天"
+    },
+    {
+      "name": "v12_search_past_three_days",
+      "value": "过去三天"
+    },
+    {
+      "name": "v12_search_past_seven_days",
+      "value": "过去七天"
+    },
+    {
+      "name": "v12_search_past_thirty_days",
+      "value": "过去三十天"
+    },
+    {
+      "name": "v12_search_project",
+      "value": "项目"
+    },
+    {
+      "name": "v12_search_agent",
+      "value": "Agent"
+    },
+    {
+      "name": "v12_clear_search",
+      "value": "清除搜索"
+    },
+    {
+      "name": "v12_reset",
+      "value": "重置"
+    },
+    {
+      "name": "v12_done",
+      "value": "完成"
+    },
+    {
+      "name": "v12_no_synced_projects",
+      "value": "暂无已同步项目"
+    },
+    {
+      "name": "v12_project_order",
+      "value": "项目顺序"
+    },
+    {
+      "name": "v12_recent_project_order",
+      "value": "最近活动"
+    },
+    {
+      "name": "v12_custom_project_order",
+      "value": "自定义顺序"
+    },
+    {
+      "name": "v12_syncing_project_order",
+      "value": "正在同步项目顺序…"
+    },
+    {
+      "name": "v12_local_project_order",
+      "value": "此设备暂不支持同步，使用本机顺序"
+    },
+    {
+      "name": "v12_drag_project_order",
+      "value": "拖动项目行调整顺序"
+    },
+    {
+      "name": "v12_project_order_sync_failed",
+      "value": "项目顺序同步失败，已恢复当前顺序"
+    },
+    {
+      "name": "v12_expand_project",
+      "value": "展开项目"
+    },
+    {
+      "name": "v12_collapse_project",
+      "value": "收起项目"
+    },
+    {
+      "name": "v12_share_still_generating",
+      "value": "消息仍在生成，完成后再分享"
+    },
+    {
+      "name": "v12_select_messages_first",
+      "value": "请先选择要分享的消息"
+    },
+    {
+      "name": "v12_no_shareable_content",
+      "value": "当前没有可分享的内容"
+    },
+    {
+      "name": "v12_cancel_selection",
+      "value": "取消选择"
+    },
+    {
+      "name": "v12_selected_messages",
+      "value": "已选 %d 条消息"
+    },
+    {
+      "name": "v12_share",
+      "value": "分享"
+    },
+    {
+      "name": "v12_select_all",
+      "value": "全选"
+    },
+    {
+      "name": "v12_clear",
+      "value": "清空"
+    },
+    {
+      "name": "v12_wait_generation",
+      "value": "等待生成完成"
+    },
+    {
+      "name": "v12_visible_messages_only",
+      "value": "仅分享当前可见消息"
+    },
+    {
+      "name": "v12_select_message",
+      "value": "选择消息"
+    },
+    {
+      "name": "v12_deselect_message",
+      "value": "取消选择消息"
+    },
+    {
+      "name": "v12_select_messages_share",
+      "value": "选择消息分享"
+    },
+    {
+      "name": "v12_share_as_image",
+      "value": "分享为图片"
+    },
+    {
+      "name": "v12_share_image_generating",
+      "value": "正在生成分享图片…"
+    },
+    {
+      "name": "v12_share_generation_failed",
+      "value": "生成失败"
+    },
+    {
+      "name": "v12_share_content_too_long",
+      "value": "内容过长，请收起部分工作过程后再分享"
+    },
+    {
+      "name": "v12_share_item_too_long",
+      "value": "单条内容过长，请缩小分享范围后重试"
+    },
+    {
+      "name": "v12_share_generation_failed_detail",
+      "value": "生成分享图片失败"
+    },
+    {
+      "name": "v12_share_retry",
+      "value": "重试"
+    },
+    {
+      "name": "v12_share_preview",
+      "value": "分享预览"
+    },
+    {
+      "name": "v12_share_generated_images",
+      "value": "已生成 %d 张图片"
+    },
+    {
+      "name": "v12_share_collapsed_notice",
+      "value": "仅包含当前展开的内容，折叠的工作过程不会被分享"
+    },
+    {
+      "name": "v12_share_omitted_content_label",
+      "value": "仅包含当前展开的内容"
+    },
+    {
+      "name": "v12_share_cancel",
+      "value": "取消"
+    },
+    {
+      "name": "v12_generation_in_progress",
+      "value": "生成中"
+    },
+    {
+      "name": "v12_generation_accessibility",
+      "value": "生成状态 %s"
+    },
+    {
+      "name": "v12_subagent",
+      "value": "Subagent"
+    },
+    {
+      "name": "v12_subagent_detail",
+      "value": "Subagent 详情"
+    },
+    {
+      "name": "v12_close_subagent_detail",
+      "value": "关闭 Subagent 详情"
+    },
+    {
+      "name": "v12_subagent_content",
+      "value": "Subagent 对话内容"
+    },
+    {
+      "name": "v12_no_displayable_content",
+      "value": "暂无可展示的内容"
+    },
+    {
+      "name": "v12_final_result",
+      "value": "最终结果"
+    },
+    {
+      "name": "v12_expand_subagent_content",
+      "value": "展开 Subagent 内容"
+    },
+    {
+      "name": "v12_collapse_subagent_content",
+      "value": "收起 Subagent 内容"
+    },
+    {
+      "name": "v12_subagent_completed",
+      "value": "已完成"
+    },
+    {
+      "name": "v12_subagent_failed",
+      "value": "失败"
+    },
+    {
+      "name": "v12_subagent_stopped",
+      "value": "已停止"
+    },
+    {
+      "name": "v12_subagent_running",
+      "value": "正在协作"
+    },
+    {
+      "name": "v12_status_duration",
+      "value": "%s · %s"
+    },
+    {
+      "name": "v12_agent_task_fallback",
+      "value": "Agent 任务"
+    },
+    {
+      "name": "v12_agent_tokens",
+      "value": "%s tokens"
+    },
+    {
+      "name": "v12_agent_tool_uses",
+      "value": "%d 次工具调用"
+    },
+    {
+      "name": "v12_recent_tool",
+      "value": "最近工具：%s"
+    },
+    {
+      "name": "v12_work_step",
+      "value": "工作步骤"
+    },
+    {
+      "name": "v12_interaction_issue_title",
+      "value": "Issue 确认"
+    },
+    {
+      "name": "v12_interaction_issue_label",
+      "value": "Issue"
+    },
+    {
+      "name": "v12_interaction_issue_message",
+      "value": "请回到电脑端确认标题与正文后再继续。"
+    },
+    {
+      "name": "v12_interaction_rename_title",
+      "value": "任务名称变更确认"
+    },
+    {
+      "name": "v12_interaction_rename_label",
+      "value": "重命名"
+    },
+    {
+      "name": "v12_interaction_rename_message",
+      "value": "任务名称变更只能在被控电脑确认；请回到桌面端查看变更清单并继续。"
+    },
+    {
+      "name": "v12_interaction_ghost_title",
+      "value": "文件访问权限确认"
+    },
+    {
+      "name": "v12_interaction_ghost_label",
+      "value": "文件访问"
+    },
+    {
+      "name": "v12_interaction_ghost_message",
+      "value": "文件访问权限只能在被控电脑确认；请回到桌面端核对文件和路径后继续。"
+    },
+    {
+      "name": "v12_interaction_desktop_title",
+      "value": "电脑端处理"
+    },
+    {
+      "name": "v12_interaction_desktop_message",
+      "value": "鸿蒙端暂不支持此类远程请求，请回到被控电脑继续处理。"
+    },
+    {
+      "name": "v12_pending_interactions",
+      "value": "待处理 %d 个"
+    },
+    {
+      "name": "v12_pending_interaction_button",
+      "value": "%d · %s"
     }
   ]
 }

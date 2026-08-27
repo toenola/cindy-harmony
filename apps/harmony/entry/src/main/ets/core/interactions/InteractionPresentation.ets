@@ -64,7 +64,8 @@ export function interactionPriority(kind: string): number {
   if (kind === 'plan_review') return 0;
   if (kind === 'permission') return 1;
   if (kind === 'ask_user_question') return 2;
-  if (kind === 'issue_confirm') return 3;
+  if (kind === 'issue_confirm' || kind === 'rename_sessions_confirm'
+    || kind === 'ghost_grant_confirm') return 3;
   if (kind === 'plugin_setup') return 4;
   return 100;
 }
@@ -89,6 +90,8 @@ export function interactionKindLabel(kind: string): string {
   if (kind === 'permission') return '授权';
   if (kind === 'ask_user_question') return '问题';
   if (kind === 'issue_confirm') return 'Issue';
+  if (kind === 'rename_sessions_confirm') return '重命名';
+  if (kind === 'ghost_grant_confirm') return '文件访问';
   if (kind === 'plugin_setup') return '插件';
   return '请求';
 }

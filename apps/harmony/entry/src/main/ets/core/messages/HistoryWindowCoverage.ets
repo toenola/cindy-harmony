@@ -1,4 +1,4 @@
-import { RemoteMessage, readBool } from '../tasks/TaskModels';
+import { RemoteMessage, readBool, isAgentTaskTerminalStatus } from '../tasks/TaskModels';
 
 export class MessageWindowCoverage {
   since: number = 0;
@@ -48,6 +48,22 @@ function preferExistingCompleteRow(existing: RemoteMessage, latest: RemoteMessag
     && !readBool(existing.agentMeta, 'remoteContentTruncated', false);
 }
 
+function applyAgentTaskStatus(
+  existing: RemoteMessage | undefined,
+  incoming: RemoteMessage,
+  selected: RemoteMessage,
+  preferIncoming: boolean,
+): void {
+  const existingStatus = existing?.agentTaskStatus ?? '';
+  const incomingStatus = incoming.agentTaskStatus;
+  const status = preferIncoming
+    ? (incomingStatus.length > 0 ? incomingStatus : existingStatus)
+    : (existingStatus.length > 0 ? existingStatus : incomingStatus);
+  if (!isAgentTaskTerminalStatus(status)) return;
+  selected.agentTaskStatus = status;
+  selected.agentMeta['agentTaskStatus'] = status;
+}
+
 /**
  * 最新页只为自己和已验证相接的旧段背书；满页/裁页时丢弃来源不明的历史孤岛。
  */
@@ -90,8 +106,11 @@ export function reconcileLatestMessageWindow(
   for (let i = 0; i < latest.length; i++) {
     const key = identity(latest[i]);
     const existingRow = existingById.get(key);
-    byId.set(key, existingRow !== undefined && preferExistingCompleteRow(existingRow, latest[i])
-      ? existingRow : latest[i]);
+    const keepExisting = existingRow !== undefined && preferExistingCompleteRow(existingRow, latest[i]);
+    const selected: RemoteMessage = keepExisting && existingRow !== undefined
+      ? existingRow : latest[i];
+    applyAgentTaskStatus(existingRow, latest[i], selected, !keepExisting);
+    byId.set(key, selected);
   }
   for (let i = 0; i < existing.length; i++) {
     const message = existing[i];

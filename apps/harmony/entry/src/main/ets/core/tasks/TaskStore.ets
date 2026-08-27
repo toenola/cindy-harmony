@@ -36,7 +36,12 @@ export class TaskStore {
   private devices: Map<string, PresenceSnapshot> = new Map();
   private sessionsByDevice: Map<string, RemoteSession[]> = new Map();
   private sessionLoadRevisions: Map<string, number> = new Map();
+  /** 同一设备的列表恢复 single-flight；代次仍负责拒绝清理后的旧结果。 */
+  private sessionLoadOperations: Map<string, Promise<boolean>> = new Map();
+  /** 同一设备的运行态补快照 single-flight；撤权/重连通过 sessionLoadRevisions 使旧结果失效。 */
+  private activeRefreshOperations: Map<string, Promise<void>> = new Map();
   private pendingActivityByDevice: Map<string, Map<string, string>> = new Map();
+  /** sessionId 可能跨设备重复；运行态投影使用 deviceId + sessionId 复合键。 */
   private liveActivityBySession: Map<string, SessionLiveActivity> = new Map();
   /** 同一任务的元数据写使用字段级代次；旧响应/旧失败不能覆盖新操作。 */
   private metaWriteGenerations: Map<string, number> = new Map();
@@ -161,6 +166,16 @@ export class TaskStore {
   private invalidateSessions(deviceId: string): void {
     const revision = (this.sessionLoadRevisions.get(deviceId) ?? 0) + 1;
     this.sessionLoadRevisions.set(deviceId, revision);
+    this.sessionLoadOperations.delete(deviceId);
+    this.activeRefreshOperations.delete(deviceId);
+    const activityPrefix = liveActivityKeyPrefix(deviceId);
+    const ownedActivityKeys: string[] = [];
+    this.liveActivityBySession.forEach((_activity: SessionLiveActivity, key: string) => {
+      if (key.startsWith(activityPrefix)) ownedActivityKeys.push(key);
+    });
+    for (let i = 0; i < ownedActivityKeys.length; i++) {
+      this.liveActivityBySession.delete(ownedActivityKeys[i]);
+    }
     this.sessionsByDevice.delete(deviceId);
     this.pendingActivityByDevice.delete(deviceId);
   }
@@ -173,8 +188,15 @@ export class TaskStore {
    * 跨设备按 id 查任务快照。消息驻留策略用它读取权威 `source`；
    * 快照尚未到达时返回 undefined，调用方按普通任务保守处理。
    */
-  findSessionById(sessionId: string): RemoteSession | undefined {
+  findSessionById(sessionId: string, deviceId: string = ''): RemoteSession | undefined {
     if (sessionId.length === 0) return undefined;
+    if (deviceId.length > 0) {
+      const scoped = this.sessionsByDevice.get(deviceId) ?? [];
+      for (let i = 0; i < scoped.length; i++) {
+        if (scoped[i].id === sessionId) return scoped[i];
+      }
+      return undefined;
+    }
     let found: RemoteSession | undefined = undefined;
     this.sessionsByDevice.forEach((sessions: RemoteSession[]) => {
       if (found !== undefined) return;
@@ -219,6 +241,8 @@ export class TaskStore {
     this.devices.clear();
     this.sessionsByDevice.clear();
     this.sessionLoadRevisions.clear();
+    this.sessionLoadOperations.clear();
+    this.activeRefreshOperations.clear();
     this.pendingActivityByDevice.clear();
     this.liveActivityBySession.clear();
     this.metaWriteGenerations.clear();
@@ -226,12 +250,26 @@ export class TaskStore {
     this.notify();
   }
 
-  getLiveActivity(sessionId: string): SessionLiveActivity | null {
-    return this.liveActivityBySession.get(sessionId) ?? null;
+  getLiveActivity(sessionId: string, deviceId: string = ''): SessionLiveActivity | null {
+    if (deviceId.length > 0) {
+      return this.liveActivityBySession.get(liveActivityKey(deviceId, sessionId)) ?? null;
+    }
+    const suffix = liveActivityKeySuffix(sessionId);
+    let found: SessionLiveActivity | undefined = undefined;
+    this.liveActivityBySession.forEach((activity: SessionLiveActivity, key: string) => {
+      if (found === undefined && key.endsWith(suffix)) found = activity;
+    });
+    return found ?? null;
   }
 
   /** 新建任务拿到 sessionId 后先占位，避免 sessions:created push 晚到导致详情页空壳。 */
   upsertSession(deviceId: string, session: RemoteSession): void {
+    if (session.status === 'deleted') {
+      // deleted 是终态；搜索结果、created push 或本地占位都不能把墓碑重新
+      // 投影成可见任务。
+      this.removeSession(deviceId, session.id);
+      return;
+    }
     const list = this.sessionsByDevice.get(deviceId) ?? [];
     for (let i = 0; i < list.length; i++) {
       if (list[i].id === session.id) {
@@ -250,6 +288,22 @@ export class TaskStore {
 
   /** 拉取某设备的 active + archived 列表；deleted 永不进入本地投影。 */
   async loadSessions(deviceId: string): Promise<boolean> {
+    const existing = this.sessionLoadOperations.get(deviceId);
+    if (existing !== undefined) {
+      return await existing;
+    }
+    const operation = this.loadSessionsOnce(deviceId);
+    this.sessionLoadOperations.set(deviceId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.sessionLoadOperations.get(deviceId) === operation) {
+        this.sessionLoadOperations.delete(deviceId);
+      }
+    }
+  }
+
+  private async loadSessionsOnce(deviceId: string): Promise<boolean> {
     const client = this.client;
     if (!client) return false;
     const stateGeneration = this.stateGeneration;
@@ -267,6 +321,9 @@ export class TaskStore {
       const device = this.devices.get(deviceId);
       if (device !== undefined && !device.remoteControlEnabled) return false;
       const result = unwrapInvokeResult(env);
+      // 空数组是权威的“当前没有任务”；其它形态代表旧端/异常响应，不能
+      // 被 parseSessionList 当成空列表从而覆盖当前可用快照。
+      if (!Array.isArray(result)) return false;
       const sessions = this.parseSessionList(result);
       const previous = this.sessionsByDevice.get(deviceId) ?? [];
       const pendingById = new Map<string, RemoteSession>();
@@ -295,20 +352,71 @@ export class TaskStore {
     }
   }
 
+  /** 从搜索结果打开缓存中尚不存在的历史任务；返回后写入当前设备快照。 */
+  async loadSession(deviceId: string, sessionId: string): Promise<RemoteSession | undefined> {
+    const client = this.client;
+    if (!client || sessionId.length === 0) return undefined;
+    const stateGeneration = this.stateGeneration;
+    const revision = this.sessionLoadRevisions.get(deviceId) ?? 0;
+    try {
+      const opts = new DlInvokeOptions();
+      opts.channel = DlChannels.SESSIONS_GET;
+      opts.args = [sessionId];
+      const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
+      if (stateGeneration !== this.stateGeneration
+        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) return undefined;
+      const device = this.devices.get(deviceId);
+      if (device !== undefined && !device.remoteControlEnabled) return undefined;
+      if (result === undefined || result === null || typeof result !== 'object'
+        || Array.isArray(result)) return undefined;
+      const session = parseSession(result as Record<string, Object>);
+      if (session.id !== sessionId || session.status === 'deleted') return undefined;
+      this.upsertSession(deviceId, session);
+      return session;
+    } catch (_error) {
+      // 搜索结果仍可用摘要打开；详情页的消息 Store 会继续按 sessionId 拉历史。
+      return undefined;
+    }
+  }
+
   /** maker:list-active 是列表运行态的权威补快照；只消费明确的 boolean 状态。 */
   async refreshActiveSessions(deviceId: string): Promise<void> {
+    const existing = this.activeRefreshOperations.get(deviceId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const operation = this.refreshActiveSessionsOnce(deviceId);
+    this.activeRefreshOperations.set(deviceId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.activeRefreshOperations.get(deviceId) === operation) {
+        this.activeRefreshOperations.delete(deviceId);
+      }
+    }
+  }
+
+  private async refreshActiveSessionsOnce(deviceId: string): Promise<void> {
     const client = this.client;
     if (!client) return;
     const stateGeneration = this.stateGeneration;
+    const revision = this.sessionLoadRevisions.get(deviceId) ?? 0;
+    const device = this.devices.get(deviceId);
+    if (device !== undefined && !device.remoteControlEnabled) return;
     try {
       const opts = new DlInvokeOptions();
       opts.channel = 'maker:list-active';
       opts.args = [];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
-      if (stateGeneration !== this.stateGeneration) return;
+      if (stateGeneration !== this.stateGeneration
+        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) return;
+      const currentDevice = this.devices.get(deviceId);
+      if (currentDevice !== undefined && !currentDevice.remoteControlEnabled) return;
       if (!Array.isArray(result)) return;
       const rows = result as Object[];
       let changed = false;
+      const activeIds = new Set<string>();
       for (let i = 0; i < rows.length; i++) {
         const raw = rows[i];
         if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
@@ -316,19 +424,35 @@ export class TaskStore {
         const sessionId = readStr(row, 'sessionId');
         const rawRunning = row['isTurnRunning'];
         if (sessionId.length === 0 || typeof rawRunning !== 'boolean') continue;
-        const current = this.liveActivityBySession.get(sessionId);
+        const activityKey = liveActivityKey(deviceId, sessionId);
+        const current = this.liveActivityBySession.get(activityKey);
         if (rawRunning) {
+          activeIds.add(sessionId);
           const activity = current ?? new SessionLiveActivity();
-          activity.phase = 'running';
-          this.liveActivityBySession.set(sessionId, activity);
-          changed = true;
+          if (current === undefined || current.phase !== 'running') {
+            activity.phase = 'running';
+            this.liveActivityBySession.set(activityKey, activity);
+            changed = true;
+          }
         } else if (current !== undefined && current.phase === 'running') {
-          this.liveActivityBySession.delete(sessionId);
+          this.liveActivityBySession.delete(activityKey);
+          changed = true;
+        }
+      }
+      // Desktop 的结果可能只包含当前活动任务；省略项同样代表该设备已不在运行。
+      // 只清理自己设备、明确属于 running 的投影，避免抹掉 needs-interaction 等状态。
+      const knownSessions = this.sessionsByDevice.get(deviceId) ?? [];
+      for (let i = 0; i < knownSessions.length; i++) {
+        const sessionId = knownSessions[i].id;
+        const activityKey = liveActivityKey(deviceId, sessionId);
+        const current = this.liveActivityBySession.get(activityKey);
+        if (current !== undefined && current.phase === 'running' && !activeIds.has(sessionId)) {
+          this.liveActivityBySession.delete(activityKey);
           changed = true;
         }
       }
       if (changed) this.notify();
-    } catch (e) {
+    } catch (_error) {
       // 老被控端没有可选快照时继续依赖 sessions activity push。
     }
   }
@@ -341,6 +465,7 @@ export class TaskStore {
     const client = this.client;
     if (!client || sessionId.length === 0) return false;
     const stateGeneration = this.stateGeneration;
+    const revision = this.sessionLoadRevisions.get(deviceId) ?? 0;
     const list = this.sessionsByDevice.get(deviceId) ?? [];
     let before: RemoteSession | undefined = undefined;
     for (let i = 0; i < list.length; i++) {
@@ -350,16 +475,18 @@ export class TaskStore {
       }
     }
     if (before === undefined) return false;
-    const generation = (this.metaWriteGenerations.get(sessionId) ?? 0) + 1;
-    this.metaWriteGenerations.set(sessionId, generation);
+    const writeKey = `${deviceId}:${sessionId}`;
+    const generation = (this.metaWriteGenerations.get(writeKey) ?? 0) + 1;
+    this.metaWriteGenerations.set(writeKey, generation);
     this.applyOptimisticMetaPatch(deviceId, before, patch);
     try {
       const opts = new DlInvokeOptions();
       opts.channel = 'local-db:sessions:patch-meta';
       opts.args = [sessionId, patch];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
-      if (stateGeneration !== this.stateGeneration) return false;
-      if (this.metaWriteGenerations.get(sessionId) !== generation) return true;
+      if (stateGeneration !== this.stateGeneration
+        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) return false;
+      if (this.metaWriteGenerations.get(writeKey) !== generation) return true;
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
         const session = parseSession(result as Record<string, Object>);
         if (session.status === 'deleted') this.removeSession(deviceId, sessionId);
@@ -370,7 +497,8 @@ export class TaskStore {
       return true;
     } catch (e) {
       if (stateGeneration === this.stateGeneration
-        && this.metaWriteGenerations.get(sessionId) === generation) {
+        && revision === (this.sessionLoadRevisions.get(deviceId) ?? 0)
+        && this.metaWriteGenerations.get(writeKey) === generation) {
         this.upsertSession(deviceId, before);
         void this.loadSessions(deviceId);
       }
@@ -382,6 +510,7 @@ export class TaskStore {
     const client = this.client;
     if (!client || sessionId.length === 0) return '';
     const stateGeneration = this.stateGeneration;
+    const revision = this.sessionLoadRevisions.get(deviceId) ?? 0;
     try {
       const request: Record<string, Object> = {};
       request['sessionId'] = sessionId;
@@ -389,7 +518,8 @@ export class TaskStore {
       opts.channel = 'maker:regenerate-title';
       opts.args = [request];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
-      if (stateGeneration !== this.stateGeneration) return '';
+      if (stateGeneration !== this.stateGeneration
+        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) return '';
       if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) return '';
       return readStr(result as Record<string, Object>, 'title');
     } catch (e) {
@@ -414,12 +544,22 @@ export class TaskStore {
 
   private removeSession(deviceId: string, sessionId: string): void {
     const list = this.sessionsByDevice.get(deviceId);
-    if (list === undefined) return;
+    if (list === undefined) {
+      this.clearLiveActivity(deviceId, sessionId);
+      return;
+    }
     const filtered = list.filter((item: RemoteSession) => item.id !== sessionId);
-    if (filtered.length === list.length) return;
+    if (filtered.length === list.length) {
+      this.clearLiveActivity(deviceId, sessionId);
+      return;
+    }
     this.sessionsByDevice.set(deviceId, filtered);
-    this.liveActivityBySession.delete(sessionId);
+    this.clearLiveActivity(deviceId, sessionId);
     this.notify();
+  }
+
+  private clearLiveActivity(deviceId: string, sessionId: string): void {
+    this.liveActivityBySession.delete(liveActivityKey(deviceId, sessionId));
   }
 
   setPendingLocalCreation(deviceId: string, sessionId: string, pending: boolean): void {
@@ -450,6 +590,8 @@ export class TaskStore {
 
   /** sessions topic 的 push 分发。 */
   handleSessionsPush(deviceId: string, channel: string, payload: Object | undefined): void {
+    const device = this.devices.get(deviceId);
+    if (device !== undefined && !device.remoteControlEnabled) return;
     switch (channel) {
       case DlChannels.SESSIONS_CREATED:
         // 新会话行：整表重拉最可靠（列表通常不大）。
@@ -495,6 +637,12 @@ export class TaskStore {
       return;
     }
     if (changed) {
+      if (readStr(patch, 'status') === 'deleted') {
+        // deleted 是终态，不让它进入本地任务投影；列表与搜索都依赖这里
+        // 及时移除，避免只靠 UI 过滤留下旧任务缓存。
+        this.removeSession(deviceId, sessionId);
+        return;
+      }
       list.sort(sortSessionsByUpdatedAt);
       this.notify();
     }
@@ -505,12 +653,15 @@ export class TaskStore {
     const p = payload as Record<string, Object>;
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
+    const activityKey = liveActivityKey(deviceId, sessionId);
+    const device = this.devices.get(deviceId);
+    if (device !== undefined && !device.remoteControlEnabled) return;
     const detail = readStr(p, 'compactDetail');
     const phase = readStr(p, 'phase');
     const attention = p['attention'] === true;
     const interactionKind = readStr(p, 'interactionKind');
     if ((phase === 'completed' || phase === 'error') && !attention) {
-      this.liveActivityBySession.delete(sessionId);
+      this.liveActivityBySession.delete(activityKey);
     } else if (phase === 'running' || phase === 'needs-interaction'
       || phase === 'completed' || phase === 'error') {
       const activity = new SessionLiveActivity();
@@ -518,7 +669,7 @@ export class TaskStore {
       activity.attention = attention;
       activity.compactDetail = detail;
       activity.interactionKind = interactionKind;
-      this.liveActivityBySession.set(sessionId, activity);
+      this.liveActivityBySession.set(activityKey, activity);
     }
     if (detail.length > 0) this.rememberActivity(deviceId, sessionId, detail);
     const list = this.sessionsByDevice.get(deviceId);
@@ -641,12 +792,25 @@ export class TaskStore {
     for (let i = 0; i < list.length; i++) {
       const raw: Object = list[i];
       if (raw !== undefined && typeof raw === 'object' && !Array.isArray(raw)) {
-        out.push(parseSession(raw as Record<string, Object>));
+        const session = parseSession(raw as Record<string, Object>);
+        if (session.status !== 'deleted') out.push(session);
       }
     }
     out.sort(sortSessionsByUpdatedAt);
     return out;
   }
+}
+
+function liveActivityKeyPrefix(deviceId: string): string {
+  return `${deviceId}\u0000`;
+}
+
+function liveActivityKey(deviceId: string, sessionId: string): string {
+  return `${liveActivityKeyPrefix(deviceId)}${sessionId}`;
+}
+
+function liveActivityKeySuffix(sessionId: string): string {
+  return `\u0000${sessionId}`;
 }
 
 /** 是否为桌面平台（darwin / win32 / linux）；控制端（ios/android/harmony）不算。 */

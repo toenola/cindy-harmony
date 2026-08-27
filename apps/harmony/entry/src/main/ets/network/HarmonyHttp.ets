@@ -10,6 +10,7 @@ import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { safeErrorMessage } from '../core/tasks/TaskModels';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyHttp';
@@ -53,7 +54,7 @@ export class HarmonyHttp {
         req.destroy();
         if (err) {
           hilog.error(DOMAIN, TAG, '%{public}s %{public}s failed: %{public}s',
-            method, url, JSON.stringify(err));
+            method, url, safeErrorMessage(err));
           reject(new Error(`${method} ${url}: ${err.message}`));
           return;
         }

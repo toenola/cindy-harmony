@@ -22,8 +22,10 @@ import {
   CONTROLLER_CAPABILITIES, MAKER_EVENT_BATCH_CHANNEL, expandMakerEventBatchPayload,
 } from './device-link/DlProtocol';
 import { TaskStore } from './tasks/TaskStore';
+import { TaskSearchStore } from './tasks/TaskSearchStore';
+import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
-import { DeviceView, parseDeviceView, readStr } from './tasks/TaskModels';
+import { DeviceView, parseDeviceView, readStr, safeErrorMessage } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
@@ -51,6 +53,8 @@ export class AppServices {
 
   readonly auth: AuthStore = new AuthStore();
   readonly tasks: TaskStore = new TaskStore();
+  readonly taskSearch: TaskSearchStore = new TaskSearchStore();
+  readonly taskProjectOrder: TaskProjectOrderStore = new TaskProjectOrderStore();
   readonly messages: MessageStore = new MessageStore();
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
@@ -86,6 +90,14 @@ export class AppServices {
   private sessionSnapshotRetryCounts: Map<string, number> = new Map();
   private sessionSnapshotRetryTimers: Map<string, number> = new Map();
   private sessionSubscriptionGeneration: number = 0;
+  /** 同一设备的 link-open 只允许一个在途请求；订阅、历史和发送共享它。 */
+  private linkOperations: Map<string, Promise<void>> = new Map();
+  /** 连接或账号切换后，旧 link-open 回包不得复活已建立标记。 */
+  private linkGeneration: number = 0;
+  /** REST 设备快照 single-flight；重连、页面刷新和账号恢复不能叠加请求。 */
+  private deviceLoadInFlight: Promise<boolean> | undefined = undefined;
+  /** 账号切换后不能让新账号加入旧账号的设备快照请求。 */
+  private deviceLoadInFlightEpoch: number = -1;
 
   private constructor() {
     const opts = new DlClientOptions();
@@ -96,6 +108,12 @@ export class AppServices {
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
     this.tasks.attach(this.client);
+    this.taskSearch.attach(this.client, this.tasks, (deviceId: string) => this.openLink(deviceId));
+    this.taskProjectOrder.attach(
+      this.client,
+      (deviceId: string) => this.openLink(deviceId),
+      (): string => this.auth.cacheAccountId,
+    );
     this.tasks.onChanged(() => {
       this.syncSessionSubscriptions();
       this.taskListSnapshot.save(() => snapshotDevices(
@@ -106,9 +124,19 @@ export class AppServices {
     this.auth.setLogoutCleanup(async (): Promise<void> => {
       // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
       this.securityObservability.clearUser();
+      // 自动 token 失效路径不会经过 SettingsPage 的 client.stop()；这里也必须
+      // 断开旧账号链路并清掉队列、交互和新建任务，避免下一账号读取旧投影。
+      this.client.stop();
+      // 这次是账号级清理；旧账号临时 topic 的补偿退订不能跨过
+      // stop/新账号复用同一 deviceId，避免误伤新账号的同名会话。
+      this.newSessionCreations.clearAll(false);
+      this.inputQueue.clearAll();
+      this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
+      this.taskProjectOrder.clearAll();
       this.tasks.clearAll();
+      this.goals.clearAll();
     });
     this.messages.attach(this.client);
     this.inputQueue.attach(this.client);
@@ -117,7 +145,7 @@ export class AppServices {
     this.messages.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     // 消息驻留分类只认任务快照的权威 `source` 字段，不用标题猜测 scheduler。
     this.messages.setSessionSnapshotResolver(
-      (sessionId: string) => this.tasks.findSessionById(sessionId));
+      (sessionId: string, deviceId: string) => this.tasks.findSessionById(sessionId, deviceId));
     this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.interactions.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
@@ -165,7 +193,26 @@ export class AppServices {
     if (this.linkedDevices.has(deviceId)) {
       return;
     }
+    const existing = this.linkOperations.get(deviceId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const operation = this.openLinkOnce(deviceId);
+    this.linkOperations.set(deviceId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.linkOperations.get(deviceId) === operation) {
+        this.linkOperations.delete(deviceId);
+      }
+    }
+  }
+
+  private async openLinkOnce(deviceId: string): Promise<void> {
     await this.client.waitUntilOnline(5000);
+    const linkGeneration = this.linkGeneration;
+    const authEpoch = this.auth.sessionEpoch;
     const opts = new DlOpenLinkOptions();
     opts.controllerName = 'Cindy Harmony';
     opts.appVersion = AppConfig.appVersion;
@@ -178,9 +225,13 @@ export class AppServices {
         }),
       ]);
       // 只有真实 link-accept 才标记；超时必须允许下一次调用重试。
+      if (linkGeneration !== this.linkGeneration
+        || authEpoch !== this.auth.sessionEpoch
+        || this.client.getStatus() !== 'online'
+        || !this.auth.isLoggedIn) return;
       this.linkedDevices.add(deviceId);
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'openLink failed: %{public}s', JSON.stringify(e));
+      hilog.warn(DOMAIN, TAG, 'openLink failed: %{public}s', safeErrorMessage(e));
     }
   }
 
@@ -316,13 +367,16 @@ export class AppServices {
       } else {
         // relay 重连后旧 topic registry 已失效；让下一次 online 重新订阅。
         // link-open 也是连接级状态，不能沿用旧 socket 上的已建立标记。
+        this.linkGeneration += 1;
         this.linkedDevices.clear();
+        this.taskProjectOrder.resetConnectionFence();
         this.resetSessionSubscriptions();
         this.messages.invalidateLiveTailTrust();
         if (status === 'stopped') {
           this.newSessionCreations.clearAll();
           this.inputQueue.clearAll();
           this.interactions.clearAll();
+          this.goals.clearAll();
         } else {
           this.inputQueue.invalidateActiveAuthorities();
         }
@@ -358,8 +412,13 @@ export class AppServices {
         void this.inputQueue.resyncDevice(snap.deviceId);
       }
     };
-    events.onPush = (deviceId: string, channel: string, payload: Object | undefined) => {
-      this.dispatchPush(deviceId, channel, payload);
+    events.onPush = (
+      deviceId: string,
+      channel: string,
+      payload: Object | undefined,
+      ownerStamp: Object | undefined,
+    ) => {
+      this.dispatchPush(deviceId, channel, payload, ownerStamp);
     };
     return events;
   }
@@ -376,92 +435,123 @@ export class AppServices {
 
   /** 拉取全量设备快照（REST 管理面），presence 补丁保留在线状态不回退。 */
   async loadDevices(): Promise<boolean> {
+    const epoch = this.auth.sessionEpoch;
+    const existing = this.deviceLoadInFlight;
+    if (existing !== undefined && this.deviceLoadInFlightEpoch === epoch) {
+      return await existing;
+    }
+    const operation = this.loadDevicesOnce();
+    this.deviceLoadInFlight = operation;
+    this.deviceLoadInFlightEpoch = epoch;
+    try {
+      return await operation;
+    } finally {
+      if (this.deviceLoadInFlight === operation) {
+        this.deviceLoadInFlight = undefined;
+        this.deviceLoadInFlightEpoch = -1;
+      }
+    }
+  }
+
+  private async loadDevicesOnce(): Promise<boolean> {
     const authEpoch = this.auth.sessionEpoch;
     let retried = false;
     try {
       for (;;) {
-      const token = await this.auth.getAccessToken();
-      if (token === null || token.length === 0) {
-        return false;
-      }
-      const headers: Record<string, string> = {};
-      headers['Authorization'] = `Bearer ${token}`;
-      const res = await this.http.requestJson(
-        `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices`,
-        'GET',
-        headers,
-        undefined,
-      );
-      if (res.statusCode === 401 && !retried) {
-        // access token 过期：强制刷新后重试一次。
-        retried = true;
-        const refreshed = await this.auth.forceRefreshToken();
-        if (refreshed !== null && refreshed.length > 0) {
-          continue;
+        const token = await this.auth.getAccessToken();
+        if (token === null || token.length === 0) {
+          return false;
         }
-        return false;
-      }
-      if (res.statusCode >= 300) {
-        hilog.warn(DOMAIN, TAG, 'load devices status=%{public}d', res.statusCode);
-        return false;
-      }
-      const views: DeviceView[] = [];
-      let parsed: Object;
-      try {
-        parsed = JSON.parse(res.body) as Object;
-      } catch (e) {
-        hilog.warn(DOMAIN, TAG, 'load devices: response is not json');
-        return false;
-      }
-      // 兼容两种响应形态：直接数组，或 { devices: [...] }。
-      let rawList: Object[] = [];
-      if (Array.isArray(parsed)) {
-        rawList = parsed as Object[];
-      } else if (parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const obj = parsed as Record<string, Object>;
-        const inner = obj['devices'];
-        if (Array.isArray(inner)) {
-          rawList = inner as Object[];
+        const headers: Record<string, string> = {};
+        headers['Authorization'] = `Bearer ${token}`;
+        const res = await this.http.requestJson(
+          `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices`,
+          'GET',
+          headers,
+          undefined,
+        );
+        if (res.statusCode === 401 && !retried) {
+          // access token 过期：强制刷新后重试一次。
+          retried = true;
+          const refreshed = await this.auth.forceRefreshToken();
+          if (refreshed !== null && refreshed.length > 0) {
+            continue;
+          }
+          return false;
         }
-      }
-      for (let i = 0; i < rawList.length; i++) {
-        const raw = rawList[i];
-        if (raw !== undefined && typeof raw === 'object' && !Array.isArray(raw)) {
-          views.push(parseDeviceView(raw as Record<string, Object>));
+        if (res.statusCode >= 300) {
+          hilog.warn(DOMAIN, TAG, 'load devices status=%{public}d', res.statusCode);
+          return false;
         }
-      }
-      if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
-      hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
-      this.tasks.mergeServerDevices(views);
-      const seenDeviceIds = new Set<string>();
-      for (let i = 0; i < views.length; i++) seenDeviceIds.add(views[i].deviceId);
-      const availableDeviceIds = new Set<string>();
-      const mergedDevices = this.tasks.deviceList;
-      for (let i = 0; i < mergedDevices.length; i++) {
-        if (mergedDevices[i].online && mergedDevices[i].remoteControlEnabled) {
-          availableDeviceIds.add(mergedDevices[i].deviceId);
+        const views: DeviceView[] = [];
+        let parsed: Object;
+        try {
+          parsed = JSON.parse(res.body) as Object;
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'load devices: response is not json');
+          return false;
         }
-      }
-      this.inputQueue.reconcileDeviceSnapshot(seenDeviceIds, availableDeviceIds);
-      this.syncSessionSubscriptions();
-      for (let i = 0; i < views.length; i++) {
-        if (views[i].online && views[i].remoteControlEnabled) {
-          void this.messages.hydrateActiveSessions(views[i].deviceId);
+        // 兼容两种响应形态：直接数组，或 { devices: [...] }。
+        let rawList: Object[] = [];
+        if (Array.isArray(parsed)) {
+          rawList = parsed as Object[];
+        } else if (parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const obj = parsed as Record<string, Object>;
+          const inner = obj['devices'];
+          if (Array.isArray(inner)) {
+            rawList = inner as Object[];
+          }
         }
-      }
-      return true;
+        for (let i = 0; i < rawList.length; i++) {
+          const raw = rawList[i];
+          if (raw !== undefined && typeof raw === 'object' && !Array.isArray(raw)) {
+            views.push(parseDeviceView(raw as Record<string, Object>));
+          }
+        }
+        if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
+        hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
+        this.tasks.mergeServerDevices(views);
+        const seenDeviceIds = new Set<string>();
+        for (let i = 0; i < views.length; i++) seenDeviceIds.add(views[i].deviceId);
+        const availableDeviceIds = new Set<string>();
+        const mergedDevices = this.tasks.deviceList;
+        for (let i = 0; i < mergedDevices.length; i++) {
+          if (mergedDevices[i].online && mergedDevices[i].remoteControlEnabled) {
+            availableDeviceIds.add(mergedDevices[i].deviceId);
+          }
+        }
+        this.inputQueue.reconcileDeviceSnapshot(seenDeviceIds, availableDeviceIds);
+        this.syncSessionSubscriptions();
+        for (let i = 0; i < views.length; i++) {
+          if (views[i].online && views[i].remoteControlEnabled) {
+            void this.messages.hydrateActiveSessions(views[i].deviceId);
+          }
+        }
+        return true;
       }
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'load devices failed: %{public}s', JSON.stringify(e));
+      hilog.warn(DOMAIN, TAG, 'load devices failed: %{public}s', safeErrorMessage(e));
       return false;
     }
   }
 
   private async switchTaskListAccountScope(previousAccountId: string, accountId: string): Promise<void> {
     if (previousAccountId.length > 0 && previousAccountId !== accountId) {
+      // hello-ack 发现账号变化时未必经过 SettingsPage.logout；清理所有带
+      // 账号语义的运行投影和应用级 sessions 订阅，不能只清任务/消息列表。
+      this.linkGeneration += 1;
+      this.linkedDevices.clear();
+      this.resetSessionSubscriptions();
+      // hello-ack 发现账号变化时同样丢弃旧账号 topic lease；当前连接可能已
+      // 属于新账号，不能把旧账号的 pending unsubscribe 发到新账号。
+      this.newSessionCreations.clearAll(false);
+      this.inputQueue.clearAll();
+      this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
+      this.taskProjectOrder.clearAll();
       this.tasks.clearAll();
+      this.goals.clearAll();
     }
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
@@ -470,15 +560,23 @@ export class AppServices {
     void this.loadDevices();
   }
 
-  private dispatchPush(deviceId: string, channel: string, payload: Object | undefined): void {
+  private dispatchPush(
+    deviceId: string,
+    channel: string,
+    payload: Object | undefined,
+    ownerStamp: Object | undefined = undefined,
+  ): void {
     switch (channel) {
+      case 'sidebar-settings:project-order-changed':
+        this.taskProjectOrder.handlePush(deviceId, payload, ownerStamp);
+        break;
       case DlChannels.SESSIONS_CREATED:
       case DlChannels.SESSIONS_PATCHED:
       case DlChannels.SESSION_ACTIVITY:
       case DlChannels.SESSION_ERROR_PERSISTED:
         this.tasks.handleSessionsPush(deviceId, channel, payload);
         if (channel === DlChannels.SESSION_ACTIVITY) {
-          this.messages.handleSessionActivity(payload);
+          this.messages.handleSessionActivity(payload, deviceId);
         } else if (channel === DlChannels.SESSION_ERROR_PERSISTED) {
           this.messages.handleSessionPush(deviceId, channel, payload);
         }
@@ -488,34 +586,34 @@ export class AppServices {
         this.messages.handleSessionPush(deviceId, channel, payload);
         break;
       case 'maker:event': {
-        this.dispatchMakerEventPayload(payload);
+        this.dispatchMakerEventPayload(payload, deviceId);
         break;
       }
       case MAKER_EVENT_BATCH_CHANNEL: {
         const events = expandMakerEventBatchPayload(payload);
-        for (let i = 0; i < events.length; i++) this.dispatchMakerEventPayload(events[i]);
+        for (let i = 0; i < events.length; i++) this.dispatchMakerEventPayload(events[i], deviceId);
         break;
       }
       case 'maker:status-changed':
-        this.messages.handleMakerStatusChanged(payload);
+        this.messages.handleMakerStatusChanged(payload, deviceId);
         if (payload !== undefined && typeof payload === 'object' && !Array.isArray(payload)) {
           const statusPayload = payload as Record<string, Object>;
           if (readStr(statusPayload, 'status') === 'closed') {
-            this.inputQueue.noteTurnTerminal(readStr(statusPayload, 'sessionId'));
+            this.inputQueue.noteTurnTerminal(readStr(statusPayload, 'sessionId'), deviceId);
           }
         }
         break;
       case 'maker:interaction-request':
-        this.interactions.handleInteractionRequest(payload);
+        this.interactions.handleInteractionRequest(payload, deviceId);
         break;
       case 'maker:interaction-dismissed':
-        this.interactions.handleInteractionDismissed(payload);
+        this.interactions.handleInteractionDismissed(payload, deviceId);
         break;
       case 'maker:input:projection':
-        this.inputQueue.handleProjectionPush(payload);
+        this.inputQueue.handleProjectionPush(payload, deviceId);
         break;
       case 'maker:goal:status-changed':
-        this.goals.handleStatusChanged(payload);
+        this.goals.handleStatusChanged(payload, deviceId);
         break;
       default:
         // 未识别的 push channel 忽略（切片 2+ 逐步接入）。
@@ -524,14 +622,17 @@ export class AppServices {
   }
 
   /** 单条与微批展开后的事件共用唯一处理路径，保证状态/终态顺序完全一致。 */
-  private dispatchMakerEventPayload(payload: Object | undefined): void {
+  private dispatchMakerEventPayload(payload: Object | undefined, deviceId: string = ''): void {
     if (payload === undefined || payload === null || typeof payload !== 'object'
       || Array.isArray(payload)) return;
     const record = payload as Record<string, Object>;
     const sessionId = readStr(record, 'sessionId');
     if (sessionId.length === 0) return;
-    this.messages.handleMakerEvent(sessionId, record['event'], readStr(record, 'persistId'));
-    if (isTerminalMakerInputEvent(record['event'])) this.inputQueue.noteTurnTerminal(sessionId);
+    this.messages.handleMakerEvent(
+      sessionId, record['event'], readStr(record, 'persistId'), deviceId);
+    if (isTerminalMakerInputEvent(record['event'])) {
+      this.inputQueue.noteTurnTerminal(sessionId, deviceId);
+    }
   }
 
   private async subscribeSessions(deviceId: string, generation: number): Promise<void> {

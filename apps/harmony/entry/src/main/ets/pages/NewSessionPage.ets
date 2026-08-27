@@ -51,7 +51,7 @@ import {
   uploadImage, deleteUpload, presignGet, isUploadRevisionCurrent,
 } from '../core/attachments/AttachmentUpload';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../core/attachments/AttachmentModels';
-import { ComposerFile } from '../core/attachments/ComposerFileQueue';
+import { ComposerFile, ComposerFileQueue } from '../core/attachments/ComposerFileQueue';
 import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
@@ -178,6 +178,9 @@ export struct NewSessionPageContent {
   @State composerImages: ComposerImage[] = [];
   @State composerFiles: ComposerFile[] = [];
   @State pickingImages: boolean = false;
+  @State pickingFiles: boolean = false;
+  /** 新建页与详情页共用同一套文件附件上传、重试和回收语义。 */
+  private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
   @State contextSheetOpen: boolean = false;
@@ -244,11 +247,29 @@ export struct NewSessionPageContent {
   private attachmentsHandedOff: boolean = false;
   private attachmentsDisposed: boolean = false;
   private pageActive: boolean = false;
+  /** 使系统图片选择器的迟到回包不能写入已离开的新建任务页。 */
+  private imagePickerGeneration: number = 0;
+  /** 目录浏览切换路径、设备或页面后，旧目录回包不能覆盖当前浏览位置。 */
+  private browseGeneration: number = 0;
   private newSessionDraftGeneration: number = 0;
   private newSessionInputRevision: number = 0;
   private newSessionDraftCheckpointTimer: number = -1;
   aboutToAppear(): void {
     this.pageActive = true;
+    // 页面实例可能被展开屏导航复用；上一轮已交接的附件不属于新草稿。
+    this.attachmentsHandedOff = false;
+    this.attachmentsDisposed = false;
+    this.cancelImagePicking();
+    this.pickingFiles = false;
+    this.fileQueue.onChanged = (files: ComposerFile[]): void => {
+      this.composerFiles = files;
+    };
+    this.fileQueue.onPickingChanged = (picking: boolean): void => {
+      this.pickingFiles = picking;
+    };
+    this.fileQueue.isBusy = (): boolean => this.creating || !this.pageActive || this.attachmentsDisposed;
+    this.fileQueue.occupiedByOtherAttachments = (): number => this.composerImages.length;
+    this.fileQueue.cancelPicking();
     const params = (router.getParams() ?? {}) as Record<string, Object>;
     this.routeDeviceId = this.paneDeviceId.length > 0
       ? this.paneDeviceId : readStr(params, 'deviceId');
@@ -262,9 +283,11 @@ export struct NewSessionPageContent {
       this.workingDir = editDraft.workingDir;
       this.applyNewSessionInput(editDraft.text);
       this.composerImages = this.editDraftImages(editDraft.images);
-      this.composerFiles = this.editDraftFiles(editDraft.files);
+      this.fileQueue.files = [];
+      this.composerFiles = [];
+      const restoredFiles = this.fileQueue.restoreReady(editDraft.files);
       const missingAttachments = editDraft.images.length - this.composerImages.length
-        + editDraft.files.length - this.composerFiles.length;
+        + editDraft.files.length - restoredFiles;
       if (missingAttachments > 0) {
         this.error = `有 ${missingAttachments} 个附件因数量上限未恢复`;
       }
@@ -281,6 +304,8 @@ export struct NewSessionPageContent {
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    this.cancelImagePicking();
+    this.fileQueue.cancelPicking();
     this.getUIContext().getFocusController().clearFocus();
     this.composerBlurGeneration += 1;
     this.composerFocused = false;
@@ -291,6 +316,8 @@ export struct NewSessionPageContent {
     this.cancelNewSessionDraftCheckpoint();
     void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
     this.runtimeLoadGeneration += 1;
+    this.browseGeneration += 1;
+    this.browseLoading = false;
     this.runtimeToolbarLoadActive = false;
     this.composerToolbarReady = false;
     if (!this.attachmentsHandedOff) this.disposeUnsentAttachments();
@@ -298,6 +325,12 @@ export struct NewSessionPageContent {
       unsubscribe();
     }
     this.unsubs = [];
+  }
+
+  /** 让尚未返回的系统图片选择器结果失效，并收口新建页选择状态。 */
+  private cancelImagePicking(): void {
+    this.imagePickerGeneration += 1;
+    this.pickingImages = false;
   }
 
   private restoreNewSessionDraft(): void {
@@ -342,9 +375,11 @@ export struct NewSessionPageContent {
     if (this.attachmentsDisposed) return;
     this.attachmentsDisposed = true;
     const images = this.composerImages.slice();
-    const files = this.composerFiles.slice();
+    const files = this.fileQueue.files.slice();
     this.composerImages = [];
     this.composerFiles = [];
+    this.fileQueue.files = [];
+    this.fileQueue.cancelPicking();
     for (let i = 0; i < images.length; i++) {
       images[i].uploadRevision += 1;
       images[i].removed = true;
@@ -376,21 +411,6 @@ export struct NewSessionPageContent {
       images.push(image);
     }
     return images;
-  }
-
-  private editDraftFiles(refs: RemoteSerializedAttachment[]): ComposerFile[] {
-    const files: ComposerFile[] = [];
-    const available = Math.max(0, MAX_COMPOSER_IMAGES - this.composerImages.length);
-    for (let i = 0; i < refs.length && files.length < available; i++) {
-      const file = new ComposerFile();
-      file.uri = refs[i].path;
-      file.name = refs[i].name.length > 0 ? refs[i].name : `attachment-${i + 1}`;
-      file.size = refs[i].size;
-      file.status = 'ready';
-      file.ref = refs[i];
-      files.push(file);
-    }
-    return files;
   }
 
   private resolveEditDraftImagePreviews(): void {
@@ -538,6 +558,8 @@ export struct NewSessionPageContent {
   }
 
   private selectDialogue(): void {
+    this.browseGeneration += 1;
+    this.browseLoading = false;
     this.workspaceKind = 'dialogue';
     this.workingDir = '';
     this.workspacePopupOpen = false;
@@ -548,6 +570,8 @@ export struct NewSessionPageContent {
   private selectProject(path: string): void {
     const value = path.trim();
     if (value.length === 0) return;
+    this.browseGeneration += 1;
+    this.browseLoading = false;
     this.workspaceKind = 'project';
     this.workingDir = value;
     this.workspacePopupOpen = false;
@@ -558,7 +582,7 @@ export struct NewSessionPageContent {
 
   /** Composer 的上下文 Sheet 与详情页同层级：图片、计划和运行时设置都从这里进入。 */
   private openContextSheet(page: string = 'main'): void {
-    if (this.creating || this.pickingImages) return;
+    if (this.creating || this.pickingImages || this.pickingFiles) return;
     this.contextSheetPage = page;
     this.contextSelectedUris = [];
     try {
@@ -572,7 +596,7 @@ export struct NewSessionPageContent {
   }
 
   private openComposerControlPopup(page: string): void {
-    if (this.creating || this.pickingImages) return;
+    if (this.creating || this.pickingImages || this.pickingFiles) return;
     this.contextSheetPage = page;
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
@@ -673,7 +697,9 @@ export struct NewSessionPageContent {
   }
 
   private remainingImageSlots(): number {
-    return Math.max(0, MAX_COMPOSER_IMAGES - this.composerImages.length);
+    // 图片与普通文件共享每条消息的 20 个附件上限，和详情页 Composer 保持一致。
+    return Math.max(0, MAX_COMPOSER_IMAGES
+      - this.composerImages.length - this.fileQueue.files.length);
   }
 
   private selectRecentImage(uri: string): void {
@@ -705,11 +731,21 @@ export struct NewSessionPageContent {
     }
     this.contextSheetOpen = false;
     this.pickingImages = true;
+    const generation = ++this.imagePickerGeneration;
     setTimeout(() => {
-      pickImageUris(remaining).then((uris: string[]) => {
+      if (generation !== this.imagePickerGeneration) return;
+      if (!this.pageActive || this.creating || this.attachmentsDisposed) {
         this.pickingImages = false;
-        this.enqueueImageUris(uris);
+        return;
+      }
+      pickImageUris(remaining).then((uris: string[]) => {
+        if (generation !== this.imagePickerGeneration) return;
+        this.pickingImages = false;
+        if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
+          this.enqueueImageUris(uris);
+        }
       }).catch(() => {
+        if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
       });
     }, 160);
@@ -725,13 +761,25 @@ export struct NewSessionPageContent {
     this.contextSheetOpen = false;
     this.pickingImages = true;
     const context = getContext(this) as common.UIAbilityContext;
+    const generation = ++this.imagePickerGeneration;
     setTimeout(() => {
+      if (generation !== this.imagePickerGeneration) return;
+      if (!this.pageActive || this.creating || this.attachmentsDisposed) {
+        this.pickingImages = false;
+        return;
+      }
       pickScreenshotUris(context, remaining).then((uris: string[]) => {
+        if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
-        this.enqueueImageUris(uris);
+        if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
+          this.enqueueImageUris(uris);
+        }
       }).catch(() => {
+        if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
-        promptAction.showToast({ message: '无法打开截图选择器' });
+        if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
+          promptAction.showToast({ message: '无法打开截图选择器' });
+        }
       });
     }, 160);
   }
@@ -746,15 +794,37 @@ export struct NewSessionPageContent {
     this.contextSheetOpen = false;
     this.pickingImages = true;
     const context = getContext(this) as common.UIAbilityContext;
+    const generation = ++this.imagePickerGeneration;
     setTimeout(() => {
+      if (generation !== this.imagePickerGeneration) return;
+      if (!this.pageActive || this.creating || this.attachmentsDisposed) {
+        this.pickingImages = false;
+        return;
+      }
       takePhotoUri(context).then((uri: string) => {
+        if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
-        if (uri.length > 0) this.enqueueImageUris([uri]);
+        if (this.pageActive && !this.creating && !this.attachmentsDisposed && uri.length > 0) {
+          this.enqueueImageUris([uri]);
+        }
       }).catch(() => {
+        if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
-        promptAction.showToast({ message: '无法打开相机' });
+        if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
+          promptAction.showToast({ message: '无法打开相机' });
+        }
       });
     }, 160);
+  }
+
+  private pickFiles(): void {
+    if (this.pickingFiles || this.creating) return;
+    if (this.fileQueue.remainingSlots() <= 0) {
+      promptAction.showToast({ message: '每条消息最多添加 20 个附件' });
+      return;
+    }
+    this.contextSheetOpen = false;
+    this.fileQueue.pick(getContext(this) as common.UIAbilityContext);
   }
 
   private enqueueImageUris(uris: string[]): void {
@@ -889,16 +959,11 @@ export struct NewSessionPageContent {
   }
 
   private readyComposerFiles(): RemoteSerializedAttachment[] {
-    const ready: RemoteSerializedAttachment[] = [];
-    for (let i = 0; i < this.composerFiles.length; i++) {
-      const file = this.composerFiles[i];
-      if (file.status === 'ready' && file.ref !== null) ready.push(file.ref);
-    }
-    return ready;
+    return this.fileQueue.readyFiles();
   }
 
   private canSend(): boolean {
-    if (this.creating) return false;
+    if (this.creating || this.pickingImages || this.pickingFiles) return false;
     let readyCount = 0;
     for (let i = 0; i < this.composerImages.length; i++) {
       const image = this.composerImages[i];
@@ -914,15 +979,11 @@ export struct NewSessionPageContent {
   }
 
   private removeComposerFile(localId: string): void {
-    if (this.creating) return;
-    const file = this.composerFiles.find((item: ComposerFile) => item.localId === localId);
-    if (file === undefined) return;
-    file.uploadRevision += 1;
-    file.removed = true;
-    this.composerFiles = this.composerFiles.filter(
-      (item: ComposerFile) => item.localId !== localId);
-    if (file.ref === null) return;
-    this.recycleComposerFileRef(file.ref);
+    this.fileQueue.remove(localId);
+  }
+
+  private retryComposerFile(localId: string): void {
+    this.fileQueue.retry(localId);
   }
 
   private recycleComposerFileRef(ref: RemoteSerializedAttachment): void {
@@ -1311,16 +1372,20 @@ export struct NewSessionPageContent {
 
   private async loadBrowsePath(targetPath: string): Promise<void> {
     if (this.selectedDeviceId.length === 0 || this.creating) return;
+    const generation = ++this.browseGeneration;
+    const deviceId = this.selectedDeviceId;
     this.browseLoading = true;
     this.browseError = '';
     try {
-      await AppServices.instance.openLink(this.selectedDeviceId);
+      await AppServices.instance.openLink(deviceId);
+      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
       const options = new DlInvokeOptions();
       options.channel = DlChannels.FS_LIST_DIR;
       const request: Record<string, Object> = {};
       request['path'] = targetPath.trim().length > 0 ? targetPath.trim() : '~';
       options.args = [request];
-      const envelope = await AppServices.instance.client.invoke(this.selectedDeviceId, options);
+      const envelope = await AppServices.instance.client.invoke(deviceId, options);
+      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
       const result = unwrapInvokeResult(envelope);
       if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error('目录返回格式无效');
@@ -1330,10 +1395,11 @@ export struct NewSessionPageContent {
       this.browseParent = readStr(record, 'parent');
       this.browseEntries = this.parseDirectories(record['entries']);
     } catch (e) {
+      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
       this.browseEntries = [];
       this.browseError = e instanceof Error ? e.message : '无法读取远端目录';
     } finally {
-      this.browseLoading = false;
+      if (generation === this.browseGeneration) this.browseLoading = false;
     }
   }
 
@@ -1443,7 +1509,7 @@ export struct NewSessionPageContent {
 
   private async send(): Promise<void> {
     const text = this.input.trim();
-    if (this.creating) return;
+    if (this.creating || this.pickingImages || this.pickingFiles) return;
     let uploading = false;
     let failed = false;
     for (let i = 0; i < this.composerImages.length; i++) {
@@ -1456,6 +1522,14 @@ export struct NewSessionPageContent {
     }
     if (failed) {
       promptAction.showToast({ message: '请重试或移除上传失败的图片' });
+      return;
+    }
+    if (this.fileQueue.hasUploading()) {
+      promptAction.showToast({ message: '文件上传中，请稍候' });
+      return;
+    }
+    if (this.fileQueue.hasFailed()) {
+      promptAction.showToast({ message: '请重试或移除上传失败的文件' });
       return;
     }
     const readyImages = this.readyComposerImages();
@@ -1489,6 +1563,16 @@ export struct NewSessionPageContent {
     this.cancelNewSessionDraftCheckpoint();
     AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
     this.attachmentsHandedOff = true;
+    // creation store 已持有首条附件的独立引用；从页面镜像移除但不调用回收，
+    // 这样页面复用或创建失败回详情时不会显示/回收同一批已交接资源。
+    for (let i = 0; i < this.composerImages.length; i++) {
+      this.composerImages[i].removed = true;
+      this.composerImages[i].uploadRevision += 1;
+    }
+    this.composerImages = [];
+    this.fileQueue.removeSent(
+      this.fileQueue.files.map((file: ComposerFile) => file.localId));
+    this.composerFiles = [];
     this.onSessionStarted(params.deviceId, sessionId);
   }
 
@@ -2040,6 +2124,7 @@ export struct NewSessionPageContent {
   private selectContextPermission(option: RuntimeChoiceOption): void {
     if (this.creating) return;
     if (option.id === 'bypassPermissions') {
+      const runtimeGeneration = this.runtimeLoadGeneration;
       this.getUIContext().showAlertDialog({
         title: '确认完全访问',
         message: 'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。',
@@ -2051,6 +2136,7 @@ export struct NewSessionPageContent {
         secondaryButton: {
           value: '继续',
           action: () => {
+            if (!this.pageActive || runtimeGeneration !== this.runtimeLoadGeneration) return;
             this.runtimePermissionTouchedGeneration = this.runtimeLoadGeneration;
             this.permissionMode = option.id;
             this.permissionModeBeforePlan = option.id;
@@ -2140,6 +2226,8 @@ export struct NewSessionPageContent {
         this.contextActionRow($r('sys.symbol.snapshot'), '截图', () => this.pickScreenshots())
         Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
         this.contextActionRow($r('sys.symbol.camera'), '拍照', () => this.takePhoto())
+        Divider().strokeWidth(0.5).color($r('app.color.border')).margin({ left: 64 })
+        this.contextActionRow($r('sys.symbol.doc'), '文件', () => this.pickFiles())
       }
       .width('100%')
       .padding({ bottom: 24 })
@@ -2354,11 +2442,12 @@ export struct NewSessionPageContent {
         images: this.composerImages,
         files: this.composerFiles,
         pickingImages: this.pickingImages,
+        pickingFiles: this.pickingFiles,
         sending: this.creating,
         streaming: false,
         hasContent: this.hasComposerContent(),
         canSend: this.canSend(),
-        composerEnabled: true,
+        composerEnabled: !this.creating,
         contextBusy: this.creating,
         toolbarReady: this.composerToolbarReady,
         hasPermissionOptions: this.permissionOptions.length > 0,
@@ -2421,7 +2510,7 @@ export struct NewSessionPageContent {
         onRemoveImage: (localId: string): void => this.removeComposerImage(localId),
         onRetryImage: (localId: string): void => this.retryComposerImage(localId),
         onRemoveFile: (localId: string): void => this.removeComposerFile(localId),
-        onRetryFile: (_localId: string): void => {},
+        onRetryFile: (localId: string): void => this.retryComposerFile(localId),
       })
     }
     .width('100%')

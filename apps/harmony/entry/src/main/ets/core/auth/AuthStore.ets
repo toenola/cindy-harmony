@@ -13,6 +13,7 @@ import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthApi, AuthApiError, LoginOutcome } from './AuthApi';
 import { SecureStore } from '../storage/SecureStore';
+import { safeErrorMessage } from '../tasks/TaskModels';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyAuth';
@@ -32,6 +33,9 @@ export class AuthStore {
   private relayUserId: string = '';
   /** 登录/登出账号代次；旧网络响应不得跨代写回新账号状态。 */
   private authEpoch: number = 0;
+  /** 同一账号代次只允许一个 refresh 在途，避免并发 401 互相覆盖 token pair。 */
+  private refreshInFlight: Promise<string | null> | undefined = undefined;
+  private refreshInFlightEpoch: number = -1;
   /** 登录状态（UI 订阅用）。 */
   private listeners: Array<() => void> = [];
   private logoutCleanup: (() => Promise<void>) | undefined = undefined;
@@ -62,7 +66,9 @@ export class AuthStore {
   }
 
   get isLoggedIn(): boolean {
-    return this.accessToken.length > 0;
+    // 冷启动时 access 可能尚未刷新，但只要 refresh 仍在就应进入主流程，
+    // 由首次网络请求统一换取新 access；两者都为空才是真正的未登录。
+    return this.accessToken.length > 0 || this.refreshToken.length > 0;
   }
 
   get cacheAccountId(): string {
@@ -89,15 +95,17 @@ export class AuthStore {
     return next;
   }
 
-  /** 启动时恢复本地会话；返回 true = 已有可用 access token。 */
+  /** 启动时恢复本地会话；返回 true = 有可恢复的登录凭据。 */
   async restoreSession(): Promise<boolean> {
     await this.ensureDeviceId();
     const access = await this.store.get(KEY_ACCESS, '');
     const refresh = await this.store.get(KEY_REFRESH, '');
     this.relayUserId = await this.store.get(KEY_RELAY_USER_ID, '');
-    if (access.length > 0) {
-      this.accessToken = access;
-      this.refreshToken = refresh;
+    // access 可能在上次进程退出前已被清空，但 refresh 仍然有效；必须恢复它，
+    // 否则冷启动后的第一次 Device Link 会被误判为未登录。
+    this.accessToken = access;
+    this.refreshToken = refresh;
+    if (access.length > 0 || refresh.length > 0) {
       this.authEpoch += 1;
       this.notifyChanged();
       return true;
@@ -140,10 +148,33 @@ export class AuthStore {
     if (this.refreshToken.length === 0) {
       return null;
     }
+
+    const epoch = this.authEpoch;
+    const existing = this.refreshInFlight;
+    if (existing !== undefined && this.refreshInFlightEpoch === epoch) {
+      return await existing;
+    }
+    const refreshToken = this.refreshToken;
+    const operation = this.refreshAccessToken(refreshToken, epoch);
+    this.refreshInFlight = operation;
+    this.refreshInFlightEpoch = epoch;
+    void operation.finally(() => {
+      if (this.refreshInFlight === operation) {
+        this.refreshInFlight = undefined;
+        this.refreshInFlightEpoch = -1;
+      }
+    });
+    return await operation;
+  }
+
+  private async refreshAccessToken(refreshToken: string, epoch: number): Promise<string | null> {
     try {
-      const outcome = await this.api.refresh(this.refreshToken, await this.ensureDeviceId());
+      const outcome = await this.api.refresh(refreshToken, await this.ensureDeviceId());
       // refresh 响应是 tokenPair（accessToken/refreshToken/membership），没有 status 字段，
-      // 与登录响应不同——成功只看 accessToken 非空。
+      // 与登录响应不同——成功只看 accessToken 非空。旧账号代次的回包不得写入新会话。
+      if (this.authEpoch !== epoch || this.refreshToken !== refreshToken) {
+        return null;
+      }
       if (outcome.accessToken.length > 0) {
         this.accessToken = outcome.accessToken;
         if (outcome.refreshToken.length > 0) {
@@ -153,11 +184,13 @@ export class AuthStore {
         void this.store.set(KEY_ACCESS, this.accessToken);
         return this.accessToken;
       }
-      // 刷新失败（token 已失效）→ 清会话
-      await this.logout();
+      // 刷新失败（token 已失效）→ 清会话；只清理仍属于同一代次的会话。
+      if (this.authEpoch === epoch && this.refreshToken === refreshToken) {
+        await this.logout();
+      }
       return null;
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'refresh failed: %{public}s', JSON.stringify(e));
+      hilog.warn(DOMAIN, TAG, 'refresh failed: %{public}s', safeErrorMessage(e));
       return null;
     }
   }

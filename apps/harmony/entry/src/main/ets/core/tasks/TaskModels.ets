@@ -56,6 +56,22 @@ export function readAny(obj: Record<string, Object> | null | undefined, key: str
   return v === undefined || v === null ? undefined : (v as Object);
 }
 
+/**
+ * 将远端/系统抛出的值安全转换为诊断文本。
+ *
+ * Device Link 旧端可能直接 reject `undefined`，某些系统错误还可能带有
+ * 循环引用；错误处理路径不能因为再次 JSON.stringify 失败而掩盖原始失败。
+ */
+export function safeErrorMessage(error: Object | undefined): string {
+  try {
+    if (error instanceof Error) return error.message;
+    const serialized = JSON.stringify(error);
+    return typeof serialized === 'string' ? serialized : '';
+  } catch (_error) {
+    return '';
+  }
+}
+
 // ─── 设备 ────────────────────────────────────────────────────────────────────
 
 /** REST /api/device-link/devices 的设备视图（对齐 DeviceView）。 */
@@ -205,6 +221,8 @@ export class RemoteMessage {
   isStreaming: boolean = false;
   /** 保留少量 agentMeta 语义，避免渲染层只能靠消息顺序猜测 turn。 */
   agentMeta: Record<string, Object> = {};
+  /** Desktop 写入 originating Agent/Task tool_use 的持久终态；历史回放优先于结果文本推断。 */
+  agentTaskStatus: string = '';
   /** 自动化任务注入的消息（agentMeta.origin 非空）——折叠阈值更紧。 */
   automationOrigin: boolean = false;
   /** 自动续跑注入行属于 UI 指令；保留 turn 边界，但不能退化成普通用户气泡。 */
@@ -234,6 +252,11 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
   // readAutomationOrigin 同源；其它 origin 不能误用自动化的 4 行收起阈值。
   const agentMeta = readObj(raw, 'agentMeta');
   m.agentMeta = agentMeta;
+  const metadataAgentTaskStatus = readStr(agentMeta, 'agentTaskStatus');
+  const rawAgentTaskStatus = readStr(raw, 'agentTaskStatus');
+  m.agentTaskStatus = isAgentTaskTerminalStatus(metadataAgentTaskStatus)
+    ? metadataAgentTaskStatus : (isAgentTaskTerminalStatus(rawAgentTaskStatus)
+      ? rawAgentTaskStatus : '');
   if (m.role === 'user' && readBool(agentMeta, 'autoResume', false)) {
     const info = readObj(agentMeta, 'autoResumeInfo');
     const data: Record<string, Object> = {};
@@ -346,6 +369,28 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
     }
   }
   return m;
+}
+
+/** 只接受 Desktop 持久化协议定义的终态，未知值继续走历史兼容推断。 */
+export function isAgentTaskTerminalStatus(value: string): boolean {
+  return value === 'completed' || value === 'failed' || value === 'stopped';
+}
+
+/** 合并同一持久消息的终态元数据；正文选择与状态选择相互独立。 */
+export function mergeAgentTaskTerminalStatus(
+  existing: RemoteMessage,
+  incoming: RemoteMessage,
+  preferIncoming: boolean = false,
+): void {
+  if (existing.agentTaskStatus.length === 0 && incoming.agentTaskStatus.length === 0) return;
+  let selected = incoming.agentTaskStatus;
+  if (existing.agentTaskStatus.length > 0
+    && (selected.length === 0 || !preferIncoming)) {
+    selected = existing.agentTaskStatus;
+  }
+  if (!isAgentTaskTerminalStatus(selected)) return;
+  incoming.agentTaskStatus = selected;
+  incoming.agentMeta['agentTaskStatus'] = selected;
 }
 
 function messageUserText(content: Object | undefined): string {

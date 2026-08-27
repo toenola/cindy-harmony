@@ -60,6 +60,7 @@ export struct ConversationComposer {
   @Prop canSend: boolean = false;
   @Prop composerEnabled: boolean = true;
   @Prop pickingImages: boolean = false;
+  @Prop pickingFiles: boolean = false;
   @Prop contextBusy: boolean = false;
   /** 运行时能力与 provider 目录全部落定后再一次性展示工具栏，避免按钮分批插入跳动。 */
   @Prop toolbarReady: boolean = true;
@@ -689,7 +690,7 @@ export struct ConversationComposer {
           this.composerIconButton(
             $r('sys.symbol.plus'),
             $r('app.color.text_primary'),
-            this.composerEnabled && !this.sending && !this.pickingImages,
+            this.composerEnabled && !this.sending && !this.pickingImages && !this.pickingFiles,
             '添加附件或上下文',
             () => this.onAdd(),
           )

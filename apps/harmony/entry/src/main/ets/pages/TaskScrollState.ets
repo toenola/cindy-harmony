@@ -18,6 +18,61 @@ export const FOLLOW_LATEST_RETRY_DELAYS: number[] = [24, 80, 180];
 /** 与 Mobile/iOS 一致：短首屏在没有用户手势时最多再补三页。 */
 export const INITIAL_HISTORY_AUTOFILL_PAGES: number = 3;
 
+/** Composer 只响应明确的连续浏览意图，过滤手指抖动和单帧布局位移。 */
+export const COMPOSER_SCROLL_NOISE: number = 0.25;
+export const COMPOSER_SCROLL_HIDE_DISTANCE: number = 10;
+export const COMPOSER_SCROLL_SHOW_DISTANCE: number = 8;
+export const COMPOSER_SCROLL_ACTION_NONE: number = 0;
+export const COMPOSER_SCROLL_ACTION_HIDE: number = 1;
+export const COMPOSER_SCROLL_ACTION_SHOW: number = -1;
+
+export class ComposerScrollUpdate {
+  intent: number = 0;
+  action: number = COMPOSER_SCROLL_ACTION_NONE;
+
+  constructor(intent: number, action: number) {
+    this.intent = intent;
+    this.action = action;
+  }
+}
+
+/**
+ * 会话详情中手指向上滑时隐藏 Composer，手指向下滑时恢复。
+ * TaskPage 的 onDidScroll 实机方向为负值对应手指上滑、正值对应手指下滑，
+ * 这里按用户手势而不是内容位移命名行为。
+ * 正负方向切换会重新累计，避免一次犹豫手势把两种意图叠加；编辑、附件和运行态
+ * 由 canHide 统一保护，此时任何滚动都只允许恢复，不允许继续隐藏。
+ */
+export function updateComposerScrollVisibility(
+  currentIntent: number,
+  scrollOffset: number,
+  canHide: boolean,
+): ComposerScrollUpdate {
+  if (!canHide) {
+    return new ComposerScrollUpdate(0, COMPOSER_SCROLL_ACTION_SHOW);
+  }
+  if (Math.abs(scrollOffset) < COMPOSER_SCROLL_NOISE) {
+    return new ComposerScrollUpdate(currentIntent, COMPOSER_SCROLL_ACTION_NONE);
+  }
+
+  let nextIntent = currentIntent;
+  if (scrollOffset > 0) {
+    if (nextIntent < 0) nextIntent = 0;
+    nextIntent += scrollOffset;
+    if (nextIntent >= COMPOSER_SCROLL_SHOW_DISTANCE) {
+      return new ComposerScrollUpdate(0, COMPOSER_SCROLL_ACTION_SHOW);
+    }
+    return new ComposerScrollUpdate(nextIntent, COMPOSER_SCROLL_ACTION_NONE);
+  }
+
+  if (nextIntent > 0) nextIntent = 0;
+  nextIntent += scrollOffset;
+  if (nextIntent <= -COMPOSER_SCROLL_HIDE_DISTANCE) {
+    return new ComposerScrollUpdate(0, COMPOSER_SCROLL_ACTION_HIDE);
+  }
+  return new ComposerScrollUpdate(nextIntent, COMPOSER_SCROLL_ACTION_NONE);
+}
+
 /** 回看历史时，一次触摸手势只允许触发一页；冷开自动补窗不受此门禁影响。 */
 export function historyGestureAllowsLoad(
   userReviewIntent: boolean,
@@ -144,6 +199,7 @@ function toolPresentationState(tool: RenderToolItem): string {
     `r:${tool.hasResult ? '1' : '0'}`,
     `e:${tool.hasError ? '1' : '0'}`,
     `o:${textRevision(tool.resultText)}`,
+    `a:${textRevision(tool.agentTaskStatus)}`,
     `d:${tool.diff === null ? '0' : '1'}`,
     `m:${mediaState.join(',')}`,
   ].join('|');
@@ -175,6 +231,7 @@ function agentTaskPresentationState(item: RenderAgentTaskItem): string {
     tool?.toolName ?? '',
     tool?.inputRaw ?? '',
     tool?.resultText ?? '',
+    tool?.agentTaskStatus ?? '',
   );
   const usage = update?.usage;
   return [

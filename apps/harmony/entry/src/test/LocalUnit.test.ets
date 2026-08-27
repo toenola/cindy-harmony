@@ -8,6 +8,7 @@ import {
   readObj,
   readStr,
   recordOrEmpty,
+  safeErrorMessage,
   DeviceView,
   RemoteMessage,
   RemoteSession,
@@ -25,6 +26,7 @@ import {
 } from '../main/ets/core/attachments/AttachmentUpload';
 import { renameForImagePreprocess } from '../main/ets/core/attachments/ImagePreprocess';
 import { parseGoalModeState } from '../main/ets/core/goals/GoalModels';
+import { GoalStore } from '../main/ets/core/goals/GoalStore';
 import {
   shouldAutoCollapseUserMessage,
   collapsedUserMessageLineLimit,
@@ -63,6 +65,10 @@ import {
   deriveAgentTaskStatus,
 } from '../main/ets/core/messages/AgentTaskStore';
 import {
+  findSubagentGroupByKey,
+  subagentStatusLabel,
+} from '../main/ets/core/messages/SubagentDetailPresentation';
+import {
   findMessageSearchHits,
   messageSearchPagingPresentation,
   nextMessageSearchIndex,
@@ -93,6 +99,10 @@ import {
   sessionActivityElapsedMs,
 } from '../main/ets/core/messages/SessionActivityPresentation';
 import {
+  generationStatusLabel,
+  SessionGenerationStatus,
+} from '../main/ets/core/messages/GenerationStatus';
+import {
   attachmentDisplayName,
   compareTaskListLabels,
   compareTaskSessionsForList,
@@ -103,6 +113,7 @@ import {
   taskIsAutomation,
   taskListCategory,
   taskListEntryPresentationState,
+  taskListShouldShowFloatingBarAtBoundary,
   taskPreviewText,
   taskProjectKey,
   taskProjectName,
@@ -148,7 +159,13 @@ import {
   parseInputProjection,
   parseQueuedInputItem,
 } from '../main/ets/core/messages/InputQueueStore';
-import { shouldApplyComposerDraftRead } from '../main/ets/core/messages/ComposerDraftStore';
+import {
+  ComposerDraftStore,
+  composerDraftScopeKey,
+  composerDraftStorageKey,
+  shouldApplyComposerDraftRead,
+} from '../main/ets/core/messages/ComposerDraftStore';
+import { SecureStore } from '../main/ets/core/storage/SecureStore';
 import {
   freezeShareProjection,
   isShareableMessageKind,
@@ -190,9 +207,12 @@ import {
   trimMessageWindow,
 } from '../main/ets/core/messages/MessageRetentionPolicy';
 import {
+  ComposerDocument,
+  composerDocumentProjectedText,
   projectSlashCommandsInText,
   SerializedComposerDocument,
   slashCommandDisplayLabel,
+  textComposerDocument,
 } from '../main/ets/core/messages/ComposerDocument';
 import {
   extendCoverageEarlier,
@@ -217,6 +237,9 @@ import {
 import {
   assertInvokeSucceeded,
   DlError,
+  DlClient,
+  DlClientOptions,
+  DlInvokeOptions,
   isSafeUnsentDlError,
 } from '../main/ets/core/device-link/DlClient';
 import {
@@ -232,6 +255,29 @@ import {
 } from '../main/ets/core/ComposerCatalog';
 import { TaskStore } from '../main/ets/core/tasks/TaskStore';
 import {
+  listTaskSearchProjects,
+  mergeTaskSearchPages,
+  normalizeTaskSearchWorkingDir,
+  parseTaskSearchResponse,
+  remoteTaskSearchIgnoredWorkingDirs,
+  searchCachedTaskSessions,
+  TaskSearchFilters,
+  TaskSearchOrigin,
+  TaskSearchRequest,
+  TaskSearchStore,
+} from '../main/ets/core/tasks/TaskSearchStore';
+import {
+  normalizeTaskProjectPath,
+  parseTaskProjectOrderSnapshot,
+  reconcileTaskProjectOrder,
+  reorderVisibleTaskProjectOrder,
+  SIDEBAR_GET_PROJECT_ORDER,
+  TaskProjectOrderStore,
+  taskProjectOrderKey,
+  taskProjectOrderKeysFromHost,
+} from '../main/ets/core/tasks/TaskProjectOrderStore';
+import { ShareSelectionStore } from '../main/ets/core/sharing/ShareSelectionStore';
+import {
   TASK_LIST_RECONCILE_INTERVAL_MS,
   TaskListReconcileBackoff,
 } from '../main/ets/core/tasks/TaskListReconcilePolicy';
@@ -241,6 +287,9 @@ import {
   serializeTaskListSnapshot,
 } from '../main/ets/core/tasks/TaskListSnapshotStore';
 import {
+  COMPOSER_SCROLL_ACTION_HIDE,
+  COMPOSER_SCROLL_ACTION_NONE,
+  COMPOSER_SCROLL_ACTION_SHOW,
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
   historyGestureAllowsLoad,
@@ -250,6 +299,7 @@ import {
   messageListRenderNodeKey,
   shouldAutoLoadEarlier,
   shouldTakeOverTail,
+  updateComposerScrollVisibility,
 } from '../main/ets/pages/TaskScrollState';
 import {
   isTextFileReference,
@@ -270,6 +320,8 @@ import {
   permissionRiskSummary,
   permissionAutoReviewUnavailableNotice,
   pendingInteractionsBlockRemoteComposer,
+  interactionKindLabel,
+  interactionPriority,
   sessionScopedPermissionSuggestions,
   sortPendingInteractions,
 } from '../main/ets/core/interactions/InteractionPresentation';
@@ -363,7 +415,580 @@ class ThrowingObservabilitySink implements SecurityObservabilitySink {
   }
 }
 
+/** 草稿持久化测试替身；不触碰真实 preferences，也不写入设备凭证。 */
+class MemorySecureStore extends SecureStore {
+  values: Map<string, string> = new Map();
+
+  async get(key: string, defaultValue: string): Promise<string> {
+    return this.values.get(key) ?? defaultValue;
+  }
+
+  async set(key: string, value: string): Promise<void> {
+    this.values.set(key, value);
+  }
+
+  async remove(key: string): Promise<void> {
+    this.values.delete(key);
+  }
+}
+
+class DeferredEnvelope {
+  promise: Promise<Envelope>;
+  private resolver: ((value: Envelope) => void) | undefined = undefined;
+
+  constructor() {
+    this.promise = new Promise<Envelope>((resolve) => {
+      this.resolver = resolve;
+    });
+  }
+
+  resolve(value: Envelope): void {
+    const resolver = this.resolver;
+    if (resolver === undefined) return;
+    this.resolver = undefined;
+    resolver(value);
+  }
+}
+
+function successfulInvokeEnvelope(result: Object | undefined): Envelope {
+  const payload: Record<string, Object> = {};
+  payload['ok'] = true;
+  if (result !== undefined) payload['result'] = result;
+  const envelope = new Envelope();
+  envelope.payload = payload;
+  return envelope;
+}
+
+/** 只覆盖恢复测试所需的调用；不启动真实 WebSocket 或改变设备状态。 */
+class RecoveryTestClient extends DlClient {
+  private historyCalls: number = 0;
+  private historyStartResolver: (() => void) | undefined = undefined;
+  historyStarted: Promise<void>;
+  staleHistory: DeferredEnvelope = new DeferredEnvelope();
+
+  constructor() {
+    super(new DlClientOptions());
+    this.historyStarted = new Promise<void>((resolve) => {
+      this.historyStartResolver = resolve;
+    });
+  }
+
+  async subscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  async unsubscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    if (options.channel !== 'local-db:messages:list') {
+      return Promise.resolve(successfulInvokeEnvelope(false));
+    }
+    this.historyCalls += 1;
+    if (this.historyCalls === 1) {
+      return Promise.resolve(successfulInvokeEnvelope([]));
+    }
+    const resolver = this.historyStartResolver;
+    if (resolver !== undefined) {
+      this.historyStartResolver = undefined;
+      resolver();
+    }
+    return this.staleHistory.promise;
+  }
+}
+
+/** 只覆盖消息设备切换测试所需的空历史响应；不连接真实 WebSocket。 */
+class EmptyHistoryTestClient extends DlClient {
+  constructor() {
+    super(new DlClientOptions());
+  }
+
+  async subscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  async unsubscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
+/** 只覆盖消息深链定位切换设备测试所需的延迟 around 响应。 */
+class DeferredAroundTestClient extends DlClient {
+  aroundResponse: DeferredEnvelope = new DeferredEnvelope();
+  aroundStarted: Promise<void>;
+  private aroundStartResolver: (() => void) | undefined = undefined;
+
+  constructor() {
+    super(new DlClientOptions());
+    this.aroundStarted = new Promise<void>((resolve) => {
+      this.aroundStartResolver = resolve;
+    });
+  }
+
+  async subscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  async unsubscribe(deviceId: string, topics: string[], timeoutMs: number = 0): Promise<Envelope> {
+    return successfulInvokeEnvelope(undefined);
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    if (options.channel === 'local-db:messages:around-client-id') {
+      const resolver = this.aroundStartResolver;
+      if (resolver !== undefined) {
+        this.aroundStartResolver = undefined;
+        resolver();
+      }
+      return this.aroundResponse.promise;
+    }
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
+/** 只覆盖 maker:list-active 恢复测试所需的调用；不连接真实设备。 */
+class ActiveSnapshotTestClient extends DlClient {
+  activeCalls: number = 0;
+  activeResponse: DeferredEnvelope = new DeferredEnvelope();
+
+  constructor() {
+    super(new DlClientOptions());
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    if (options.channel === 'maker:list-active') {
+      this.activeCalls += 1;
+      return this.activeResponse.promise;
+    }
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
+/** 旧 Desktop 搜索 channel 回退测试替身：明确返回错误码而不是拼在 message 中。 */
+class LegacyTaskSearchTestClient extends DlClient {
+  channels: string[] = [];
+  private readonly rejectWithPlainCode: boolean;
+  private readonly rejectWithCyclicError: boolean;
+  private readonly rejectWithUndefinedError: boolean;
+
+  constructor(
+    rejectWithPlainCode: boolean = false,
+    rejectWithCyclicError: boolean = false,
+    rejectWithUndefinedError: boolean = false,
+  ) {
+    super(new DlClientOptions());
+    this.rejectWithPlainCode = rejectWithPlainCode;
+    this.rejectWithCyclicError = rejectWithCyclicError;
+    this.rejectWithUndefinedError = rejectWithUndefinedError;
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    this.channels.push(options.channel);
+    if (options.channel === DlChannels.CONVERSATIONS_SEARCH) {
+      if (this.rejectWithCyclicError) {
+        const error: Record<string, Object> = {};
+        error['self'] = error;
+        return Promise.reject(error);
+      }
+      if (this.rejectWithUndefinedError) return Promise.reject(undefined);
+      if (this.rejectWithPlainCode) {
+        const error: Record<string, Object> = {};
+        error['code'] = 'CHANNEL_NOT_ALLOWED';
+        return Promise.reject(error);
+      }
+      return Promise.reject(new DlError('CHANNEL_NOT_ALLOWED', 'search channel is unavailable'));
+    }
+    if (options.channel === DlChannels.SESSIONS_LIST) {
+      return Promise.resolve(successfulInvokeEnvelope([
+        searchSession('legacy-hit', 'Legacy search task', '/repo', 'legacy body'),
+      ]));
+    }
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
+/** 旧 Desktop 项目顺序 channel 回退测试替身：错误码可能是普通对象字段。 */
+class LegacyTaskProjectOrderTestClient extends DlClient {
+  channels: string[] = [];
+  private readonly rejectWithUndefinedError: boolean;
+
+  constructor(rejectWithUndefinedError: boolean = false) {
+    super(new DlClientOptions());
+    this.rejectWithUndefinedError = rejectWithUndefinedError;
+  }
+
+  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    this.channels.push(options.channel);
+    if (options.channel === SIDEBAR_GET_PROJECT_ORDER) {
+      if (this.rejectWithUndefinedError) return Promise.reject(undefined);
+      const error: Record<string, Object> = {};
+      error['code'] = 'CHANNEL_NOT_ALLOWED';
+      return Promise.reject(error);
+    }
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
+function searchSession(
+  id: string,
+  title: string,
+  workingDir: string,
+  preview: string,
+): RemoteSession {
+  const session = new RemoteSession();
+  session.id = id;
+  session.title = title;
+  session.workingDir = workingDir;
+  session.preview = preview;
+  session.workspaceKind = 'project';
+  session.agentKind = 'cc';
+  session.status = 'active';
+  session.updatedAt = '2026-08-26T00:00:00.000Z';
+  session.userSendAt = session.updatedAt;
+  return session;
+}
+
 export default function localUnitTest() {
+  describe('taskSearchAlignment', () => {
+    it('normalizesWorktreesAndKeepsProjectKeysDeviceScoped', 0, () => {
+      expect(normalizeTaskSearchWorkingDir('/repo/.cindy-worktrees/feature-a'))
+        .assertEqual('/repo');
+      expect(normalizeTaskSearchWorkingDir('C:\\repo\\.claude\\worktrees\\feature-a'))
+        .assertEqual('c:/repo');
+      expect(normalizeTaskSearchWorkingDir('C:\\Repo\\.claude\\worktrees\\feature-a'))
+        .assertEqual('c:/repo');
+
+      const first = searchSession('one', 'One', '/repo/.cindy-worktrees/feature-a', '');
+      const second = searchSession('two', 'Two', '/repo', '');
+      const dialogue = searchSession('dialogue', 'Dialogue', '/repo', '');
+      dialogue.workspaceKind = 'dialogue';
+      const deleted = searchSession('deleted', 'Deleted', '/repo', '');
+      deleted.status = 'deleted';
+      const projects = listTaskSearchProjects(
+        'desktop-a', 'Studio', [first, second, dialogue, deleted]);
+      expect(projects.length).assertEqual(1);
+      expect(projects[0].key).assertEqual('desktop-a:/repo');
+      expect(projects[0].remoteWorkingDirs.length).assertEqual(2);
+      expect(projects[0].remoteWorkingDirs[0]).assertEqual('/repo/.cindy-worktrees/feature-a');
+      expect(projects[0].remoteWorkingDirs[1]).assertEqual('/repo');
+      expect(projects[0].count).assertEqual(2);
+    });
+
+    it('scopesSessionSnapshotLookupsToTheOwningDevice', 0, () => {
+      const tasks = new TaskStore();
+      const first = searchSession('same-session-id', 'Studio task', '/repo', '');
+      first.source = 'scheduler';
+      const second = searchSession('same-session-id', 'Laptop task', '/repo', '');
+      second.source = 'manual';
+      tasks.upsertSession('desktop-a', first);
+      tasks.upsertSession('desktop-b', second);
+
+      expect(tasks.findSessionById('same-session-id', 'desktop-a')?.source)
+        .assertEqual('scheduler');
+      expect(tasks.findSessionById('same-session-id', 'desktop-b')?.source)
+        .assertEqual('manual');
+    });
+
+    it('searchesCachedContentButSkipsWorkerSessions', 0, () => {
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.deviceName = 'Studio';
+      const request = new TaskSearchRequest();
+      request.query = 'needle';
+      const contentHit = searchSession('content', 'Unrelated', '/repo', 'A needle in the message');
+      const worker = searchSession('worker', 'Needle worker', '/repo', '');
+      worker.orcaRole = 'worker';
+      const page = searchCachedTaskSessions(origin, request, [contentHit, worker]);
+      expect(page.results.length).assertEqual(1);
+      expect(page.results[0].session.id).assertEqual('content');
+      expect(page.results[0].matchKind).assertEqual('content');
+      expect(page.results[0].locallyCached).assertEqual(true);
+      expect(page.usedCacheFallback).assertEqual(true);
+    });
+
+    it('parsesContentHitsAndDeduplicatesOnlyWithinOneDevice', 0, () => {
+      const session: Record<string, Object> = {};
+      session['id'] = 'same-id';
+      session['title'] = 'Old task';
+      session['workingDir'] = '/repo';
+      session['workspaceKind'] = 'project';
+      session['agentKind'] = 'cc';
+      session['status'] = 'active';
+      session['updatedAt'] = '2026-08-26T00:00:00.000Z';
+      session['userSendAt'] = '2026-08-26T00:00:00.000Z';
+      const hit: Record<string, Object> = {};
+      hit['preview'] = 'needle in message history';
+      hit['messageClientId'] = 'message-7';
+      const item: Record<string, Object> = {};
+      item['session'] = session;
+      item['matchKind'] = 'content';
+      item['contentHit'] = hit;
+      item['rankScore'] = 4;
+      const raw: Record<string, Object> = {};
+      raw['results'] = [item];
+
+      const studioPage = parseTaskSearchResponse(raw, 'needle', 'desktop-a', 'Studio');
+      const laptopPage = parseTaskSearchResponse(raw, 'needle', 'desktop-b', 'Laptop');
+      studioPage.searchedDeviceCount = 1;
+      studioPage.remoteDeviceCount = 1;
+      laptopPage.searchedDeviceCount = 1;
+      laptopPage.remoteDeviceCount = 1;
+      const request = new TaskSearchRequest();
+      request.query = 'needle';
+      const merged = mergeTaskSearchPages([studioPage, laptopPage], request);
+      expect(merged.results.length).assertEqual(2);
+      expect(merged.results[0].contentMessageClientId).assertEqual('message-7');
+      expect(merged.results[0].deviceId === merged.results[1].deviceId).assertEqual(false);
+    });
+
+    it('detectsLegacyHostsThatIgnoreWorkingDirectoryFilters', 0, () => {
+      const session: Record<string, Object> = {};
+      session['id'] = 'outside';
+      session['title'] = 'Task';
+      session['workingDir'] = '/other';
+      session['status'] = 'active';
+      const item: Record<string, Object> = {};
+      item['session'] = session;
+      const raw: Record<string, Object> = {};
+      raw['results'] = [item];
+      const page = parseTaskSearchResponse(raw, 'task', 'desktop-a', 'Studio');
+      expect(remoteTaskSearchIgnoredWorkingDirs(page, ['/repo'])).assertEqual(true);
+      expect(remoteTaskSearchIgnoredWorkingDirs(page, null)).assertEqual(false);
+
+      const filters = new TaskSearchFilters();
+      filters.workingDirs = ['/repo'];
+      expect(filters.workingDirs?.length).assertEqual(1);
+    });
+
+    it('fallsBackThroughLegacySessionListWhenSearchErrorUsesAChannelCode', 0, async () => {
+      const client = new LegacyTaskSearchTestClient();
+      const store = new TaskSearchStore();
+      store.attach(client, new TaskStore(), (_deviceId: string) => Promise.resolve());
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.deviceName = 'Studio';
+      origin.reachable = true;
+      const request = new TaskSearchRequest();
+      request.query = 'legacy';
+
+      const page = await store.search([origin], request);
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        DlChannels.CONVERSATIONS_SEARCH,
+        DlChannels.SESSIONS_LIST,
+      ]));
+      expect(page.results.length).assertEqual(1);
+      expect(page.results[0].session.id).assertEqual('legacy-hit');
+      expect(page.usedCacheFallback).assertEqual(true);
+    });
+
+    it('fallsBackWhenSearchErrorCarriesAPlainChannelCode', 0, async () => {
+      const client = new LegacyTaskSearchTestClient(true);
+      const store = new TaskSearchStore();
+      store.attach(client, new TaskStore(), (_deviceId: string) => Promise.resolve());
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.deviceName = 'Studio';
+      origin.reachable = true;
+      const request = new TaskSearchRequest();
+      request.query = 'legacy';
+
+      const page = await store.search([origin], request);
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        DlChannels.CONVERSATIONS_SEARCH,
+        DlChannels.SESSIONS_LIST,
+      ]));
+      expect(page.results[0].session.id).assertEqual('legacy-hit');
+    });
+
+    it('KeepsCachedSearchAliveWhenRemoteErrorCannotBeSerialized', 0, async () => {
+      const client = new LegacyTaskSearchTestClient(false, true);
+      const tasks = new TaskStore();
+      tasks.upsertSession('desktop-a', searchSession('cached-hit', 'Cached search task', '/repo', 'legacy body'));
+      const store = new TaskSearchStore();
+      store.attach(client, tasks, (_deviceId: string) => Promise.resolve());
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.deviceName = 'Studio';
+      origin.reachable = true;
+      const request = new TaskSearchRequest();
+      request.query = 'legacy';
+
+      const page = await store.search([origin], request);
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        DlChannels.CONVERSATIONS_SEARCH,
+      ]));
+      expect(page.usedCacheFallback).assertEqual(true);
+      expect(page.results.length).assertEqual(1);
+      expect(page.results[0].session.id).assertEqual('cached-hit');
+    });
+
+    it('KeepsSearchFallbackAliveWhenRemoteErrorIsUndefined', 0, async () => {
+      const client = new LegacyTaskSearchTestClient(false, false, true);
+      const tasks = new TaskStore();
+      tasks.upsertSession('desktop-a', searchSession('cached-undefined-error', 'Cached undefined error', '/repo', 'legacy body'));
+      const store = new TaskSearchStore();
+      store.attach(client, tasks, (_deviceId: string) => Promise.resolve());
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.deviceName = 'Studio';
+      origin.reachable = true;
+      const request = new TaskSearchRequest();
+      request.query = 'legacy';
+
+      const page = await store.search([origin], request);
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        DlChannels.CONVERSATIONS_SEARCH,
+      ]));
+      expect(page.usedCacheFallback).assertEqual(true);
+      expect(page.results[0].session.id).assertEqual('cached-undefined-error');
+    });
+  });
+
+  describe('taskProjectOrderAlignment', () => {
+    it('normalizesWindowsWorktreesAndPreservesDeviceScopedKeys', 0, () => {
+      expect(normalizeTaskProjectPath('C:\\Repo\\.claude\\worktrees\\feature-a'))
+        .assertEqual('c:/repo');
+      expect(normalizeTaskProjectPath('//SERVER/Repo/.worktrees/feature-b'))
+        .assertEqual('//server/repo');
+      expect(taskProjectOrderKey('desktop-a', '/repo/.cindy-worktrees/feature-a'))
+        .assertEqual('desktop-a:/repo');
+      expect(JSON.stringify(taskProjectOrderKeysFromHost('desktop-a', ['local:C:/Repo', 'device:x:/bad'])))
+        .assertEqual(JSON.stringify(['desktop-a:c:/repo']));
+    });
+
+    it('ReconcilesNewProjectsWithoutReorderingExistingProjects', 0, () => {
+      const previous = ['desktop-a:/repo/two', 'desktop-a:/repo/one'];
+      const active = ['desktop-a:/repo/one', 'desktop-a:/repo/two', 'desktop-a:/repo/three'];
+      expect(JSON.stringify(reconcileTaskProjectOrder(previous, active)))
+        .assertEqual(JSON.stringify([
+          'desktop-a:/repo/two', 'desktop-a:/repo/one', 'desktop-a:/repo/three',
+        ]));
+    });
+
+    it('CanonicalizesRawProjectKeysDuringReconcile', 0, () => {
+      const previous = ['desktop-a:C:\\Repo\\Two'];
+      const active = [
+        'desktop-a:C:\\Repo\\.cindy-worktrees\\feature-a',
+        'desktop-a:C:\\Repo\\Two',
+      ];
+      expect(JSON.stringify(reconcileTaskProjectOrder(previous, active)))
+        .assertEqual(JSON.stringify(['desktop-a:c:/repo/two', 'desktop-a:c:/repo']));
+    });
+
+    it('ReordersOnlyVisibleProjectsAndLeavesHiddenSlotsInPlace', 0, () => {
+      const full = [
+        'desktop-b:/hidden-before',
+        'desktop-a:/repo/one',
+        'desktop-a:/repo/two',
+        'desktop-b:/hidden-after',
+      ];
+      const next = reorderVisibleTaskProjectOrder(
+        full,
+        ['desktop-a:/repo/one', 'desktop-a:/repo/two'],
+        'desktop-a:/repo/two',
+        0,
+      );
+      expect(JSON.stringify(next)).assertEqual(JSON.stringify([
+        'desktop-b:/hidden-before',
+        'desktop-a:/repo/two',
+        'desktop-a:/repo/one',
+        'desktop-b:/hidden-after',
+      ]));
+    });
+
+    it('ParsesOwnerStampAndRejectsMalformedSnapshotFields', 0, () => {
+      const raw: Record<string, Object> = {};
+      raw['authoritative'] = true;
+      raw['projectOrder'] = 'custom';
+      raw['manualProjectOrder'] = ['local:/repo', 'local:/repo'];
+      const stamp: Record<string, Object> = {};
+      stamp['dataOwnerId'] = 'account-1';
+      stamp['ownerGeneration'] = 4;
+      raw['ownerStamp'] = stamp;
+      const parsed = parseTaskProjectOrderSnapshot(raw);
+      expect(parsed.authoritative).assertEqual(true);
+      expect(parsed.projectOrder).assertEqual('custom');
+      expect(parsed.manualProjectOrder.length).assertEqual(1);
+      expect(parsed.ownerStamp?.dataOwnerId).assertEqual('account-1');
+      expect(parsed.ownerStamp?.ownerGeneration).assertEqual(4);
+    });
+
+    it('FallsBackWhenProjectOrderErrorCarriesAPlainChannelCode', 0, async () => {
+      const client = new LegacyTaskProjectOrderTestClient();
+      const store = new TaskProjectOrderStore();
+      store.attach(client, (_deviceId: string) => Promise.resolve(), () => 'account-1');
+
+      const result = await store.fetch('desktop-a');
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        SIDEBAR_GET_PROJECT_ORDER,
+      ]));
+      expect(result.kind).assertEqual('unavailable');
+      expect(result.snapshot?.available).assertEqual(false);
+    });
+
+    it('KeepsProjectOrderFallbackAliveWhenRemoteErrorIsUndefined', 0, async () => {
+      const client = new LegacyTaskProjectOrderTestClient(true);
+      const store = new TaskProjectOrderStore();
+      store.attach(client, (_deviceId: string) => Promise.resolve(), () => 'account-1');
+
+      const result = await store.fetch('desktop-a');
+      expect(JSON.stringify(client.channels)).assertEqual(JSON.stringify([
+        SIDEBAR_GET_PROJECT_ORDER,
+      ]));
+      expect(result.kind).assertEqual('transient');
+      expect(result.snapshot === undefined).assertEqual(true);
+    });
+  });
+
+  describe('shareSelectionAlignment', () => {
+    it('keepsSelectionScopedToOneSessionAndSupportsPreselection', 0, () => {
+      const store = new ShareSelectionStore();
+      store.enter('session-a', 'message-2');
+      store.toggle('message-1');
+      expect(store.isActive()).assertEqual(true);
+      expect(store.activeSessionId()).assertEqual('session-a');
+      expect(store.count()).assertEqual(2);
+      expect(JSON.stringify(store.selectedIdsInOrder(['message-1', 'message-2'])))
+        .assertEqual(JSON.stringify(['message-1', 'message-2']));
+
+      store.enter('session-b');
+      expect(store.activeSessionId()).assertEqual('session-b');
+      expect(store.count()).assertEqual(0);
+    });
+
+    it('reconcilesMissingMessagesAndNotifiesOnlyOnChanges', 0, () => {
+      const store = new ShareSelectionStore();
+      let notifications = 0;
+      store.onChanged(() => notifications += 1);
+      store.enter('session-a');
+      store.setSelection(['message-1', 'message-2']);
+      const afterSelection = notifications;
+      store.setSelection(['message-2', 'message-1']);
+      expect(notifications).assertEqual(afterSelection);
+      store.reconcile(['message-2', 'message-3']);
+      expect(JSON.stringify(store.selectedIds())).assertEqual(JSON.stringify(['message-2']));
+      expect(notifications).assertEqual(afterSelection + 1);
+      store.exit();
+      expect(store.isActive()).assertEqual(false);
+      expect(store.count()).assertEqual(0);
+    });
+
+    it('doesNotToggleBeforeEnteringSelectionMode', 0, () => {
+      const store = new ShareSelectionStore();
+      store.toggle('message-1');
+      expect(store.count()).assertEqual(0);
+      store.enter('session-a');
+      store.toggle('message-1');
+      store.toggle('message-1');
+      expect(store.count()).assertEqual(0);
+    });
+  });
+
   describe('harmonyMessageAlignment', () => {
     it('treatsMissingTaskRouteParamsAndJsonRecordsAsEmpty', 0, () => {
       const params = recordOrEmpty(undefined);
@@ -509,6 +1134,10 @@ export default function localUnitTest() {
       expect(sorted[0].requestId).assertEqual('plan');
       expect(sorted[1].requestId).assertEqual('permission');
       expect(sorted[2].requestId).assertEqual('ask');
+      expect(interactionKindLabel('rename_sessions_confirm')).assertEqual('重命名');
+      expect(interactionKindLabel('ghost_grant_confirm')).assertEqual('文件访问');
+      expect(interactionPriority('rename_sessions_confirm')).assertEqual(3);
+      expect(interactionPriority('ghost_grant_confirm')).assertEqual(3);
 
       const evidence = buildPlanReviewEvidence([
         '# 总览',
@@ -544,6 +1173,37 @@ export default function localUnitTest() {
       snapshot?.selectedLabels.push('字母排序');
       expect(store.readAskDraft('ask-1')?.selectedLabels.length).assertEqual(1);
       unsubscribe();
+    });
+
+    it('keepsPendingInteractionsScopedToTheirSourceDevice', 0, () => {
+      const store = new InteractionStore();
+      const requestA: Record<string, Object> = {};
+      requestA['requestId'] = 'same-request-a';
+      requestA['kind'] = 'ask_user_question';
+      const payloadA: Record<string, Object> = {};
+      payloadA['sessionId'] = 'same-session';
+      payloadA['request'] = requestA;
+      store.handleInteractionRequest(payloadA, 'desktop-a');
+
+      const requestB: Record<string, Object> = {};
+      requestB['requestId'] = 'same-request-b';
+      requestB['kind'] = 'permission';
+      const payloadB: Record<string, Object> = {};
+      payloadB['sessionId'] = 'same-session';
+      payloadB['request'] = requestB;
+      store.handleInteractionRequest(payloadB, 'desktop-b');
+
+      expect(store.getPending('same-session', 'desktop-a').length).assertEqual(1);
+      expect(store.getPending('same-session', 'desktop-a')[0].deviceId).assertEqual('desktop-a');
+      expect(store.getPending('same-session', 'desktop-b').length).assertEqual(1);
+      expect(store.getPending('same-session').length).assertEqual(0);
+
+      const dismissed: Record<string, Object> = {};
+      dismissed['sessionId'] = 'same-session';
+      dismissed['requestId'] = 'same-request-a';
+      store.handleInteractionDismissed(dismissed, 'desktop-a');
+      expect(store.getPending('same-session', 'desktop-a').length).assertEqual(0);
+      expect(store.getPending('same-session', 'desktop-b').length).assertEqual(1);
     });
 
     it('blocksComposerOnlyForLocallyResolvablePendingInteractions', 0, () => {
@@ -891,9 +1551,12 @@ export default function localUnitTest() {
       expect(store.captureAuthorityEpoch('s1') > beforePush).assertEqual(true);
       store.noteTurnTerminal('s1');
       expect(store.getProjection('s1').continuationTurnClientId).assertEqual('');
+      store.activateSession('device-1', 's1');
       const beforeClear = store.captureAuthorityEpoch('s1');
       store.clearSession('s1');
       expect(store.captureAuthorityEpoch('s1') > beforeClear).assertEqual(true);
+      void store.resyncActiveSessions();
+      expect(store.getProjection('s1').pendingQueue.length).assertEqual(0);
       const oldOther = store.captureAuthorityEpoch('other');
       store.clearAll();
       expect(store.captureAuthorityEpoch('other') > oldOther).assertEqual(true);
@@ -930,7 +1593,46 @@ export default function localUnitTest() {
       expect(store.getProjection(session.id).pendingQueue.length).assertEqual(1);
       store.invalidateDevice('device-1');
       expect(store.getProjection(session.id).pendingQueue.length).assertEqual(0);
+      const lateProjection: Record<string, Object> = {};
+      lateProjection['sessionId'] = session.id;
+      lateProjection['pendingQueue'] = [];
+      store.handleProjectionPush(lateProjection, 'device-1');
+      expect(store.getProjection(session.id, 'device-1').pendingQueue.length).assertEqual(0);
       expect(store.captureAuthorityEpoch(session.id) > before).assertEqual(true);
+    });
+
+    it('rejectsForeignInputProjectionAndTerminalForSameSession', 0, () => {
+      const store = new InputQueueStore();
+      const session = new RemoteSession();
+      session.id = 'same-session-queue';
+      session.model = 'model';
+      session.permissionMode = 'ask';
+      store.seedOptimisticText('desktop-a', session, 'from A', [], 'queue-a');
+
+      const ownerProjection: Record<string, Object> = {};
+      ownerProjection['sessionId'] = session.id;
+      ownerProjection['continuationTurnClientId'] = 'continuation-a';
+      ownerProjection['pendingQueue'] = [
+        store.getProjection(session.id, 'desktop-a').pendingQueue[0].raw,
+      ];
+      store.handleProjectionPush(ownerProjection, 'desktop-a');
+
+      const foreignProjection: Record<string, Object> = {};
+      foreignProjection['sessionId'] = session.id;
+      foreignProjection['continuationTurnClientId'] = '';
+      foreignProjection['pendingQueue'] = [];
+      store.handleProjectionPush(foreignProjection, 'desktop-b');
+      store.noteTurnTerminal(session.id, 'desktop-b');
+
+      const owner = store.getProjection(session.id, 'desktop-a');
+      expect(owner.pendingQueue.length).assertEqual(1);
+      expect(owner.continuationTurnClientId).assertEqual('continuation-a');
+      expect(store.getProjection(session.id, 'desktop-b').pendingQueue.length).assertEqual(0);
+
+      // 页面明确切换到 B 时清掉 A 的投影；之后 B 才能建立自己的队列上下文。
+      store.seedOptimisticText('desktop-b', session, 'from B', [], 'queue-b');
+      expect(store.getProjection(session.id, 'desktop-a').pendingQueue.length).assertEqual(0);
+      expect(store.getProjection(session.id, 'desktop-b').pendingQueue.length).assertEqual(1);
     });
 
     it('doesNotDuplicateOptimisticFirstMessageWithStableClientId', 0, () => {
@@ -994,6 +1696,55 @@ export default function localUnitTest() {
         .assertEqual(false);
       expect(shouldApplyComposerDraftRead('session-1', 'session-2', 3, 3, 7, 7, false))
         .assertEqual(false);
+    });
+
+    it('isolatesComposerDraftsByRemoteDeviceAndClaimsLegacyDraftOnce', 0, async () => {
+      const storage = new MemorySecureStore();
+      const legacyWriter = new ComposerDraftStore(storage);
+      legacyWriter.save('same-session', textComposerDocument('legacy draft'));
+      await legacyWriter.flush('same-session');
+
+      expect(composerDraftScopeKey('same-session', 'desktop-a') ===
+        composerDraftScopeKey('same-session', 'desktop-b')).assertEqual(false);
+      expect(composerDraftStorageKey('same-session', 'desktop-a') ===
+        composerDraftStorageKey('same-session', 'desktop-b')).assertEqual(false);
+
+      const reader = new ComposerDraftStore(storage);
+      const migrated = await Promise.all([
+        reader.read('same-session', 'desktop-a'),
+        reader.read('same-session', 'desktop-b'),
+      ]);
+      expect((migrated[0] !== null) !== (migrated[1] !== null)).assertEqual(true);
+      const claimedDocument: ComposerDocument | null = migrated[0] ?? migrated[1];
+      expect(claimedDocument !== null).assertEqual(true);
+      if (claimedDocument !== null) {
+        expect(composerDocumentProjectedText(claimedDocument)).assertEqual('legacy draft');
+      }
+      expect(storage.values.has(composerDraftStorageKey('same-session'))).assertEqual(false);
+
+      reader.save('same-session', textComposerDocument('from A'), 'desktop-a');
+      reader.save('same-session', textComposerDocument('from B'), 'desktop-b');
+      await Promise.all([
+        reader.flush('same-session', 'desktop-a'),
+        reader.flush('same-session', 'desktop-b'),
+      ]);
+      const fromA = await reader.read('same-session', 'desktop-a');
+      const fromB = await reader.read('same-session', 'desktop-b');
+      expect(fromA !== null).assertEqual(true);
+      expect(fromB !== null).assertEqual(true);
+      if (fromA !== null) expect(composerDocumentProjectedText(fromA)).assertEqual('from A');
+      if (fromB !== null) expect(composerDocumentProjectedText(fromB)).assertEqual('from B');
+      expect(storage.values.has(composerDraftStorageKey('same-session', 'desktop-a'))).assertEqual(true);
+      expect(storage.values.has(composerDraftStorageKey('same-session', 'desktop-b'))).assertEqual(true);
+
+      reader.clear('same-session', 'desktop-a');
+      await reader.flush('same-session', 'desktop-a');
+      expect(await reader.read('same-session', 'desktop-a')).assertEqual(null);
+      const retainedB = await reader.read('same-session', 'desktop-b');
+      expect(retainedB !== null).assertEqual(true);
+      if (retainedB !== null) {
+        expect(composerDocumentProjectedText(retainedB)).assertEqual('from B');
+      }
     });
 
     it('keepsCreationFollowUpsInLocalFifoUntilExplicitHandoff', 0, () => {
@@ -1069,6 +1820,36 @@ export default function localUnitTest() {
       expect(bubbles[0].clientId).assertEqual('failed-client');
       expect(bubbles[0].phase).assertEqual('failed');
       expect(bubbles[0].errorText).assertEqual('relay unavailable');
+    });
+
+    it('recordsRemoteQueueEvidenceAndSettlesFastActiveDelivery', 0, () => {
+      const projected = new InputQueueStore();
+      const session = new RemoteSession();
+      session.id = 'remote-evidence-session';
+      session.model = 'model';
+      session.permissionMode = 'ask';
+      projected.seedOptimisticText('device-1', session, 'remote item', [], 'remote-client');
+      const remoteEpoch = projected.captureRemoteEvidenceEpoch(session.id);
+      expect(projected.hasRemoteEvidenceSince(session.id, 'remote-client', remoteEpoch))
+        .assertEqual(false);
+      const raw = projected.getProjection(session.id).pendingQueue[0].raw;
+      const push: Record<string, Object> = {};
+      push['sessionId'] = session.id;
+      push['pendingQueue'] = [raw];
+      projected.handleProjectionPush(push);
+      expect(projected.hasRemoteEvidenceSince(session.id, 'remote-client', remoteEpoch))
+        .assertEqual(true);
+
+      const delivered = new InputQueueStore();
+      delivered.seedOptimisticText('device-1', session, 'already active', [], 'active-client');
+      const deliveredEpoch = delivered.captureRemoteEvidenceEpoch(session.id);
+      const ids = new Set<string>();
+      ids.add('active-client');
+      delivered.setDeliveredClientIds(session.id, ids);
+      expect(delivered.getProjection(session.id).pendingQueue.length).assertEqual(0);
+      expect(delivered.getBubbles(session.id).length).assertEqual(0);
+      expect(delivered.hasRemoteEvidenceSince(session.id, 'active-client', deliveredEpoch))
+        .assertEqual(true);
     });
 
     it('keepsTodoCardAndStepKeysStableAcrossPlanStatusUpdates', 0, () => {
@@ -1258,6 +2039,13 @@ export default function localUnitTest() {
       expect(isPayloadTooLargeError(new Error('PAYLOAD_TOO_LARGE: history page'))).assertEqual(true);
       expect(isPayloadTooLargeError(new Error('WebSocket frame exceeds 1048576 bytes'))).assertEqual(true);
       expect(isPayloadTooLargeError(new Error('network disconnected'))).assertEqual(false);
+
+      const cyclic: Record<string, Object> = {};
+      cyclic['self'] = cyclic;
+      expect(safeErrorMessage(undefined)).assertEqual('');
+      expect(safeErrorMessage(cyclic)).assertEqual('');
+      expect(isPayloadTooLargeError(undefined)).assertEqual(false);
+      expect(isPayloadTooLargeError(cyclic)).assertEqual(false);
     });
 
     it('letsASettledHistoryPageOwnTheLoadEarlierAffordance', 0, () => {
@@ -2145,6 +2933,17 @@ export default function localUnitTest() {
       workChild.body = '已读取配置文件';
       expandedWork.children = [workChild];
 
+      const nestedWork = new RenderWorkGroupItem();
+      nestedWork.type = 'work_group';
+      nestedWork.key = 'w-nested';
+      const nestedUser = new RenderMessageItem();
+      nestedUser.type = 'message';
+      nestedUser.key = 'nested-user';
+      nestedUser.kind = 'user';
+      nestedUser.body = '嵌套第一行\n嵌套第二行\n隐藏正文';
+      nestedWork.children = [nestedUser];
+      expandedWork.children.push(nestedWork);
+
       const expanded = new Set<string>();
       expanded.add('w-expanded');
       const projection = freezeShareProjection(
@@ -2157,7 +2956,28 @@ export default function localUnitTest() {
       // 折叠的用户正文按可见行截断，并标记有内容被省略。
       expect(projection.items[0].text).assertEqual('第一行\n第二行');
       expect(projection.omittedCollapsedContent).assertEqual(true);
-      expect(projection.items[2].text).assertEqual('已读取配置文件');
+      expect(projection.items[2].text).assertEqual('已读取配置文件\n嵌套第一行\n嵌套第二行');
+
+      // 已展开工作组的嵌套消息也必须沿用实际屏幕折叠结果，不能因投影递归失败
+      // 把隐藏的长用户正文带出分享图。
+      const nestedVisible = new Map<string, string>();
+      nestedVisible.set('nested-user', '嵌套第一行…');
+      const nestedProjection = freezeShareProjection(
+        [expandedWork], expanded, 2, nestedVisible);
+      expect(nestedProjection.items.length).assertEqual(1);
+      expect(nestedProjection.items[0].text).assertEqual('已读取配置文件\n嵌套第一行…');
+      expect(nestedProjection.omittedCollapsedContent).assertEqual(true);
+
+      const subagent = new RenderSubagentGroupItem();
+      subagent.type = 'subagent_group';
+      subagent.key = 'subagent-expanded';
+      subagent.summary = '子任务已完成';
+      subagent.children = [workChild];
+      expanded.add(subagent.key);
+      const subagentProjection = freezeShareProjection([subagent], expanded, 2);
+      expect(subagentProjection.items.length).assertEqual(1);
+      // summary 是界面上的子任务状态，不是用户可见消息正文，不应被导出。
+      expect(subagentProjection.items[0].text).assertEqual('已读取配置文件');
 
       // 未折叠、未展开任何内容时不误报省略。
       const clean = freezeShareProjection([answer], new Set<string>(), 10);
@@ -2184,7 +3004,9 @@ export default function localUnitTest() {
       expect(isShareableRenderType('permission')).assertEqual(false);
       expect(isShareableRenderType('todo')).assertEqual(false);
       expect(isShareableRenderType('message')).assertEqual(true);
+      expect(isShareableRenderType('subagent_group')).assertEqual(true);
       expect(isShareableMessageKind('error')).assertEqual(false);
+      expect(isShareableMessageKind('system')).assertEqual(false);
     });
 
     it('plansShareSegmentsWithoutAnUnboundedCanvas', 0, () => {
@@ -2719,6 +3541,11 @@ export default function localUnitTest() {
       expect(isTransientNewSessionError(new DlError('CHANNEL_NOT_ALLOWED', 'timeout text')))
         .assertEqual(false);
       expect(isTransientNewSessionError(new Error('invalid working directory'))).assertEqual(false);
+      expect(isTransientNewSessionError(undefined)).assertEqual(false);
+
+      const cyclic: Record<string, Object> = {};
+      cyclic['self'] = cyclic;
+      expect(isTransientNewSessionError(cyclic)).assertEqual(false);
     });
 
     it('onlyReturnsNewSessionToEditAfterExactAbsence', 0, () => {
@@ -3032,6 +3859,21 @@ export default function localUnitTest() {
       expect(updated.pendingLocalCreation).assertEqual(true);
     });
 
+    it('removesDeletedSessionFromTaskProjectionOnPatchPush', 0, () => {
+      const store = new TaskStore();
+      const session = new RemoteSession();
+      session.id = 'deleted-session';
+      session.title = '待删除任务';
+      store.upsertSession('device-1', session);
+      const patch: Record<string, Object> = {};
+      patch['status'] = 'deleted';
+      const payload: Record<string, Object> = {};
+      payload['sessionId'] = session.id;
+      payload['patch'] = patch;
+      store.handleSessionsPush('device-1', DlChannels.SESSIONS_PATCHED, payload);
+      expect(store.getSessions('device-1').length).assertEqual(0);
+    });
+
     it('keepsCreatedSessionInTheListWhenStartingPostCreateReconciliation', 0, () => {
       const store = new TaskStore();
       const session = new RemoteSession();
@@ -3293,6 +4135,342 @@ export default function localUnitTest() {
       unsubscribe();
     });
 
+    it('clearsMessageProjectionBeforeOpeningTheSameSessionOnAnotherDevice', 0, async () => {
+      const store = new MessageStore();
+      store.attach(new EmptyHistoryTestClient());
+      expect(await store.openSession('desktop-a', 'same-session')).assertEqual(true);
+
+      const message: Record<string, Object> = {};
+      message['id'] = 'desktop-a-message';
+      message['clientId'] = 'desktop-a-message';
+      message['sessionId'] = 'same-session';
+      message['role'] = 'user';
+      message['content'] = '来自桌面 A';
+      const push: Record<string, Object> = {};
+      push['sessionId'] = 'same-session';
+      push['message'] = message;
+      store.handleSessionPush('desktop-a', 'local-db:messages:created', push);
+      expect(store.getMessages('same-session').length).assertEqual(1);
+      const liveData: Record<string, Object> = {};
+      liveData['text'] = '桌面 A 正在运行';
+      const liveEvent: Record<string, Object> = {};
+      liveEvent['type'] = 'text';
+      liveEvent['data'] = liveData;
+      store.handleMakerEvent('same-session', liveEvent, '', 'desktop-a');
+      expect(store.isSessionRunning('same-session', 'desktop-a')).assertEqual(true);
+      const foreignData: Record<string, Object> = {};
+      foreignData['text'] = '桌面 B 不应写入';
+      const foreignEvent: Record<string, Object> = {};
+      foreignEvent['type'] = 'text';
+      foreignEvent['data'] = foreignData;
+      store.handleMakerEvent('same-session', foreignEvent, '', 'desktop-b');
+      expect(store.getStreaming('same-session')?.text ?? '').assertEqual('桌面 A 正在运行');
+      expect(store.getMessages('same-session', 'desktop-b').length).assertEqual(0);
+      expect(store.getMessagesWithStreaming('same-session', 'desktop-b').length).assertEqual(0);
+      expect(store.getStreaming('same-session', 'desktop-b') === undefined).assertEqual(true);
+      expect(store.hasMessageClientId('same-session', 'desktop-a-message', 'desktop-b'))
+        .assertEqual(false);
+      expect(await store.probeMessageClientId(
+        'desktop-b', 'same-session', 'desktop-a-message', 20)).assertEqual('unknown');
+      expect(store.isSessionOpen('same-session', 'desktop-b')).assertEqual(false);
+      expect(store.isSessionStreaming('same-session', 'desktop-b')).assertEqual(false);
+      expect(store.getTaskUpdates('same-session', 'desktop-b').size).assertEqual(0);
+
+      expect(await store.openSession('desktop-b', 'same-session')).assertEqual(true);
+      expect(store.getMessages('same-session').length).assertEqual(0);
+      expect(store.isSessionRunning('same-session', 'desktop-a')).assertEqual(false);
+      expect(store.isSessionRunning('same-session', 'desktop-b')).assertEqual(false);
+
+      const deviceBData: Record<string, Object> = {};
+      deviceBData['text'] = '桌面 B 正在运行';
+      const deviceBEvent: Record<string, Object> = {};
+      deviceBEvent['type'] = 'text';
+      deviceBEvent['data'] = deviceBData;
+      store.handleMakerEvent('same-session', deviceBEvent, '', 'desktop-b');
+      expect(store.getMessagesWithStreaming('same-session', 'desktop-a').length).assertEqual(0);
+      expect(store.getMessagesWithStreaming('same-session', 'desktop-b').length).assertEqual(1);
+      expect(store.isSessionStreaming('same-session', 'desktop-b')).assertEqual(true);
+    });
+
+    it('dropsLateAroundResponseAfterSwitchingTheSameSessionToAnotherDevice', 0, async () => {
+      const client = new DeferredAroundTestClient();
+      const store = new MessageStore();
+      store.attach(client);
+      expect(await store.openSession('desktop-a', 'around-session')).assertEqual(true);
+
+      const locating = store.loadAroundClientId(
+        'desktop-a', 'around-session', 'late-around-message', 20);
+      await client.aroundStarted;
+      expect(await store.openSession('desktop-b', 'around-session')).assertEqual(true);
+
+      const stale: Record<string, Object> = {};
+      stale['id'] = 'late-around-message';
+      stale['clientId'] = 'late-around-message';
+      stale['sessionId'] = 'around-session';
+      stale['role'] = 'assistant';
+      stale['content'] = '旧设备定位结果';
+      stale['createdAt'] = '2026-08-27T11:00:00.000Z';
+      client.aroundResponse.resolve(successfulInvokeEnvelope([stale]));
+
+      expect(await locating).assertEqual(false);
+      expect(store.getMessages('around-session', 'desktop-b').length).assertEqual(0);
+      expect(store.hasMessageClientId(
+        'around-session', 'late-around-message', 'desktop-b')).assertEqual(false);
+    });
+
+    it('dropsLateAroundResponseAfterSwitchingBackToSameDevice', 0, async () => {
+      const client = new DeferredAroundTestClient();
+      const store = new MessageStore();
+      store.attach(client);
+      expect(await store.openSession('desktop-a', 'around-same-device-session')).assertEqual(true);
+
+      const locating = store.loadAroundClientId(
+        'desktop-a', 'around-same-device-session', 'late-around-same-device-message', 20);
+      await client.aroundStarted;
+      expect(await store.openSession('desktop-b', 'around-same-device-session')).assertEqual(true);
+      expect(await store.openSession('desktop-a', 'around-same-device-session')).assertEqual(true);
+
+      const stale: Record<string, Object> = {};
+      stale['id'] = 'late-around-same-device-message';
+      stale['clientId'] = 'late-around-same-device-message';
+      stale['sessionId'] = 'around-same-device-session';
+      stale['role'] = 'assistant';
+      stale['content'] = '同设备旧定位结果';
+      stale['createdAt'] = '2026-08-27T11:01:00.000Z';
+      client.aroundResponse.resolve(successfulInvokeEnvelope([stale]));
+
+      expect(await locating).assertEqual(false);
+      expect(store.getMessages('around-same-device-session', 'desktop-a').length).assertEqual(0);
+      expect(store.hasMessageClientId(
+        'around-same-device-session', 'late-around-same-device-message', 'desktop-a'))
+        .assertEqual(false);
+    });
+
+    it('dropsLateRecoveryWindowAfterConnectionGenerationChanges', 0, async () => {
+      const client = new RecoveryTestClient();
+      const store = new MessageStore();
+      store.attach(client);
+      expect(await store.openSession('device-recovery', 'recovery-session')).assertEqual(true);
+
+      const healing = store.resubscribeAndHeal('device-recovery', 'recovery-session');
+      await client.historyStarted;
+      store.invalidateLiveTailTrust();
+
+      const staleRow: Record<string, Object> = {};
+      staleRow['id'] = 'stale-recovery-row';
+      staleRow['clientId'] = 'stale-recovery-row';
+      staleRow['sessionId'] = 'recovery-session';
+      staleRow['role'] = 'assistant';
+      staleRow['content'] = '旧连接返回的消息';
+      staleRow['createdAt'] = '2026-08-27T10:00:00.000Z';
+      const staleRows: Object[] = [staleRow];
+      client.staleHistory.resolve(successfulInvokeEnvelope(staleRows));
+      await healing;
+
+      expect(store.getMessages('recovery-session').length).assertEqual(0);
+      expect(store.isSessionOpen('recovery-session')).assertEqual(true);
+    });
+
+    it('singleFlightsActiveRefreshAndDropsItAfterDeviceInvalidation', 0, async () => {
+      const client = new ActiveSnapshotTestClient();
+      const store = new TaskStore();
+      store.attach(client);
+
+      const device = new DeviceView();
+      device.deviceId = 'active-device';
+      device.name = 'Active desktop';
+      device.platform = 'darwin';
+      device.online = true;
+      device.remoteControlEnabled = true;
+      store.mergeServerDevices([device]);
+
+      const session = new RemoteSession();
+      session.id = 'active-session';
+      session.status = 'active';
+      store.upsertSession(device.deviceId, session);
+
+      const first = store.refreshActiveSessions(device.deviceId);
+      const second = store.refreshActiveSessions(device.deviceId);
+      expect(client.activeCalls).assertEqual(1);
+
+      const disabled = new DeviceView();
+      disabled.deviceId = device.deviceId;
+      disabled.name = device.name;
+      disabled.platform = device.platform;
+      // 保持在线但撤销远程控制，避免 mergeServerDevices 的旧离线快照保护掩盖撤权。
+      disabled.online = true;
+      disabled.remoteControlEnabled = false;
+      store.mergeServerDevices([disabled]);
+
+      const staleActivity: Record<string, Object> = {};
+      staleActivity['sessionId'] = session.id;
+      staleActivity['phase'] = 'running';
+      store.handleSessionsPush(device.deviceId, DlChannels.SESSION_ACTIVITY, staleActivity);
+      expect(store.getLiveActivity(session.id, device.deviceId) === null).assertEqual(true);
+
+      const activeRow: Record<string, Object> = {};
+      activeRow['sessionId'] = session.id;
+      activeRow['isTurnRunning'] = true;
+      client.activeResponse.resolve(successfulInvokeEnvelope([activeRow]));
+      await first;
+      await second;
+
+      expect(store.getSessions(device.deviceId).length).assertEqual(0);
+      expect(store.getLiveActivity(session.id, device.deviceId) === null).assertEqual(true);
+    });
+
+    it('reconcilesOmittedInactiveSessionsFromTheActiveSnapshot', 0, async () => {
+      const client = new ActiveSnapshotTestClient();
+      const store = new TaskStore();
+      store.attach(client);
+
+      const device = new DeviceView();
+      device.deviceId = 'active-device-2';
+      device.name = 'Active desktop 2';
+      device.platform = 'darwin';
+      device.online = true;
+      device.remoteControlEnabled = true;
+      store.mergeServerDevices([device]);
+
+      const session = new RemoteSession();
+      session.id = 'active-session-2';
+      session.status = 'active';
+      store.upsertSession(device.deviceId, session);
+      const activity: Record<string, Object> = {};
+      activity['sessionId'] = session.id;
+      activity['phase'] = 'running';
+      activity['attention'] = false;
+      store.handleSessionsPush(device.deviceId, DlChannels.SESSION_ACTIVITY, activity);
+      expect(store.getLiveActivity(session.id, device.deviceId) === null).assertEqual(false);
+
+      client.activeResponse.resolve(successfulInvokeEnvelope([]));
+      await store.refreshActiveSessions(device.deviceId);
+
+      expect(client.activeCalls).assertEqual(1);
+      expect(store.getLiveActivity(session.id, device.deviceId) === null).assertEqual(true);
+    });
+
+    it('keepsIdenticalSessionIdsAndActivityScopedAcrossDevices', 0, () => {
+      const store = new TaskStore();
+      const deviceA = new DeviceView();
+      deviceA.deviceId = 'activity-device-a';
+      deviceA.name = 'Activity desktop A';
+      deviceA.platform = 'darwin';
+      deviceA.online = true;
+      deviceA.remoteControlEnabled = true;
+      const deviceB = new DeviceView();
+      deviceB.deviceId = 'activity-device-b';
+      deviceB.name = 'Activity desktop B';
+      deviceB.platform = 'darwin';
+      deviceB.online = true;
+      deviceB.remoteControlEnabled = true;
+      store.mergeServerDevices([deviceA, deviceB]);
+
+      const sessionA = new RemoteSession();
+      sessionA.id = 'same-session-id';
+      sessionA.status = 'active';
+      const sessionB = new RemoteSession();
+      sessionB.id = sessionA.id;
+      sessionB.status = 'active';
+      store.upsertSession(deviceA.deviceId, sessionA);
+      store.upsertSession(deviceB.deviceId, sessionB);
+
+      const activityA: Record<string, Object> = {};
+      activityA['sessionId'] = sessionA.id;
+      activityA['phase'] = 'running';
+      const activityB: Record<string, Object> = {};
+      activityB['sessionId'] = sessionB.id;
+      activityB['phase'] = 'running';
+      store.handleSessionsPush(deviceA.deviceId, DlChannels.SESSION_ACTIVITY, activityA);
+      store.handleSessionsPush(deviceB.deviceId, DlChannels.SESSION_ACTIVITY, activityB);
+
+      expect(store.getLiveActivity(sessionA.id, deviceA.deviceId) === null).assertEqual(false);
+      expect(store.getLiveActivity(sessionB.id, deviceB.deviceId) === null).assertEqual(false);
+
+      const revokedA = new DeviceView();
+      revokedA.deviceId = deviceA.deviceId;
+      revokedA.name = deviceA.name;
+      revokedA.platform = deviceA.platform;
+      revokedA.online = true;
+      revokedA.remoteControlEnabled = false;
+      store.mergeServerDevices([revokedA, deviceB]);
+      expect(store.getLiveActivity(sessionA.id, deviceA.deviceId) === null).assertEqual(true);
+      expect(store.getLiveActivity(sessionB.id, deviceB.deviceId) === null).assertEqual(false);
+    });
+
+    it('keepsReliableGenerationMetricsAndClearsThemAtTheNextTurn', 0, () => {
+      const store = new MessageStore();
+      const liveData: Record<string, Object> = {};
+      liveData['isRunning'] = true;
+      liveData['outputTokens'] = 40;
+      liveData['generationDurationMs'] = 800;
+      liveData['generationActive'] = true;
+      liveData['generationReliable'] = true;
+      liveData['status'] = 'Generating';
+      const live: Record<string, Object> = {};
+      live['type'] = 'status';
+      live['data'] = liveData;
+      store.handleMakerEvent('generation-1', live);
+
+      const running = store.getGenerationStatus('generation-1');
+      expect(running.isRunning).assertEqual(true);
+      expect(running.outputTokens).assertEqual(40);
+      expect(running.generationDurationMs).assertEqual(800);
+      expect(running.generationActive).assertEqual(true);
+      expect(running.generationReliable).assertEqual(true);
+      expect(generationStatusLabel(running)).assertEqual('50 tok/s');
+
+      const continuedData: Record<string, Object> = {};
+      continuedData['isRunning'] = false;
+      const continued: Record<string, Object> = {};
+      continued['type'] = 'status';
+      continued['data'] = continuedData;
+      continued['turnContinuationId'] = 2;
+      store.handleMakerEvent('generation-1', continued);
+      expect(store.getGenerationStatus('generation-1').isRunning).assertEqual(true);
+      expect(store.getGenerationStatus('generation-1').outputTokens).assertEqual(40);
+
+      const completedData: Record<string, Object> = {};
+      completedData['isRunning'] = false;
+      const completed: Record<string, Object> = {};
+      completed['type'] = 'status';
+      completed['data'] = completedData;
+      store.handleMakerEvent('generation-1', completed);
+      const finished = store.getGenerationStatus('generation-1');
+      expect(finished.isRunning).assertEqual(false);
+      expect(finished.generationActive).assertEqual(false);
+      expect(finished.outputTokens).assertEqual(40);
+      expect(generationStatusLabel(finished)).assertEqual('');
+
+      const nextTurnData: Record<string, Object> = {};
+      nextTurnData['isRunning'] = true;
+      nextTurnData['status'] = 'Thinking';
+      const nextTurn: Record<string, Object> = {};
+      nextTurn['type'] = 'status';
+      nextTurn['data'] = nextTurnData;
+      store.handleMakerEvent('generation-1', nextTurn);
+      const reset = store.getGenerationStatus('generation-1');
+      expect(reset.outputTokens).assertEqual(0);
+      expect(reset.generationDurationMs).assertEqual(0);
+      expect(reset.generationActive).assertEqual(false);
+      expect(reset.generationReliable).assertEqual(true);
+      expect(generationStatusLabel(reset)).assertEqual('');
+    });
+
+    it('fallsBackToCumulativeTokensWhenGenerationIsUnreliable', 0, () => {
+      const status = new SessionGenerationStatus();
+      status.isRunning = true;
+      status.outputTokens = 1250;
+      status.generationDurationMs = 500;
+      status.generationActive = true;
+      status.generationReliable = false;
+      expect(generationStatusLabel(status)).assertEqual('1.25K tokens');
+
+      status.generationReliable = true;
+      status.generationActive = false;
+      expect(generationStatusLabel(status)).assertEqual('1.25K tokens');
+    });
+
     it('surfacesManagedToolResultImagesOutsideWorkGroup', 0, () => {
       const user = new RemoteMessage();
       user.id = 'user-media';
@@ -3393,6 +4571,29 @@ export default function localUnitTest() {
       expect(goal?.budgetTokens).assertEqual(-1);
     });
 
+    it('keepsGoalStatusScopedToItsSourceDevice', 0, () => {
+      const store = new GoalStore();
+      const activeGoal: Record<string, Object> = {};
+      activeGoal['status'] = 'active';
+      activeGoal['objective'] = '来自 A';
+      const activePush: Record<string, Object> = {};
+      activePush['sessionId'] = 'same-goal-session';
+      activePush['goal'] = activeGoal;
+      store.handleStatusChanged(activePush, 'desktop-a');
+
+      const pausedGoal: Record<string, Object> = {};
+      pausedGoal['status'] = 'paused';
+      pausedGoal['objective'] = '来自 B';
+      const pausedPush: Record<string, Object> = {};
+      pausedPush['sessionId'] = 'same-goal-session';
+      pausedPush['goal'] = pausedGoal;
+      store.handleStatusChanged(pausedPush, 'desktop-b');
+
+      expect(store.getState('same-goal-session', 'desktop-a')?.status).assertEqual('active');
+      expect(store.getState('same-goal-session', 'desktop-b')?.status).assertEqual('paused');
+      expect(store.getState('same-goal-session', 'desktop-a')?.objective).assertEqual('来自 A');
+    });
+
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {
       expect(isWideTaskLayout(639, 400)).assertEqual(false);
       expect(isWideTaskLayout(640, 400)).assertEqual(true);
@@ -3456,6 +4657,37 @@ export default function localUnitTest() {
       expect(resolveTaskRightStatus('completed', true, 0, false)).assertEqual('done');
       expect(resolveTaskRightStatus('error', true, 0, true)).assertEqual('error');
       expect(resolveTaskRightStatus('completed', true, 1, true)).assertEqual('waiting');
+    });
+
+    it('showsTaskListFloatingBarAtBothScrollBoundaries', 0, () => {
+      expect(taskListShouldShowFloatingBarAtBoundary(0, false)).assertEqual(true);
+      expect(taskListShouldShowFloatingBarAtBoundary(0, true)).assertEqual(true);
+      expect(taskListShouldShowFloatingBarAtBoundary(160, true)).assertEqual(true);
+      expect(taskListShouldShowFloatingBarAtBoundary(160, false)).assertEqual(false);
+    });
+
+    it('hidesAndShowsDetailComposerAfterClearDirectionalScroll', 0, () => {
+      let update = updateComposerScrollVisibility(0, -4, true);
+      expect(update.action).assertEqual(COMPOSER_SCROLL_ACTION_NONE);
+      expect(update.intent).assertEqual(-4);
+
+      update = updateComposerScrollVisibility(update.intent, -6, true);
+      expect(update.action).assertEqual(COMPOSER_SCROLL_ACTION_HIDE);
+      expect(update.intent).assertEqual(0);
+
+      update = updateComposerScrollVisibility(0, 8, true);
+      expect(update.action).assertEqual(COMPOSER_SCROLL_ACTION_SHOW);
+      expect(update.intent).assertEqual(0);
+    });
+
+    it('resetsComposerScrollIntentAcrossDirectionsAndProtectsEditing', 0, () => {
+      let update = updateComposerScrollVisibility(-7, 2, true);
+      expect(update.action).assertEqual(COMPOSER_SCROLL_ACTION_NONE);
+      expect(update.intent).assertEqual(2);
+
+      update = updateComposerScrollVisibility(update.intent, -11, false);
+      expect(update.action).assertEqual(COMPOSER_SCROLL_ACTION_SHOW);
+      expect(update.intent).assertEqual(0);
     });
 
     it('rebuildsTaskListRowsWhenVisibleSessionStateChanges', 0, () => {
@@ -3556,11 +4788,16 @@ export default function localUnitTest() {
       const preferences = new TaskListPreferences();
       preferences.activeListTab = 'automations';
       preferences.sortMode = 'alphabetic';
+      preferences.projectOrder = 'custom';
+      preferences.manualProjectOrder = ['desktop-a:/repo', 'desktop-a:/repo'];
       preferences.searchQuery = '巡检';
       const serialized = serializeTaskListPreferences(preferences);
       const roundTrip = parseTaskListPreferences(serialized);
       expect(roundTrip.activeListTab).assertEqual('automations');
       expect(roundTrip.sortMode).assertEqual('alphabetic');
+      expect(roundTrip.projectOrder).assertEqual('custom');
+      expect(roundTrip.manualProjectOrder.length).assertEqual(1);
+      expect(roundTrip.manualProjectOrder[0]).assertEqual('desktop-a:/repo');
       expect(roundTrip.searchQuery).assertEqual('巡检');
 
       const invalidSort = parseTaskListPreferences(JSON.stringify({ sortMode: 'unknown' }));
@@ -3693,6 +4930,67 @@ export default function localUnitTest() {
         'running', 'collab:spawnAgent', '{}', 'reviewer: completed')).assertEqual('completed');
       expect(deriveAgentTaskStatus(
         'failed', 'collab:spawnAgent', '{}', 'reviewer: completed')).assertEqual('failed');
+    });
+
+    it('restoresPersistedSubagentTerminalStatusAcrossHistoryAndPartialRows', 0, () => {
+      const raw: Record<string, Object> = {};
+      raw['id'] = 'agent-use-1';
+      raw['role'] = 'tool_use';
+      const content: Record<string, Object> = {};
+      content['toolName'] = 'Agent';
+      content['toolUseId'] = 'agent-use-1';
+      raw['content'] = content;
+      const agentMeta: Record<string, Object> = {};
+      agentMeta['agentTaskStatus'] = 'failed';
+      raw['agentMeta'] = agentMeta;
+      const parsed = parseMessage(raw);
+      expect(parsed.agentTaskStatus).assertEqual('failed');
+      expect(deriveAgentTaskStatus('running', 'Agent', '{}', '', parsed.agentTaskStatus))
+        .assertEqual('failed');
+
+      const existing = new RemoteMessage();
+      existing.id = 'agent-use-2';
+      existing.role = 'tool_use';
+      existing.agentTaskStatus = 'completed';
+      const latest = new RemoteMessage();
+      latest.id = 'agent-use-2';
+      latest.role = 'tool_use';
+      const mergedMissingStatus = reconcileLatestMessageWindow(
+        [existing], [latest], false, null, false);
+      expect(mergedMissingStatus.items[0].agentTaskStatus).assertEqual('completed');
+
+      const completeExisting = new RemoteMessage();
+      completeExisting.id = 'agent-use-3';
+      completeExisting.role = 'tool_use';
+      completeExisting.agentMeta['remoteContentTruncated'] = false;
+      const truncatedLatest = new RemoteMessage();
+      truncatedLatest.id = 'agent-use-3';
+      truncatedLatest.role = 'tool_use';
+      truncatedLatest.agentMeta['remoteContentTruncated'] = true;
+      truncatedLatest.agentTaskStatus = 'stopped';
+      const mergedTruncated = reconcileLatestMessageWindow(
+        [completeExisting], [truncatedLatest], false, null, false);
+      expect(mergedTruncated.items[0].agentTaskStatus).assertEqual('stopped');
+    });
+
+    it('keepsSubagentDetailOnTheLatestNestedRenderTree', 0, () => {
+      const parent = new RenderSubagentGroupItem();
+      parent.type = 'subagent_group';
+      parent.key = 'subagent-parent';
+      const nested = new RenderSubagentGroupItem();
+      nested.type = 'subagent_group';
+      nested.key = 'subagent-nested';
+      parent.children = [nested];
+      const work = new RenderWorkGroupItem();
+      work.type = 'work_group';
+      work.children = [parent];
+
+      expect(findSubagentGroupByKey([work], 'subagent-nested')?.key ?? '')
+        .assertEqual('subagent-nested');
+      expect(findSubagentGroupByKey([work], 'subagent-missing')).assertEqual(null);
+      expect(subagentStatusLabel('failed')).assertEqual('失败');
+      expect(subagentStatusLabel('stopped')).assertEqual('已停止');
+      expect(subagentStatusLabel('running')).assertEqual('正在协作');
     });
 
     it('deduplicatesLegacyDefaultAndAskPermissionModes', 0, () => {

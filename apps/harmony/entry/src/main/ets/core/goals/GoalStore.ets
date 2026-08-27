@@ -23,7 +23,10 @@ export class GoalStore {
   private client: DlClient | undefined = undefined;
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
   private listeners: Array<() => void> = [];
-  private stateBySession: Map<string, GoalModeState | null> = new Map();
+  /** 同一 sessionId 可能来自多个 Desktop，目标状态必须保留来源设备。 */
+  private stateByScope: Map<string, GoalModeState | null> = new Map();
+  /** 登出/账号切换后，旧目标 RPC 的回包不得重建新账号状态。 */
+  private stateGeneration: number = 0;
 
   attach(client: DlClient): void {
     this.client = client;
@@ -49,11 +52,11 @@ export class GoalStore {
     }
   }
 
-  getState(sessionId: string): GoalModeState | null {
-    return this.stateBySession.get(sessionId) ?? null;
+  getState(sessionId: string, deviceId: string = ''): GoalModeState | null {
+    return this.stateByScope.get(goalScopeKey(deviceId, sessionId)) ?? null;
   }
 
-  handleStatusChanged(payload: Object | undefined): void {
+  handleStatusChanged(payload: Object | undefined, deviceId: string = ''): void {
     if (payload === undefined || payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
       return;
     }
@@ -62,14 +65,18 @@ export class GoalStore {
     if (sessionId.length === 0) {
       return;
     }
-    this.stateBySession.set(sessionId, parseGoalModeState(record['goal']));
+    const sourceDeviceId = deviceId.length > 0 ? deviceId : readStr(record, 'deviceId');
+    this.stateByScope.set(
+      goalScopeKey(sourceDeviceId, sessionId), parseGoalModeState(record['goal']));
     this.notify();
   }
 
   async refresh(deviceId: string, sessionId: string): Promise<boolean> {
+    const stateGeneration = this.stateGeneration;
     try {
       const result = await this.invoke(deviceId, 'maker:goal:get-status', [sessionId]);
-      this.stateBySession.set(sessionId, parseGoalModeState(result));
+      if (stateGeneration !== this.stateGeneration) return false;
+      this.stateByScope.set(goalScopeKey(deviceId, sessionId), parseGoalModeState(result));
       this.notify();
       return true;
     } catch (e) {
@@ -84,6 +91,7 @@ export class GoalStore {
     objective: string,
     limits: GoalStartOptions,
   ): Promise<void> {
+    const stateGeneration = this.stateGeneration;
     const args: Record<string, Object> = {};
     args['sessionId'] = sessionId;
     args['objective'] = objective;
@@ -95,22 +103,36 @@ export class GoalStore {
       args['limits'] = limitValues;
     }
     await this.invoke(deviceId, 'maker:goal:set', [args]);
+    if (stateGeneration !== this.stateGeneration) return;
     await this.refresh(deviceId, sessionId);
   }
 
   async clear(deviceId: string, sessionId: string): Promise<void> {
+    const stateGeneration = this.stateGeneration;
     await this.invoke(deviceId, 'maker:goal:clear', [sessionId]);
-    this.stateBySession.set(sessionId, null);
+    if (stateGeneration !== this.stateGeneration) return;
+    this.stateByScope.set(goalScopeKey(deviceId, sessionId), null);
+    this.notify();
+  }
+
+  clearAll(): void {
+    this.stateGeneration += 1;
+    if (this.stateByScope.size === 0) return;
+    this.stateByScope.clear();
     this.notify();
   }
 
   async pause(deviceId: string, sessionId: string): Promise<void> {
+    const stateGeneration = this.stateGeneration;
     await this.invoke(deviceId, 'maker:goal:pause', [sessionId]);
+    if (stateGeneration !== this.stateGeneration) return;
     await this.refresh(deviceId, sessionId);
   }
 
   async resume(deviceId: string, sessionId: string): Promise<void> {
+    const stateGeneration = this.stateGeneration;
     await this.invoke(deviceId, 'maker:goal:resume', [sessionId]);
+    if (stateGeneration !== this.stateGeneration) return;
     await this.refresh(deviceId, sessionId);
   }
 
@@ -128,4 +150,8 @@ export class GoalStore {
     const envelope = await client.invoke(deviceId, options);
     return unwrapInvokeResult(envelope);
   }
+}
+
+function goalScopeKey(deviceId: string, sessionId: string): string {
+  return deviceId + '\u0000' + sessionId;
 }

@@ -46,6 +46,8 @@ export class ComposerImageQueue {
 
   images: ComposerImage[] = [];
   picking: boolean = false;
+  /** 页面退场时使系统图片选择器的迟到回包失效；不能依赖系统 picker 可取消。 */
+  private pickerGeneration: number = 0;
 
   private setPicking(picking: boolean): void {
     this.picking = picking;
@@ -150,11 +152,20 @@ export class ComposerImageQueue {
     return false;
   }
 
-  /** 从发送成功的图片集合中移除已发送项（详情页保留后续新增的图片）。 */
-  removeSent(sent: ComposerImage[]): void {
+  /**
+   * 从发送成功的图片 ID 集合中移除已发送项（详情页保留后续新增的图片）。
+   *
+   * 这里故意只接收稳定 localId，而不是依赖 @Prop 传递的对象引用；ArkUI
+   * 可能在一帧之间复制附件对象，引用相等不能证明它仍是队列中的真实条目。
+   */
+  removeSent(sentLocalIds: string[]): void {
+    const sent = new Set<string>();
+    for (let i = 0; i < sentLocalIds.length; i++) {
+      if (sentLocalIds[i].length > 0) sent.add(sentLocalIds[i]);
+    }
     const remaining: ComposerImage[] = [];
     for (let i = 0; i < this.images.length; i++) {
-      if (sent.indexOf(this.images[i]) < 0) {
+      if (!sent.has(this.images[i].localId)) {
         remaining.push(this.images[i]);
       } else {
         this.images[i].removed = true;
@@ -172,12 +183,19 @@ export class ComposerImageQueue {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
+    const generation = ++this.pickerGeneration;
     this.setPicking(true);
     setTimeout(() => {
+      if (generation !== this.pickerGeneration || this.isBusy()) {
+        if (generation === this.pickerGeneration) this.setPicking(false);
+        return;
+      }
       pickImageUris(remaining).then((uris: string[]) => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
-        this.enqueue(uris);
+        if (!this.isBusy()) this.enqueue(uris);
       }).catch(() => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
       });
     }, 160);
@@ -190,14 +208,21 @@ export class ComposerImageQueue {
       promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
       return;
     }
+    const generation = ++this.pickerGeneration;
     this.setPicking(true);
     setTimeout(() => {
+      if (generation !== this.pickerGeneration || this.isBusy()) {
+        if (generation === this.pickerGeneration) this.setPicking(false);
+        return;
+      }
       pickScreenshotUris(context, remaining).then((uris: string[]) => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
-        this.enqueue(uris);
+        if (!this.isBusy()) this.enqueue(uris);
       }).catch(() => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
-        promptAction.showToast({ message: '无法打开截图选择器' });
+        if (!this.isBusy()) promptAction.showToast({ message: '无法打开截图选择器' });
       });
     }, 160);
   }
@@ -209,19 +234,34 @@ export class ComposerImageQueue {
       }
       return;
     }
+    const generation = ++this.pickerGeneration;
     this.setPicking(true);
     setTimeout(() => {
+      if (generation !== this.pickerGeneration || this.isBusy()) {
+        if (generation === this.pickerGeneration) this.setPicking(false);
+        return;
+      }
       takePhotoUri(context).then((uri: string) => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
-        if (uri.length > 0) this.enqueue([uri]);
+        if (!this.isBusy() && uri.length > 0) this.enqueue([uri]);
       }).catch(() => {
+        if (generation !== this.pickerGeneration) return;
         this.setPicking(false);
-        promptAction.showToast({ message: '无法打开相机' });
+        if (!this.isBusy()) promptAction.showToast({ message: '无法打开相机' });
       });
     }, 160);
   }
 
+  /** 使尚未返回的系统选择器结果失效，并同步收口页面忙碌态。 */
+  cancelPicking(): void {
+    this.pickerGeneration += 1;
+    if (!this.picking) return;
+    this.setPicking(false);
+  }
+
   enqueue(uris: string[]): void {
+    if (this.isBusy()) return;
     let remaining = this.remainingSlots();
     let accepted = 0;
     for (let i = 0; i < uris.length && remaining > 0; i++) {

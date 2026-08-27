@@ -18,9 +18,11 @@
 import {
   RenderItem,
   RenderMessageItem,
+  RenderSubagentGroupItem,
   RenderThinkingItem,
   RenderWorkGroupItem,
 } from '../messages/MessageRender';
+import { readObj } from '../tasks/TaskModels';
 
 /** 单张导出图任一边的保守像素上限（设备实际值可用 hidumper vktextureLimit 查询）。 */
 export const SHARE_MAX_IMAGE_EDGE_PX = 8192;
@@ -52,12 +54,13 @@ export class ShareProjection {
  * 它们是"当前待办"而不是对话内容，且常含内部路径与失败堆栈。
  */
 export function isShareableRenderType(type: string): boolean {
-  return type === 'message' || type === 'work_group' || type === 'thinking';
+  return type === 'message' || type === 'work_group' || type === 'thinking'
+    || type === 'subagent_group';
 }
 
 /** 内部错误详情与敏感路径不进导出；这类消息 kind 直接排除。 */
 export function isShareableMessageKind(kind: string): boolean {
-  return kind === 'user' || kind === 'assistant' || kind === 'system';
+  return kind === 'user' || kind === 'assistant';
 }
 
 class VisibleText {
@@ -85,8 +88,7 @@ export function freezeShareProjection(
 
     if (item.type === 'message') {
       const message = item as RenderMessageItem;
-      if (message.hidden) continue;
-      if (!isShareableMessageKind(message.kind)) continue;
+      if (!isShareableMessage(message)) continue;
       const projected = new ShareProjectionItem();
       projected.key = item.key;
       projected.kind = message.kind;
@@ -113,15 +115,145 @@ export function freezeShareProjection(
     const projected = new ShareProjectionItem();
     projected.key = item.key;
     if (item.type === 'thinking') {
+      const thinking = item as RenderThinkingItem;
+      if (thinking.redacted || thinking.body.trim().length === 0) continue;
       projected.kind = 'thinking';
-      projected.text = (item as RenderThinkingItem).body;
-    } else {
+      projected.text = thinking.body;
+    } else if (item.type === 'work_group') {
       projected.kind = 'work';
-      projected.text = workGroupShareText(item as RenderWorkGroupItem);
+      const work = workGroupShareText(
+        item as RenderWorkGroupItem, expandedKeys, collapsedUserTextLimit,
+        visibleUserTextOverrides,
+      );
+      projected.text = work.text;
+      out.omittedCollapsedContent = out.omittedCollapsedContent || work.omitted;
+    } else {
+      // Subagent group 的展开态与 work_group 共用同一份可见子树；折叠时不应把
+      // 摘要或子消息偷偷带入导出，展开后只保留实际可见的正文与思考内容。
+      projected.kind = 'work';
+      const subagent = item as RenderSubagentGroupItem;
+      const work = subagentShareText(
+        subagent, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides,
+      );
+      projected.text = work.text;
+      out.omittedCollapsedContent = out.omittedCollapsedContent || work.omitted;
     }
+    // 展开的工作组可能只有工具调用或被隐藏的内部行；不要生成空白工作卡。
+    if (projected.text.trim().length === 0) continue;
     out.items.push(projected);
   }
   return out;
+}
+
+/** 工作组子树的可见文字；不把工具 input/result 原文带出设备。 */
+class WorkShareText {
+  text: string = '';
+  omitted: boolean = false;
+}
+
+function appendWorkSharePart(result: WorkShareText, text: string): void {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return;
+  result.text = result.text.length === 0 ? trimmed : `${result.text}\n${trimmed}`;
+}
+
+function workGroupShareText(
+  group: RenderWorkGroupItem,
+  expandedKeys: Set<string>,
+  collapsedUserTextLimit: number,
+  visibleUserTextOverrides: Map<string, string> | undefined,
+): WorkShareText {
+  const result = new WorkShareText();
+  collectWorkShareText(
+    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result,
+  );
+  return result;
+}
+
+function subagentShareText(
+  group: RenderSubagentGroupItem,
+  expandedKeys: Set<string>,
+  collapsedUserTextLimit: number,
+  visibleUserTextOverrides: Map<string, string> | undefined,
+): WorkShareText {
+  const result = new WorkShareText();
+  collectWorkShareText(
+    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result,
+  );
+  return result;
+}
+
+function collectWorkShareText(
+  items: RenderItem[],
+  expandedKeys: Set<string>,
+  collapsedUserTextLimit: number,
+  visibleUserTextOverrides: Map<string, string> | undefined,
+  result: WorkShareText,
+): void {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type === 'message') {
+      const message = item as RenderMessageItem;
+      if (!isShareableMessage(message)) continue;
+      const overriddenText = visibleUserTextOverrides?.get(item.key);
+      if (overriddenText !== undefined) {
+        appendWorkSharePart(result, overriddenText);
+        if (overriddenText !== message.body) result.omitted = true;
+        continue;
+      }
+      const visible = visibleUserText(message, collapsedUserTextLimit);
+      appendWorkSharePart(result, visible.text);
+      if (visible.truncated) result.omitted = true;
+      continue;
+    }
+    if (item.type === 'work_group') {
+      // 当前 ArkUI 的 workGroupChild 会把嵌套 work_group 直接展开，不提供第二个
+      // 折叠入口，因此父组打开后递归读取其子树即可。
+      collectWorkShareText(
+        (item as RenderWorkGroupItem).children, expandedKeys, collapsedUserTextLimit,
+        visibleUserTextOverrides, result,
+      );
+      continue;
+    }
+    if (item.type === 'thinking') {
+      const thinking = item as RenderThinkingItem;
+      if (!expandedKeys.has(item.key)) {
+        if (thinking.redacted || thinking.body.trim().length > 0) result.omitted = true;
+        continue;
+      }
+      if (thinking.redacted) {
+        result.omitted = true;
+        continue;
+      }
+      appendWorkSharePart(result, thinking.body);
+      continue;
+    }
+    if (item.type === 'subagent_group') {
+      const subagent = item as RenderSubagentGroupItem;
+      if (!expandedKeys.has(item.key)) {
+        if (subagent.children.length > 0) {
+          result.omitted = true;
+        }
+        continue;
+      }
+      collectWorkShareText(
+        subagent.children, expandedKeys, collapsedUserTextLimit,
+        visibleUserTextOverrides, result,
+      );
+    }
+  }
+}
+
+/** 与页面选择态及 Mobile isShareableMessage 保持同一过滤边界。 */
+function isShareableMessage(message: RenderMessageItem): boolean {
+  if (message.hidden || !isShareableMessageKind(message.kind)) return false;
+  const source = message.message;
+  // 纯逻辑单测可构造没有原始消息的 RenderMessageItem；其 kind 已足够表达分享边界。
+  if (source === undefined) return true;
+  if (source.systemCardType.length > 0 || source.isSyntheticTrigger || source.presentedAsAgent) {
+    return false;
+  }
+  return Object.keys(readObj(source.agentMeta, 'hookSource')).length === 0;
 }
 
 /** 长用户消息收起后只导出可见行，与屏幕一致。 */
@@ -134,19 +266,6 @@ function visibleUserText(message: RenderMessageItem, collapsedLimit: number): Vi
   result.text = lines.slice(0, collapsedLimit).join('\n');
   result.truncated = true;
   return result;
-}
-
-/** 工作组只导出子项的可读摘要，不导出内部工具入参与结果原文。 */
-function workGroupShareText(group: RenderWorkGroupItem): string {
-  const parts: string[] = [];
-  for (let i = 0; i < group.children.length; i++) {
-    const child = group.children[i];
-    if (child.type === 'message') {
-      const body = (child as RenderMessageItem).body.trim();
-      if (body.length > 0) parts.push(body);
-    }
-  }
-  return parts.join('\n');
 }
 
 /** 分段计划：一次导出需要几张图，以及是否必须让用户缩小范围。 */

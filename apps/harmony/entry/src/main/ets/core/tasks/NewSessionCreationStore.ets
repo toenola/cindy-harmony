@@ -10,7 +10,7 @@ import { DlChannels, sessionTopic } from '../device-link/DlProtocol';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
 import { InputQueueStore, QueuedInputItem } from '../messages/InputQueueStore';
 import { MessageStore } from '../messages/MessageStore';
-import { RemoteSession, parseSession, readStr } from './TaskModels';
+import { RemoteSession, parseSession, readStr, safeErrorMessage } from './TaskModels';
 import { TaskStore, unwrapInvokeResult } from './TaskStore';
 
 const CREATE_ATTEMPTS = 3;
@@ -24,7 +24,7 @@ function creationDelay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-export function isTransientNewSessionError(error: Object): boolean {
+export function isTransientNewSessionError(error: Object | undefined): boolean {
   let code = '';
   if (error instanceof DlError) {
     code = error.code;
@@ -32,7 +32,7 @@ export function isTransientNewSessionError(error: Object): boolean {
     const rawCode = (error as Record<string, Object>)['code'];
     if (typeof rawCode === 'string') code = rawCode;
   }
-  const message = error instanceof Error ? error.message : JSON.stringify(error);
+  const message = safeErrorMessage(error);
   const text = `${code} ${message}`;
   const permanent = ['REMOTE_DISABLED', 'CHANNEL_NOT_ALLOWED', 'DEVICE_UNRESPONSIVE'];
   for (let i = 0; i < permanent.length; i++) {
@@ -108,6 +108,8 @@ export class NewSessionCreationTask {
   params: NewSessionCreationParams = new NewSessionCreationParams();
   temporaryTopicRequested: boolean = false;
   temporaryTopicHandedOff: boolean = false;
+  /** 任务被全局清理后，旧订阅 Promise 不能再为新账号/新页面排队退订。 */
+  lifecycleGeneration: number = 0;
 }
 
 class NewSessionExactProbeResult {
@@ -147,6 +149,8 @@ export class NewSessionCreationStore {
   private topicRemovalEpochs: Map<string, number> = new Map();
   private nextTopicRemovalEpoch: number = 0;
   private topicRemovalRetryTimers: Map<string, number> = new Map();
+  /** 账号切换/停止清理会推进此代次，围住所有临时 topic 异步回调。 */
+  private lifecycleGeneration: number = 0;
 
   attach(
     client: DlClient,
@@ -196,6 +200,7 @@ export class NewSessionCreationStore {
     task.firstMessageFiles = params.firstMessageFiles.slice();
     task.session = params.session;
     task.params = params;
+    task.lifecycleGeneration = this.lifecycleGeneration;
     this.tasks.set(task.sessionId, task);
     this.tasksStore?.upsertSession(task.deviceId, task.session);
     this.inputQueue?.seedOptimisticText(
@@ -255,7 +260,7 @@ export class NewSessionCreationStore {
       task.status = 'create-failed';
       task.error = '暂时无法确认电脑上是否已经创建该任务，请稍后重试';
       this.inputQueue?.markLocalFailure(
-        task.sessionId, task.firstMessageClientId, task.error);
+        task.sessionId, task.firstMessageClientId, task.error, task.deviceId);
       this.notify();
       return 'unknown';
     }
@@ -311,7 +316,7 @@ export class NewSessionCreationStore {
     this.releaseTemporaryTopic(task);
     if (removeSyntheticSession) {
       this.tasksStore?.removeLocalSession(task.deviceId, sessionId);
-      this.inputQueue?.clearSession(sessionId);
+      this.inputQueue?.clearSession(sessionId, task.deviceId);
     }
     this.notify();
   }
@@ -325,17 +330,36 @@ export class NewSessionCreationStore {
     this.notify();
   }
 
-  clearAll(): void {
+  /**
+   * 清理应用级创建任务。
+   *
+   * 同账号的普通断线可以保留待退订 topic，待下一次 online 补偿；登出时调用方
+   * 已经停止旧 socket，则必须丢弃这些旧账号的退订请求，不能让新账号复用同一
+   * deviceId 时误操作旧 lease。
+   */
+  clearAll(preserveTopicRemovals: boolean = true): void {
+    const tasks: NewSessionCreationTask[] = [];
+    this.tasks.forEach((task: NewSessionCreationTask) => tasks.push(task));
+    // 先释放仍由当前 Store 持有的临时 lease，再推进代次；已经 handoff 的任务由
+    // 正式 MessageStore owner 管理，不应在这里抢退订。
+    for (let i = 0; i < tasks.length; i++) {
+      if (!tasks[i].temporaryTopicHandedOff) this.releaseTemporaryTopic(tasks[i]);
+    }
+    this.lifecycleGeneration += 1;
     this.editDraft = null;
-    if (this.tasks.size === 0) return;
-    const pending: NewSessionCreationTask[] = [];
-    this.tasks.forEach((task: NewSessionCreationTask) => pending.push(task));
     this.tasks.clear();
-    for (let i = 0; i < pending.length; i++) {
-      this.releaseTemporaryTopic(pending[i]);
-      if (pending[i].session.pendingLocalCreation) {
-        this.tasksStore?.removeLocalSession(pending[i].deviceId, pending[i].sessionId);
+    for (let i = 0; i < tasks.length; i++) {
+      if (tasks[i].session.pendingLocalCreation) {
+        this.tasksStore?.removeLocalSession(tasks[i].deviceId, tasks[i].sessionId);
       }
+    }
+    if (!preserveTopicRemovals) {
+      this.topicRemovalRetryTimers.forEach((timer: number) => clearTimeout(timer));
+      this.topicRemovalRetryTimers.clear();
+      // 在途 unsubscribe 的 finally/catch 通过 epoch map 失效，不得触碰新账号状态。
+      this.pendingTopicRemovals.clear();
+      this.topicRemovalInFlight.clear();
+      this.topicRemovalEpochs.clear();
     }
     this.notify();
   }
@@ -351,6 +375,10 @@ export class NewSessionCreationStore {
 
   private isCurrent(task: NewSessionCreationTask): boolean {
     return this.tasks.get(task.sessionId) === task;
+  }
+
+  private isCurrentLifecycle(task: NewSessionCreationTask): boolean {
+    return task.lifecycleGeneration === this.lifecycleGeneration;
   }
 
   private async run(
@@ -394,7 +422,8 @@ export class NewSessionCreationStore {
         if (verdict === 'queued') {
           this.inputQueue?.clearLocalFailure(task.firstMessageClientId);
         } else if (verdict === 'applied') {
-          this.inputQueue?.resolveAppliedDelivery(task.sessionId, task.firstMessageClientId);
+          this.inputQueue?.resolveAppliedDelivery(
+            task.sessionId, task.firstMessageClientId, task.deviceId);
         } else {
           await this.failEnqueue(task, verdict === 'missing'
             ? '首条消息尚未送达，请先核对任务内容后再重新发送'
@@ -425,10 +454,11 @@ export class NewSessionCreationStore {
     } catch (error) {
       if (!this.isCurrent(task)) return;
       this.releaseTemporaryTopic(task);
-      const message = error instanceof Error ? error.message : JSON.stringify(error);
+      const message = safeErrorMessage(error);
       task.status = 'create-failed';
       task.error = message.length > 0 ? message : '新任务创建失败，请重试';
-      this.inputQueue?.markLocalFailure(task.sessionId, task.firstMessageClientId, task.error);
+      this.inputQueue?.markLocalFailure(
+        task.sessionId, task.firstMessageClientId, task.error, task.deviceId);
       this.notify();
     }
   }
@@ -463,7 +493,7 @@ export class NewSessionCreationStore {
         }
         return record;
       } catch (error) {
-        const normalized = error instanceof Error ? error : new Error(JSON.stringify(error));
+        const normalized = error instanceof Error ? error : new Error(safeErrorMessage(error));
         lastError = normalized;
         if (!isTransientNewSessionError(normalized)) throw normalized;
       }
@@ -533,13 +563,14 @@ export class NewSessionCreationStore {
     for (let i = 0; i < ENQUEUE_PROBE_DELAYS_MS.length; i++) {
       await creationDelay(ENQUEUE_PROBE_DELAYS_MS[i]);
       if (!this.isCurrent(task)) return 'unknown';
-      if (this.messages?.hasMessageClientId(task.sessionId, task.firstMessageClientId)) {
+      if (this.messages?.hasMessageClientId(
+        task.sessionId, task.firstMessageClientId, task.deviceId)) {
         return 'applied';
       }
       const projectionLoaded = await this.inputQueue?.refresh(task.deviceId, task.sessionId) ?? false;
       if (!this.isCurrent(task)) return 'unknown';
       if (!projectionLoaded) continue;
-      const projection = this.inputQueue?.getProjection(task.sessionId);
+      const projection = this.inputQueue?.getProjection(task.sessionId, task.deviceId);
       if (projection !== undefined && projection.pendingQueue.some((item) =>
         item.clientId === task.firstMessageClientId)) return 'queued';
       const messageVerdict = await this.messages?.probeMessageClientId(
@@ -560,7 +591,7 @@ export class NewSessionCreationStore {
     task.status = 'enqueue-failed';
     task.error = message;
     task.session.pendingLocalCreation = false;
-    this.inputQueue?.discardProjection(task.sessionId);
+    this.inputQueue?.discardProjection(task.sessionId, task.deviceId);
     this.tasksStore?.setPendingLocalCreation(task.deviceId, task.sessionId, false);
     task.temporaryTopicHandedOff = true;
     this.notify();
@@ -577,6 +608,7 @@ export class NewSessionCreationStore {
     // 先记 lease，再发 RPC；clearAll 与 ACK 丢失窗口都能据此安排补偿 unsubscribe。
     task.temporaryTopicRequested = true;
     void client.subscribe(task.deviceId, [topic], TEMPORARY_TOPIC_TIMEOUT_MS).then(() => {
+      if (!this.isCurrentLifecycle(task)) return;
       if (task.temporaryTopicHandedOff) {
         return;
       }
@@ -586,6 +618,7 @@ export class NewSessionCreationStore {
         this.queueTopicRemoval(task.deviceId, topic);
       }
     }).catch(() => {
+      if (!this.isCurrentLifecycle(task)) return;
       // 请求可能已在 Desktop 生效但 ACK 丢失；释放过的 lease 必须保留补偿清理。
       if (!task.temporaryTopicHandedOff
         && (!task.temporaryTopicRequested || !this.isCurrent(task))) {
@@ -595,6 +628,7 @@ export class NewSessionCreationStore {
   }
 
   private releaseTemporaryTopic(task: NewSessionCreationTask): void {
+    if (!this.isCurrentLifecycle(task)) return;
     if (task.temporaryTopicHandedOff) return;
     if (!task.temporaryTopicRequested) return;
     task.temporaryTopicRequested = false;
@@ -603,8 +637,10 @@ export class NewSessionCreationStore {
 
   /** notify 后让仍在场的 TaskPage 先登记正式订阅；页面已离场时才补做退订。 */
   private finishTemporaryTopicHandoff(task: NewSessionCreationTask): void {
+    const lifecycleGeneration = task.lifecycleGeneration;
     setTimeout(() => {
-      if (this.messages?.isSessionOpen(task.sessionId)) {
+      if (lifecycleGeneration !== this.lifecycleGeneration) return;
+      if (this.messages?.isSessionOpen(task.sessionId, task.deviceId)) {
         task.temporaryTopicRequested = false;
         return;
       }
@@ -700,7 +736,7 @@ export class NewSessionCreationStore {
 
   private isNotFoundError(error: Object): boolean {
     if (error instanceof DlError && error.code === 'NOT_FOUND') return true;
-    const message = error instanceof Error ? error.message : JSON.stringify(error);
+    const message = safeErrorMessage(error);
     return message.indexOf('[NOT_FOUND]') >= 0;
   }
 

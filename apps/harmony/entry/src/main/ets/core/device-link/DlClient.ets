@@ -20,6 +20,7 @@ import {
   RECONNECT_CONGESTION_STABLE_RESET_MS, ReconnectStability,
   CONTROLLER_CAPABILITIES, encodeEnvelope, decodeEnvelope,
 } from './DlProtocol';
+import { safeErrorMessage } from '../tasks/TaskModels';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyDl';
@@ -118,8 +119,17 @@ export class DlEvents {
   onPresence: (snap: PresenceSnapshot) => void = (snap: PresenceSnapshot) => {
   };
   /** push 帧（src=deviceId） */
-  onPush: (deviceId: string, channel: string, payload: Object | undefined) => void =
-    (deviceId: string, channel: string, payload: Object | undefined) => {
+  onPush: (
+    deviceId: string,
+    channel: string,
+    payload: Object | undefined,
+    ownerStamp: Object | undefined,
+  ) => void = (
+    deviceId: string,
+    channel: string,
+    payload: Object | undefined,
+    ownerStamp: Object | undefined,
+  ) => {
     };
   /** 握手成功（hello-ack 收到）。 */
   onHelloAck: (ack: HelloAckPayload) => void = (ack: HelloAckPayload) => {
@@ -256,7 +266,7 @@ export class DlClient {
     try {
       token = await this.opts.getToken();
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'getToken failed: %{public}s', JSON.stringify(e));
+      hilog.warn(DOMAIN, TAG, 'getToken failed: %{public}s', safeErrorMessage(e));
     }
     if (token === null || token.length === 0) {
       hilog.warn(DOMAIN, TAG, 'no token, schedule reconnect');
@@ -473,7 +483,7 @@ export class DlClient {
     const p = this.payloadObj(env);
     const channel = this.readStr(p, 'channel');
     const payload = p['payload'];
-    this.opts.events.onPush(env.src, channel, payload);
+    this.opts.events.onPush(env.src, channel, payload, p['ownerStamp']);
   }
 
   private handleRelayError(env: Envelope): void {
@@ -607,7 +617,7 @@ export class DlClient {
         } catch (e) {
           this.pending.delete(id);
           this.clearTimer(req.timer);
-          const message = e instanceof Error ? e.message : JSON.stringify(e);
+          const message = safeErrorMessage(e);
           reject(new DlError('SEND_FAILED', message, true));
           return;
         }

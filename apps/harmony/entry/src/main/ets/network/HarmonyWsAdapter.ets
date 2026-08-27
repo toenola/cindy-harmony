@@ -14,6 +14,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
 import { WsAdapter, WsCallbacks, WsMessage } from './WsAdapter';
+import { safeErrorMessage } from '../core/tasks/TaskModels';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyWs';
@@ -46,7 +47,7 @@ export class HarmonyWsAdapter implements WsAdapter {
 
     ws.on('open', (err: BusinessError) => {
       if (err) {
-        hilog.error(DOMAIN, TAG, 'open error: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, TAG, 'open error: %{public}s', safeErrorMessage(err));
         this.callbacks.onError(new Error(err.message));
         return;
       }
@@ -56,7 +57,7 @@ export class HarmonyWsAdapter implements WsAdapter {
 
     ws.on('message', (err: BusinessError, data: string | ArrayBuffer) => {
       if (err) {
-        hilog.error(DOMAIN, TAG, 'message error: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, TAG, 'message error: %{public}s', safeErrorMessage(err));
         this.callbacks.onError(new Error(err.message));
         return;
       }
@@ -73,7 +74,7 @@ export class HarmonyWsAdapter implements WsAdapter {
 
     ws.on('close', (err: BusinessError, value: webSocket.CloseResult) => {
       if (err) {
-        hilog.error(DOMAIN, TAG, 'close error: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, TAG, 'close error: %{public}s', safeErrorMessage(err));
         this.callbacks.onError(new Error(err.message));
       }
       hilog.info(DOMAIN, TAG, 'closed code=%{public}d reason=%{public}s',
@@ -83,11 +84,11 @@ export class HarmonyWsAdapter implements WsAdapter {
     });
 
     ws.on('error', (err: BusinessError) => {
-      hilog.error(DOMAIN, TAG, 'error: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, 'error: %{public}s', safeErrorMessage(err));
       // 鸿蒙 WS 的握手失败信息在 err.data（如 "401"），message 常为空——
-      // 必须透传完整信息（JSON.stringify(err) 含 code/data），client 侧靠它
-      // 识别鉴权失败（401/unauthorized）。
-      const detail = `${err.message} ${JSON.stringify(err)}`.trim();
+      // 必须透传完整信息（安全序列化结果含 code/data），client 侧靠它识别
+      // 鉴权失败（401/unauthorized）。
+      const detail = `${err.message} ${safeErrorMessage(err)}`.trim();
       this.callbacks.onError(new Error(detail.length > 0 ? detail : 'WebSocket error'));
     });
 

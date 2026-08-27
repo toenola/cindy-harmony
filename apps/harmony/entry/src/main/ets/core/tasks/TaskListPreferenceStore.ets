@@ -10,6 +10,9 @@ export class TaskListPreferences {
   selectedDeviceName: string = '';
   activeListTab: string = 'projects';
   sortMode: string = 'recency';
+  /** 所有电脑范围下的本机项目顺序；单台电脑范围优先使用被控端正本。 */
+  projectOrder: string = 'activity';
+  manualProjectOrder: string[] = [];
   searchQuery: string = '';
   openProjectKeys: string[] = [];
   fullyExpandedProjectKeys: string[] = [];
@@ -51,6 +54,8 @@ export function parseTaskListPreferences(raw: string): TaskListPreferences {
     if (sortMode === 'default' || sortMode === 'recency' || sortMode === 'alphabetic') {
       out.sortMode = sortMode;
     }
+    if (safeString(record, 'projectOrder', 20) === 'custom') out.projectOrder = 'custom';
+    out.manualProjectOrder = safeKeys(record['manualProjectOrder']);
     // 旧版把自动化放在状态筛选中；升级后迁移到新的一级分类。
     if (safeString(record, 'statusFilter', 20) === 'automation') out.activeListTab = 'automations';
     out.searchQuery = safeString(record, 'searchQuery', 256);
@@ -69,6 +74,8 @@ export function serializeTaskListPreferences(value: TaskListPreferences): string
   if (value.selectedDeviceName.length > 0) out['selectedDeviceName'] = value.selectedDeviceName;
   if (value.activeListTab !== 'projects') out['activeListTab'] = value.activeListTab;
   if (value.sortMode !== 'recency') out['sortMode'] = value.sortMode;
+  if (value.projectOrder === 'custom') out['projectOrder'] = 'custom';
+  if (value.manualProjectOrder.length > 0) out['manualProjectOrder'] = value.manualProjectOrder;
   if (value.searchQuery.length > 0) out['searchQuery'] = value.searchQuery;
   if (value.openProjectKeys.length > 0) out['openProjectKeys'] = value.openProjectKeys;
   if (value.fullyExpandedProjectKeys.length > 0) out['fullyExpandedProjectKeys'] = value.fullyExpandedProjectKeys;

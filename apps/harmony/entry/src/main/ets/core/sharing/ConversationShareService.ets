@@ -200,6 +200,9 @@ export class ConversationShareService {
     this.controller = controller;
     this.flow.resources().notePanelSubscribed(true);
     const settle = (): void => {
+      // dismiss/shareCompleted 可能在页面退出后迟到，或同一个控制器同时发出两次；
+      // 旧代次不能结束新一轮分享，也不能重复清理新一轮的资源。
+      if (!this.flow.isCurrent(generation)) return;
       this.release();
       onFinished();
     };
@@ -216,8 +219,10 @@ export class ConversationShareService {
     } catch (e) {
       const message = e instanceof Error ? (e as Error).message : 'share-panel-failed';
       hilog.error(DOMAIN, TAG, 'share panel failed: %{public}s', message);
-      this.fail(generation, message);
-      onFinished();
+      if (this.flow.isCurrent(generation)) {
+        this.fail(generation, message);
+        onFinished();
+      }
     }
   }
 

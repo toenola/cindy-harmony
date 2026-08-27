@@ -31,9 +31,33 @@ import {
   hdsMaterial,
 } from '@kit.UIDesignKit';
 import { AppServices } from '../core/AppServices';
+import { harmonyV12String } from '../core/HarmonyStrings';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr } from '../core/tasks/TaskModels';
 import { SessionLiveActivity, SessionMetaPatch } from '../core/tasks/TaskStore';
+import {
+  listTaskSearchProjects,
+  TaskSearchAgentFilter,
+  TaskSearchFilters,
+  TaskSearchLastActivityFilter,
+  TaskSearchOrigin,
+  TaskSearchProjectOption,
+  TaskSearchRequest,
+  TaskSearchResult,
+  TaskSearchSortBy,
+  TaskSearchStatus,
+  TaskSearchStatusFilter,
+  TASK_SEARCH_DEBOUNCE_MS,
+  taskSearchActiveFilterCount,
+} from '../core/tasks/TaskSearchStore';
+import {
+  TaskProjectOrderMode,
+  TaskProjectOrderProject,
+  TaskProjectOrderSnapshot,
+  reconcileTaskProjectOrder,
+  reorderVisibleTaskProjectOrder,
+  taskProjectOrderKey,
+} from '../core/tasks/TaskProjectOrderStore';
 import { TaskListPreferences } from '../core/tasks/TaskListPreferenceStore';
 import {
   TASK_LIST_RECONCILE_INTERVAL_MS,
@@ -59,11 +83,11 @@ import {
   taskDisplayTitle,
   taskListEntryPresentationState,
   taskListCategory,
+  taskListShouldShowFloatingBarAtBoundary,
   TaskListCategory,
   TaskRightStatusKind,
   TaskListSortMode,
   taskPreviewText,
-  taskProjectKey,
   taskProjectName,
   taskRelativeTime,
   taskVisibleInTaskList,
@@ -112,6 +136,8 @@ class TaskListEntry {
 
 class TaskProjectGroup {
   key: string = '';
+  deviceId: string = '';
+  workingDir: string = '';
   title: string = '';
   latestActivityAt: string = '';
   entries: TaskListEntry[] = [];
@@ -133,8 +159,26 @@ struct TaskListPage {
   @State sortMenuOpen: boolean = false;
   @State activeListTab: TaskListCategory = 'projects';
   @State sortMode: TaskListSortMode = 'recency';
+  /** 多设备范围使用本机账本；单设备范围优先使用被控端账本。 */
+  @State projectOrderMode: TaskProjectOrderMode = 'activity';
+  @State projectManualOrder: string[] = [];
+  @State projectOrderHostLoaded: boolean = false;
+  @State projectOrderHostAvailable: boolean = true;
+  @State projectOrderSyncing: boolean = false;
+  @State projectOrderPendingMode: string = '';
+  @State projectOrderPendingKeys: string[] = [];
+  @State projectOrderDraggingKey: string = '';
   @State searchOpen: boolean = false;
   @State searchQuery: string = '';
+  @State taskSearchStatus: TaskSearchStatus = 'idle';
+  @State taskSearchResults: TaskSearchResult[] = [];
+  @State taskSearchUsedCacheFallback: boolean = false;
+  @State taskSearchFilterOpen: boolean = false;
+  @State taskSearchStatusFilter: TaskSearchStatusFilter = 'all';
+  @State taskSearchAgentFilter: TaskSearchAgentFilter = 'all';
+  @State taskSearchLastActivityFilter: TaskSearchLastActivityFilter = 'all';
+  @State taskSearchSortBy: TaskSearchSortBy = 'relevance';
+  @State taskSearchProjectKeys: string[] = [];
   @State refreshing: boolean = false;
   @State sessionActionBusy: boolean = false;
   @State bulkMode: boolean = false;
@@ -162,11 +206,21 @@ struct TaskListPage {
   private taskListLoadInFlight: Map<string, Promise<boolean>> = new Map();
   private taskListReconcileBackoff: TaskListReconcileBackoff = new TaskListReconcileBackoff();
   private taskListReconcileGeneration: number = 0;
+  private taskSearchGeneration: number = 0;
+  private taskSearchTimer: number = -1;
+  private projectOrderScopeGeneration: number = 0;
+  private projectOrderSuppressClick: boolean = false;
+  private projectDragStartY: number = 0;
+  private projectDragStartIndex: number = -1;
+  private projectDragStartOrder: string[] = [];
+  private projectDragMoved: boolean = false;
   private dividerTouchStartX: number = 0;
   private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
   private foldStatusListening: boolean = false;
   private singlePaneNavigationPending: boolean = false;
   private pageActive: boolean = false;
+  /** 页面重进后，旧的刷新/任务操作 Promise 不能再改写新页面状态。 */
+  private pageLifecycleGeneration: number = 0;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
@@ -193,6 +247,7 @@ struct TaskListPage {
   };
 
   aboutToAppear(): void {
+    this.pageLifecycleGeneration += 1;
     this.pageActive = true;
     this.singlePaneNavigationPending = false;
     this.taskListReconcileGeneration += 1;
@@ -228,14 +283,35 @@ struct TaskListPage {
     this.unsubs.push(AppServices.instance.messages.onRunningStateChanged(() => {
       this.refreshProjection();
     }));
+    this.unsubs.push(AppServices.instance.taskProjectOrder.onChanged((deviceId: string) => {
+      if (deviceId !== this.selectedDeviceId) return;
+      const snapshot = AppServices.instance.taskProjectOrder.snapshot(deviceId);
+      this.projectOrderHostLoaded = snapshot !== undefined;
+      this.projectOrderHostAvailable = this.isUsableHostProjectOrder(snapshot);
+      this.projectOrderPendingKeys = [];
+      this.projectOrderSyncing = false;
+      this.refreshProjection();
+    }));
     this.unsubs.push(AppServices.instance.onStatus((status: string) => {
       this.connectionStatus = status;
+      if (status === 'online') {
+        if (this.selectedDeviceId.length > 0) void this.refreshProjectOrderForScope();
+      } else {
+        // 连接代次变化时，旧主机快照不能继续作为当前正本；页面暂时使用本机投影。
+        this.projectOrderScopeGeneration += 1;
+        this.projectOrderHostLoaded = false;
+        this.projectOrderHostAvailable = true;
+        this.projectOrderPendingKeys = [];
+        this.projectOrderSyncing = false;
+        this.refreshProjection();
+      }
     }));
     this.unsubs.push(AppServices.instance.onDeepLink(() => {
       this.tryOpenPendingDeepLink();
     }));
 
     this.refreshProjection();
+    void this.refreshProjectOrderForScope();
     AppServices.instance.syncSessionSubscriptions();
     // Mobile 同源语义：进入列表先做一轮权威对账；push 仍是实时主路径。
     void this.refreshTaskList(false);
@@ -249,8 +325,10 @@ struct TaskListPage {
   }
 
   aboutToDisappear(): void {
+    this.pageLifecycleGeneration += 1;
     this.pageActive = false;
     this.taskListReconcileGeneration += 1;
+    this.cancelTaskSearch();
     for (const unsubscribe of this.unsubs) {
       unsubscribe();
     }
@@ -265,6 +343,8 @@ struct TaskListPage {
     }
     this.taskListLoadInFlight.clear();
     this.taskListReconcileBackoff.clear();
+    this.refreshing = false;
+    this.sessionActionBusy = false;
     this.stopFoldStatusObservation();
     this.stopKeyboardHeightObservation();
     this.keyboardHeight = 0;
@@ -274,9 +354,17 @@ struct TaskListPage {
     void AppServices.instance.taskListPreferences.flush();
     this.scopeMenuOpen = false;
     this.sortMenuOpen = false;
+    this.taskSearchFilterOpen = false;
+    this.projectOrderScopeGeneration += 1;
+    this.projectOrderPendingKeys = [];
+    this.projectOrderDraggingKey = '';
   }
 
   onBackPress(): boolean {
+    if (this.taskSearchFilterOpen) {
+      this.closeTaskSearchFilter();
+      return true;
+    }
     if (this.scopeMenuOpen) {
       this.closeScopeMenu();
       return true;
@@ -304,6 +392,8 @@ struct TaskListPage {
     this.sortMode = prefs.sortMode as TaskListSortMode;
     this.searchQuery = prefs.searchQuery;
     this.searchOpen = prefs.searchQuery.length > 0;
+    this.projectOrderMode = prefs.projectOrder === 'custom' ? 'custom' : 'activity';
+    this.projectManualOrder = prefs.manualProjectOrder.slice();
     this.savedOpenProjectKeys = prefs.openProjectKeys.slice();
     this.expandedProjectKeys = prefs.fullyExpandedProjectKeys.slice();
     this.pinnedCollapsed = prefs.pinnedCollapsed;
@@ -317,6 +407,8 @@ struct TaskListPage {
     prefs.activeListTab = this.activeListTab;
     prefs.sortMode = this.sortMode;
     prefs.searchQuery = this.searchQuery.slice(0, 256);
+    prefs.projectOrder = this.projectOrderMode;
+    prefs.manualProjectOrder = this.projectManualOrder.slice();
     const groups = this.projectGroups();
     for (let i = 0; i < groups.length; i++) {
       if (!this.projectCollapsed(groups[i].key)) prefs.openProjectKeys.push(groups[i].key);
@@ -377,9 +469,11 @@ struct TaskListPage {
     }
     this.devices = devices;
     this.entries = next;
+    this.reconcileTaskSearchProjectKeys();
     this.collapseProjectGroupsOnce();
     this.ensureWideSelection();
     this.tryOpenPendingDeepLink();
+    if (this.taskSearchActive()) this.scheduleTaskSearch();
   }
 
   /**
@@ -397,6 +491,26 @@ struct TaskListPage {
   private ensureWideSelection(): void {
     if (!this.splitLayoutEnabled()) return;
     if (this.newSessionDraftOpen) return;
+    if (this.taskSearchActive()) {
+      // 搜索请求尚未完成时保留当前详情，避免每次输入一个字符右栏闪空；
+      // 结果落地后再按当前 Tab 选择首条搜索结果。
+      if (this.taskSearchStatus !== 'ready') return;
+      const results = this.taskSearchResultsForCategory(this.activeListTab);
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].deviceId === this.selectedSessionDeviceId
+          && results[i].session.id === this.selectedSessionId) return;
+      }
+      if (results.length === 0) {
+        this.selectedSessionDeviceId = '';
+        this.selectedSessionId = '';
+        this.selectedMessageClientId = '';
+        return;
+      }
+      this.selectedSessionDeviceId = results[0].deviceId;
+      this.selectedSessionId = results[0].session.id;
+      this.selectedMessageClientId = results[0].contentMessageClientId;
+      return;
+    }
     const scoped = this.activeListEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].deviceId === this.selectedSessionDeviceId
@@ -440,29 +554,36 @@ struct TaskListPage {
   /** 折叠或横转竖退出双栏时，保持用户正在查看的任务详情，而不是退回列表。 */
   private async openSelectedTaskAfterSplitExit(): Promise<void> {
     if (this.singlePaneNavigationPending || this.newSessionDraftOpen) return;
+    const lifecycleGeneration = this.pageLifecycleGeneration;
+    if (!this.pageActive) return;
+    const deviceId = this.selectedSessionDeviceId;
+    const sessionId = this.selectedSessionId;
+    const messageClientId = this.selectedMessageClientId;
     this.singlePaneNavigationPending = true;
     try {
-      if (this.selectedSessionDeviceId.length === 0 || this.selectedSessionId.length === 0) return;
-      if (this.selectedMessageClientId.length > 0) {
+      if (deviceId.length === 0 || sessionId.length === 0) return;
+      if (messageClientId.length > 0) {
         await router.pushUrl({
           url: 'pages/TaskPage',
           params: {
-            deviceId: this.selectedSessionDeviceId,
-            sessionId: this.selectedSessionId,
-            message: this.selectedMessageClientId,
+            deviceId: deviceId,
+            sessionId: sessionId,
+            message: messageClientId,
           },
         });
       } else {
         await router.pushUrl({
           url: 'pages/TaskPage',
           params: {
-            deviceId: this.selectedSessionDeviceId,
-            sessionId: this.selectedSessionId,
+            deviceId: deviceId,
+            sessionId: sessionId,
           },
         });
       }
     } finally {
-      this.singlePaneNavigationPending = false;
+      if (lifecycleGeneration === this.pageLifecycleGeneration) {
+        this.singlePaneNavigationPending = false;
+      }
     }
   }
 
@@ -630,6 +751,11 @@ struct TaskListPage {
     const category = this.listTabCategory(index);
     if (category === this.activeListTab) return;
     this.activeListTab = category;
+    const visibleCount = this.taskSearchActive()
+      ? this.taskSearchResultsForCategory(category).length
+      : this.scopedEntries().length;
+    if (visibleCount === 0) this.showFloatingBar();
+    else this.restoreFloatingBarAtBoundary(category);
     this.ensureWideSelection();
     this.persistPreferences();
   }
@@ -649,7 +775,25 @@ struct TaskListPage {
     return this.projectsScroller;
   }
 
-  private handleTaskListScroll(scrollOffset: number, scrollState: ScrollState): void {
+  /**
+   * 顶部、底部和不足一屏都属于明确边界：底栏必须出现，方向阈值只作用于列表中段。
+   */
+  private restoreFloatingBarAtBoundary(category: TaskListCategory): boolean {
+    const scroller = this.scrollerForCategory(category);
+    const yOffset = scroller.currentOffset().yOffset;
+    if (!taskListShouldShowFloatingBarAtBoundary(yOffset, scroller.isAtEnd())) return false;
+    this.floatingBarScrollIntent = 0;
+    this.showFloatingBar();
+    return true;
+  }
+
+  private handleTaskListScroll(
+    category: TaskListCategory,
+    scrollOffset: number,
+    scrollState: ScrollState,
+  ): void {
+    // 惯性抵达边界也应立即恢复底栏；只有列表中段继续沿用手指方向判断。
+    if (this.restoreFloatingBarAtBoundary(category)) return;
     // 只响应手指拖动；惯性与边缘反馈均为 Fling，不能反向改写用户刚表达的浏览意图。
     if (scrollState !== ScrollState.Scroll) {
       this.floatingBarScrollIntent = 0;
@@ -676,7 +820,9 @@ struct TaskListPage {
     }
   }
 
-  private handleTaskListDragRelease(velocity: number): void {
+  private handleTaskListDragRelease(category: TaskListCategory, velocity: number): void {
+    // 内容不足一屏时没有有效滚动位移，但松手仍能通过真实边界恢复底栏。
+    if (this.restoreFloatingBarAtBoundary(category)) return;
     // 短距离快速甩动可能来不及累计位移，用较克制的速度门槛补齐同一方向语义。
     if (velocity >= FLOATING_BAR_FLING_VELOCITY) this.hideFloatingBar();
     else if (velocity <= -FLOATING_BAR_FLING_VELOCITY) this.showFloatingBar();
@@ -734,6 +880,40 @@ struct TaskListPage {
     });
   }
 
+  /** 搜索结果先种入摘要，再异步用 sessions:get 对账；这样旧任务也能立即进入详情。 */
+  private openTaskSearchResult(result: TaskSearchResult): void {
+    let cached: RemoteSession | undefined = undefined;
+    const sessions = AppServices.instance.tasks.getSessions(result.deviceId);
+    for (let i = 0; i < sessions.length; i++) {
+      if (sessions[i].id === result.session.id) {
+        cached = sessions[i];
+        break;
+      }
+    }
+    if (cached === undefined) {
+      AppServices.instance.tasks.upsertSession(result.deviceId, result.session);
+    }
+    for (let i = 0; i < this.devices.length; i++) {
+      if (this.devices[i].deviceId === result.deviceId && this.deviceCanOpen(this.devices[i])) {
+        void AppServices.instance.tasks.loadSession(result.deviceId, result.session.id);
+        break;
+      }
+    }
+
+    const session = cached ?? result.session;
+    this.selectedSessionDeviceId = result.deviceId;
+    this.selectedSessionId = session.id;
+    this.selectedMessageClientId = result.contentMessageClientId;
+    this.setActiveListTab(taskListCategory(session));
+    this.persistPreferences();
+    if (this.splitLayoutEnabled()) return;
+    const params: Record<string, Object> = {};
+    params['deviceId'] = result.deviceId;
+    params['sessionId'] = session.id;
+    if (result.contentMessageClientId.length > 0) params['message'] = result.contentMessageClientId;
+    void router.pushUrl({ url: 'pages/TaskPage', params });
+  }
+
   private openSettings(): void {
     router.pushUrl({ url: 'pages/SettingsPage' });
   }
@@ -784,6 +964,231 @@ struct TaskListPage {
     this.persistPreferences();
   }
 
+  private hostProjectOrderSnapshot(): TaskProjectOrderSnapshot | undefined {
+    if (this.selectedDeviceId.length === 0 || !this.projectOrderHostLoaded) return undefined;
+    return AppServices.instance.taskProjectOrder.snapshot(this.selectedDeviceId);
+  }
+
+  /** 没有 owner stamp 的旧主机只能作为本机排序的旁路数据，不能被写入。 */
+  private isUsableHostProjectOrder(snapshot: TaskProjectOrderSnapshot | undefined): boolean {
+    return snapshot !== undefined && snapshot.available && snapshot.ownerStamp !== undefined;
+  }
+
+  private displayedProjectOrderMode(): TaskProjectOrderMode {
+    if (this.projectOrderPendingMode === 'custom') return 'custom';
+    if (this.projectOrderPendingMode === 'activity') return 'activity';
+    const snapshot = this.hostProjectOrderSnapshot();
+    if (this.isUsableHostProjectOrder(snapshot)) {
+      return snapshot?.authoritative && snapshot.projectOrder === 'custom' ? 'custom' : 'activity';
+    }
+    return this.projectOrderMode;
+  }
+
+  /** 顺序包含当前筛选范围之外的键，拖动可见项目时会把它们留在原有槽位。 */
+  private displayedProjectOrderKeys(): string[] {
+    if (this.projectOrderPendingKeys.length > 0) return this.projectOrderPendingKeys.slice();
+    const snapshot = this.hostProjectOrderSnapshot();
+    if (this.isUsableHostProjectOrder(snapshot)
+      && snapshot?.authoritative && snapshot.projectOrder === 'custom') {
+      return AppServices.instance.taskProjectOrder.controllerKeys(this.selectedDeviceId);
+    }
+    if (this.isUsableHostProjectOrder(snapshot)) {
+      // 按最近活动时列表不消费手动序，但切换模式仍要把主机已有隐藏键原样带回。
+      return AppServices.instance.taskProjectOrder.controllerKeys(this.selectedDeviceId);
+    }
+    return this.projectManualOrder.slice();
+  }
+
+  private projectOrderVisibleKeys(groups: TaskProjectGroup[] = this.projectGroups()): string[] {
+    const keys: string[] = [];
+    for (let i = 0; i < groups.length; i++) keys.push(groups[i].key);
+    return keys;
+  }
+
+  private projectOrderProjects(): TaskProjectOrderProject[] {
+    const groups = this.projectGroupsFrom(this.deviceScopedEntries());
+    const projects: TaskProjectOrderProject[] = [];
+    for (let i = 0; i < groups.length; i++) {
+      const project = new TaskProjectOrderProject();
+      project.key = groups[i].key;
+      project.deviceId = groups[i].deviceId;
+      project.workingDir = groups[i].workingDir;
+      projects.push(project);
+    }
+    return projects;
+  }
+
+  private async refreshProjectOrderForScope(): Promise<void> {
+    const generation = ++this.projectOrderScopeGeneration;
+    const deviceId = this.selectedDeviceId;
+    this.projectOrderPendingMode = '';
+    this.projectOrderPendingKeys = [];
+    this.projectOrderSyncing = false;
+    if (deviceId.length === 0) {
+      this.projectOrderHostLoaded = true;
+      this.projectOrderHostAvailable = true;
+      this.refreshProjection();
+      return;
+    }
+
+    const cached = AppServices.instance.taskProjectOrder.snapshot(deviceId);
+    this.projectOrderHostLoaded = cached !== undefined;
+    this.projectOrderHostAvailable = this.isUsableHostProjectOrder(cached);
+    this.refreshProjection();
+    const result = await AppServices.instance.taskProjectOrder.fetch(deviceId);
+    if (!this.pageActive || generation !== this.projectOrderScopeGeneration
+      || deviceId !== this.selectedDeviceId) return;
+    const snapshot = result.snapshot
+      ?? AppServices.instance.taskProjectOrder.snapshot(deviceId);
+    this.projectOrderHostLoaded = snapshot !== undefined;
+    this.projectOrderHostAvailable = this.isUsableHostProjectOrder(snapshot);
+    this.projectOrderSyncing = false;
+    this.refreshProjection();
+  }
+
+  private async applyProjectOrderToHost(
+    mode: TaskProjectOrderMode,
+    order: string[],
+  ): Promise<void> {
+    const deviceId = this.selectedDeviceId;
+    const generation = this.projectOrderScopeGeneration;
+    this.projectOrderSyncing = true;
+    const result = await AppServices.instance.taskProjectOrder.apply(
+      deviceId,
+      order,
+      this.projectOrderProjects(),
+      mode,
+    );
+    if (!this.pageActive || generation !== this.projectOrderScopeGeneration
+      || deviceId !== this.selectedDeviceId) return;
+    this.projectOrderSyncing = false;
+    this.projectOrderPendingMode = '';
+    this.projectOrderPendingKeys = [];
+    if (result.kind === 'ok') {
+      const snapshot = result.snapshot
+        ?? AppServices.instance.taskProjectOrder.snapshot(deviceId);
+      this.projectOrderHostLoaded = snapshot !== undefined;
+      this.projectOrderHostAvailable = this.isUsableHostProjectOrder(snapshot);
+      if (!this.projectOrderHostAvailable) {
+        this.projectOrderMode = mode;
+        if (mode === 'custom') this.projectManualOrder = order.slice();
+        this.persistPreferences();
+      }
+      this.refreshProjection();
+      return;
+    }
+    if (result.kind === 'unavailable') {
+      // 老 Desktop 没有该 channel 时静默转为查看端本机账本，保留用户刚完成的排序。
+      this.projectOrderHostLoaded = true;
+      this.projectOrderHostAvailable = false;
+      this.projectOrderMode = mode;
+      if (mode === 'custom') this.projectManualOrder = order.slice();
+      this.persistPreferences();
+      this.refreshProjection();
+      return;
+    }
+    promptAction.showToast({ message: this.v12String('v12_project_order_sync_failed') });
+    this.refreshProjection();
+  }
+
+  private selectProjectOrderMode(mode: TaskProjectOrderMode): void {
+    this.closeSortMenu();
+    const visibleKeys = this.projectOrderVisibleKeys();
+    if (visibleKeys.length === 0) return;
+    const currentOrder = reconcileTaskProjectOrder(
+      this.displayedProjectOrderKeys(),
+      visibleKeys,
+    );
+    if (this.isUsableHostProjectOrder(this.hostProjectOrderSnapshot())) {
+      this.projectOrderPendingMode = mode;
+      this.projectOrderPendingKeys = mode === 'custom' ? currentOrder.slice() : [];
+      void this.applyProjectOrderToHost(mode, currentOrder);
+      return;
+    }
+    this.projectOrderMode = mode;
+    if (mode === 'custom') this.projectManualOrder = currentOrder;
+    this.projectOrderPendingMode = '';
+    this.projectOrderPendingKeys = [];
+    this.refreshProjection();
+    this.persistPreferences();
+  }
+
+  private handleProjectOrderTouch(group: TaskProjectGroup, event: TouchEvent): void {
+    if (this.displayedProjectOrderMode() !== 'custom' || this.projectOrderSyncing) return;
+    if (event.type === TouchType.Cancel) {
+      this.projectOrderDraggingKey = '';
+      this.projectDragStartIndex = -1;
+      this.projectDragMoved = false;
+      this.projectOrderPendingKeys = [];
+      return;
+    }
+    if (event.changedTouches.length === 0) return;
+    const point = event.changedTouches[0];
+    if (event.type === TouchType.Down) {
+      const groups = this.projectGroups();
+      const index = groups.findIndex((value: TaskProjectGroup) => value.key === group.key);
+      if (index < 0) return;
+      this.projectDragStartY = point.displayY;
+      this.projectDragStartIndex = index;
+      this.projectDragStartOrder = reconcileTaskProjectOrder(
+        this.displayedProjectOrderKeys(),
+        this.projectOrderVisibleKeys(groups),
+      );
+      this.projectDragMoved = false;
+      this.projectOrderDraggingKey = group.key;
+      return;
+    }
+    if (this.projectDragStartIndex < 0) return;
+    if (event.type === TouchType.Move) {
+      const deltaY = point.displayY - this.projectDragStartY;
+      if (!this.projectDragMoved && Math.abs(deltaY) < 8) return;
+      this.projectDragMoved = true;
+      const groups = this.projectGroups();
+      const visibleKeys = this.projectOrderVisibleKeys(groups);
+      const targetIndex = Math.max(0, Math.min(
+        visibleKeys.length - 1,
+        this.projectDragStartIndex + Math.round(deltaY / 52),
+      ));
+      const next = reorderVisibleTaskProjectOrder(
+        this.projectDragStartOrder,
+        visibleKeys,
+        group.key,
+        targetIndex,
+      );
+      // 触摸已经越过点击阈值，但目标索引可能又回到原位；此时保留原顺序，
+      // 不能让松手路径把空数组提交给 Desktop。
+      this.projectOrderPendingKeys = next ?? this.projectDragStartOrder.slice();
+      return;
+    }
+    if (event.type === TouchType.Up) {
+      const moved = this.projectDragMoved;
+      const order = this.projectOrderPendingKeys.length > 0
+        ? this.projectOrderPendingKeys.slice() : this.projectDragStartOrder.slice();
+      this.projectOrderDraggingKey = '';
+      this.projectDragStartIndex = -1;
+      this.projectDragMoved = false;
+      if (!moved) {
+        this.projectOrderPendingKeys = [];
+        return;
+      }
+      this.projectOrderSuppressClick = true;
+      if (order.length === 0) {
+        this.projectOrderPendingKeys = [];
+        return;
+      }
+      if (this.isUsableHostProjectOrder(this.hostProjectOrderSnapshot())) {
+        this.projectOrderPendingMode = 'custom';
+        void this.applyProjectOrderToHost('custom', order);
+      } else {
+        this.projectOrderMode = 'custom';
+        this.projectManualOrder = order;
+        this.projectOrderPendingKeys = [];
+        this.refreshProjection();
+        this.persistPreferences();
+      }
+    }
+  }
+
   private sortMenuTop(): number {
     return 60 + (this.connectionStatus === 'online' ? 0 : 36) + 4;
   }
@@ -795,9 +1200,12 @@ struct TaskListPage {
   private selectDevice(deviceId: string): void {
     this.animateMenu(() => {
       this.selectedDeviceId = deviceId;
+      this.reconcileTaskSearchProjectKeys();
       this.scopeMenuOpen = false;
     });
+    void this.refreshProjectOrderForScope();
     this.ensureWideSelection();
+    if (this.taskSearchActive()) this.scheduleTaskSearch();
     this.persistPreferences();
   }
 
@@ -859,17 +1267,232 @@ struct TaskListPage {
     return this.searchQuery.trim().length > 0;
   }
 
-  private toggleSearch(): void {
-    uiAnimateFastState(this.getUIContext(), () => {
-      this.searchOpen = !this.searchOpen;
-      if (!this.searchOpen) this.searchQuery = '';
+  private taskSearchResultsForCategory(category: TaskListCategory): TaskSearchResult[] {
+    const out: TaskSearchResult[] = [];
+    for (let i = 0; i < this.taskSearchResults.length; i++) {
+      const result = this.taskSearchResults[i];
+      if (this.selectedDeviceId.length > 0 && result.deviceId !== this.selectedDeviceId) continue;
+      if (taskListCategory(result.session) === category) out.push(result);
+    }
+    return out;
+  }
+
+  private taskSearchProjects(): TaskSearchProjectOption[] {
+    const out: TaskSearchProjectOption[] = [];
+    for (let i = 0; i < this.devices.length; i++) {
+      const device = this.devices[i];
+      if (!device.remoteControlEnabled) continue;
+      if (this.selectedDeviceId.length > 0 && device.deviceId !== this.selectedDeviceId) continue;
+      const projects = listTaskSearchProjects(
+        device.deviceId,
+        device.deviceName,
+        AppServices.instance.tasks.getSessions(device.deviceId),
+      );
+      for (let projectIndex = 0; projectIndex < projects.length; projectIndex++) {
+        out.push(projects[projectIndex]);
+      }
+    }
+    return out;
+  }
+
+  private reconcileTaskSearchProjectKeys(): void {
+    if (this.taskSearchProjectKeys.length === 0) return;
+    const projects = this.taskSearchProjects();
+    const visibleKeys: string[] = [];
+    for (let i = 0; i < projects.length; i++) visibleKeys.push(projects[i].key);
+    const next = this.taskSearchProjectKeys.filter((key: string) => visibleKeys.indexOf(key) >= 0);
+    if (next.length !== this.taskSearchProjectKeys.length) this.taskSearchProjectKeys = next;
+  }
+
+  private taskSearchOrigins(): TaskSearchOrigin[] {
+    const projects = this.taskSearchProjects();
+    const dirsByDevice: Map<string, string[]> = new Map();
+    for (let i = 0; i < projects.length; i++) {
+      const project = projects[i];
+      if (this.taskSearchProjectKeys.indexOf(project.key) < 0) continue;
+      const dirs = dirsByDevice.get(project.deviceId) ?? [];
+      const remoteWorkingDirs = project.remoteWorkingDirs.length > 0
+        ? project.remoteWorkingDirs : [project.workingDir];
+      for (let dirIndex = 0; dirIndex < remoteWorkingDirs.length; dirIndex++) {
+        const remoteWorkingDir = remoteWorkingDirs[dirIndex];
+        if (remoteWorkingDir.length > 0 && dirs.indexOf(remoteWorkingDir) < 0) dirs.push(remoteWorkingDir);
+      }
+      dirsByDevice.set(project.deviceId, dirs);
+    }
+    const out: TaskSearchOrigin[] = [];
+    for (let i = 0; i < this.devices.length; i++) {
+      const device = this.devices[i];
+      if (!device.remoteControlEnabled) continue;
+      if (this.selectedDeviceId.length > 0 && device.deviceId !== this.selectedDeviceId) continue;
+      if (this.taskSearchProjectKeys.length > 0 && !dirsByDevice.has(device.deviceId)) continue;
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = device.deviceId;
+      origin.deviceName = device.deviceName;
+      origin.reachable = this.deviceCanOpen(device);
+      const dirs = dirsByDevice.get(device.deviceId);
+      origin.workingDirs = dirs === undefined ? null : dirs.slice();
+      out.push(origin);
+    }
+    return out;
+  }
+
+  private taskSearchRequest(): TaskSearchRequest {
+    const request = new TaskSearchRequest();
+    request.query = this.searchQuery.trim();
+    request.sortBy = this.taskSearchSortBy;
+    const filters = new TaskSearchFilters();
+    filters.status = this.taskSearchStatusFilter;
+    filters.agentKind = this.taskSearchAgentFilter;
+    filters.lastActivity = this.taskSearchLastActivityFilter;
+    request.filters = filters;
+    return request;
+  }
+
+  private scheduleTaskSearch(): void {
+    this.taskSearchGeneration += 1;
+    const generation = this.taskSearchGeneration;
+    if (this.taskSearchTimer >= 0) {
+      clearTimeout(this.taskSearchTimer);
+      this.taskSearchTimer = -1;
+    }
+    const query = this.searchQuery.trim();
+    if (query.length === 0) {
+      this.taskSearchStatus = 'idle';
+      this.taskSearchResults = [];
+      this.taskSearchUsedCacheFallback = false;
+      this.ensureWideSelection();
+      return;
+    }
+    this.taskSearchStatus = 'searching';
+    this.taskSearchResults = [];
+    this.taskSearchUsedCacheFallback = false;
+    this.taskSearchTimer = setTimeout(() => {
+      this.taskSearchTimer = -1;
+      void this.runTaskSearch(generation, query);
+    }, TASK_SEARCH_DEBOUNCE_MS);
+  }
+
+  private async runTaskSearch(generation: number, query: string): Promise<void> {
+    const request = this.taskSearchRequest();
+    const origins = this.taskSearchOrigins();
+    try {
+      const page = await AppServices.instance.taskSearch.search(origins, request);
+      if (!this.pageActive || generation !== this.taskSearchGeneration
+        || query !== this.searchQuery.trim()) return;
+      this.taskSearchResults = page.results.slice();
+      this.taskSearchUsedCacheFallback = page.usedCacheFallback;
+      this.taskSearchStatus = 'ready';
+      this.ensureWideSelection();
+    } catch (_error) {
+      if (!this.pageActive || generation !== this.taskSearchGeneration
+        || query !== this.searchQuery.trim()) return;
+      this.taskSearchResults = [];
+      this.taskSearchUsedCacheFallback = true;
+      this.taskSearchStatus = 'ready';
+      this.ensureWideSelection();
+    }
+  }
+
+  private cancelTaskSearch(): void {
+    this.taskSearchGeneration += 1;
+    if (this.taskSearchTimer >= 0) {
+      clearTimeout(this.taskSearchTimer);
+      this.taskSearchTimer = -1;
+    }
+    this.taskSearchStatus = 'idle';
+    this.taskSearchResults = [];
+    this.taskSearchUsedCacheFallback = false;
+    this.taskSearchFilterOpen = false;
+  }
+
+  private taskSearchCoverageLabel(): string {
+    if (!this.taskSearchUsedCacheFallback) return '';
+    return this.v12String('v12_cached_search_only');
+  }
+
+  private v12String(name: string, ...args: Array<string | number>): string {
+    return harmonyV12String(this.getUIContext().getHostContext(), name, ...args);
+  }
+
+  private taskSearchFilterCount(): number {
+    return taskSearchActiveFilterCount(this.taskSearchFilters(), this.taskSearchProjectKeys);
+  }
+
+  private taskSearchFilters(): TaskSearchFilters {
+    const filters = new TaskSearchFilters();
+    filters.status = this.taskSearchStatusFilter;
+    filters.agentKind = this.taskSearchAgentFilter;
+    filters.lastActivity = this.taskSearchLastActivityFilter;
+    return filters;
+  }
+
+  private openTaskSearchFilter(): void {
+    this.animateMenu(() => {
+      this.scopeMenuOpen = false;
+      this.sortMenuOpen = false;
+      this.taskSearchFilterOpen = true;
     });
+  }
+
+  private closeTaskSearchFilter(): void {
+    this.animateMenu(() => {
+      this.taskSearchFilterOpen = false;
+    });
+  }
+
+  private selectTaskSearchStatus(value: TaskSearchStatusFilter): void {
+    this.taskSearchStatusFilter = value;
+    this.scheduleTaskSearch();
+  }
+
+  private selectTaskSearchAgent(value: TaskSearchAgentFilter): void {
+    this.taskSearchAgentFilter = value;
+    this.scheduleTaskSearch();
+  }
+
+  private selectTaskSearchLastActivity(value: TaskSearchLastActivityFilter): void {
+    this.taskSearchLastActivityFilter = value;
+    this.scheduleTaskSearch();
+  }
+
+  private selectTaskSearchSort(value: TaskSearchSortBy): void {
+    this.taskSearchSortBy = value;
+    this.scheduleTaskSearch();
+  }
+
+  private toggleTaskSearchProject(key: string): void {
+    const index = this.taskSearchProjectKeys.indexOf(key);
+    if (index >= 0) {
+      this.taskSearchProjectKeys = this.taskSearchProjectKeys.filter((item: string) => item !== key);
+    } else {
+      this.taskSearchProjectKeys = this.taskSearchProjectKeys.concat([key]);
+    }
+    this.scheduleTaskSearch();
+  }
+
+  private resetTaskSearchFilters(): void {
+    this.taskSearchStatusFilter = 'all';
+    this.taskSearchAgentFilter = 'all';
+    this.taskSearchLastActivityFilter = 'all';
+    this.taskSearchSortBy = 'relevance';
+    this.taskSearchProjectKeys = [];
+    this.scheduleTaskSearch();
+  }
+
+  private toggleSearch(): void {
+    const nextOpen = !this.searchOpen;
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.searchOpen = nextOpen;
+      if (!nextOpen) this.searchQuery = '';
+    });
+    if (!nextOpen) this.cancelTaskSearch();
     this.ensureWideSelection();
     this.persistPreferences();
   }
 
   private async refreshTaskList(visible: boolean): Promise<boolean> {
     if (this.refreshing) return false;
+    const lifecycleGeneration = this.pageLifecycleGeneration;
     if (visible) this.refreshing = true;
     let deviceSnapshotLoaded = false;
     let eligibleCount = 0;
@@ -880,7 +1503,9 @@ struct TaskListPage {
         try {
           await AppServices.instance.client.waitUntilOnline(5000);
         } catch (_err) {
-          if (visible) promptAction.showToast({ message: '连接电脑后才能刷新任务' });
+          if (visible && this.pageActive && lifecycleGeneration === this.pageLifecycleGeneration) {
+            promptAction.showToast({ message: '连接电脑后才能刷新任务' });
+          }
           return false;
         }
       }
@@ -897,6 +1522,7 @@ struct TaskListPage {
         loads.push(this.loadTaskListSingleFlight(devices[i].deviceId, visible));
       }
       const outcomes = await Promise.all(loads);
+      if (!this.pageActive || lifecycleGeneration !== this.pageLifecycleGeneration) return false;
       for (let i = 0; i < outcomes.length; i++) {
         if (outcomes[i]) loadedCount += 1;
       }
@@ -904,7 +1530,7 @@ struct TaskListPage {
       if (visible && !success) promptAction.showToast({ message: '部分任务刷新失败，请重试' });
       return success;
     } finally {
-      if (visible) this.refreshing = false;
+      if (visible && lifecycleGeneration === this.pageLifecycleGeneration) this.refreshing = false;
     }
   }
 
@@ -957,8 +1583,10 @@ struct TaskListPage {
   }
 
   private async applySessionPatch(entry: TaskListEntry, patch: SessionMetaPatch): Promise<boolean> {
+    const lifecycleGeneration = this.pageLifecycleGeneration;
     this.sessionActionBusy = true;
     const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
+    if (!this.pageActive || lifecycleGeneration !== this.pageLifecycleGeneration) return false;
     this.sessionActionBusy = false;
     if (!ok) promptAction.showToast({ message: '任务更新失败，请重试' });
     return ok;
@@ -1006,6 +1634,8 @@ struct TaskListPage {
   private bulkAction(action: string): void {
     const count = this.selectedEntryKeys.length;
     if (count === 0 || this.sessionActionBusy) return;
+    const lifecycleGeneration = this.pageLifecycleGeneration;
+    const keys = this.selectedEntryKeys.slice();
     this.getUIContext().showAlertDialog({
       title: `处理 ${count} 个任务？`,
       message: action === 'delete' ? '选中的任务将被删除。' : '将对选中的适用任务执行此操作。',
@@ -1018,69 +1648,80 @@ struct TaskListPage {
         value: '继续',
         fontColor: action === 'delete' ? $r('app.color.danger') : $r('app.color.text_primary'),
         action: () => {
-          void this.applyBulkAction(action);
+          if (!this.pageActive || lifecycleGeneration !== this.pageLifecycleGeneration) return;
+          void this.applyBulkAction(action, lifecycleGeneration, keys);
         },
       },
     });
   }
 
-  private async applyBulkAction(action: string): Promise<void> {
-    if (this.sessionActionBusy) return;
+  private async applyBulkAction(
+    action: string,
+    lifecycleGeneration: number,
+    selectedKeys: string[],
+  ): Promise<void> {
+    if (this.sessionActionBusy || !this.pageActive
+      || lifecycleGeneration !== this.pageLifecycleGeneration) return;
     this.sessionActionBusy = true;
-    const keys = this.selectedEntryKeys.slice();
+    const keys = selectedKeys.slice();
     const retained: string[] = [];
     let failed = 0;
     let skipped = 0;
-    for (let i = 0; i < keys.length; i++) {
-      const entry = this.entryForKey(keys[i]);
-      if (entry === null) continue;
-      const patch = new SessionMetaPatch();
-      if (action === 'pin') {
-        if (entry.session.status !== 'active' || entry.session.pinnedAt.length > 0) {
-          retained.push(keys[i]);
-          skipped += 1;
-          continue;
+    try {
+      for (let i = 0; i < keys.length; i++) {
+        if (!this.pageActive || lifecycleGeneration !== this.pageLifecycleGeneration) return;
+        const entry = this.entryForKey(keys[i]);
+        if (entry === null) continue;
+        const patch = new SessionMetaPatch();
+        if (action === 'pin') {
+          if (entry.session.status !== 'active' || entry.session.pinnedAt.length > 0) {
+            retained.push(keys[i]);
+            skipped += 1;
+            continue;
+          }
+          patch.pinnedAt = new Date().toISOString();
+        } else if (action === 'unpin') {
+          if (entry.session.pinnedAt.length === 0) {
+            retained.push(keys[i]);
+            skipped += 1;
+            continue;
+          }
+          patch.pinnedAt = null;
+        } else if (action === 'archive') {
+          if (entry.session.status !== 'active') {
+            retained.push(keys[i]);
+            skipped += 1;
+            continue;
+          }
+          patch.status = 'archived';
+          patch.pinnedAt = null;
+        } else if (action === 'restore') {
+          if (entry.session.status !== 'archived') {
+            retained.push(keys[i]);
+            skipped += 1;
+            continue;
+          }
+          patch.status = 'active';
+        } else if (action === 'delete') {
+          patch.status = 'deleted';
         }
-        patch.pinnedAt = new Date().toISOString();
-      } else if (action === 'unpin') {
-        if (entry.session.pinnedAt.length === 0) {
+        const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
+        if (!this.pageActive || lifecycleGeneration !== this.pageLifecycleGeneration) return;
+        if (!ok) {
+          failed += 1;
           retained.push(keys[i]);
-          skipped += 1;
-          continue;
         }
-        patch.pinnedAt = null;
-      } else if (action === 'archive') {
-        if (entry.session.status !== 'active') {
-          retained.push(keys[i]);
-          skipped += 1;
-          continue;
-        }
-        patch.status = 'archived';
-        patch.pinnedAt = null;
-      } else if (action === 'restore') {
-        if (entry.session.status !== 'archived') {
-          retained.push(keys[i]);
-          skipped += 1;
-          continue;
-        }
-        patch.status = 'active';
-      } else if (action === 'delete') {
-        patch.status = 'deleted';
       }
-      const ok = await AppServices.instance.tasks.patchSession(entry.deviceId, entry.session.id, patch);
-      if (!ok) {
-        failed += 1;
-        retained.push(keys[i]);
+      this.selectedEntryKeys = retained;
+      this.bulkMode = retained.length > 0;
+      if (failed > 0 || skipped > 0) {
+        const parts: string[] = [];
+        if (failed > 0) parts.push(`${failed} 个失败`);
+        if (skipped > 0) parts.push(`${skipped} 个不适用`);
+        promptAction.showToast({ message: `${parts.join('，')}，已保留选择` });
       }
-    }
-    this.sessionActionBusy = false;
-    this.selectedEntryKeys = retained;
-    this.bulkMode = retained.length > 0;
-    if (failed > 0 || skipped > 0) {
-      const parts: string[] = [];
-      if (failed > 0) parts.push(`${failed} 个失败`);
-      if (skipped > 0) parts.push(`${skipped} 个不适用`);
-      promptAction.showToast({ message: `${parts.join('，')}，已保留选择` });
+    } finally {
+      if (lifecycleGeneration === this.pageLifecycleGeneration) this.sessionActionBusy = false;
     }
   }
 
@@ -1115,11 +1756,13 @@ struct TaskListPage {
       const entry = entries[i];
       const session = entry.session;
       if (taskListCategory(session) !== 'projects') continue;
-      const key = taskProjectKey(entry.deviceId, session.workingDir);
+      const key = taskProjectOrderKey(entry.deviceId, session.workingDir);
       let group = groups.get(key);
       if (group === undefined) {
         group = new TaskProjectGroup();
         group.key = key;
+        group.deviceId = entry.deviceId;
+        group.workingDir = session.workingDir;
         group.title = taskProjectName(session.workingDir);
         group.latestActivityAt = taskActivityAt(session);
         groups.set(key, group);
@@ -1130,7 +1773,22 @@ struct TaskListPage {
     }
     const out: TaskProjectGroup[] = [];
     groups.forEach((group: TaskProjectGroup) => out.push(group));
-    if (this.sortMode !== 'default') {
+    if (this.displayedProjectOrderMode() === 'custom') {
+      const manualOrder = reconcileTaskProjectOrder(
+        this.displayedProjectOrderKeys(),
+        this.projectOrderVisibleKeys(out),
+      );
+      const rank = new Map<string, number>();
+      for (let i = 0; i < manualOrder.length; i++) rank.set(manualOrder[i], i);
+      out.sort((a: TaskProjectGroup, b: TaskProjectGroup) => {
+        const aRank = rank.get(a.key);
+        const bRank = rank.get(b.key);
+        if (aRank !== undefined && bRank !== undefined && aRank !== bRank) return aRank - bRank;
+        if (aRank !== undefined) return -1;
+        if (bRank !== undefined) return 1;
+        return a.key.localeCompare(b.key);
+      });
+    } else if (this.sortMode !== 'default') {
       out.sort((a: TaskProjectGroup, b: TaskProjectGroup) => {
         if (this.sortMode === 'alphabetic') {
           const titleResult = compareTaskListLabels(a.title, b.title);
@@ -1373,6 +2031,9 @@ struct TaskListPage {
       if (this.sortMenuOpen) {
         this.sortMenuLayer()
       }
+      if (this.taskSearchFilterOpen) {
+        this.taskSearchFilterLayer()
+      }
       if (this.bulkMode) {
         this.bulkActionBar()
       }
@@ -1529,7 +2190,15 @@ struct TaskListPage {
   @Builder
   taskListTabPage(category: TaskListCategory) {
     Column() {
-      if (this.scopedEntries().length === 0) {
+      if (this.taskSearchActive()) {
+        if (this.taskSearchStatus === 'searching') {
+          this.buildTaskSearchLoading()
+        } else if (this.taskSearchResultsForCategory(category).length === 0) {
+          this.activeTabEmptyState(category)
+        } else {
+          this.buildTaskSearchEntries(category)
+        }
+      } else if (this.scopedEntries().length === 0) {
         this.buildTaskListEmpty()
       } else {
         this.buildTaskListEntries(category)
@@ -1769,7 +2438,7 @@ struct TaskListPage {
       SymbolGlyph($r('sys.symbol.magnifyingglass'))
         .fontSize(16)
         .fontColor([$r('app.color.text_secondary')])
-      TextInput({ placeholder: '搜索标题、项目、模型或消息…', text: this.searchQuery })
+      TextInput({ placeholder: $r('app.string.v12_search_placeholder'), text: this.searchQuery })
         .fontSize(14)
         .fontColor($r('app.color.text_primary'))
         .placeholderColor($r('app.color.text_placeholder'))
@@ -1780,6 +2449,7 @@ struct TaskListPage {
         .padding(0)
         .onChange((value: string) => {
           this.searchQuery = value;
+          this.scheduleTaskSearch();
           this.ensureWideSelection();
           this.persistPreferences();
         })
@@ -1794,12 +2464,15 @@ struct TaskListPage {
         .height(32)
         .padding(0)
         .backgroundColor(Color.Transparent)
+        .accessibilityText($r('app.string.v12_clear_search'))
         .onClick(() => {
           this.searchQuery = '';
+          this.cancelTaskSearch();
           this.ensureWideSelection();
           this.persistPreferences();
         })
       }
+      this.taskSearchFilterButton()
     }
     .width('calc(100% - 32vp)')
     .height(44)
@@ -1808,6 +2481,34 @@ struct TaskListPage {
     .backgroundColor($r('app.color.bg_chip'))
     .borderRadius(UI_RADIUS_PILL)
     .transition(uiRevealTransition())
+  }
+
+  @Builder
+  taskSearchFilterButton() {
+    Button() {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
+          .fontSize(16)
+          .fontColor([$r('app.color.text_secondary')])
+        if (this.taskSearchFilterCount() > 0) {
+          Circle()
+            .width(6)
+            .height(6)
+            .fill($r('app.color.accent'))
+            .position({ x: 12, y: 1 })
+        }
+      }
+      .width(24)
+      .height(24)
+    }
+    .type(ButtonType.Circle)
+    .width(32)
+    .height(32)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .accessibilityText($r('app.string.v12_search_filter'))
+    .onClick(() => this.openTaskSearchFilter())
   }
 
   @Builder
@@ -1827,6 +2528,7 @@ struct TaskListPage {
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
     .padding({ left: 32, right: 32, bottom: 80 })
+    .onAppear(() => this.showFloatingBar())
   }
 
   @Builder
@@ -1950,11 +2652,145 @@ struct TaskListPage {
     // Spring 无强度参数；Fade 保留触底反馈，但不会把整列内容明显拉离边界。
     .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
-      this.handleTaskListScroll(scrollOffset, scrollState);
+      this.handleTaskListScroll(category, scrollOffset, scrollState);
     })
     .onWillStopDragging((velocity: number) => {
-      this.handleTaskListDragRelease(velocity);
+      this.handleTaskListDragRelease(category, velocity);
     })
+    .onReachStart(() => {
+      this.restoreFloatingBarAtBoundary(category);
+    })
+    .onReachEnd(() => {
+      // 官方 onReachEnd 在短列表首次布局和内容变短时也会触发；再用 isAtEnd
+      // 精确复核，避免最后一行刚进入视口就过早显示底栏。
+      this.restoreFloatingBarAtBoundary(category);
+    })
+  }
+
+  @Builder
+  buildTaskSearchLoading() {
+    Column({ space: 10 }) {
+      LoadingProgress()
+        .width(24)
+        .height(24)
+        .color($r('app.color.text_secondary'))
+      Text($r('app.string.v12_searching_tasks'))
+        .fontSize(14)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+    .padding({ bottom: 72 })
+  }
+
+  @Builder
+  buildTaskSearchEntries(category: TaskListCategory) {
+    List({ scroller: this.scrollerForCategory(category) }) {
+      if (this.taskSearchCoverageLabel().length > 0) {
+        ListItem() {
+          this.taskSearchCoverageNotice()
+        }
+      }
+      ForEach(this.taskSearchResultsForCategory(category), (result: TaskSearchResult) => {
+        ListItem() {
+          this.taskSearchResultRow(result)
+        }
+      }, (result: TaskSearchResult) => this.taskSearchResultRenderKey(result))
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .contentEndOffset(this.floatingBarContentInset())
+    .padding({ top: 8 })
+    .clip(false)
+    .cachedCount(3, true)
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
+    .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
+      this.handleTaskListScroll(category, scrollOffset, scrollState);
+    })
+    .onReachStart(() => this.restoreFloatingBarAtBoundary(category))
+    .onReachEnd(() => this.restoreFloatingBarAtBoundary(category))
+  }
+
+  @Builder
+  taskSearchCoverageNotice() {
+    Row() {
+      Text($r('app.string.v12_cached_search_only'))
+        .fontSize(12)
+        .fontColor($r('app.color.text_tertiary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .height(30)
+    .padding({ left: LIST_INSET, right: LIST_INSET })
+  }
+
+  @Builder
+  taskSearchResultRow(result: TaskSearchResult) {
+    Row({ space: 10 }) {
+      this.agentMark(result.session.agentKind)
+      Column({ space: 4 }) {
+        Row({ space: 10 }) {
+          Text(taskDisplayTitle(result.session))
+            .fontSize(15)
+            .lineHeight(20)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          if (taskRelativeTime(taskActivityAt(result.session), this.now).length > 0) {
+            Text(taskRelativeTime(taskActivityAt(result.session), this.now))
+              .fontSize(11)
+              .fontColor($r('app.color.text_tertiary'))
+          }
+        }
+        .width('100%')
+        if (taskPreviewText(result.contentPreview).length > 0) {
+          Text(taskPreviewText(result.contentPreview))
+            .fontSize(12)
+            .lineHeight(16)
+            .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        }
+        Text(this.taskSearchResultSubtitle(result))
+          .fontSize(11)
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('auto')
+    .constraintSize({ minHeight: result.contentPreview.length > 0 ? 78 : 62 })
+    .padding({ left: 14, right: 14, top: 9, bottom: 9 })
+    .margin({ left: LIST_INSET, right: LIST_INSET, bottom: 8 })
+    .backgroundColor(this.selectedSessionDeviceId === result.deviceId
+      && this.selectedSessionId === result.session.id
+      ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => this.openTaskSearchResult(result))
+  }
+
+  private taskSearchResultSubtitle(result: TaskSearchResult): string {
+    const device = result.deviceName.length > 0
+      ? result.deviceName : this.v12String('v12_device');
+    const project = result.session.workingDir.length > 0
+      ? taskProjectName(result.session.workingDir)
+      : taskListCategory(result.session) === 'automations'
+        ? this.v12String('v12_automation') : this.v12String('v12_dialogue');
+    return `${device} · ${project}`;
+  }
+
+  private taskSearchResultRenderKey(result: TaskSearchResult): string {
+    return `${result.deviceId}:${result.session.id}:${result.matchKind}:${result.contentMessageClientId}`;
   }
 
   @Builder
@@ -2131,12 +2967,12 @@ struct TaskListPage {
   }
 
   private taskRightStatusKind(entry: TaskListEntry): TaskRightStatusKind {
-    const activity = AppServices.instance.tasks.getLiveActivity(entry.session.id);
+    const activity = AppServices.instance.tasks.getLiveActivity(entry.session.id, entry.deviceId);
     return resolveTaskRightStatus(
       activity?.phase ?? '',
       activity?.attention === true,
-      AppServices.instance.interactions.getPending(entry.session.id).length,
-      AppServices.instance.messages.isSessionRunning(entry.session.id),
+      AppServices.instance.interactions.getPending(entry.session.id, entry.deviceId).length,
+      AppServices.instance.messages.isSessionRunning(entry.session.id, entry.deviceId),
     );
   }
 
@@ -2197,13 +3033,30 @@ struct TaskListPage {
       Text(`${group.entries.length}`)
         .fontSize(12)
         .fontColor($r('app.color.text_tertiary'))
+      if (this.displayedProjectOrderMode() === 'custom') {
+        SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
+          .fontSize(16)
+          .fontColor([$r('app.color.text_tertiary')])
+          .opacity(this.projectOrderDraggingKey === group.key ? 0.55 : 1)
+      }
       this.collapseChevron(this.projectCollapsed(group.key))
     }
     .width('100%')
     .height(52)
     .padding({ left: LIST_INSET, right: LIST_INSET })
+    .backgroundColor(this.projectOrderDraggingKey === group.key
+      ? $r('app.color.bg_chip') : Color.Transparent)
     .clickEffect(UI_LIST_CLICK_EFFECT)
-    .onClick(() => this.toggleProject(group.key))
+    .onClick(() => {
+      if (this.projectOrderSuppressClick) {
+        this.projectOrderSuppressClick = false;
+        return;
+      }
+      this.toggleProject(group.key);
+    })
+    .onTouch((event: TouchEvent) => {
+      this.handleProjectOrderTouch(group, event);
+    })
   }
 
   @Builder
@@ -2323,10 +3176,33 @@ struct TaskListPage {
               .strokeWidth(1)
               .color($r('app.color.border'))
               .margin({ top: 4, bottom: 4 })
+            Text($r('app.string.v12_project_order'))
+              .fontSize(12)
+              .fontColor($r('app.color.text_tertiary'))
+              .margin({ left: 10, top: 2, bottom: 2 })
+              .alignSelf(ItemAlign.Start)
+            this.projectOrderMenuOption(this.v12String('v12_recent_project_order'), 'activity')
+            this.projectOrderMenuOption(this.v12String('v12_custom_project_order'), 'custom')
+            if (this.projectOrderSyncing) {
+              Text($r('app.string.v12_syncing_project_order'))
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .margin({ left: 10, top: 2, bottom: 4 })
+            } else if (this.selectedDeviceId.length > 0 && !this.projectOrderHostAvailable) {
+              Text($r('app.string.v12_local_project_order'))
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .margin({ left: 10, top: 2, bottom: 4 })
+            } else if (this.displayedProjectOrderMode() === 'custom') {
+              Text($r('app.string.v12_drag_project_order'))
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .margin({ left: 10, top: 2, bottom: 4 })
+            }
             this.projectExpandMenuOption()
           }
         }
-        .width(184)
+        .width(220)
         .padding(8)
         .backgroundColor($r('app.color.task_list_menu_surface'))
         .border({ width: 1, color: $r('app.color.border') })
@@ -2365,6 +3241,28 @@ struct TaskListPage {
   }
 
   @Builder
+  projectOrderMenuOption(label: string, mode: TaskProjectOrderMode) {
+    Row({ space: 10 }) {
+      this.menuCheck(this.displayedProjectOrderMode() === mode)
+      Text(label)
+        .fontSize(15)
+        .fontWeight(this.displayedProjectOrderMode() === mode
+          ? FontWeight.Medium : FontWeight.Regular)
+        .fontColor($r('app.color.text_primary'))
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .height(44)
+    .padding({ left: 10, right: 12 })
+    .backgroundColor(this.displayedProjectOrderMode() === mode
+      ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTROL)
+    .enabled(!this.projectOrderSyncing)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => this.selectProjectOrderMode(mode))
+  }
+
+  @Builder
   projectExpandMenuOption() {
     Row({ space: 10 }) {
       Stack({ alignContent: Alignment.Center }) {
@@ -2376,7 +3274,8 @@ struct TaskListPage {
       }
       .width(18)
       .height(18)
-      Text(this.allProjectsCollapsed() ? '展开项目' : '收起项目')
+      Text(this.allProjectsCollapsed()
+        ? $r('app.string.v12_expand_project') : $r('app.string.v12_collapse_project'))
         .fontSize(15)
         .fontColor(this.projectGroups().length > 0
           ? $r('app.color.text_primary')
@@ -2391,6 +3290,197 @@ struct TaskListPage {
     .enabled(this.projectGroups().length > 0)
     .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick(() => this.toggleAllProjectsFromMenu())
+  }
+
+  private taskSearchFilterTop(): number {
+    return 60 + (this.connectionStatus === 'online' ? 0 : 36) + 4;
+  }
+
+  private taskSearchFilterWidth(): number {
+    const available = this.splitLayoutEnabled() ? this.listPaneWidth() : this.viewportWidth;
+    if (available <= 0) return 300;
+    return Math.max(280, available - 32);
+  }
+
+  private taskSearchFilterMaxHeight(): number {
+    if (this.viewportHeight <= 0) return 520;
+    return Math.max(240, this.viewportHeight - this.taskSearchFilterTop() - 16);
+  }
+
+  @Builder
+  taskSearchFilterLayer() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column()
+        .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
+        .height('100%')
+        .backgroundColor($r('app.color.task_list_overlay'))
+        .transition(uiRevealTransition())
+        .onClick(() => this.closeTaskSearchFilter())
+
+      Column() {
+        Row({ space: 8 }) {
+          Text($r('app.string.v12_search_filter'))
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          if (this.taskSearchFilterCount() > 0) {
+            Button($r('app.string.v12_reset'))
+              .height(32)
+              .padding({ left: 10, right: 10 })
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .backgroundColor(Color.Transparent)
+              .borderRadius(UI_RADIUS_PILL)
+              .onClick(() => this.resetTaskSearchFilters())
+          }
+          Button($r('app.string.v12_done'))
+            .height(32)
+            .padding({ left: 12, right: 12 })
+            .fontSize(12)
+            .fontColor($r('app.color.chat_cta_text'))
+            .backgroundColor($r('app.color.chat_cta'))
+            .borderRadius(UI_RADIUS_PILL)
+            .onClick(() => this.closeTaskSearchFilter())
+        }
+        .width('100%')
+        .height(44)
+        .padding({ left: 10, right: 10 })
+
+        Scroll() {
+          Column() {
+            this.taskSearchFilterSectionTitle(this.v12String('v12_search_sort'))
+            this.taskSearchFilterOption(this.v12String('v12_search_relevance'), this.taskSearchSortBy === 'relevance',
+              () => this.selectTaskSearchSort('relevance'))
+            this.taskSearchFilterOption(this.v12String('v12_search_recent_activity'), this.taskSearchSortBy === 'activityDesc',
+              () => this.selectTaskSearchSort('activityDesc'))
+            this.taskSearchFilterOption(this.v12String('v12_search_earliest_activity'), this.taskSearchSortBy === 'activityAsc',
+              () => this.selectTaskSearchSort('activityAsc'))
+            Divider()
+              .strokeWidth(1)
+              .color($r('app.color.border'))
+              .margin({ top: 6, bottom: 6 })
+
+            this.taskSearchFilterSectionTitle(this.v12String('v12_search_status'))
+            this.taskSearchFilterOption(this.v12String('v12_search_all_status'), this.taskSearchStatusFilter === 'all',
+              () => this.selectTaskSearchStatus('all'))
+            this.taskSearchFilterOption(this.v12String('v12_search_active'), this.taskSearchStatusFilter === 'active',
+              () => this.selectTaskSearchStatus('active'))
+            this.taskSearchFilterOption(this.v12String('v12_search_archived'), this.taskSearchStatusFilter === 'archived',
+              () => this.selectTaskSearchStatus('archived'))
+            Divider()
+              .strokeWidth(1)
+              .color($r('app.color.border'))
+              .margin({ top: 6, bottom: 6 })
+
+            this.taskSearchFilterSectionTitle(this.v12String('v12_search_agent'))
+            this.taskSearchFilterOption(this.v12String('v12_search_all_agents'), this.taskSearchAgentFilter === 'all',
+              () => this.selectTaskSearchAgent('all'))
+            this.taskSearchFilterOption(this.v12String('v12_search_agent_claude_code'),
+              this.taskSearchAgentFilter === 'cc',
+              () => this.selectTaskSearchAgent('cc'))
+            this.taskSearchFilterOption(this.v12String('v12_search_agent_codex'),
+              this.taskSearchAgentFilter === 'codex',
+              () => this.selectTaskSearchAgent('codex'))
+            this.taskSearchFilterOption(this.v12String('v12_search_agent_pi'),
+              this.taskSearchAgentFilter === 'pi',
+              () => this.selectTaskSearchAgent('pi'))
+            Divider()
+              .strokeWidth(1)
+              .color($r('app.color.border'))
+              .margin({ top: 6, bottom: 6 })
+
+            this.taskSearchFilterSectionTitle(this.v12String('v12_search_time'))
+            this.taskSearchFilterOption(this.v12String('v12_search_any_time'), this.taskSearchLastActivityFilter === 'all',
+              () => this.selectTaskSearchLastActivity('all'))
+            this.taskSearchFilterOption(this.v12String('v12_search_past_one_day'), this.taskSearchLastActivityFilter === '1d',
+              () => this.selectTaskSearchLastActivity('1d'))
+            this.taskSearchFilterOption(this.v12String('v12_search_past_three_days'), this.taskSearchLastActivityFilter === '3d',
+              () => this.selectTaskSearchLastActivity('3d'))
+            this.taskSearchFilterOption(this.v12String('v12_search_past_seven_days'), this.taskSearchLastActivityFilter === '7d',
+              () => this.selectTaskSearchLastActivity('7d'))
+            this.taskSearchFilterOption(this.v12String('v12_search_past_thirty_days'), this.taskSearchLastActivityFilter === '30d',
+              () => this.selectTaskSearchLastActivity('30d'))
+            Divider()
+              .strokeWidth(1)
+              .color($r('app.color.border'))
+              .margin({ top: 6, bottom: 6 })
+
+            this.taskSearchFilterSectionTitle(this.v12String('v12_search_project'))
+            ForEach(this.taskSearchProjects(), (project: TaskSearchProjectOption) => {
+              this.taskSearchFilterOption(
+                `${project.title} · ${project.deviceName}`,
+                this.taskSearchProjectKeys.indexOf(project.key) >= 0,
+                () => this.toggleTaskSearchProject(project.key),
+                `${project.count}`,
+              )
+            }, (project: TaskSearchProjectOption) => `search-project:${project.key}`)
+            if (this.taskSearchProjects().length === 0) {
+              Text($r('app.string.v12_no_synced_projects'))
+                .fontSize(13)
+                .fontColor($r('app.color.text_tertiary'))
+                .padding({ left: 10, top: 8, bottom: 8 })
+            }
+          }
+          .width('100%')
+          .padding({ left: 8, right: 8, bottom: 8 })
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: this.taskSearchFilterMaxHeight() })
+        .scrollBar(BarState.Auto)
+      }
+      .width(this.taskSearchFilterWidth())
+      .margin({ left: LIST_INSET, top: this.taskSearchFilterTop() })
+      .backgroundColor($r('app.color.task_list_menu_surface'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
+      .transition(uiOverlayTransition())
+      .onClick(() => {
+        // 截住面板区域点击，避免关闭筛选层。
+      })
+    }
+    .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
+    .height('100%')
+  }
+
+  @Builder
+  taskSearchFilterSectionTitle(label: string) {
+    Text(label)
+      .fontSize(11)
+      .fontColor($r('app.color.text_tertiary'))
+      .height(28)
+      .padding({ left: 10, top: 8 })
+  }
+
+  @Builder
+  taskSearchFilterOption(
+    label: string,
+    selected: boolean,
+    action: () => void,
+    count: string = '',
+  ) {
+    Row({ space: 8 }) {
+      this.menuCheck(selected)
+      Text(label)
+        .fontSize(14)
+        .fontWeight(selected ? FontWeight.Medium : FontWeight.Regular)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      if (count.length > 0) {
+        Text(count)
+          .fontSize(11)
+          .fontColor($r('app.color.text_tertiary'))
+      }
+    }
+    .width('100%')
+    .height(42)
+    .padding({ left: 10, right: 10 })
+    .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(action)
   }
 
   @Builder

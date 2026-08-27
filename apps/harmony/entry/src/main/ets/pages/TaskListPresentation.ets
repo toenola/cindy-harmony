@@ -20,6 +20,19 @@ export type TaskListSortMode = 'default' | 'recency' | 'alphabetic';
 export type TaskRightStatusKind = 'error' | 'waiting' | 'running' | 'done' | 'time';
 
 /**
+ * 列表位于任一真实边界时必须展示底部浮栏。
+ *
+ * 短列表的 yOffset 为 0 且 isAtEnd 同时为 true；长列表则分别在顶部和底部命中。
+ * 给顶部保留 0.5vp 测量误差，避免浮点抖动让已经回到顶部的列表仍被判为中段。
+ */
+export function taskListShouldShowFloatingBarAtBoundary(
+  yOffset: number,
+  isAtEnd: boolean,
+): boolean {
+  return yOffset <= 0.5 || isAtEnd;
+}
+
+/**
  * 与 Mobile 会话行同一优先级：运行事实必须压过旧的 completed 未读态，
  * 避免 maker:event 已进入新一轮后，列表仍被迟到的完成活动标成「已完成」。
  */

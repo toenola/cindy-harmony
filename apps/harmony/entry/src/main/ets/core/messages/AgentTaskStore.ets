@@ -138,7 +138,10 @@ export function deriveAgentTaskStatus(
   toolName: string,
   inputRaw: string,
   resultText: string,
+  persistedStatus: string = '',
 ): string {
+  if (persistedStatus === 'completed' || persistedStatus === 'failed'
+    || persistedStatus === 'stopped') return persistedStatus;
   if (updateStatus === 'failed' || updateStatus === 'stopped' || updateStatus === 'completed') {
     return updateStatus;
   }

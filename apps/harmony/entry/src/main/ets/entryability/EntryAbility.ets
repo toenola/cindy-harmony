@@ -6,6 +6,7 @@ import {
   taskCompletedPushDataFromWant,
   taskSessionDeepLink,
 } from '../core/notifications/TaskCompletionPushModels';
+import { safeErrorMessage } from '../core/tasks/TaskModels';
 import { setSystemFontSizeScale } from '../components/UiKit';
 
 const DOMAIN = 0x0000;
@@ -19,7 +20,7 @@ export default class EntryAbility extends UIAbility {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
-      hilog.error(DOMAIN, 'CindyHarmony', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, 'CindyHarmony', 'Failed to set colorMode. Cause: %{public}s', safeErrorMessage(err));
     }
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onCreate');
     // 首帧前先记录系统字体缩放，避免放大字号下模型元信息一开始就被截断。
@@ -44,7 +45,7 @@ export default class EntryAbility extends UIAbility {
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
-        hilog.error(DOMAIN, 'CindyHarmony', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, 'CindyHarmony', 'Failed to load the content. Cause: %{public}s', safeErrorMessage(err));
         return;
       }
       hilog.info(DOMAIN, 'CindyHarmony', 'Succeeded in loading the content.');
@@ -106,7 +107,7 @@ export default class EntryAbility extends UIAbility {
       });
     } catch (err) {
       hilog.error(DOMAIN, 'CindyHarmony',
-        'Failed to apply system bar appearance. Cause: %{public}s', JSON.stringify(err));
+        'Failed to apply system bar appearance. Cause: %{public}s', safeErrorMessage(err));
     }
   }
 

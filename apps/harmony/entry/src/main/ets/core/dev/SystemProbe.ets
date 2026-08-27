@@ -15,6 +15,7 @@ import { HarmonyWsAdapter } from '../../network/HarmonyWsAdapter';
 import { WsCallbacks } from '../../network/WsAdapter';
 import { HarmonyHttp } from '../../network/HarmonyHttp';
 import { SecureStore } from '../storage/SecureStore';
+import { safeErrorMessage } from '../tasks/TaskModels';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyProbe';
@@ -104,7 +105,7 @@ export class SystemProbe {
       }
       return ok;
     } catch (e) {
-      hilog.error(DOMAIN, TAG, '[storage] FAILED: %{public}s', JSON.stringify(e));
+      hilog.error(DOMAIN, TAG, '[storage] FAILED: %{public}s', safeErrorMessage(e));
       return false;
     }
   }
