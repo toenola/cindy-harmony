@@ -42,6 +42,7 @@ import {
   RenderThinkingItem,
   RenderWorkGroupItem,
   RenderMessageItem,
+  contentPreview,
   todoCardContentSignature,
   todoCardIndexAtRankFromTail,
   todoCardRankFromTail,
@@ -80,6 +81,7 @@ import {
   buildAgentUserContent,
   buildPersistedUserContent,
   MessageStore,
+  oldestMessageCursor,
   TEXT_DELTA_BATCH_INTERVAL_MS,
   preferIncomingCreatedMessage,
   reconcileDeferredAuthoritativeEmptyMessages,
@@ -146,6 +148,25 @@ import {
   parseMarkdown,
   tokenizeInline,
 } from '../main/ets/core/messages/MarkdownParser';
+import {
+  sanitizeInternalOutput,
+  sanitizeStreamingOutput,
+} from '../main/ets/core/messages/InternalOutputSanitizer';
+import {
+  formatToolResultCompactionBytes,
+  parseToolResultCompactionMarker,
+  toolResultCompactionPreview,
+} from '../main/ets/core/messages/ToolResultCompaction';
+import {
+  clipBareHttpAutolinkText,
+  findBareHttpAutolinkAt,
+} from '../main/ets/core/messages/UrlTextBoundary';
+import {
+  buildVoiceDictionaryEntryViews,
+  isFresherVoiceDictionarySnapshot,
+  parseVoiceDictionarySnapshot,
+  VoiceDictionarySnapshot,
+} from '../main/ets/core/messages/VoiceDictionaryStore';
 import { tokenizeThinkingText } from '../main/ets/core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../main/ets/core/messages/MarkdownTableLayout';
 import {
@@ -292,8 +313,11 @@ import {
   COMPOSER_SCROLL_ACTION_SHOW,
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
-  historyGestureAllowsLoad,
+  HISTORY_PREFETCH_MIN_DISTANCE,
+  HISTORY_PREFETCH_VIEWPORTS,
+  historyPrefetchDistance,
   INITIAL_HISTORY_AUTOFILL_PAGES,
+  isNearHistoryStart,
   messageListBottomIndex,
   messageListItemPresentationState,
   messageListRenderNodeKey,
@@ -3996,10 +4020,26 @@ export default function localUnitTest() {
       expect(shouldAutoLoadEarlier(
         true, 0, false, true, false, true, true, true, 2, 'first-3', '',
       )).assertEqual(false);
-      expect(historyGestureAllowsLoad(false, false, false)).assertEqual(true);
-      expect(historyGestureAllowsLoad(true, false, false)).assertEqual(false);
-      expect(historyGestureAllowsLoad(true, true, false)).assertEqual(true);
-      expect(historyGestureAllowsLoad(true, true, true)).assertEqual(false);
+      expect(HISTORY_PREFETCH_VIEWPORTS).assertEqual(2);
+      expect(HISTORY_PREFETCH_MIN_DISTANCE).assertEqual(96);
+      expect(historyPrefetchDistance(800)).assertEqual(1600);
+      expect(historyPrefetchDistance(0)).assertEqual(96);
+      expect(isNearHistoryStart(1600, 800)).assertEqual(true);
+      expect(isNearHistoryStart(1601, 800)).assertEqual(false);
+      expect(isNearHistoryStart(400, 0)).assertEqual(false);
+      expect(isNearHistoryStart(5000, 800, true)).assertEqual(true);
+    });
+
+    it('usesTheOldestPersistedMessageAsHistoryCursor', 0, () => {
+      const localCard = new RemoteMessage();
+      localCard.id = 'harmony-system-local-card';
+      localCard.localOnly = true;
+      const oldest = new RemoteMessage();
+      oldest.id = 'persisted-oldest';
+      const newest = new RemoteMessage();
+      newest.id = 'persisted-newest';
+      expect(oldestMessageCursor([localCard, oldest, newest])).assertEqual('persisted-oldest');
+      expect(oldestMessageCursor([localCard])).assertEqual('');
     });
 
     it('stripsEditorLocationsBeforeReadingGeneratedFiles', 0, () => {
@@ -5173,6 +5213,139 @@ export default function localUnitTest() {
       backoff.report('desktop-a', true, start + TASK_LIST_RECONCILE_INTERVAL_MS * 3, 0.5);
       expect(backoff.shouldAttempt('desktop-a', start + TASK_LIST_RECONCILE_INTERVAL_MS * 3))
         .assertEqual(true);
+    });
+  });
+
+  describe('v13Compatibility', () => {
+    it('keeps paid models visible but never selects them as defaults', 0, () => {
+      const paid: Record<string, Object> = {};
+      paid['id'] = 'paid-model';
+      paid['displayName'] = 'Paid Model';
+      paid['availability'] = 'requires_payment';
+      paid['newSessionDefault'] = ['codex'];
+      paid['sortOrder'] = 1;
+      const free: Record<string, Object> = {};
+      free['id'] = 'free-model';
+      free['displayName'] = 'Free Model';
+      free['newSessionDefault'] = ['codex'];
+      free['sortOrder'] = 2;
+
+      const options = parseModelOptions([paid, free]);
+      expect(options.length).assertEqual(2);
+      expect(options[0].availability).assertEqual('requires_payment');
+      expect(resolveNewSessionDefaultModel(options, 'codex')?.id).assertEqual('free-model');
+    });
+
+    it('projects runtime model state and preserves it in the task snapshot', 0, () => {
+      const baseline: Record<string, Object> = {};
+      baseline['agentKind'] = 'codex';
+      baseline['model'] = 'gpt-base';
+      baseline['fastMode'] = false;
+      const effective: Record<string, Object> = {};
+      effective['agentKind'] = 'codex';
+      effective['model'] = 'gpt-runtime';
+      effective['providerId'] = 'openai';
+      effective['effort'] = 'high';
+      effective['fastMode'] = true;
+      const pendingProfile: Record<string, Object> = {};
+      pendingProfile['agentKind'] = 'codex';
+      pendingProfile['model'] = 'gpt-next';
+      pendingProfile['fastMode'] = false;
+      const pending: Record<string, Object> = {};
+      pending['generation'] = 5;
+      pending['source'] = 'queued';
+      pending['profile'] = pendingProfile;
+      const raw: Record<string, Object> = {};
+      raw['id'] = 'runtime-task';
+      raw['agentKind'] = 'codex';
+      raw['model'] = 'gpt-base';
+      raw['status'] = 'active';
+      raw['runtimeGeneration'] = 4;
+      raw['runtimeBaseline'] = baseline;
+      raw['runtimeEffective'] = effective;
+      raw['runtimePending'] = pending;
+      const parsed = parseSession(raw);
+      expect(parsed.runtimeGeneration).assertEqual(4);
+      expect(parsed.runtimeBaseline?.model).assertEqual('gpt-base');
+      expect(parsed.runtimeBaseline?.providerId).assertEqual('');
+      expect(parsed.runtimeEffective?.model).assertEqual('gpt-runtime');
+      expect(parsed.runtimeEffective?.fastMode).assertEqual(true);
+      expect(parsed.runtimePending?.generation).assertEqual(5);
+
+      const device = new CachedTaskListDevice();
+      device.deviceId = 'desktop-runtime';
+      device.deviceName = 'Desktop';
+      device.sessions = [parsed];
+      const serialized = serializeTaskListSnapshot('account-runtime', [device]);
+      const restored = parseTaskListSnapshot(serialized ?? '', 'account-runtime');
+      expect(restored.length).assertEqual(1);
+      expect(restored[0].sessions[0].runtimeEffective?.model).assertEqual('gpt-runtime');
+      expect(restored[0].sessions[0].runtimePending?.generation).assertEqual(5);
+    });
+
+    it('renders compacted tool output and removes internal output markers', 0, () => {
+      const marker: Record<string, Object> = {};
+      marker['type'] = 'tool_result_compacted';
+      marker['version'] = 1;
+      marker['originalBytes'] = 128 * 1024;
+      marker['compactedAt'] = 500;
+      expect(parseToolResultCompactionMarker(marker)?.originalBytes).assertEqual(128 * 1024);
+      expect(formatToolResultCompactionBytes(128 * 1024)).assertEqual('128 KB');
+      expect(toolResultCompactionPreview(marker)).assertEqual('工具输出已压缩（原始大小 128 KB）');
+      expect(contentPreview(marker)).assertEqual('工具输出已压缩（原始大小 128 KB）');
+
+      const result = new RemoteMessage();
+      result.id = 'compacted-result';
+      result.role = 'tool_result';
+      result.content = marker;
+      expect(toolResultHasError(result, 'Read')).assertEqual(false);
+
+      const citation = '\uE200cite\uE202source\uE201';
+      expect(sanitizeInternalOutput(`答案${citation}完成`)).assertEqual('答案完成');
+      expect(sanitizeInternalOutput('<|eot_id|>')).assertEqual('');
+      expect(sanitizeStreamingOutput('<|eot')).assertEqual('');
+      expect(sanitizeInternalOutput('The token is <|eot_id|>')).assertEqual('The token is <|eot_id|>');
+    });
+
+    it('autolinks bare URLs without swallowing prose punctuation', 0, () => {
+      const text = '看 https://example.com/path（说明）。';
+      const cursor = text.indexOf('https://');
+      expect(findBareHttpAutolinkAt(text, cursor)).assertEqual('https://example.com/path');
+      expect(clipBareHttpAutolinkText('https://example.com/path,')).assertEqual('https://example.com/path');
+      expect(clipBareHttpAutolinkText('https://en.wikipedia.org/wiki/Foo_(bar)'))
+        .assertEqual('https://en.wikipedia.org/wiki/Foo_(bar)');
+      expect(findBareHttpAutolinkAt('xhttps://example.com', 1)).assertEqual('');
+      const tokens = tokenizeInline(text);
+      expect(tokens[1].kind).assertEqual('link');
+      expect(tokens[1].value).assertEqual('https://example.com/path');
+    });
+
+    it('chooses the latest complete voice dictionary snapshot', 0, () => {
+      const raw: Record<string, Object> = {};
+      raw['ok'] = true;
+      const entry: Record<string, Object> = {};
+      entry['text'] = '  Cindy  ';
+      entry['frequency'] = 4;
+      const alias: Record<string, Object> = {};
+      alias['text'] = ' Sindy ';
+      alias['count'] = 2;
+      entry['aliases'] = [alias];
+      raw['entries'] = [entry];
+      raw['emittedAt'] = 20;
+      const snapshot = parseVoiceDictionarySnapshot(raw);
+      expect(snapshot !== null).assertEqual(true);
+      expect(snapshot?.entries[0].text).assertEqual('Cindy');
+      expect(buildVoiceDictionaryEntryViews(snapshot === null ? [] : [snapshot])[0].aliases[0])
+        .assertEqual('Sindy');
+
+      const older = new VoiceDictionarySnapshot();
+      older.fetchedAt = 10;
+      older.emittedAt = 10;
+      const newer = new VoiceDictionarySnapshot();
+      newer.fetchedAt = 20;
+      newer.emittedAt = 20;
+      expect(isFresherVoiceDictionarySnapshot(newer, older)).assertEqual(true);
+      expect(isFresherVoiceDictionarySnapshot(older, newer)).assertEqual(false);
     });
   });
 }

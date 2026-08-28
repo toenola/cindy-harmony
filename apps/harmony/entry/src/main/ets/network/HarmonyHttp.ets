@@ -20,7 +20,7 @@ export interface HttpResponseData {
   body: string;
 }
 
-export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 export class HarmonyHttp {
   /** 发起 JSON 请求。headers 已含 Content-Type 时不再追加。 */
@@ -94,6 +94,8 @@ export class HarmonyHttp {
         return http.RequestMethod.POST;
       case 'PUT':
         return http.RequestMethod.PUT;
+      case 'PATCH':
+        return http.RequestMethod.PATCH;
       case 'DELETE':
         return http.RequestMethod.DELETE;
       default:

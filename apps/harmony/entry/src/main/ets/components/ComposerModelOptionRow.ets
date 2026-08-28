@@ -13,6 +13,7 @@ export struct ComposerModelOptionRow {
   @Prop providerInitial: string = 'S';
   @Prop selected: boolean = false;
   @Prop subscription: boolean = false;
+  @Prop paymentRequired: boolean = false;
   @Prop disabled: boolean = false;
   @Prop effortIds: string[] = [];
   @Prop selectedEffort: string = '';
@@ -93,7 +94,7 @@ export struct ComposerModelOptionRow {
           .height(28)
           .padding({ left: 5, right: 5 })
           .backgroundColor(Color.Transparent)
-          .enabled(!this.disabled)
+          .enabled(!this.disabled && (!this.paymentRequired || this.selected))
           .accessibilityText(`${this.label}思考强度`)
           .onClick(() => this.onToggleEffortPicker())
         }
@@ -101,7 +102,7 @@ export struct ComposerModelOptionRow {
         if (this.fastModeVisible) {
           Toggle({ type: ToggleType.Switch, isOn: this.fastModeOn })
             .selectedColor($r('app.color.accent'))
-            .enabled(!this.disabled)
+            .enabled(!this.disabled && (!this.paymentRequired || this.selected))
             .accessibilityText(`${this.label}快速模式`)
             .onChange((enabled: boolean) => this.onFastModeChange(enabled))
         }
@@ -113,6 +114,13 @@ export struct ComposerModelOptionRow {
               .fontSize(uiFontSize(17))
               .fontColor([$r('app.color.text_primary')])
               .onClick(() => this.onSelect())
+          } else if (this.paymentRequired) {
+            Text('需付费')
+              .fontSize(uiFontSize(10))
+              .fontColor($r('app.color.text_tertiary'))
+              .backgroundColor($r('app.color.bg_chip'))
+              .borderRadius(UI_RADIUS_CONTROL)
+              .padding({ left: 5, right: 5, top: 2, bottom: 2 })
           } else if (this.subscription) {
             Text('订阅')
               .fontSize(uiFontSize(10))
@@ -152,8 +160,8 @@ export struct ComposerModelOptionRow {
     .margin({ left: 12, right: 12 })
     .backgroundColor(this.selected ? $r('app.color.bg_chip') : Color.Transparent)
     .borderRadius(UI_RADIUS_CONTROL)
-    .opacity(this.disabled ? 0.6 : 1)
-    .enabled(!this.disabled)
+    .opacity(this.disabled || (this.paymentRequired && !this.selected) ? 0.55 : 1)
+    .enabled(!this.disabled && (!this.paymentRequired || this.selected))
   }
 }
 

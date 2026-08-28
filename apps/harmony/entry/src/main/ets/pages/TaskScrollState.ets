@@ -18,6 +18,10 @@ export const FOLLOW_LATEST_RETRY_DELAYS: number[] = [24, 80, 180];
 /** 与 Mobile/iOS 一致：短首屏在没有用户手势时最多再补三页。 */
 export const INITIAL_HISTORY_AUTOFILL_PAGES: number = 3;
 
+/** 历史分页提前两个可视区域触发；至少保留 96vp，避免触顶后才开始请求。 */
+export const HISTORY_PREFETCH_VIEWPORTS: number = 2;
+export const HISTORY_PREFETCH_MIN_DISTANCE: number = 96;
+
 /** Composer 只响应明确的连续浏览意图，过滤手指抖动和单帧布局位移。 */
 export const COMPOSER_SCROLL_NOISE: number = 0.25;
 export const COMPOSER_SCROLL_HIDE_DISTANCE: number = 10;
@@ -73,13 +77,29 @@ export function updateComposerScrollVisibility(
   return new ComposerScrollUpdate(nextIntent, COMPOSER_SCROLL_ACTION_NONE);
 }
 
-/** 回看历史时，一次触摸手势只允许触发一页；冷开自动补窗不受此门禁影响。 */
-export function historyGestureAllowsLoad(
-  userReviewIntent: boolean,
-  touchActive: boolean,
-  loadTriggered: boolean,
+/** 与 Mobile 同源：按可视区域高度计算历史预加载距离，未测量时退回最小阈值。 */
+export function historyPrefetchDistance(viewportHeight: number): number {
+  const measuredHeight = Number.isFinite(viewportHeight) && viewportHeight > 0
+    ? viewportHeight : 0;
+  return Math.max(
+    HISTORY_PREFETCH_MIN_DISTANCE,
+    measuredHeight * HISTORY_PREFETCH_VIEWPORTS,
+  );
+}
+
+/**
+ * 根据 Scroller 的绝对 yOffset 判断是否接近历史起点。
+ * List 的 currentOffset().yOffset 在起点为 0，向列表末尾移动时递增；
+ * atStart 用于 onReachStart 已经确认边界、但 offset 尚未完成同步的那一帧。
+ */
+export function isNearHistoryStart(
+  yOffset: number,
+  viewportHeight: number,
+  atStart: boolean = false,
 ): boolean {
-  return !userReviewIntent || (touchActive && !loadTriggered);
+  if (atStart) return true;
+  if (!Number.isFinite(yOffset)) return false;
+  return yOffset <= historyPrefetchDistance(viewportHeight);
 }
 
 /**

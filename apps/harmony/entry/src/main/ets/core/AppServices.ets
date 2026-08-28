@@ -16,12 +16,12 @@ import { AppConfig } from '../AppConfig';
 import { HarmonyWsAdapter } from '../network/HarmonyWsAdapter';
 import { HarmonyHttp } from '../network/HarmonyHttp';
 import { AuthStore } from './auth/AuthStore';
-import { DlClient, DlClientOptions, DlEvents, DlOpenLinkOptions } from './device-link/DlClient';
+import { DlClient, DlClientOptions, DlEvents, DlInvokeOptions, DlOpenLinkOptions } from './device-link/DlClient';
 import {
   HelloPayload, HelloAckPayload, PresenceSnapshot, DlChannels, SESSIONS_TOPIC,
   CONTROLLER_CAPABILITIES, MAKER_EVENT_BATCH_CHANNEL, expandMakerEventBatchPayload,
 } from './device-link/DlProtocol';
-import { TaskStore } from './tasks/TaskStore';
+import { TaskStore, unwrapInvokeResult } from './tasks/TaskStore';
 import { TaskSearchStore } from './tasks/TaskSearchStore';
 import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
@@ -37,9 +37,12 @@ import { NewSessionCreationStore } from './tasks/NewSessionCreationStore';
 import { SessionDeepLinkIntent, parseSessionDeepLink } from './navigation/SessionDeepLink';
 import { TaskCompletionPushPreferenceStore } from './notifications/TaskCompletionPushPreferenceStore';
 import { TaskCompletionPushService } from './notifications/TaskCompletionPushService';
+import { VoiceDictionaryStore, parseVoiceDictionarySnapshot } from './messages/VoiceDictionaryStore';
+import { SecureStore } from './storage/SecureStore';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
+const KEY_SELF_DEVICE_NAME = 'settings.selfDeviceName';
 
 /** 简单延时。 */
 function delay(ms: number): Promise<void> {
@@ -64,6 +67,8 @@ export class AppServices {
     new TaskCompletionPushPreferenceStore();
   readonly taskCompletionPush: TaskCompletionPushService =
     new TaskCompletionPushService(this.taskCompletionPushPreference);
+  /** Mobile 设置页的语音词典只读投影；正本与合并逻辑在桌面端。 */
+  readonly voiceDictionary: VoiceDictionaryStore = new VoiceDictionaryStore();
   readonly interactions: InteractionStore = new InteractionStore();
   readonly goals: GoalStore = new GoalStore();
   /**
@@ -77,6 +82,8 @@ export class AppServices {
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
   private readonly http: HarmonyHttp = new HarmonyHttp();
+  private readonly settingsStore: SecureStore = new SecureStore();
+  private selfDeviceName: string = '';
   private statusListeners: Array<(status: string) => void> = [];
   private deepLinkListeners: Array<() => void> = [];
   private pendingDeepLink: SessionDeepLinkIntent | null = null;
@@ -137,6 +144,8 @@ export class AppServices {
       this.taskProjectOrder.clearAll();
       this.tasks.clearAll();
       this.goals.clearAll();
+      this.selfDeviceName = '';
+      await this.voiceDictionary.clear();
     });
     this.messages.attach(this.client);
     this.inputQueue.attach(this.client);
@@ -242,8 +251,11 @@ export class AppServices {
       this.taskListPreferences.init(context),
       this.taskListSnapshot.init(context),
       this.taskCompletionPushPreference.init(context),
+      this.voiceDictionary.init(context),
+      this.settingsStore.init(context),
       this.messages.initCache(context),
     ]);
+    this.selfDeviceName = (await this.settingsStore.get(KEY_SELF_DEVICE_NAME, '')).trim();
     await this.taskCompletionPush.init(context);
   }
 
@@ -252,7 +264,81 @@ export class AppServices {
     const accountId = this.auth.cacheAccountId;
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
+    this.voiceDictionary.setAccountScope(accountId);
     this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
+  }
+
+  getSelfDeviceName(): string {
+    return this.selfDeviceName;
+  }
+
+  /**
+   * 更新本机在桌面授权列表里的显示名。服务端成功后才更新本地 hello 名称，
+   * 避免网络失败时下次重连把未保存的草稿广播出去。
+   */
+  async renameSelfDevice(rawName: string): Promise<string> {
+    const name = rawName.trim();
+    if (name.length > 64) throw new Error('设备名称不能超过 64 个字符');
+    const deviceId = await this.auth.ensureDeviceId();
+    const token = await this.auth.getAccessToken();
+    if (token === null || token.length === 0) throw new Error('登录状态已失效');
+    const headers: Record<string, string> = {};
+    headers['Authorization'] = `Bearer ${token}`;
+    const body = JSON.stringify({ name: name.length > 0 ? name : null });
+    let responseBody = '';
+    const res = await this.http.requestJson(
+      `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
+      'PATCH',
+      headers,
+      body,
+      12000,
+    );
+    responseBody = res.body;
+    if (res.statusCode === 401) {
+      const refreshed = await this.auth.forceRefreshToken();
+      if (refreshed !== null && refreshed.length > 0) {
+        headers['Authorization'] = `Bearer ${refreshed}`;
+        const retry = await this.http.requestJson(
+          `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
+          'PATCH',
+          headers,
+          body,
+          12000,
+        );
+        if (retry.statusCode < 200 || retry.statusCode >= 300) {
+          throw new Error(`设备名称保存失败（HTTP ${retry.statusCode}）`);
+        }
+        responseBody = retry.body;
+      } else {
+        throw new Error('登录状态已失效');
+      }
+    } else if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw new Error(`设备名称保存失败（HTTP ${res.statusCode}）`);
+    }
+    let savedName = name;
+    try {
+      const raw = JSON.parse(responseBody) as Record<string, Object>;
+      if (typeof raw['name'] === 'string') savedName = (raw['name'] as string).trim();
+    } catch (_) {
+      // 服务端旧版本可能只返回状态码；本地采用已提交的规范化名称。
+    }
+    this.selfDeviceName = savedName;
+    if (savedName.length > 0) await this.settingsStore.set(KEY_SELF_DEVICE_NAME, savedName);
+    else await this.settingsStore.remove(KEY_SELF_DEVICE_NAME);
+    return savedName;
+  }
+
+  /** 读取一台在线桌面的只读语音词典快照；失败由设置页保留离线缓存。 */
+  async fetchVoiceDictionary(deviceId: string): Promise<boolean> {
+    await this.openLink(deviceId);
+    const options = new DlInvokeOptions();
+    options.channel = DlChannels.VOICE_DICTIONARY_GET;
+    options.args = [];
+    const result = parseVoiceDictionarySnapshot(
+      unwrapInvokeResult(await this.client.invoke(deviceId, options)),
+    );
+    if (result === null) return false;
+    return await this.voiceDictionary.accept(deviceId, result);
   }
 
   /** 连接状态订阅（登录后调用 start）；返回退订函数。 */
@@ -344,7 +430,7 @@ export class AppServices {
 
   private buildHello(): HelloPayload {
     const hello = new HelloPayload();
-    hello.deviceName = 'Cindy Harmony';
+    hello.deviceName = this.selfDeviceName.length > 0 ? this.selfDeviceName : 'Cindy Harmony';
     hello.platform = AppConfig.platform;
     hello.appVersion = AppConfig.appVersion;
     // 鸿蒙端是控制端，不接受被远程控制。
@@ -396,6 +482,11 @@ export class AppServices {
       // 本机身份，避免冷启动对设备 REST 发出两份完全相同的并发请求。
       this.tasks.setSelfDeviceId(ack.deviceId);
       const previousAccountId = this.auth.cacheAccountId;
+      if (previousAccountId.length > 0 && previousAccountId !== ack.userId) {
+        // 本机名称由服务端按账号保存；换号后不能把上个账号的名称带进新账号。
+        this.selfDeviceName = '';
+        void this.settingsStore.remove(KEY_SELF_DEVICE_NAME);
+      }
       if (this.auth.rememberRelayUserId(ack.userId)) {
         void this.switchTaskListAccountScope(previousAccountId, ack.userId);
       }
@@ -510,6 +601,16 @@ export class AppServices {
         }
         if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
         hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
+        const ownDeviceId = await this.auth.ensureDeviceId();
+        for (let i = 0; i < views.length; i++) {
+          if (views[i].isSelf || views[i].deviceId === ownDeviceId) {
+            const serverName = views[i].name.trim();
+            this.selfDeviceName = serverName;
+            if (serverName.length > 0) void this.settingsStore.set(KEY_SELF_DEVICE_NAME, serverName);
+            else void this.settingsStore.remove(KEY_SELF_DEVICE_NAME);
+            break;
+          }
+        }
         this.tasks.mergeServerDevices(views);
         const seenDeviceIds = new Set<string>();
         for (let i = 0; i < views.length; i++) seenDeviceIds.add(views[i].deviceId);
@@ -555,6 +656,7 @@ export class AppServices {
     }
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
+    this.voiceDictionary.setAccountScope(accountId);
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);
     void this.loadDevices();
@@ -615,6 +717,11 @@ export class AppServices {
       case 'maker:goal:status-changed':
         this.goals.handleStatusChanged(payload, deviceId);
         break;
+      case DlChannels.VOICE_DICTIONARY_SNAPSHOT: {
+        const snapshot = parseVoiceDictionarySnapshot(payload);
+        if (snapshot !== null) void this.voiceDictionary.accept(deviceId, snapshot);
+        break;
+      }
       default:
         // 未识别的 push channel 忽略（切片 2+ 逐步接入）。
         break;

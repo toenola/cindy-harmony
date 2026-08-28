@@ -155,7 +155,7 @@ import {
   pendingQueueBubbleRenderKey,
 } from '../core/messages/InputQueueStore';
 import { shouldApplyComposerDraftRead } from '../core/messages/ComposerDraftStore';
-import { RewindPreview } from '../core/messages/MessageStore';
+import { oldestMessageCursor, RewindPreview } from '../core/messages/MessageStore';
 import { deriveAgentTaskStatus } from '../core/messages/AgentTaskStore';
 import {
   AutoResumePresentation,
@@ -193,8 +193,8 @@ import {
   ComposerScrollUpdate,
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
-  historyGestureAllowsLoad,
   INITIAL_HISTORY_AUTOFILL_PAGES,
+  isNearHistoryStart,
   messageListBottomIndex,
   messageListItemPresentationState,
   messageListRenderNodeKey,
@@ -492,6 +492,8 @@ export struct TaskPageContent {
   @State sessionStreaming: boolean = false;
   /** 真实消息区宽度；折叠双栏下不能拿整块屏幕宽度估算 Markdown 表格。 */
   @State messageAreaWidth: number = 0;
+  /** 真实消息区高度；历史预加载阈值按可视区域计算，避免依赖顶层 item 数量。 */
+  @State messageAreaHeight: number = 0;
   private tableColumnWidthCache: Map<MdBlock, number[]> = new Map();
   /** 完成态 Markdown 数组身份稳定；缓存连续文本组，避免页面状态刷新时重复线性分组。 */
   private markdownSelectableGroupCache: Map<MdBlock[], MdSelectableBlockGroup[]> = new Map();
@@ -601,11 +603,11 @@ export struct TaskPageContent {
   private listTouchPulledDown: boolean = false;
   /** 当前手势是否明确向消息尾部移动。 */
   private listTouchPushedUp: boolean = false;
-  private listTouchLoadTriggered: boolean = false;
   private historyReviewIntent: boolean = false;
   /** 冷开短窗口的剩余自动补页次数；真实上翻后不再受此预算限制。 */
   private initialHistoryAutofillRemaining: number = INITIAL_HISTORY_AUTOFILL_PAGES;
-  private historyLastAttemptFirstKey: string = '';
+  /** 最近一次请求使用的真实最早消息游标；不能使用折叠 work_group 的渲染 key。 */
+  private historyLastAttemptCursor: string = '';
   /** 用户历史分页按可见业务锚点最终校准；mVCP 只负责减少投影落地时的瞬时位移。 */
   private historyAnchorRestoreGeneration: number = 0;
   private pendingHistoryAnchorRestore: (() => void) | undefined = undefined;
@@ -848,11 +850,10 @@ export struct TaskPageContent {
     this.listTouchActive = false;
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
-    this.listTouchLoadTriggered = false;
     this.hasOlderMessages = false;
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
-    this.historyLastAttemptFirstKey = '';
+    this.historyLastAttemptCursor = '';
     this.historyAnchorRestoreGeneration += 1;
     this.pendingHistoryAnchorRestore = undefined;
     this.agentSwitchConfirmed = false;
@@ -1165,6 +1166,11 @@ export struct TaskPageContent {
       this.messageAreaWidth = width;
       this.tableColumnWidthCache.clear();
     }
+    const heightValue = newArea.height;
+    const height = typeof heightValue === 'number' ? heightValue : 0;
+    if (Number.isFinite(height) && height > 0 && height !== this.messageAreaHeight) {
+      this.messageAreaHeight = height;
+    }
   }
 
   private session(): RemoteSession | undefined {
@@ -1198,9 +1204,30 @@ export struct TaskPageContent {
     }
     if (this.pendingAgentSwitchIntent !== null
       && this.pendingAgentSwitchIntent.targetAgentKind === this.currentAgentTab()
-      && this.pendingAgentSwitchIntent.model === session.model) {
+      && this.pendingAgentSwitchIntent.model === this.effectiveModelId(session)) {
       this.pendingAgentSwitchIntent = null;
     }
+  }
+
+  /** Runtime fallback/temporary route is host-owned; Harmony only projects it. */
+  private effectiveModelId(session: RemoteSession): string {
+    return session.runtimeEffective !== undefined && session.runtimeEffective.model.length > 0
+      ? session.runtimeEffective.model : session.model;
+  }
+
+  private effectiveProviderId(session: RemoteSession): string {
+    return session.runtimeEffective !== undefined
+      ? session.runtimeEffective.providerId : session.providerId;
+  }
+
+  private effectiveEffort(session: RemoteSession): string {
+    return session.runtimeEffective !== undefined
+      ? session.runtimeEffective.effort : session.effort;
+  }
+
+  private effectiveFastMode(session: RemoteSession): boolean {
+    return session.runtimeEffective !== undefined
+      ? session.runtimeEffective.fastMode : session.fastMode;
   }
 
   private agentKindForCapability(session: RemoteSession): string {
@@ -1210,8 +1237,11 @@ export struct TaskPageContent {
   /** 当前会话的模型选中线索：被隐藏的当前模型也必须保留在目录中。 */
   private currentModelSelectionHint(): ModelSelectionHint | undefined {
     const session = this.session();
-    if (session === undefined || session.model.length === 0) return undefined;
-    const hint: ModelSelectionHint = { model: session.model, providerId: session.providerId };
+    if (session === undefined || this.effectiveModelId(session).length === 0) return undefined;
+    const hint: ModelSelectionHint = {
+      model: this.effectiveModelId(session),
+      providerId: this.effectiveProviderId(session),
+    };
     return hint;
   }
 
@@ -1517,12 +1547,14 @@ export struct TaskPageContent {
       return this.pendingModelSelectionKey === this.modelRuntimeKey(option);
     }
     const session = this.session();
-    if (!this.browsingCurrentAgent() || session === undefined || option.id !== session.model) return false;
-    if (session.providerId.length > 0) return option.providerId === session.providerId;
+    if (!this.browsingCurrentAgent() || session === undefined
+      || option.id !== this.effectiveModelId(session)) return false;
+    const providerId = this.effectiveProviderId(session);
+    if (providerId.length > 0) return option.providerId === providerId;
     if (option.providerId.length === 0) return true;
     const source = this.visibleModelOptions();
     for (let i = 0; i < source.length; i++) {
-      if (source[i].id === session.model) return source[i].providerId === option.providerId;
+      if (source[i].id === this.effectiveModelId(session)) return source[i].providerId === option.providerId;
     }
     return false;
   }
@@ -1541,8 +1573,9 @@ export struct TaskPageContent {
 
   private modelEffortForRow(option: ComposerModelOption): string {
     const session = this.session();
-    if (this.modelOptionIsCurrent(option) && session !== undefined && session.effort.length > 0) {
-      return session.effort;
+    if (this.modelOptionIsCurrent(option) && session !== undefined
+      && this.effectiveEffort(session).length > 0) {
+      return this.effectiveEffort(session);
     }
     const remembered = this.modelEffortMemory.get(this.modelRuntimeKey(option));
     if (remembered !== undefined && option.efforts.indexOf(remembered) >= 0) return remembered;
@@ -1552,7 +1585,10 @@ export struct TaskPageContent {
 
   private modelFastForRow(option: ComposerModelOption): boolean {
     if (!this.visibleFastModeCapability() || !option.supportsFastMode) return false;
-    if (this.modelOptionIsCurrent(option)) return this.session()?.fastMode ?? false;
+    if (this.modelOptionIsCurrent(option)) {
+      const session = this.session();
+      return session === undefined ? false : this.effectiveFastMode(session);
+    }
     return this.modelFastMemory.get(this.modelRuntimeKey(option)) ?? false;
   }
 
@@ -1630,7 +1666,8 @@ export struct TaskPageContent {
     for (let i = 0; i < source.length; i++) {
       if (this.modelOptionIsCurrent(source[i])) return source[i];
     }
-    const modelId = this.session()?.model ?? '';
+    const session = this.session();
+    const modelId = session === undefined ? '' : this.effectiveModelId(session);
     for (let i = 0; i < source.length; i++) {
       if (source[i].id === modelId) return source[i];
     }
@@ -1642,18 +1679,21 @@ export struct TaskPageContent {
     if (option !== null) {
       return option.label;
     }
-    return this.session()?.model ?? '';
+    const session = this.session();
+    return session === undefined ? '' : this.effectiveModelId(session);
   }
 
   private currentModelEffortLabel(): string {
     const option = this.currentModelOption();
     if (option !== null) {
-      const selectedEffort = this.session()?.effort ?? '';
+      const session = this.session();
+      const selectedEffort = session === undefined ? '' : this.effectiveEffort(session);
       const effort = selectedEffort.length > 0 ? selectedEffort : option.defaultEffort;
       if (effort.length === 0) return '';
       return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
     }
-    const effort = this.session()?.effort ?? '';
+    const session = this.session();
+    const effort = session === undefined ? '' : this.effectiveEffort(session);
     return effort.length > 0 ? this.effortOptionLabel(effort, effort) : '';
   }
 
@@ -1893,6 +1933,10 @@ export struct TaskPageContent {
   private async selectComposerModel(option: ComposerModelOption): Promise<void> {
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
+      return;
+    }
+    if (option.availability === 'requires_payment' && !this.modelOptionIsCurrent(option)) {
+      promptAction.showToast({ message: '该模型需要付费后才能使用' });
       return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
@@ -2616,11 +2660,10 @@ export struct TaskPageContent {
     this.listTouchActive = false;
     this.listTouchPulledDown = false;
     this.listTouchPushedUp = false;
-    this.listTouchLoadTriggered = false;
     this.hasOlderMessages = false;
     this.historyReviewIntent = false;
     this.initialHistoryAutofillRemaining = INITIAL_HISTORY_AUTOFILL_PAGES;
-    this.historyLastAttemptFirstKey = '';
+    this.historyLastAttemptCursor = '';
     this.syncMessageCount();
     this.beginInitialLoad();
   }
@@ -3620,6 +3663,11 @@ export struct TaskPageContent {
     this.showComposerAfterScroll();
     this.followingLatest = true;
     this.hasNewMessages = false;
+    // “回到最新”结束历史浏览意图；这不是首屏补窗入口，避免短列表回到底部时
+    // 因 yOffset 仍为 0 又立即请求更早历史。
+    this.historyReviewIntent = false;
+    this.initialHistoryAutofillRemaining = 0;
+    this.historyLastAttemptCursor = '';
     this.historyAnchorRestoreGeneration += 1;
     this.pendingHistoryAnchorRestore = undefined;
     this.loadingOlder = false;
@@ -3812,7 +3860,6 @@ export struct TaskPageContent {
       this.historyAnchorRestoreGeneration += 1;
       this.listTouchPulledDown = false;
       this.listTouchPushedUp = false;
-      this.listTouchLoadTriggered = false;
       return;
     }
     if (event.type === TouchType.Move) {
@@ -3825,7 +3872,7 @@ export struct TaskPageContent {
         // 空页、重复页或网络失败会保留同一首项去重；新的明确下拉手势
         // 解除这次止损，允许用户恢复网络后重试一次。
         if (beginsHistoryGesture && !this.loadingOlder) {
-          this.historyLastAttemptFirstKey = '';
+          this.historyLastAttemptCursor = '';
         }
         if (!this.historyReviewIntent) {
           this.historyReviewIntent = true;
@@ -3857,7 +3904,6 @@ export struct TaskPageContent {
       this.listTouchStartY = 0;
       this.listTouchPulledDown = false;
       this.listTouchPushedUp = false;
-      this.listTouchLoadTriggered = false;
     }
   }
 
@@ -3891,12 +3937,12 @@ export struct TaskPageContent {
       this.followScrollTrailingRequested = false;
       this.historyReviewIntent = true;
     }
-    const requestFirstKey = this.items.length > 0
-      ? this.renderAnchorKey(this.items[0], this.items) : '';
+    const requestCursor = oldestMessageCursor(
+      AppServices.instance.messages.getMessages(this.sessionId, this.deviceId));
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const deviceId = this.deviceId;
     const sessionId = this.sessionId;
-    this.historyLastAttemptFirstKey = requestFirstKey;
+    this.historyLastAttemptCursor = requestCursor;
     this.loadingOlder = true;
     AppServices.instance.messages.loadOlder(deviceId, sessionId).then((added: number) => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
@@ -3990,17 +4036,25 @@ export struct TaskPageContent {
   }
 
   private nearHistoryStart(): boolean {
-    const visibleCount = Math.max(1, this.visibleEndIndex - this.visibleStartIndex + 1);
-    return this.visibleStartIndex <= Math.max(1, visibleCount * 2);
+    try {
+      const offset = this.listScroller.currentOffset();
+      return isNearHistoryStart(
+        offset.yOffset,
+        this.messageAreaHeight,
+        this.visibleStartIndex <= 0,
+      );
+    } catch (_) {
+      // Scroller 尚未绑定时只保留精确的首项兜底；正常运行路径使用物理 yOffset。
+      return this.visibleStartIndex <= 1;
+    }
   }
 
   private attemptAutoLoadEarlier(): void {
-    // 用户回看历史时，一次按下/拖动手势最多加载一页。onReachStart、onScrollIndex
-    // 与 prepend 后的几何回调可能连续到达，不能把它们解释成新的用户意图。
-    if (!historyGestureAllowsLoad(
-      this.historyReviewIntent, this.listTouchActive, this.listTouchLoadTriggered)) return;
-    const firstKey = this.items.length > 0
-      ? this.renderAnchorKey(this.items[0], this.items) : '';
+    // 历史浏览采用电平触发：滚动回调、惯性滚动结束后的回调和 prepend 布局回调
+    // 都可以重新评估。loadingOlder 与真实游标去重负责防止重复请求，不再要求请求
+    // 必须发生在手指仍按住屏幕的那一帧。
+    const firstCursor = oldestMessageCursor(
+      AppServices.instance.messages.getMessages(this.sessionId, this.deviceId));
     if (this.routeMessageClientId.length > 0 || !shouldAutoLoadEarlier(
       this.historyReviewIntent,
       this.initialHistoryAutofillRemaining,
@@ -4011,12 +4065,11 @@ export struct TaskPageContent {
       this.nearHistoryStart(),
       this.hasOlderMessages,
       this.items.length,
-      firstKey,
-      this.historyLastAttemptFirstKey,
+      firstCursor,
+      this.historyLastAttemptCursor,
     )) return;
     const initialAutofill = !this.historyReviewIntent;
     if (initialAutofill) this.initialHistoryAutofillRemaining -= 1;
-    this.listTouchLoadTriggered = true;
     this.loadOlder(false, initialAutofill);
   }
 
@@ -5025,7 +5078,7 @@ export struct TaskPageContent {
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(this.sessionActionInfoMode
                 ? this.sessionTitle()
-                : `${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.session()?.model || '默认模型'}`)
+                : `${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.currentModelLabel() || '默认模型'}`)
                 .fontSize(uiFontSize(12))
                 .fontColor($r('app.color.text_secondary'))
                 .maxLines(1)
@@ -5957,6 +6010,7 @@ export struct TaskPageContent {
         })
         .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
           this.handleComposerListScroll(scrollOffset, scrollState);
+          this.attemptAutoLoadEarlier();
         })
         .onTouch((event: TouchEvent) => {
           this.handleListTouch(event);
@@ -6524,6 +6578,7 @@ export struct TaskPageContent {
         ? option.providerName.charAt(0).toUpperCase() : 'S',
       selected: this.modelOptionIsCurrent(option),
       subscription: option.subscription,
+      paymentRequired: option.availability === 'requires_payment',
       disabled: this.contextRpcBusy,
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
@@ -6561,6 +6616,33 @@ export struct TaskPageContent {
                   .fontWeight(FontWeight.Medium)
                   .fontColor($r('app.color.text_primary'))
                 Text(`${modelAgentLabel(this.pendingAgentSwitchIntent.targetAgentKind)} · ${this.pendingAgentSwitchIntent.model}`)
+                  .fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+            }
+            .width('calc(100% - 32vp)')
+            .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+            .margin({ left: 16, right: 16 })
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTROL)
+          }
+
+          if (this.session()?.runtimePending !== undefined
+            && this.session()?.runtimePending !== null) {
+            Row({ space: 9 }) {
+              SymbolGlyph($r('sys.symbol.clock'))
+                .fontSize(uiFontSize(15))
+                .fontColor([$r('app.color.text_secondary')])
+              Column({ space: 2 }) {
+                Text('运行时模型切换等待中')
+                  .fontSize(uiFontSize(13))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text(`${this.session()?.runtimePending?.profile.model ?? ''}`)
                   .fontSize(uiFontSize(12))
                   .fontColor($r('app.color.text_secondary'))
                   .maxLines(1)

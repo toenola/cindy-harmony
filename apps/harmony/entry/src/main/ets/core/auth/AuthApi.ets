@@ -22,8 +22,33 @@ export class LoginOutcome {
   refreshToken: string = '';
   membershipId: string = '';
   displayName: string = '';
+  email: string = '';
   /** 后续登录需要确认账号时服务端给的票据 */
   loginTicket: string = '';
+}
+
+export class AccountDeletionAvailability {
+  available: boolean = false;
+  channel: string = '';
+  maskedTarget: string = '';
+  manualAppleRevocationRequired: boolean = false;
+}
+
+export class AccountDeletionChallenge {
+  challengeId: string = '';
+  receiptToken: string = '';
+  channel: string = '';
+  maskedTarget: string = '';
+  expiresAt: string = '';
+}
+
+export class AccountDeletionStatus {
+  status: string = '';
+  requestedAt: string = '';
+  deleteAfter: string = '';
+  processingAt: string = '';
+  completedAt: string = '';
+  cancelledAt: string = '';
 }
 
 export class AuthApiError extends Error {
@@ -97,6 +122,117 @@ export class AuthApi {
     return this.parseLoginOutcome(res.body);
   }
 
+  async getAccountDeletionAvailability(accessToken: string): Promise<AccountDeletionAvailability> {
+    const headers: Record<string, string> = {};
+    headers['Authorization'] = `Bearer ${accessToken}`;
+    const res = await this.http.requestJson(
+      `${AppConfig.authApiBaseUrl}/api/auth/account/deletion`,
+      'GET',
+      headers,
+    );
+    if (res.statusCode >= 300) {
+      throw this.responseError(res.body, res.statusCode, 'account deletion');
+    }
+    let obj: Record<string, Object>;
+    try {
+      obj = JSON.parse(res.body) as Record<string, Object>;
+    } catch (_) {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion response is not valid json');
+    }
+    const result = new AccountDeletionAvailability();
+    result.available = obj['available'] === true;
+    const verification = obj['verification'];
+    if (verification !== undefined && verification !== null
+      && typeof verification === 'object' && !Array.isArray(verification)) {
+      const record = verification as Record<string, Object>;
+      result.channel = this.readString(record, 'channel');
+      result.maskedTarget = this.readString(record, 'maskedTarget');
+    }
+    result.manualAppleRevocationRequired = obj['manualAppleRevocationRequired'] === true;
+    return result;
+  }
+
+  async requestAccountDeletionChallenge(accessToken: string): Promise<AccountDeletionChallenge> {
+    const headers: Record<string, string> = {};
+    headers['Authorization'] = `Bearer ${accessToken}`;
+    const res = await this.http.requestJson(
+      `${AppConfig.authApiBaseUrl}/api/auth/account/deletion/challenge`,
+      'POST',
+      headers,
+      JSON.stringify({ locale: AppConfig.locale }),
+    );
+    if (res.statusCode >= 300) {
+      throw this.responseError(res.body, res.statusCode, 'account deletion challenge');
+    }
+    let obj: Record<string, Object>;
+    try {
+      obj = JSON.parse(res.body) as Record<string, Object>;
+    } catch (_) {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion challenge is not valid json');
+    }
+    const result = new AccountDeletionChallenge();
+    result.challengeId = this.readString(obj, 'challengeId');
+    result.receiptToken = this.readString(obj, 'receiptToken');
+    result.channel = this.readString(obj, 'channel');
+    result.maskedTarget = this.readString(obj, 'maskedTarget');
+    result.expiresAt = this.readString(obj, 'expiresAt');
+    if (result.challengeId.length === 0 || result.receiptToken.length === 0) {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion challenge is incomplete');
+    }
+    return result;
+  }
+
+  async confirmAccountDeletion(
+    accessToken: string,
+    challengeId: string,
+    receiptToken: string,
+    code: string,
+  ): Promise<AccountDeletionStatus> {
+    const headers: Record<string, string> = {};
+    headers['Authorization'] = `Bearer ${accessToken}`;
+    const res = await this.http.requestJson(
+      `${AppConfig.authApiBaseUrl}/api/auth/account/deletion/confirm`,
+      'POST',
+      headers,
+      JSON.stringify({
+        challengeId,
+        receiptToken,
+        code,
+        acknowledged: true,
+      }),
+    );
+    if (res.statusCode >= 300) {
+      throw this.responseError(res.body, res.statusCode, 'account deletion confirm');
+    }
+    let obj: Record<string, Object>;
+    try {
+      obj = JSON.parse(res.body) as Record<string, Object>;
+    } catch (_) {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion status is not valid json');
+    }
+    return this.parseAccountDeletionStatus(obj);
+  }
+
+  /** 查询确认后保留的 receipt；该接口不再携带登录 token。 */
+  async getAccountDeletionStatus(receiptToken: string): Promise<AccountDeletionStatus> {
+    const res = await this.http.requestJson(
+      `${AppConfig.authApiBaseUrl}/api/auth/account/deletion/status`,
+      'POST',
+      {},
+      JSON.stringify({ receiptToken }),
+    );
+    if (res.statusCode >= 300) {
+      throw this.responseError(res.body, res.statusCode, 'account deletion status');
+    }
+    let obj: Record<string, Object>;
+    try {
+      obj = JSON.parse(res.body) as Record<string, Object>;
+    } catch (_) {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion status is not valid json');
+    }
+    return this.parseAccountDeletionStatus(obj);
+  }
+
   private parseLoginOutcome(rawBody: string): LoginOutcome {
     const outcome = new LoginOutcome();
     let obj: Record<string, Object> = {};
@@ -116,8 +252,47 @@ export class AuthApi {
       const m = membership as Record<string, Object>;
       outcome.membershipId = this.readString(m, 'id');
       outcome.displayName = this.readString(m, 'displayName');
+      outcome.email = this.readString(m, 'email');
     }
     return outcome;
+  }
+
+  private parseAccountDeletionStatus(obj: Record<string, Object>): AccountDeletionStatus {
+    const result = new AccountDeletionStatus();
+    result.status = this.readString(obj, 'status');
+    result.requestedAt = this.readString(obj, 'requestedAt');
+    result.deleteAfter = this.readString(obj, 'deleteAfter');
+    result.processingAt = this.readString(obj, 'processingAt');
+    result.completedAt = this.readString(obj, 'completedAt');
+    result.cancelledAt = this.readString(obj, 'cancelledAt');
+    if (result.status !== 'pending' && result.status !== 'processing'
+      && result.status !== 'completed' && result.status !== 'cancelled') {
+      throw new AuthApiError('INVALID_RESPONSE', 'account deletion status is incomplete');
+    }
+    return result;
+  }
+
+  private responseError(body: string, statusCode: number, operation: string): AuthApiError {
+    let code = `HTTP_${statusCode}`;
+    let message = `${operation} ${statusCode}`;
+    try {
+      const obj = JSON.parse(body) as Record<string, Object>;
+      const directCode = this.readString(obj, 'code');
+      const directMessage = this.readString(obj, 'message');
+      if (directCode.length > 0) code = directCode;
+      if (directMessage.length > 0) message = directMessage;
+      const nested = obj['error'];
+      if (nested !== undefined && nested !== null && typeof nested === 'object'
+        && !Array.isArray(nested)) {
+        const error = nested as Record<string, Object>;
+        const nestedCode = this.readString(error, 'code');
+        const nestedMessage = this.readString(error, 'message');
+        if (nestedCode.length > 0) code = nestedCode;
+        if (nestedMessage.length > 0) message = nestedMessage;
+      }
+    } catch (_) {
+    }
+    return new AuthApiError(code, message);
   }
 
   private readString(obj: Record<string, Object>, key: string): string {

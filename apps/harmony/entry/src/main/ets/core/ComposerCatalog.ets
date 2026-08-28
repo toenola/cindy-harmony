@@ -27,6 +27,8 @@ export class ComposerModelOption {
   providerLogoKind: string = '';
   modelIcon: string = '';
   subscription: boolean = false;
+  /** Server entitlement state. Paid models stay visible for discovery but are not routable. */
+  availability: string = 'available';
   /**
    * 该模型被远端标记为哪些 agent 的新任务默认种子（model-access v3 `newSessionDefault`）。
    * 客户端不跨 agent 投影；缺省表示不作为默认。
@@ -203,6 +205,7 @@ export function parseModelOptions(value: Object | undefined): ComposerModelOptio
       option.description = readStr(record, 'description');
       option.defaultEffort = readStr(record, 'defaultEffort');
       option.supportsFastMode = readBool(record, 'supportsFastMode', false);
+      option.availability = readAvailability(record);
       readNewSessionDefaults(record, option);
       readEffortDisplayNames(record, option);
       const rawEfforts = record['efforts'];
@@ -257,6 +260,7 @@ export function resolveNewSessionDefaultModel(
   let bestOrder = 0;
   for (let i = 0; i < options.length; i++) {
     const option = options[i];
+    if (option.availability === 'requires_payment') continue;
     if (!stringArrayHasAgent(option.newSessionDefaultAgents, agent)) continue;
     if (best === null || option.sortOrder < bestOrder) {
       best = option;
@@ -343,6 +347,7 @@ export function parseProviderModelOptions(
       option.providerLogoKind = providerLogoKind;
       option.modelIcon = readStr(model, 'icon');
       option.subscription = subscription;
+      option.availability = readAvailability(model);
       const rawEfforts = model['efforts'];
       if (Array.isArray(rawEfforts)) {
         const efforts = rawEfforts as Object[];
@@ -354,6 +359,11 @@ export function parseProviderModelOptions(
     }
   }
   return out;
+}
+
+function readAvailability(record: Record<string, Object>): string {
+  const value = readStr(record, 'availability');
+  return value === 'requires_payment' ? 'requires_payment' : 'available';
 }
 
 /** 从 provider:list 结果提取 modelVisibilityOverrides；无则返回空表。 */

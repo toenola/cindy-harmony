@@ -11,7 +11,10 @@
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { AuthApi, AuthApiError, LoginOutcome } from './AuthApi';
+import {
+  AccountDeletionAvailability, AccountDeletionChallenge, AccountDeletionStatus,
+  AuthApi, AuthApiError, LoginOutcome,
+} from './AuthApi';
 import { SecureStore } from '../storage/SecureStore';
 import { safeErrorMessage } from '../tasks/TaskModels';
 
@@ -22,6 +25,9 @@ const KEY_ACCESS = 'auth.accessToken';
 const KEY_REFRESH = 'auth.refreshToken';
 const KEY_DEVICE_ID = 'auth.deviceId';
 const KEY_RELAY_USER_ID = 'auth.relayUserId';
+const KEY_ACCOUNT_NAME = 'auth.accountName';
+const KEY_ACCOUNT_EMAIL = 'auth.accountEmail';
+const KEY_ACCOUNT_DELETION_RECEIPT = 'auth.accountDeletionReceipt';
 
 export class AuthStore {
   private api: AuthApi = new AuthApi();
@@ -31,6 +37,12 @@ export class AuthStore {
   private refreshToken: string = '';
   /** relay hello-ack 的稳定账号 id；仅用于隔离可丢弃的本地列表快照。 */
   private relayUserId: string = '';
+  /** 当前 membership 展示名；用于设置页账号头部，不参与鉴权。 */
+  private accountName: string = '';
+  /** 当前 membership 邮箱；用于设置页账号头部，不参与鉴权。 */
+  private accountEmail: string = '';
+  /** 注销确认后用于登录页查询状态的短期 receipt；普通登出会清除。 */
+  private accountDeletionReceipt: string = '';
   /** 登录/登出账号代次；旧网络响应不得跨代写回新账号状态。 */
   private authEpoch: number = 0;
   /** 同一账号代次只允许一个 refresh 在途，避免并发 401 互相覆盖 token pair。 */
@@ -75,6 +87,18 @@ export class AuthStore {
     return this.relayUserId;
   }
 
+  get displayName(): string {
+    return this.accountName;
+  }
+
+  get email(): string {
+    return this.accountEmail;
+  }
+
+  get deletionReceipt(): string {
+    return this.accountDeletionReceipt;
+  }
+
   get sessionEpoch(): number {
     return this.authEpoch;
   }
@@ -101,6 +125,9 @@ export class AuthStore {
     const access = await this.store.get(KEY_ACCESS, '');
     const refresh = await this.store.get(KEY_REFRESH, '');
     this.relayUserId = await this.store.get(KEY_RELAY_USER_ID, '');
+    this.accountName = await this.store.get(KEY_ACCOUNT_NAME, '');
+    this.accountEmail = await this.store.get(KEY_ACCOUNT_EMAIL, '');
+    this.accountDeletionReceipt = await this.store.get(KEY_ACCOUNT_DELETION_RECEIPT, '');
     // access 可能在上次进程退出前已被清空，但 refresh 仍然有效；必须恢复它，
     // 否则冷启动后的第一次 Device Link 会被误判为未登录。
     this.accessToken = access;
@@ -130,10 +157,19 @@ export class AuthStore {
     }
     this.accessToken = outcome.accessToken;
     this.refreshToken = outcome.refreshToken;
+    this.accountName = outcome.displayName.trim();
+    this.accountEmail = outcome.email.trim();
+    // 新登录已经进入正常会话，旧账号的注销状态不应泄露到新账号。
+    this.accountDeletionReceipt = '';
     this.authEpoch += 1;
     // 持久化；写入失败不阻断内存会话（下次启动重新登录即可）。
     void this.store.set(KEY_ACCESS, this.accessToken);
     void this.store.set(KEY_REFRESH, this.refreshToken);
+    if (this.accountName.length > 0) void this.store.set(KEY_ACCOUNT_NAME, this.accountName);
+    else void this.store.remove(KEY_ACCOUNT_NAME);
+    if (this.accountEmail.length > 0) void this.store.set(KEY_ACCOUNT_EMAIL, this.accountEmail);
+    else void this.store.remove(KEY_ACCOUNT_EMAIL);
+    void this.store.remove(KEY_ACCOUNT_DELETION_RECEIPT);
     this.notifyChanged();
   }
 
@@ -177,6 +213,14 @@ export class AuthStore {
       }
       if (outcome.accessToken.length > 0) {
         this.accessToken = outcome.accessToken;
+        if (outcome.displayName.trim().length > 0) {
+          this.accountName = outcome.displayName.trim();
+          void this.store.set(KEY_ACCOUNT_NAME, this.accountName);
+        }
+        if (outcome.email.trim().length > 0) {
+          this.accountEmail = outcome.email.trim();
+          void this.store.set(KEY_ACCOUNT_EMAIL, this.accountEmail);
+        }
         if (outcome.refreshToken.length > 0) {
           this.refreshToken = outcome.refreshToken;
           void this.store.set(KEY_REFRESH, this.refreshToken);
@@ -204,6 +248,48 @@ export class AuthStore {
     return this.getAccessToken();
   }
 
+  async getAccountDeletionAvailability(): Promise<AccountDeletionAvailability> {
+    const token = await this.getAccessToken();
+    if (token === null || token.length === 0) throw new AuthApiError('UNAUTHENTICATED', 'not signed in');
+    return await this.api.getAccountDeletionAvailability(token);
+  }
+
+  async requestAccountDeletionChallenge(): Promise<AccountDeletionChallenge> {
+    const token = await this.getAccessToken();
+    if (token === null || token.length === 0) throw new AuthApiError('UNAUTHENTICATED', 'not signed in');
+    const challenge = await this.api.requestAccountDeletionChallenge(token);
+    this.accountDeletionReceipt = challenge.receiptToken;
+    await this.store.set(KEY_ACCOUNT_DELETION_RECEIPT, this.accountDeletionReceipt);
+    this.notifyChanged();
+    return challenge;
+  }
+
+  async confirmAccountDeletion(
+    challengeId: string,
+    receiptToken: string,
+    code: string,
+  ): Promise<AccountDeletionStatus> {
+    const token = await this.getAccessToken();
+    if (token === null || token.length === 0) throw new AuthApiError('UNAUTHENTICATED', 'not signed in');
+    return await this.api.confirmAccountDeletion(token, challengeId, receiptToken, code);
+  }
+
+  async getAccountDeletionStatus(): Promise<AccountDeletionStatus | null> {
+    if (this.accountDeletionReceipt.length === 0) return null;
+    return await this.api.getAccountDeletionStatus(this.accountDeletionReceipt);
+  }
+
+  async clearAccountDeletionReceipt(): Promise<void> {
+    this.accountDeletionReceipt = '';
+    await this.store.remove(KEY_ACCOUNT_DELETION_RECEIPT);
+    this.notifyChanged();
+  }
+
+  /** 注销确认成功后清理本地会话，但保留 receipt 供登录页展示服务端状态。 */
+  async completeAccountDeletion(): Promise<void> {
+    await this.clearSession(true);
+  }
+
   /**
    * hello-ack 到达后记住稳定账号 id。返回 true 表示账号作用域发生变化，调用方
    * 必须让旧请求/旧快照失效并重新拉取。
@@ -217,15 +303,30 @@ export class AuthStore {
   }
 
   async logout(): Promise<void> {
+    await this.clearSession(false);
+  }
+
+  private async clearSession(preserveDeletionReceipt: boolean): Promise<void> {
     this.authEpoch += 1;
     this.accessToken = '';
     this.refreshToken = '';
     this.relayUserId = '';
+    this.accountName = '';
+    this.accountEmail = '';
+    if (!preserveDeletionReceipt) this.accountDeletionReceipt = '';
     if (this.logoutCleanup !== undefined) {
       await this.logoutCleanup();
     }
     // 只清 token 等敏感信息，保留 deviceId（设备身份与服务端一致）。
-    await this.store.clearSensitive();
+    if (preserveDeletionReceipt) {
+      await this.store.remove(KEY_ACCESS);
+      await this.store.remove(KEY_REFRESH);
+      await this.store.remove(KEY_RELAY_USER_ID);
+      await this.store.remove(KEY_ACCOUNT_NAME);
+      await this.store.remove(KEY_ACCOUNT_EMAIL);
+    } else {
+      await this.store.clearSensitive();
+    }
     this.notifyChanged();
   }
 }

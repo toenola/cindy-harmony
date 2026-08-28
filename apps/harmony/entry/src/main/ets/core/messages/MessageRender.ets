@@ -16,6 +16,8 @@ import {
   RemoteMessage, readStr, readObj, readAny,
 } from '../tasks/TaskModels';
 import { parseMarkdown, MdBlock } from './MarkdownParser';
+import { sanitizeInternalOutput } from './InternalOutputSanitizer';
+import { parseToolResultCompactionMarker, toolResultCompactionPreview } from './ToolResultCompaction';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
 import {
   RenderDiffPayload,
@@ -438,7 +440,8 @@ export function contentPreview(content: Object | undefined): string {
     return '';
   }
   if (typeof content === 'string') {
-    return content;
+    const compacted = toolResultCompactionPreview(content);
+    return compacted.length > 0 ? compacted : sanitizeInternalOutput(content);
   }
   if (Array.isArray(content)) {
     const parts: string[] = [];
@@ -453,25 +456,27 @@ export function contentPreview(content: Object | undefined): string {
   }
   if (typeof content === 'object') {
     const record = content as Record<string, Object>;
+    const compacted = toolResultCompactionPreview(content);
+    if (compacted.length > 0) return compacted;
     const kind = readStr(record, 'kind');
     const type = readStr(record, 'type');
     if (kind === 'thinking' || type === 'thinking') {
       // 落库格式 { kind:'thinking', text, durationMs } 或 SDK 格式 { type:'thinking', thinking }。
       const text = readStr(record, 'text');
-      if (text.length > 0) return text;
+      if (text.length > 0) return sanitizeInternalOutput(text);
       const thinking = readStr(record, 'thinking');
-      if (thinking.length > 0) return thinking;
+      if (thinking.length > 0) return sanitizeInternalOutput(thinking);
       return '';
     }
     if (type === 'text') {
       const text = readStr(record, 'text');
-      if (text.length > 0) return text;
+      if (text.length > 0) return sanitizeInternalOutput(text);
     }
     const text = readStr(record, 'text');
-    if (text.length > 0) return text;
+    if (text.length > 0) return sanitizeInternalOutput(text);
     const inner = readStr(record, 'content');
-    if (inner.length > 0) return inner;
-    return JSON.stringify(content);
+    if (inner.length > 0) return sanitizeInternalOutput(inner);
+    return sanitizeInternalOutput(JSON.stringify(content));
   }
   return '';
 }
@@ -548,6 +553,8 @@ export function toolResultHasError(message: RemoteMessage, toolName: string = ''
     const record = content as Record<string, Object>;
     if (record['isError'] === true || record['is_error'] === true) return true;
   }
+  // Compaction is a successful transport projection, not a failed tool call.
+  if (parseToolResultCompactionMarker(content) !== null) return false;
   const text = contentPreview(content).trim();
   if (text.length === 0) return false;
   if (text.includes('<tool_use_error>')) return true;

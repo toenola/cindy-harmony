@@ -8,6 +8,8 @@
  * 不执行 HTML；仅把受支持的 img 标签归一为安全图片 token。
  */
 
+import { findBareHttpAutolinkAt } from './UrlTextBoundary';
+
 // ─── 行内 token ──────────────────────────────────────────────────────────────
 
 /** 全局 token 序号：保证嵌套 ForEach（Text 内 Span）的 key 全局唯一。 */
@@ -305,6 +307,19 @@ export function tokenizeInline(text: string): InlineToken[] {
             continue;
           }
         }
+      }
+    }
+    // 裸 HTTP(S) 地址：显式 Markdown 链接、代码和图片都已在前面的分支消费，
+    // 因此这里仅把普通文本中的 URL 转成可点击 link token。裁剪出的尾部标点
+    // 留给下一轮普通文本，避免中文句号/Markdown 包裹符被带入浏览器。
+    if (ch === 'h' && !isEscapedAt(text, cursor)) {
+      const url = findBareHttpAutolinkAt(text, cursor);
+      if (url.length > 0) {
+        flushPlain(cursor);
+        pushToken('link', url, url);
+        cursor += url.length;
+        plainStart = cursor;
+        continue;
       }
     }
     cursor += 1;

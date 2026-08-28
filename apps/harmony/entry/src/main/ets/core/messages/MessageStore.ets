@@ -77,6 +77,7 @@ import {
   resetGenerationMetricsForNewTurn,
   SessionGenerationStatus,
 } from './GenerationStatus';
+import { sanitizeInternalOutput, sanitizeStreamingOutput } from './InternalOutputSanitizer';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyMsg';
@@ -1738,7 +1739,7 @@ export class MessageStore {
       assistant.sessionId = sessionId;
       assistant.role = 'assistant';
       assistant.createdAt = streaming.createdAt;
-      assistant.content = streaming.text;
+      assistant.content = sanitizeInternalOutput(streaming.text);
       assistant.isStreaming = false;
       if (index >= 0) list[index] = assistant;
       else list.push(assistant);
@@ -2089,7 +2090,7 @@ export class MessageStore {
       tm.sessionId = sessionId;
       tm.role = 'assistant';
       tm.createdAt = s.createdAt;
-      tm.content = s.text;
+      tm.content = sanitizeStreamingOutput(s.text);
       tm.isStreaming = isStreaming;
       tmp.push(tm);
     }
@@ -2880,7 +2881,7 @@ export function buildPersistedUserContent(text: string, images: RemoteImageRef[]
 }
 
 /** 返回可以交给 Desktop local-db 游标的最早真实消息 id。 */
-function oldestMessageCursor(messages: RemoteMessage[]): string {
+export function oldestMessageCursor(messages: RemoteMessage[]): string {
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
     const id = message.id;

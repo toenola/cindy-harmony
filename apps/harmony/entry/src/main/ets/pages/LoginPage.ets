@@ -5,6 +5,8 @@
 
 import { router } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
+import { AccountDeletionStatus, AuthApiError } from '../core/auth/AuthApi';
+import { UI_RADIUS_CONTAINER, uiFontSize, uiLineHeight } from '../components/UiKit';
 
 @Entry
 @Component
@@ -16,13 +18,82 @@ struct LoginPage {
   @State submitting: boolean = false;
   @State error: string = '';
   @State countdown: number = 0;
+  @State accountDeletionStatus: AccountDeletionStatus | null = null;
   private timer: number = -1;
+  private deletionPollTimer: number = -1;
+  private deletionPollInFlight: boolean = false;
+
+  aboutToAppear(): void {
+    void this.refreshAccountDeletionStatus();
+    this.deletionPollTimer = setInterval(() => void this.refreshAccountDeletionStatus(), 30000);
+  }
 
   aboutToDisappear(): void {
     if (this.timer >= 0) {
       clearInterval(this.timer);
       this.timer = -1;
     }
+    if (this.deletionPollTimer >= 0) {
+      clearInterval(this.deletionPollTimer);
+      this.deletionPollTimer = -1;
+    }
+  }
+
+  private async refreshAccountDeletionStatus(): Promise<void> {
+    const auth = AppServices.instance.auth;
+    if (auth.isLoggedIn || auth.deletionReceipt.length === 0) {
+      this.accountDeletionStatus = null;
+      if (auth.deletionReceipt.length === 0 && this.deletionPollTimer >= 0) {
+        clearInterval(this.deletionPollTimer);
+        this.deletionPollTimer = -1;
+      }
+      return;
+    }
+    if (this.deletionPollInFlight) return;
+    this.deletionPollInFlight = true;
+    try {
+      const status = await auth.getAccountDeletionStatus();
+      if (status === null) return;
+      if (status.status === 'cancelled') {
+        await auth.clearAccountDeletionReceipt();
+        this.accountDeletionStatus = null;
+        return;
+      }
+      this.accountDeletionStatus = status;
+      if (status.status === 'completed' && this.deletionPollTimer >= 0) {
+        clearInterval(this.deletionPollTimer);
+        this.deletionPollTimer = -1;
+      }
+    } catch (e) {
+      if (e instanceof AuthApiError && e.code === 'ACCOUNT_DELETION_RECEIPT_INVALID') {
+        await auth.clearAccountDeletionReceipt();
+        this.accountDeletionStatus = null;
+      }
+    } finally {
+      this.deletionPollInFlight = false;
+    }
+  }
+
+  private accountDeletionStatusTitle(): string {
+    const status = this.accountDeletionStatus?.status;
+    if (status === 'processing') return '账号注销处理中';
+    if (status === 'completed') return '账号已注销';
+    return '账号注销待处理';
+  }
+
+  private accountDeletionStatusDetail(): string {
+    const status = this.accountDeletionStatus;
+    if (status === null) return '';
+    if (status.status === 'processing') return '账号正在处理注销请求，请稍候。';
+    if (status.status === 'completed') return '账号注销已完成。';
+    const date = status.deleteAfter.length > 0 ? `（预计 ${status.deleteAfter.slice(0, 10)}）` : '';
+    return `账号将在等待期结束后永久删除；等待期间重新登录可撤销${date}。`;
+  }
+
+  private dismissAccountDeletionStatus(): void {
+    void AppServices.instance.auth.clearAccountDeletionReceipt().then(() => {
+      this.accountDeletionStatus = null;
+    });
   }
 
   private sendCode(): void {
@@ -82,6 +153,32 @@ struct LoginPage {
           .width(150)
           .height(43)
           .objectFit(ImageFit.Contain)
+
+        if (this.accountDeletionStatus !== null) {
+          Column({ space: 7 }) {
+            Text(this.accountDeletionStatusTitle())
+              .fontSize(uiFontSize(15))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+            Text(this.accountDeletionStatusDetail())
+              .fontSize(uiFontSize(12))
+              .lineHeight(uiLineHeight(17))
+              .fontColor($r('app.color.text_secondary'))
+            if (this.accountDeletionStatus.status === 'completed') {
+              Button('关闭')
+                .fontSize(uiFontSize(13))
+                .fontColor($r('app.color.text_primary'))
+                .backgroundColor($r('app.color.bg_chip'))
+                .onClick(() => this.dismissAccountDeletionStatus())
+            }
+          }
+          .width('85%')
+          .constraintSize({ maxWidth: 540 })
+          .padding(16)
+          .backgroundColor($r('app.color.bg_card'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTAINER)
+        }
 
         Column({ space: 16 }) {
           TextInput({ placeholder: '手机号', text: this.phone })

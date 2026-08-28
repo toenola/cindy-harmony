@@ -7,7 +7,10 @@
 import { common } from '@kit.AbilityKit';
 import { PresenceSnapshot } from '../device-link/DlProtocol';
 import { SecureStore } from '../storage/SecureStore';
-import { RemoteSession, parseSession, sortSessionsByUpdatedAt } from './TaskModels';
+import {
+  RemoteSession, RemoteSessionRuntimePending, RemoteSessionRuntimeProfile,
+  parseSession, sortSessionsByUpdatedAt,
+} from './TaskModels';
 
 const KEY = 'task.list.snapshot.v2';
 const LEGACY_KEY = 'task.list.snapshot.v1';
@@ -33,8 +36,8 @@ function lastActivityAt(session: RemoteSession): string {
     : (session.updatedAt.length > 0 ? session.updatedAt : session.createdAt);
 }
 
-function sessionRecord(session: RemoteSession): Record<string, Object> {
-  const out: Record<string, Object> = {};
+function sessionRecord(session: RemoteSession): Record<string, Object | null> {
+  const out: Record<string, Object | null> = {};
   out['id'] = session.id;
   if (session.title.length > 0) out['title'] = truncated(session.title);
   if (session.workingDir.length > 0) out['workingDir'] = truncated(session.workingDir);
@@ -50,6 +53,31 @@ function sessionRecord(session: RemoteSession): Record<string, Object> {
   out['createdAt'] = session.createdAt;
   if (session.updatedAt.length > 0) out['updatedAt'] = session.updatedAt;
   if (session.preview.length > 0) out['preview'] = truncated(session.preview);
+  if (session.runtimeGeneration !== undefined) out['runtimeGeneration'] = session.runtimeGeneration;
+  if (session.runtimeBaseline !== undefined) out['runtimeBaseline'] = runtimeProfileRecord(session.runtimeBaseline);
+  if (session.runtimeEffective !== undefined) out['runtimeEffective'] = runtimeProfileRecord(session.runtimeEffective);
+  if (session.runtimePending !== undefined) {
+    out['runtimePending'] = session.runtimePending === null
+      ? null : runtimePendingRecord(session.runtimePending);
+  }
+  return out;
+}
+
+function runtimeProfileRecord(profile: RemoteSessionRuntimeProfile): Record<string, Object | null> {
+  const out: Record<string, Object | null> = {};
+  out['agentKind'] = profile.agentKind;
+  out['model'] = truncated(profile.model);
+  out['providerId'] = profile.providerId.length > 0 ? profile.providerId : null;
+  out['effort'] = profile.effort.length > 0 ? profile.effort : null;
+  out['fastMode'] = profile.fastMode;
+  return out;
+}
+
+function runtimePendingRecord(pending: RemoteSessionRuntimePending): Record<string, Object | null> {
+  const out: Record<string, Object | null> = {};
+  out['generation'] = pending.generation;
+  out['source'] = pending.source;
+  out['profile'] = runtimeProfileRecord(pending.profile);
   return out;
 }
 

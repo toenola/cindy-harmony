@@ -109,6 +109,38 @@ export function parseDeviceView(raw: Record<string, Object>): DeviceView {
 
 // ─── 会话 ────────────────────────────────────────────────────────────────────
 
+/** Host-owned runtime route projection (optional on older Desktop peers). */
+export class RemoteSessionRuntimeProfile {
+  agentKind: string = '';
+  model: string = '';
+  /** Empty string represents the wire-level null providerId. */
+  providerId: string = '';
+  /** Empty string represents the wire-level null effort. */
+  effort: string = '';
+  fastMode: boolean = false;
+}
+
+export class RemoteSessionRuntimePending {
+  generation: number = 0;
+  source: string = '';
+  profile: RemoteSessionRuntimeProfile = new RemoteSessionRuntimeProfile();
+}
+
+function parseRuntimeProfile(value: Object | undefined): RemoteSessionRuntimeProfile | undefined {
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, Object>;
+  const profile = new RemoteSessionRuntimeProfile();
+  profile.agentKind = readStr(raw, 'agentKind');
+  profile.model = readStr(raw, 'model');
+  profile.providerId = readStr(raw, 'providerId');
+  profile.effort = readStr(raw, 'effort');
+  profile.fastMode = readBool(raw, 'fastMode', false);
+  if (profile.agentKind.length === 0 || profile.model.length === 0) return undefined;
+  return profile;
+}
+
 export class RemoteSession {
   id: string = '';
   userId: string = '';
@@ -126,6 +158,12 @@ export class RemoteSession {
   permissionMode: string = '';
   planModeEnabled: boolean = false;
   fastMode: boolean = false;
+  /** Monotonic host runtime-control generation; undefined means old host. */
+  runtimeGeneration: number | undefined = undefined;
+  runtimeBaseline: RemoteSessionRuntimeProfile | undefined = undefined;
+  runtimeEffective: RemoteSessionRuntimeProfile | undefined = undefined;
+  /** null is an explicit “no pending mutation”; undefined means old host. */
+  runtimePending: RemoteSessionRuntimePending | null | undefined = undefined;
   /** Desktop SDK thread id；输入队列 lazy-create 时必须透传以保留上下文。 */
   sdkSessionId: string = '';
   totalTokenUsage: number = 0;
@@ -173,6 +211,30 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.permissionMode = readStr(raw, 'permissionMode');
   s.planModeEnabled = readBool(raw, 'planModeEnabled', false);
   s.fastMode = readBool(raw, 'fastMode', false);
+  const rawGeneration = raw['runtimeGeneration'];
+  if (typeof rawGeneration === 'number' && Number.isFinite(rawGeneration)) {
+    s.runtimeGeneration = rawGeneration as number;
+  }
+  s.runtimeBaseline = parseRuntimeProfile(raw['runtimeBaseline']);
+  s.runtimeEffective = parseRuntimeProfile(raw['runtimeEffective']);
+  if (raw['runtimePending'] === null) {
+    s.runtimePending = null;
+  } else {
+    const pendingRaw = raw['runtimePending'];
+    if (pendingRaw !== undefined && pendingRaw !== null
+      && typeof pendingRaw === 'object' && !Array.isArray(pendingRaw)) {
+      const pendingRecord = pendingRaw as Record<string, Object>;
+      const profile = parseRuntimeProfile(pendingRecord['profile']);
+      const generation = readNum(pendingRecord, 'generation', -1);
+      if (profile !== undefined && generation >= 0) {
+        const pending = new RemoteSessionRuntimePending();
+        pending.generation = generation;
+        pending.source = readStr(pendingRecord, 'source');
+        pending.profile = profile;
+        s.runtimePending = pending;
+      }
+    }
+  }
   s.sdkSessionId = readStr(raw, 'sdkSessionId');
   s.totalTokenUsage = readNum(raw, 'totalTokenUsage', 0);
   s.contextTokens = readNum(raw, 'contextTokens', 0);

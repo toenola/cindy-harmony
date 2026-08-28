@@ -325,6 +325,9 @@ export class DlChannels {
 
   /** 从被控桌面取回历史消息里的本地媒体。 */
   static readonly MEDIA_FETCH = 'device-link:media:fetch';
+  /** 从桌面读取语音词典只读快照；词典正本仍在桌面端。 */
+  static readonly VOICE_DICTIONARY_GET = 'device-link:voice:dictionary:get';
+  static readonly VOICE_DICTIONARY_SNAPSHOT = 'device-link:voice:dictionary:snapshot';
   /** 读取被控端生成的文本 / 代码文件预览。 */
   static readonly TEXT_FILE_READ_PREVIEW = 'text-file:read-preview';
 

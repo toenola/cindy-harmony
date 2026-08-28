@@ -527,7 +527,12 @@ export struct NewSessionPageContent {
   }
 
   private selectModel(option: RuntimeModelOption): void {
-    if (this.creating) return;
+    if (this.creating || option.availability === 'requires_payment') {
+      if (option.availability === 'requires_payment') {
+        promptAction.showToast({ message: '该模型需要付费后才能使用' });
+      }
+      return;
+    }
     this.runtimeModelTouchedGeneration = this.runtimeLoadGeneration;
     // 选模型时会一起 reconcile effort / Fast，后续异步目录回包也不能把它们改回默认值。
     this.runtimeEffortTouchedGeneration = this.runtimeLoadGeneration;
@@ -1311,6 +1316,9 @@ export struct NewSessionPageContent {
       if (!modelTouched) {
         if (recent !== undefined && recent.model.length > 0) {
           selectedModel = this.findModelOption(recent.model, recent.providerId);
+          if (selectedModel !== undefined && selectedModel.availability === 'requires_payment') {
+            selectedModel = undefined;
+          }
         }
         // 用户没选过时才用远端默认标记（model-access v3 newSessionDefault）：
         // 它优先于写死的 fallbackModel，但不得覆盖用户最近的显式选择，
@@ -2295,6 +2303,7 @@ export struct NewSessionPageContent {
         ? option.providerName.charAt(0).toUpperCase() : 'S',
       selected: this.modelOptionIsCurrent(option),
       subscription: option.subscription,
+      paymentRequired: option.availability === 'requires_payment',
       disabled: this.creating,
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
