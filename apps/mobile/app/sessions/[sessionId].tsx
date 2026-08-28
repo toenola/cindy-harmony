@@ -184,7 +184,7 @@ import { ModelPickerSheet } from '@/session/ModelPickerSheet';
 import { MobileModelIconMark } from '@/session/MobileProviderMark';
 import { getModel } from '@cindy/model-providers/registry';
 import { clearSessionMirror, makeSessionMirrorAccessors } from '@/session/sessionModelMirror';
-import { rowFastEditable } from '@/session/modelPickerRows';
+import { effortLabelFromRuntime, rowFastEditable } from '@/session/modelPickerRows';
 import {
   buildMobileModelSections,
   isSelectedSourceDisconnected,
@@ -224,6 +224,7 @@ import {
 } from '@/session/useComposerImageAnnotations';
 import { buildMediaPayload } from '@/session/messagePayload';
 import type { MobileMessageGalleryImage } from '@/session/messageGallery';
+import { canBrowsePhotoLibraryDirectly } from '@/session/photoLibraryPolicy';
 import {
   prefetchContextSheetMediaAssets,
   resolveContextSheetMediaAssetForUpload,
@@ -646,7 +647,7 @@ function buildComposerRuntimeSummary(
   runtime: MobileSessionRuntimeOptions,
 ): ComposerRuntimeSummary {
   const modelLabel = runtime.currentModel?.label ?? session.model;
-  const effortLabel = choiceLabel(runtime.effortOptions, session.effort);
+  const effortLabel = effortLabelFromRuntime(runtime, session.effort);
   return {
     modelSummary: [modelLabel, effortLabel].filter(Boolean).join(' · '),
     permissionLabel: choiceLabel(runtime.permissionOptions, session.permissionMode),
@@ -1102,6 +1103,7 @@ export default function SessionScreen() {
   // Context 面板(+ 号弹出的可拖动 sheet):open + 面板内子视图(主视图 / 截图列表 / 目标模式)。
   const [contextSheetOpen, setContextSheetOpen] = useState(false);
   const [contextSheetView, setContextSheetView] = useState<'main' | 'screenshots' | 'goal'>('main');
+  const contextSheetMediaLibraryEnabled = canBrowsePhotoLibraryDirectly(Platform.OS);
   // 模型 + 权限浮窗(ContextSheet 同款 Modal,含二级「模型选项 / 权限」叠层)。
   const [modelSheetOpen, setModelSheetOpen] = useState(false);
   // 权限模式独立浮窗(composer 左侧图标钮点开,与模型浮窗同属 composer 激活态)。
@@ -2254,7 +2256,8 @@ export default function SessionScreen() {
     () => composerDisplaySession && composerDisplayRuntimeOptions
       ? buildComposerRuntimeSummary(composerDisplaySession, composerDisplayRuntimeOptions)
       : null,
-    [composerDisplayRuntimeOptions, composerDisplaySession],
+    // effort / 权限标签按 app 语言解析,切换语言时必须重算,否则停留在上一语言。
+    [composerDisplayRuntimeOptions, composerDisplaySession, i18nInstance.language],
   );
   // 被控端供应商目录 → provider-aware 模型分段(与新建会话页同逻辑;0 供应商回退扁平 modelOptions)。
   const composerDeviceProviders = useDeviceProviders(deviceId || undefined);
@@ -7850,10 +7853,12 @@ export default function SessionScreen() {
   useEffect(() => {
     if (!contextSheetOpen) setPendingMediaAssets([]);
   }, [contextSheetOpen]);
-  // 进页面就静默预取最近照片(仅已授权时),打开 + 面板即刻出图。
+  // iOS 进页面就静默预取最近照片(仅已授权时),打开 + 面板即刻出图;Android 统一走系统选择器。
   useEffect(() => {
-    void prefetchContextSheetMediaAssets('recent');
-  }, []);
+    if (contextSheetMediaLibraryEnabled) {
+      void prefetchContextSheetMediaAssets('recent');
+    }
+  }, [contextSheetMediaLibraryEnabled]);
 
   // 目标模式:面板打开时拉一次快照(push 只送变更);动作后再拉一次收敛,避免依赖单一 push。
   const goalStatus = useSessionGoalStatus(sessionId);
@@ -8986,15 +8991,17 @@ export default function SessionScreen() {
         >
           {contextSheetView === 'main' ? (
             <>
-              <RecentPhotosStrip
-                busyAssetIds={uploadingMediaAssetIds}
-                disabled={!canUseComposer}
-                enabled={contextSheetOpen}
-                onToggleAsset={toggleMediaAssetAttachment}
-                pendingOrder={pendingMediaOrder}
-                selectedAssetIds={selectedMediaAssetIds}
-                testID="session.contextSheetPhotos"
-              />
+              {contextSheetMediaLibraryEnabled ? (
+                <RecentPhotosStrip
+                  busyAssetIds={uploadingMediaAssetIds}
+                  disabled={!canUseComposer}
+                  enabled={contextSheetOpen}
+                  onToggleAsset={toggleMediaAssetAttachment}
+                  pendingOrder={pendingMediaOrder}
+                  selectedAssetIds={selectedMediaAssetIds}
+                  testID="session.contextSheetPhotos"
+                />
+              ) : null}
               <ContextSheetGroup label={t('session.common.groupMode')}>
                 {planModeSupported ? (
                   // 点击即切换计划模式并关面板(产品决策,不做开关);已开启时显示 ✓,再点退出。
@@ -9035,14 +9042,16 @@ export default function SessionScreen() {
                   onPress={() => void addLocalImageAttachments('library')}
                   testID="session.contextSheetPhotoRow"
                 />
-                <ContextSheetRow
-                  disabled={!canUseComposer}
-                  icon={<Scan color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                  label={t('session.common.screenshot')}
-                  onPress={() => setContextSheetView('screenshots')}
-                  testID="session.contextSheetScreenshotsRow"
-                  trailing="chevron"
-                />
+                {contextSheetMediaLibraryEnabled ? (
+                  <ContextSheetRow
+                    disabled={!canUseComposer}
+                    icon={<Scan color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
+                    label={t('session.common.screenshot')}
+                    onPress={() => setContextSheetView('screenshots')}
+                    testID="session.contextSheetScreenshotsRow"
+                    trailing="chevron"
+                  />
+                ) : null}
                 <ContextSheetRow
                   accessibilityHint={composerSendUnavailableReason ?? undefined}
                   disabled={!canUseComposer}
@@ -9066,7 +9075,7 @@ export default function SessionScreen() {
                 </Text>
               ) : null}
             </>
-          ) : contextSheetView === 'screenshots' ? (
+          ) : contextSheetView === 'screenshots' && contextSheetMediaLibraryEnabled ? (
             <ScreenshotsGrid
               busyAssetIds={uploadingMediaAssetIds}
               contentWidth={Math.min(windowDimensions.width, nativeShellLayout.contentMaxWidth) - 40}

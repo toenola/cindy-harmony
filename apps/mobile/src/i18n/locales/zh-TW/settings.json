@@ -39,6 +39,7 @@
   },
   "betaChannel": {
     "title": "Beta 測試管道",
+    "badge": "Beta",
     "description": "加入 Beta 測試管道，提前接收即將發布的客戶端更新。",
     "restartHint": "Beta 測試管道需要重新啟動客戶端後才能生效，請重新啟動應用。",
     "ok": "我知道了",
@@ -83,6 +84,21 @@
     "initializing": "初始化中",
     "authServer": "Auth Server",
     "authRegion": "登入區域"
+  },
+  "devServerEnvironment": {
+    "title": "伺服器環境",
+    "description": "僅影響 CindyDev 連線的業務伺服器",
+    "accessibility": "切換伺服器環境",
+    "options": {
+      "dev": "Dev",
+      "release": "Release"
+    },
+    "confirmTitle": "切換至 {{environment}}？",
+    "confirmBody": "切換會登出目前帳號並重新啟動 App。",
+    "cancel": "取消",
+    "switchAction": "切換",
+    "switching": "切換中",
+    "switchFailed": "切換伺服器環境失敗，請再試一次。"
   },
   "updateInfo": {
     "embedded": "隨整包",

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,9 +6,12 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ghostManifestToAuthorFormat,
+  ghostManifestToLegacyV2DigestFormat,
   validateGhostManifest,
   type GhostInstallApproval,
   type GhostManifest,
+  type GhostTrustInfo,
 } from '../../../shared/ghost.js';
 const runtime = vi.hoisted(() => ({
   ghosts: [] as Array<{
@@ -15,6 +19,7 @@ const runtime = vi.hoisted(() => ({
     dir: string;
     enabled: boolean;
     approval?: GhostInstallApproval;
+    trust?: GhostTrustInfo;
   }>,
   install: vi.fn(),
   inspect: vi.fn(),
@@ -25,6 +30,7 @@ const runtime = vi.hoisted(() => ({
   pendingCalls: false,
   runningErrand: false,
   cindyWork: false,
+  generatedInstallDirs: [] as string[],
   boundaryPending: false,
   approvedInstallEvidence: vi.fn(() => null as {
     packageSha256: string | null;
@@ -66,13 +72,36 @@ vi.mock('../../logger.js', () => ({
 vi.mock('../../cindy-brain/index.js', () => ({
   getGhostManager: () => ({
     list: () =>
-      runtime.ghosts.map((ghost) => ({
-        ...ghost,
-        approval: ghost.approval ?? {
-          state: 'approved',
-          revision: '00000000-0000-4000-8000-000000000001',
-        },
-      })),
+      runtime.ghosts.map((ghost) => {
+        // Historical service tests used a production-looking placeholder path.
+        // Materialize only that fixture shape so raw-byte identity is exercised;
+        // explicit missing/unreadable temp-path cases remain untouched.
+        if (
+          ghost.dir.startsWith('/userData/cindy-brain/') &&
+          !fs.existsSync(path.join(ghost.dir, 'ghost.json'))
+        ) {
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-service-runtime-'));
+          runtime.generatedInstallDirs.push(dir);
+          fs.writeFileSync(
+            path.join(dir, 'ghost.json'),
+            JSON.stringify(ghostManifestToAuthorFormat(ghost.manifest as GhostManifest)),
+          );
+          ghost.dir = dir;
+        }
+        return {
+          ...ghost,
+          approval: ghost.approval ?? {
+            state: 'approved',
+            revision: '00000000-0000-4000-8000-000000000001',
+          },
+          trust: ghost.trust ?? {
+            level: 'unverified',
+            publisherSigned: false,
+            publisherVerified: false,
+            reviewed: false,
+          },
+        };
+      }),
     approvedInstallEvidence: runtime.approvedInstallEvidence,
     inspect: runtime.inspect,
   }),
@@ -80,11 +109,43 @@ vi.mock('../../cindy-brain/index.js', () => ({
   installOrUpdateMarketGhostPackage: async (
     filePath: string,
     options: {
-      afterCommitInLock?: (installed: unknown) => void | Promise<void>;
+      afterCommitInLock?: (
+        installed: { manifest: Record<string, unknown>; dir: string },
+        evidence: {
+          rawManifestSha256: string;
+          legacyManifestDigest: string;
+          canonicalManifest: Record<string, unknown>;
+        },
+      ) => void | Promise<void>;
     },
   ) => {
     const installed = await runtime.install(filePath, options);
-    await options.afterCommitInLock?.(installed);
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(path.join(installed.dir, 'ghost.json'));
+    } catch {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-service-installed-'));
+      runtime.generatedInstallDirs.push(dir);
+      bytes = Buffer.from(
+        JSON.stringify(ghostManifestToAuthorFormat(installed.manifest as GhostManifest)),
+      );
+      fs.writeFileSync(path.join(dir, 'ghost.json'), bytes);
+      installed.dir = dir;
+      const runtimeGhost = runtime.ghosts.find(
+        (ghost) => ghost.manifest.id === installed.manifest.id,
+      );
+      if (runtimeGhost) runtimeGhost.dir = dir;
+    }
+    await options.afterCommitInLock?.(installed, {
+      rawManifestSha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      legacyManifestDigest: ghostManifestDigest(
+        ghostManifestToLegacyV2DigestFormat(
+          installed.manifest,
+          JSON.parse(bytes.toString('utf8')) as unknown,
+        ),
+      ),
+      canonicalManifest: installed.manifest,
+    });
     return installed;
   },
   hasPendingGhostCalls: vi.fn(() => runtime.pendingCalls),
@@ -107,6 +168,7 @@ import { withGhostInstallLock } from '../../cindy-brain/ghostInstallLock';
 import {
   PluginMarketLedger,
   ghostManifestDigest,
+  legacyNoSlotsGhostManifestDigest,
   type PluginMarketInstallationRecord,
 } from '../ledger';
 import { PluginMarketService } from '../service';
@@ -138,6 +200,9 @@ afterEach(() => {
   runtime.pendingCalls = false;
   runtime.runningErrand = false;
   runtime.cindyWork = false;
+  for (const dir of runtime.generatedInstallDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
   runtime.boundaryPending = false;
   runtime.approvedInstallEvidence.mockReset();
   runtime.approvedInstallEvidence.mockReturnValue(null);
@@ -363,6 +428,242 @@ function mockUninstallDropsGhost(failFor?: string): void {
 }
 
 describe('PluginMarketService migration and defaultInstall', () => {
+  it('backfills the exact raw identity for an unchanged v0.1.61 v2 card record', async () => {
+    const rawManifest = {
+      schemaVersion: 2 as const,
+      id: 'cindy-test',
+      name: 'Test Plugin',
+      version: '1.0.0',
+      kind: 'chip' as const,
+      entry: 'main.js',
+      slots: ['card'],
+    };
+    const canonicalManifest = normalizedManifest(rawManifest);
+    const bytes = Buffer.from(`${JSON.stringify(rawManifest, null, 2)}\n`);
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-v2-card-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), bytes);
+    runtime.ghosts = [{ manifest: canonicalManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    const legacyRecord = recordForTest(item, {
+      manifestDigest: ghostManifestDigest(rawManifest),
+      updatedAt: '2026-08-01T00:00:00.000Z',
+    });
+    h.ledger.upsertInstallation(legacyRecord);
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: canonicalManifest,
+      legacyMigrated: false,
+    });
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('installed');
+    expect(h.ledger.installationForGhost(item.ghostId)).toEqual({
+      ...legacyRecord,
+      rawManifestSha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    });
+  });
+
+  it('does not backfill raw identity when the installed v2 manifest changed', async () => {
+    const approvedRaw = {
+      schemaVersion: 2 as const,
+      id: 'cindy-test',
+      name: 'Test Plugin',
+      version: '1.0.0',
+      kind: 'chip' as const,
+      entry: 'main.js',
+      slots: ['card'],
+    };
+    const changedRaw = { ...approvedRaw, description: 'changed locally' };
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-v2-changed-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(changedRaw));
+    runtime.ghosts = [{
+      manifest: normalizedManifest(changedRaw),
+      dir: installDir,
+      enabled: true,
+    }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      manifestDigest: ghostManifestDigest(approvedRaw),
+    }));
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: normalizedManifest(approvedRaw),
+      legacyMigrated: false,
+    });
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('conflict');
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBeUndefined();
+  });
+
+  it('backfills a pre-digest server record only from matching modern receipt evidence', async () => {
+    const rawManifest = manifest();
+    const bytes = Buffer.from(`${JSON.stringify(rawManifest, null, 2)}\n`);
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-no-digest-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), bytes);
+    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item));
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: normalizedManifest(rawManifest),
+      legacyMigrated: false,
+    });
+
+    await h.service.snapshot();
+
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBe(
+      crypto.createHash('sha256').update(bytes).digest('hex'),
+    );
+  });
+
+  it('does not mint raw identity when a modern receipt names a different manifest', async () => {
+    const rawManifest = manifest();
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-receipt-manifest-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      manifestDigest: ghostManifestDigest(rawManifest),
+    }));
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: normalizedManifest({ ...rawManifest, description: 'receipt mismatch' }),
+      legacyMigrated: false,
+    });
+
+    await h.service.snapshot();
+
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBeUndefined();
+  });
+
+  it.each(['market', 'local-market'] as const)(
+    'does not backfill a %s record while mutation recovery marks the install invalid',
+    async (source) => {
+      const rawManifest = manifest();
+      const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-pending-mutation-'));
+      roots.push(installDir);
+      fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+      runtime.ghosts = [{
+        manifest: rawManifest,
+        dir: installDir,
+        enabled: false,
+        approval: { state: 'invalid' },
+      }];
+      const item = summary();
+      const h = harness([item]);
+      h.ledger.upsertInstallation(recordForTest(item, {
+        source,
+        ...(source === 'local-market' ? { sourceKey: 'local:pending-mutation' } : {}),
+        manifestDigest: ghostManifestDigest(rawManifest),
+      }));
+
+      await h.service.snapshot();
+
+      expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBeUndefined();
+    },
+  );
+
+  it('backfills an affected record that was already reinstalled with the current digest', async () => {
+    const rawManifest = {
+      schemaVersion: 2 as const,
+      id: 'cindy-test',
+      name: 'Test Plugin',
+      version: '1.0.0',
+      kind: 'chip' as const,
+      entry: 'main.js',
+      slots: ['card'],
+    };
+    const canonicalManifest = normalizedManifest(rawManifest);
+    const bytes = Buffer.from(JSON.stringify(rawManifest));
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-reinstalled-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), bytes);
+    runtime.ghosts = [{ manifest: canonicalManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      manifestDigest: ghostManifestDigest(canonicalManifest),
+      updatedAt: '2026-08-01T00:00:00.000Z',
+    }));
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: canonicalManifest,
+      legacyMigrated: false,
+    });
+
+    await h.service.snapshot();
+
+    expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({
+      updatedAt: '2026-08-01T00:00:00.000Z',
+      rawManifestSha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    });
+  });
+
+  it('backfills the released intermediate v2 digest that omitted slots', async () => {
+    const rawManifest = {
+      schemaVersion: 2 as const,
+      id: 'cindy-test',
+      name: 'Test Plugin',
+      version: '1.0.0',
+      kind: 'chip' as const,
+      entry: 'main.js',
+      slots: ['card'],
+    };
+    const canonicalManifest = normalizedManifest(rawManifest);
+    const bytes = Buffer.from(JSON.stringify(rawManifest));
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-no-slots-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), bytes);
+    runtime.ghosts = [{ manifest: canonicalManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      manifestDigest: legacyNoSlotsGhostManifestDigest(canonicalManifest),
+    }));
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: canonicalManifest,
+      legacyMigrated: false,
+    });
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('installed');
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBe(
+      crypto.createHash('sha256').update(bytes).digest('hex'),
+    );
+  });
+
+  it('never overwrites an existing raw identity mismatch with a matching legacy digest', async () => {
+    const rawManifest = manifest();
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-raw-mismatch-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    const item = summary();
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      manifestDigest: ghostManifestDigest(rawManifest),
+      rawManifestSha256: 'f'.repeat(64),
+    }));
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('conflict');
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBe('f'.repeat(64));
+  });
+
   it('projects same-release display metadata without reinstalling the package', async () => {
     runtime.ghosts = [
       {
@@ -806,6 +1107,64 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install).not.toHaveBeenCalled();
   });
 
+  it('keeps a disconnected route detached when a modern receipt names another manifest', async () => {
+    const canonicalManifest = normalizedManifest(manifest());
+    const item = summary({
+      currentRelease: { ...summary().currentRelease, id: RELEASE_ID },
+    });
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-recovery-manifest-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(canonicalManifest));
+    runtime.ghosts = [{ manifest: canonicalManifest, dir: installDir, enabled: true }];
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: normalizedManifest({ ...manifest(), description: 'receipt mismatch' }),
+      legacyMigrated: false,
+    });
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      releaseId: RELEASE_ID,
+      manifestDigest: ghostManifestDigest(canonicalManifest),
+    }));
+    h.ledger.markRemoved(item.ghostId, 'user-1');
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('conflict');
+    expect(h.ledger.installationForGhost(item.ghostId)?.installed).toBe(false);
+  });
+
+  it('never restores a disconnected route across an existing raw identity mismatch', async () => {
+    const canonicalManifest = normalizedManifest(manifest());
+    const item = summary({
+      currentRelease: { ...summary().currentRelease, id: RELEASE_ID },
+    });
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-recovery-raw-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(canonicalManifest));
+    runtime.ghosts = [{ manifest: canonicalManifest, dir: installDir, enabled: true }];
+    runtime.approvedInstallEvidence.mockReturnValue({
+      packageSha256: item.currentRelease.sha256,
+      approvedManifest: canonicalManifest,
+      legacyMigrated: false,
+    });
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, {
+      releaseId: RELEASE_ID,
+      manifestDigest: ghostManifestDigest(canonicalManifest),
+      rawManifestSha256: 'f'.repeat(64),
+    }));
+    h.ledger.markRemoved(item.ghostId, 'user-1');
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('conflict');
+    expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({
+      installed: false,
+      rawManifestSha256: 'f'.repeat(64),
+    });
+  });
+
   it.each([
     { receiptCase: 'missing', receiptSha: null },
     { receiptCase: 'different', receiptSha: 'f'.repeat(64) },
@@ -903,6 +1262,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
       source: 'market',
       releaseId: RELEASE_ID,
     });
+    expect(h.ledger.installationForGhost(item.ghostId)?.rawManifestSha256).toBeUndefined();
     expect(h.api.download).not.toHaveBeenCalled();
     expect(runtime.install).not.toHaveBeenCalled();
   });
@@ -1008,7 +1368,6 @@ describe('PluginMarketService migration and defaultInstall', () => {
       expect.objectContaining({
         ghostId: 'cindy-test',
         version: '1.0.0',
-        manifestCap: manifest(),
         beforeCommitInLock: expect.any(Function),
       }),
     );
@@ -1023,7 +1382,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     });
   });
 
-  it('installs a default package whose manifest cap contains normalized setup requirements', async () => {
+  it('installs a default package whose detail manifest contains normalized setup requirements', async () => {
     const item = summary({ defaultInstall: true });
     const rawManifest = setupKvManifest();
     const approvedManifest = normalizedManifest(rawManifest);
@@ -1046,12 +1405,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     await expect(h.service.snapshot()).resolves.toMatchObject({
       items: [{ installState: 'installed', enabled: true }],
     });
-    expect(runtime.install).toHaveBeenCalledWith(
-      expect.stringMatching(/\.cindy$/),
-      expect.objectContaining({
-        manifestCap: approvedManifest,
-      }),
-    );
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('returns a Renderer snapshot before a default install download finishes', async () => {
@@ -1086,25 +1440,27 @@ describe('PluginMarketService migration and defaultInstall', () => {
     await vi.waitFor(() => expect(runtime.install).toHaveBeenCalledOnce());
   });
 
-  it('does not auto-install a package rejected for exceeding its catalog manifest', async () => {
+  it('auto-installs the verified package when its capabilities exceed stale catalog metadata', async () => {
     const item = summary({ defaultInstall: true });
-    runtime.install.mockRejectedValueOnce(
-      Object.assign(new Error('package capabilities exceed market manifest'), {
-        code: 'GHOST_FILE_INVALID',
-      }),
-    );
     const h = harness([item]);
+    const actualManifest = manifest(item.ghostId, item.currentRelease.version, ['notify', 'fs']);
+    runtime.inspectedManifest = actualManifest;
+    runtime.install.mockImplementationOnce(async () => {
+      const ghost = {
+        manifest: actualManifest,
+        dir: '/userData/cindy-brain/cindy-test',
+        enabled: true,
+      };
+      runtime.ghosts = [ghost];
+      return ghost;
+    });
 
     const snapshot = await h.service.snapshot();
 
-    expect(runtime.install).toHaveBeenCalledWith(
-      expect.stringMatching(/\.cindy$/),
-      expect.objectContaining({
-        manifestCap: manifest(),
-      }),
-    );
-    expect(snapshot.items[0]?.installState).toBe('not-installed');
-    expect(h.ledger.installationForGhost(item.ghostId)).toBeNull();
+    expect(runtime.install).toHaveBeenCalledOnce();
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
+    expect(snapshot.items[0]?.installState).toBe('installed');
+    expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({ installed: true });
   });
 
   it('does not infer historical provenance from the server manifest', async () => {
@@ -1174,7 +1530,6 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install).toHaveBeenCalledWith(expect.stringMatching(/\.cindy$/), {
       ghostId: 'cindy-test',
       version: '1.0.0',
-      manifestCap: incompatibleManifest,
       afterCommitInLock: expect.any(Function),
     });
   });
@@ -1206,7 +1561,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects downloaded tool parameter schemas that drift from the catalog manifest', async () => {
+  it('installs the verified package when tool schemas drift from stale catalog metadata', async () => {
     const item = summary();
     const reviewedManifest = normalizedManifest({
       ...manifest(),
@@ -1245,14 +1600,19 @@ describe('PluginMarketService migration and defaultInstall', () => {
       currentRelease: { ...item.currentRelease, manifest: reviewedManifest },
     } as unknown as VisiblePluginDetail);
     runtime.inspectedManifest = actualManifest;
+    runtime.install.mockResolvedValue({
+      manifest: actualManifest,
+      dir: '/userData/cindy-brain/cindy-test',
+      enabled: true,
+    });
 
     await expect(
       h.service.install(item.id, {
         expectedReleaseId: item.currentRelease.id,
         expectedManifest: reviewedManifest,
       }),
-    ).rejects.toMatchObject({ code: 'GHOST_FILE_INVALID' });
-    expect(runtime.install).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ ghost: { manifest: actualManifest } });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('keeps a no-port broker release visible in detail but rejects market installation before download', async () => {
@@ -1296,7 +1656,6 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install).toHaveBeenCalledWith(expect.stringMatching(/\.cindy$/), {
       ghostId: 'cindy-test',
       version: '1.0.0',
-      manifestCap: manifest(),
       afterCommitInLock: expect.any(Function),
     });
     // 安装入口用目录 summary 做 detail 身份绑定(防止把 A 的确认导向 B 的内容),
@@ -1396,10 +1755,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
         },
       },
     });
-    expect(runtime.install).toHaveBeenCalledWith(
-      expect.stringMatching(/\.cindy$/),
-      expect.objectContaining({ manifestCap: reviewedManifest }),
-    );
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('installs the explicitly selected official entry when another entry shares its ghostId', async () => {
@@ -1448,18 +1804,80 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install.mock.calls[0]?.[1]).toEqual({
       ghostId: 'cindy-test',
       version: '1.0.0',
-      manifestCap: manifest(),
       afterCommitInLock: expect.any(Function),
     });
   });
 
-  it('旧 source:market + manifestDigest 安装会回填 cindy-github 官方 trust', async () => {
+  it('writes the v0.1.61 digest for a newly installed v2 card package', async () => {
+    const rawManifest = {
+      schemaVersion: 2 as const,
+      id: 'cindy-test',
+      name: 'Test Plugin',
+      version: '1.0.0',
+      kind: 'chip' as const,
+      entry: 'main.js',
+      slots: ['card'] as const,
+    };
+    const canonicalManifest = normalizedManifest(rawManifest);
+    const bytes = Buffer.from(`${JSON.stringify(rawManifest, null, 2)}\n`);
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-new-v2-card-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), bytes);
+    const item = summary();
+    const h = harness([item]);
+    h.api.detail.mockResolvedValue({
+      ...item,
+      currentRelease: {
+        ...item.currentRelease,
+        manifest: rawManifest as unknown as VisiblePluginDetail['currentRelease']['manifest'],
+      },
+    });
+    runtime.inspectedManifest = canonicalManifest;
+    runtime.install.mockResolvedValue({
+      manifest: canonicalManifest,
+      dir: installDir,
+      enabled: true,
+    });
+
+    await h.service.install(item.id, {
+      expectedReleaseId: item.currentRelease.id,
+      expectedManifest: rawManifest as unknown as GhostManifest,
+      allowSourceReplacement: false,
+    });
+
+    expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({
+      manifestDigest: ghostManifestDigest(rawManifest),
+      rawManifestSha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    });
+  });
+
+  it('Host receipt 未可信时,目录中的完整 trust 镜像也不能阻止官方回填', async () => {
     const item = summary({ ghostId: 'cindy-github' });
     const rawManifest = manifest('cindy-github');
     const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-github-'));
     roots.push(installDir);
     fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
-    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    fs.writeFileSync(
+      path.join(installDir, '.cindy-trust.json'),
+      JSON.stringify({
+        level: 'cindy-official',
+        publisherSigned: true,
+        publisherVerified: true,
+        reviewed: true,
+        publisherName: 'Cindy Plugin Market',
+      }),
+    );
+    runtime.ghosts = [{
+      manifest: rawManifest,
+      dir: installDir,
+      enabled: true,
+      trust: {
+        level: 'unverified',
+        publisherSigned: false,
+        publisherVerified: false,
+        reviewed: false,
+      },
+    }];
     const h = harness([item]);
     const digest = ghostManifestDigest(rawManifest);
     h.ledger.upsertInstallation({
@@ -1488,13 +1906,59 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(h.api.download).toHaveBeenCalledWith(item.id, item.currentRelease.id);
     expect(runtime.install).toHaveBeenCalledWith(
       expect.stringMatching(/cindy-plugin-trust-backfill-.*\.cindy$/),
-      {
+      expect.objectContaining({
         ghostId: 'cindy-github',
         version: item.currentRelease.version,
         expectedInstalledApproval: APPROVED_INSTALL_TOKEN,
         officialCindyGithub: true,
-      },
+        afterCommitInLock: expect.any(Function),
+      }),
     );
+  });
+
+  it('refreshes both manifest identities when cindy-github trust backfill replaces the package', async () => {
+    const item = summary({ ghostId: 'cindy-github' });
+    const rawManifest = manifest('cindy-github');
+    const oldBytes = Buffer.from(`${JSON.stringify(rawManifest, null, 2)}\n`);
+    const packageBytes = Buffer.from(JSON.stringify(rawManifest));
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-github-raw-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), oldBytes);
+    runtime.ghosts = [{
+      manifest: rawManifest,
+      dir: installDir,
+      enabled: true,
+      trust: {
+        level: 'unverified',
+        publisherSigned: false,
+        publisherVerified: false,
+        reviewed: false,
+      },
+    }];
+    const h = harness([item]);
+    const original = recordForTest(item, {
+      updatedAt: '2026-08-07T00:00:00.000Z',
+      manifestDigest: ghostManifestDigest(rawManifest),
+      rawManifestSha256: crypto.createHash('sha256').update(oldBytes).digest('hex'),
+    });
+    h.ledger.upsertInstallation(original);
+    runtime.install.mockImplementation(async () => {
+      fs.writeFileSync(path.join(installDir, 'ghost.json'), packageBytes);
+      return {
+        manifest: rawManifest,
+        dir: installDir,
+        enabled: true,
+        trust: { level: 'cindy-official' },
+      };
+    });
+
+    await h.service.snapshot();
+
+    expect(h.ledger.installationForGhost('cindy-github')).toEqual({
+      ...original,
+      manifestDigest: ghostManifestDigest(rawManifest),
+      rawManifestSha256: crypto.createHash('sha256').update(packageBytes).digest('hex'),
+    });
   });
 
   it('完整官方 receipt 已存在时不会重复回填 cindy-github trust', async () => {
@@ -1513,7 +1977,18 @@ describe('PluginMarketService migration and defaultInstall', () => {
         publisherName: 'Cindy Plugin Market',
       }),
     );
-    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    runtime.ghosts = [{
+      manifest: rawManifest,
+      dir: installDir,
+      enabled: true,
+      trust: {
+        level: 'cindy-official',
+        publisherSigned: true,
+        publisherVerified: true,
+        reviewed: true,
+        publisherName: 'Cindy Plugin Market',
+      },
+    }];
     const h = harness([item]);
     h.ledger.upsertInstallation({
       pluginId: item.id,
@@ -1535,7 +2010,58 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(runtime.install).not.toHaveBeenCalled();
   });
 
-  it('legacy-adopted cindy-github 只通过当前市场更新获得官方 trust', async () => {
+  it('Host receipt 已可信但目录镜像缺失时仍回填旧版兼容 trust', async () => {
+    const item = summary({ ghostId: 'cindy-github' });
+    const rawManifest = manifest('cindy-github');
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-github-mirror-missing-'));
+    roots.push(installDir);
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+    runtime.ghosts = [{
+      manifest: rawManifest,
+      dir: installDir,
+      enabled: true,
+      trust: {
+        level: 'cindy-official',
+        publisherSigned: true,
+        publisherVerified: true,
+        reviewed: true,
+        publisherName: 'Cindy Plugin Market',
+      },
+    }];
+    const h = harness([item]);
+    h.ledger.upsertInstallation({
+      pluginId: item.id,
+      ghostId: item.ghostId,
+      releaseId: item.currentRelease.id,
+      version: item.currentRelease.version,
+      sha256: item.currentRelease.sha256,
+      scope: item.scope,
+      organizationId: item.organizationId,
+      source: 'market',
+      installed: true,
+      updatedAt: '2026-08-07T00:00:00.000Z',
+      manifestDigest: ghostManifestDigest(rawManifest),
+    });
+    runtime.install.mockResolvedValue({
+      manifest: rawManifest,
+      dir: installDir,
+      enabled: true,
+      trust: { level: 'cindy-official' },
+    });
+
+    await h.service.snapshot();
+
+    expect(h.api.download).toHaveBeenCalledWith(item.id, item.currentRelease.id);
+    expect(runtime.install).toHaveBeenCalledWith(
+      expect.stringMatching(/cindy-plugin-trust-backfill-.*\.cindy$/),
+      expect.objectContaining({
+        ghostId: 'cindy-github',
+        officialCindyGithub: true,
+      }),
+    );
+  });
+
+  it('legacy-adopted 记录不能成为开发版冒充 cindy-github 的官方 trust 来源', async () => {
     const item = summary({ ghostId: 'cindy-github' });
     const rawManifest = manifest('cindy-github');
     const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-legacy-github-'));
@@ -1708,7 +2234,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     });
   });
 
-  it('passes the selected server manifest as the downloaded package capability cap', async () => {
+  it('does not treat the server manifest as a downloaded package capability cap', async () => {
     const item = summary();
     runtime.install.mockResolvedValue({
       manifest: manifest(),
@@ -1719,12 +2245,10 @@ describe('PluginMarketService migration and defaultInstall', () => {
 
     await h.service.install(item.id, reviewedInstallOptions(item));
 
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest(),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
-  it('uses the selected release manifest as the update package capability cap', async () => {
+  it('does not treat the selected release manifest as an update package capability cap', async () => {
     const item = summary({
       currentRelease: { ...summary().currentRelease, id: 'release-2', version: '2.0.0' },
     });
@@ -1765,9 +2289,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
       expectedInstalledApproval: APPROVED_INSTALL_TOKEN,
     });
 
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest(item.ghostId, '2.0.0'),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('keeps a stale official record out of automatic updates but allows explicit replacement', async () => {
@@ -1832,9 +2354,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     ).resolves.toMatchObject({
       ghost: { manifest: { version: '2.0.0' } },
     });
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest(item.ghostId, '2.0.0'),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
     expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({
       pluginId: item.id,
       source: 'market',
@@ -1843,7 +2363,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     });
   });
 
-  it('uses the selected release manifest as the cap for a legacy-record update', async () => {
+  it('updates a legacy record without treating server metadata as a package cap', async () => {
     const item = summary({
       currentRelease: { ...summary().currentRelease, id: 'release-2', version: '2.0.0' },
     });
@@ -1870,9 +2390,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
       expectedInstalledApproval: APPROVED_INSTALL_TOKEN,
     });
 
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest(item.ghostId, '2.0.0'),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('installs and enables a public defaultInstall package in local mode', async () => {
@@ -1900,7 +2418,6 @@ describe('PluginMarketService migration and defaultInstall', () => {
       expect.objectContaining({
         ghostId: item.ghostId,
         version: item.currentRelease.version,
-        manifestCap: manifest(),
         beforeCommitInLock: expect.any(Function),
       }),
     );
@@ -1988,13 +2505,12 @@ describe('PluginMarketService migration and defaultInstall', () => {
       expect.objectContaining({
         ghostId: item.ghostId,
         version: '2.0.0',
-        manifestCap: upgraded,
       }),
     );
     expect(snapshot.items[0]).toMatchObject({ installState: 'installed', enabled: false });
   });
 
-  it('silently upgrades a default package whose manifest cap contains normalized setup', async () => {
+  it('silently upgrades a default package whose detail manifest contains normalized setup', async () => {
     const item = summary({
       scope: 'organization',
       organizationId: 'org-1',
@@ -2033,12 +2549,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     await expect(h.service.snapshot()).resolves.toMatchObject({
       items: [{ installState: 'installed', version: '2.0.0' }],
     });
-    expect(runtime.install).toHaveBeenCalledWith(
-      expect.stringMatching(/\.cindy$/),
-      expect.objectContaining({
-        manifestCap: upgradedManifest,
-      }),
-    );
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('integration: snapshot upgrades an organization defaultInstall release', async () => {
@@ -3063,9 +3574,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     ).resolves.toMatchObject({
       ghost: { manifest: { id: item.ghostId } },
     });
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest(),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
     expect(h.ledger.installationForGhost(item.ghostId)).toMatchObject({
       pluginId: item.id,
       source: 'market',
@@ -3099,7 +3608,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(h.ledger.installationForGhost(item.ghostId)).toBeNull();
   });
 
-  it('keeps the selected release manifest as the cap when the installed snapshot changes', async () => {
+  it('keeps the selected release identity when the installed snapshot changes', async () => {
     const item = summary({
       currentRelease: { ...summary().currentRelease, id: 'release-2', version: '2.0.0' },
     });
@@ -3129,7 +3638,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
       version: '1.0.0',
     });
     // 下载窗口期目标包相对“当前实际已装”多出 fs；安装事务仍以选中 release 的
-    // manifest 为能力上限，不再为能力变化增加另一层用户审批。
+    // id/version/SHA 为身份边界，不再把市场的展示 Manifest 当成包能力上限。
     await expect(
       h.service.install(item.id, {
         ...reviewedInstallOptions(item),
@@ -3138,9 +3647,7 @@ describe('PluginMarketService migration and defaultInstall', () => {
     ).resolves.toMatchObject({
       ghost: { manifest: { version: '2.0.0' } },
     });
-    expect(runtime.install.mock.calls[0]?.[1]).toMatchObject({
-      manifestCap: manifest('cindy-test', '2.0.0'),
-    });
+    expect(runtime.install.mock.calls[0]?.[1]).not.toHaveProperty('manifestCap');
   });
 
   it('rejects an update when the installed target disappears during download', async () => {
