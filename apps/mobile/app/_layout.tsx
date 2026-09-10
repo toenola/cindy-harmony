@@ -1,3 +1,4 @@
+import { startLocalDiagnostics } from '@/debug/localDiagnostics';
 import {
   DarkTheme as NavigationDarkTheme,
   DefaultTheme as NavigationLightTheme,
@@ -11,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, type ReactElement } from 'reac
 import { useTranslation } from 'react-i18next';
 import { Alert, AppState, Platform, Pressable, StyleSheet, View } from 'react-native';
 import { Text } from '@/components/AppText';
+import { ConnectionNoticeProvider } from '@/components/ConnectionNoticeOverlay';
 import {
   fontWeight,
   radius,
@@ -159,6 +161,10 @@ function NavigationGate() {
       >
         {/* 设置从左侧抽屉进入:接着抽屉方向从左边推出,不要默认从右边盖上来。 */}
         <Stack.Screen name="settings" options={{ animation: 'slide_from_left' }} />
+        <Stack.Screen
+          name="add-account"
+          options={{ animation: 'fade', gestureEnabled: false }}
+        />
       </Stack>
     </NavigationThemeProvider>
   );
@@ -346,6 +352,7 @@ function RootAfterEndpoints() {
 }
 
 function RootLayout() {
+  useEffect(() => startLocalDiagnostics(), []);
   // Dev-only:注册开发者菜单的"清缓存 + reload"项(内部 __DEV__ gate,生产为 no-op)。
   useEffect(() => {
     registerDevCacheMenu();
@@ -420,7 +427,7 @@ function RootLayout() {
               <StartupSplashOverlay
                 hidden={endpointGate.status === 'error' || forcedUpdate !== null}
               >
-                {body}
+                <ConnectionNoticeProvider>{body}</ConnectionNoticeProvider>
               </StartupSplashOverlay>
             </MobileLoginHandoffProvider>
           </LocaleProvider>

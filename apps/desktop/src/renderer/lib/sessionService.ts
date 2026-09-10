@@ -6,7 +6,13 @@
  * 与现有 httpClient 错误对齐。
  */
 
-import type { OrcaRole, Session, SessionStatus, WorkspaceKind } from '@/lib/ccAgent.types';
+import type {
+  OrcaRole,
+  Session,
+  SessionStatus,
+  UsageHistorySession,
+  WorkspaceKind,
+} from '@/lib/ccAgent.types';
 import { ApiError } from '@/lib/httpClient';
 import { extractIpcError } from '@/utils/ipcError';
 // device-link 透明对等:fork / rewind 按 sessionId 来源路由(本机 → 本地 maker,
@@ -52,13 +58,37 @@ export type SessionListOptions = {
   includePinned?: boolean;
   /** forceRefresh / status 重拉：绕开 main 侧 in-flight 合并。 */
   fresh?: boolean;
+  /** 用量历史页读取完整会话候选集，跳过侧栏的 1000 行上限与消息预览。 */
+  usageHistory?: boolean;
 };
 
+type SessionListRegularOptions = Omit<SessionListOptions, 'usageHistory'> & {
+  usageHistory?: false | undefined;
+};
+type SessionListUsageOptions = Omit<SessionListOptions, 'usageHistory'> & {
+  usageHistory: true;
+};
+
+export function list(
+  limit?: number,
+  status?: ListStatusFilter,
+  options?: SessionListRegularOptions,
+): Promise<Session[]>;
+export function list(
+  limit?: number,
+  status?: ListStatusFilter,
+  options?: SessionListUsageOptions,
+): Promise<UsageHistorySession[]>;
+export function list(
+  limit?: number,
+  status?: ListStatusFilter,
+  options?: SessionListOptions,
+): Promise<Session[] | UsageHistorySession[]>;
 export async function list(
   limit: number = 20,
   status?: ListStatusFilter,
   options?: SessionListOptions,
-): Promise<Session[]> {
+): Promise<Session[] | UsageHistorySession[]> {
   return wrap(window.electronAPI.localDb.sessions.list(limit, status, options));
 }
 
@@ -76,6 +106,7 @@ export async function create(body?: {
   orcaRole?: OrcaRole | null;
   /** 附加只读引用目录列表 (绝对路径); main 端 mapper 会 JSON.stringify 后写库。 */
   extraDirs?: string[];
+  writableDirs?: string[];
   /** Remote codex session (P2): 远端 SSH host alias。设置后 workingDir 须为
    *  远端绝对路径; codex agent 跑在远端机器, 本地不 spawn。 */
   remoteHostId?: string;
@@ -153,6 +184,7 @@ export async function update(
     orcaRole?: OrcaRole | null;
     /** 附加只读引用目录覆盖列表 (绝对路径); main 端会在 mapper 里 JSON.stringify 后写库。 */
     extraDirs?: string[];
+    writableDirs?: string[];
     /**
      * per-session 来源(供应商)选择,持久化到 sessions.provider_id(与 model/effort 同模式)。
      * null = 清除显式选择,回落默认路由。运行时即时生效由 maker.setModel 的第 3 参负责;
