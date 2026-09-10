@@ -8672,6 +8672,11 @@ export struct TaskPageContent {
     return this.estimatedUserMessageLines(item.body) > 1;
   }
 
+  /** 长消息及非 user 正文需要把 Markdown 子树锁在当前消息内容区。 */
+  private messageContentUsesFixedWidth(item: RenderMessageItem): boolean {
+    return item.kind !== 'user' || this.userMessageNeedsFixedBubbleWidth(item);
+  }
+
   private hasMessageActions(item: RenderMessageItem): boolean {
     return item.kind === 'user'
       || (item.kind === 'assistant' && item.isTurnFinalAssistant);
@@ -8867,14 +8872,15 @@ export struct TaskPageContent {
               if (seg.isPasted) {
                 this.pastedChip(item, seg)
               } else if (seg.mdBlocks.length > 0) {
-                this.mdBlocks(seg.mdBlocks)
+                this.mdBlocks(seg.mdBlocks, true, this.messageContentUsesFixedWidth(item))
               }
             }, (seg: RenderTextSegment) => `${item.key}-${seg.seq}`)
           } else if (item.kind === 'user' && item.segments.length > 0 && item.segments[0].isPasted) {
             this.pastedBlock(item, item.segments[0])
           } else if (item.mdBlocks.length > 0) {
             this.mdBlocks(item.mdBlocks,
-              item.message === undefined || item.message.isStreaming !== true)
+              item.message === undefined || item.message.isStreaming !== true,
+              this.messageContentUsesFixedWidth(item))
           }
 
           if (this.shouldCollapsePlainUserMessage(item)
@@ -8914,6 +8920,10 @@ export struct TaskPageContent {
             ? this.userMessageBubbleMaxWidth() : 0,
           maxWidth: item.kind === 'user' ? this.userMessageBubbleMaxWidth() : '100%',
         })
+        // ArkUI 的 constraintSize 只限制外层测量上限；对需要换行的 user 消息还要
+        // 给气泡一个确定宽度，否则 Markdown Text 可能先按自身单行宽度测量。
+        .width(item.kind === 'user' && this.userMessageNeedsFixedBubbleWidth(item)
+          ? this.userMessageBubbleMaxWidth() : 'auto')
         .alignItems(HorizontalAlign.Start)
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
         .backgroundColor(item.kind === 'user' ? $r('app.color.bg_card') : Color.Transparent)
@@ -8922,6 +8932,8 @@ export struct TaskPageContent {
           width: item.kind === 'user' ? 1 : 0,
           color: $r('app.color.chat_bubble_border'),
         })
+        // 最后一层视觉兜底：即使某个 Markdown 子节点仍返回过大的测量值，也不能越过气泡。
+        .clip(item.kind === 'user')
         .padding({
           left: item.kind === 'user' ? 12 : 0,
           right: item.kind === 'user' ? 12 : 0,
@@ -9042,7 +9054,7 @@ export struct TaskPageContent {
       })
 
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
-        this.mdBlocks(seg.mdBlocks)
+        this.mdBlocks(seg.mdBlocks, true, this.messageContentUsesFixedWidth(item))
         Text('收起')
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
@@ -9063,7 +9075,7 @@ export struct TaskPageContent {
   pastedBlock(item: RenderMessageItem, seg: RenderTextSegment) {
     Column({ space: 4 }) {
       if (this.isIn(this.expandedTextBlocks, `${item.key}-${seg.seq}`)) {
-        this.mdBlocks(seg.mdBlocks)
+        this.mdBlocks(seg.mdBlocks, true, this.messageContentUsesFixedWidth(item))
         Text('收起')
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.accent'))
@@ -9469,14 +9481,15 @@ export struct TaskPageContent {
   @Builder
   mdInlineContent(
     tokens: InlineToken[], fontSize: number, lineHeight: number,
-    heading: boolean, secondary: boolean,
+    heading: boolean, secondary: boolean, constrainToParent: boolean = true,
   ) {
     Column({ space: 4 }) {
       ForEach(groupInlineTokens(tokens), (group: InlineTokenGroup) => {
         if (group.image !== null) {
           this.mdInlineImage(group.image)
         } else {
-          this.inlineTokensText(group.tokens, fontSize, lineHeight, heading, secondary)
+          this.inlineTokensText(
+            group.tokens, fontSize, lineHeight, heading, secondary, constrainToParent)
         }
       }, (group: InlineTokenGroup) => `${group.key}`)
     }
@@ -9521,12 +9534,14 @@ export struct TaskPageContent {
   }
 
   @Builder
-  mdBlocks(blocks: MdBlock[], selectable: boolean = true) {
+  mdBlocks(
+    blocks: MdBlock[], selectable: boolean = true, constrainToParent: boolean = false,
+  ) {
     ForEach(this.markdownSelectableGroups(blocks), (group: MdSelectableBlockGroup) => {
       if (group.type === 'text_run') {
-        this.selectableMarkdownTextRun(group.textBlocks, selectable)
+        this.selectableMarkdownTextRun(group.textBlocks, selectable, constrainToParent)
       } else if (group.block !== null) {
-        this.mdBlock(group.block)
+        this.mdBlock(group.block, constrainToParent)
       }
     }, (group: MdSelectableBlockGroup) => group.key)
   }
@@ -9542,7 +9557,9 @@ export struct TaskPageContent {
   }
 
   @Builder
-  selectableMarkdownTextRun(blocks: MdSelectableTextBlock[], selectable: boolean) {
+  selectableMarkdownTextRun(
+    blocks: MdSelectableTextBlock[], selectable: boolean, constrainToParent: boolean = false,
+  ) {
     Text() {
       ForEach(blocks, (block: MdSelectableTextBlock, index?: number) => {
         this.selectableMarkdownTextBlock(block, index ?? 0)
@@ -9554,6 +9571,9 @@ export struct TaskPageContent {
     .fontWeight(FontWeight.Regular)
     .fontColor($r('app.color.text_primary'))
     .textAlign(TextAlign.Start)
+    // 统一把行内 Text 锁在父容器内容宽度内，长 URL / 无空格文本也允许断行。
+    .width(constrainToParent ? '100%' : 'auto')
+    .wordBreak(WordBreak.BREAK_ALL)
     .alignSelf(ItemAlign.Stretch)
   }
 
@@ -9639,7 +9659,7 @@ export struct TaskPageContent {
   }
 
   @Builder
-  mdBlock(b: MdBlock) {
+  mdBlock(b: MdBlock, constrainToParent: boolean = false) {
     if (b.type === 'heading') {
       this.mdInlineContent(
         b.inlineTokens,
@@ -9647,13 +9667,14 @@ export struct TaskPageContent {
         b.level <= 2 ? 28 : 26,
         true,
         false,
+        constrainToParent,
       )
     } else if (b.type === 'paragraph') {
       if (this.hasImageToken(b.inlineTokens)) {
-        this.mdInlineContent(b.inlineTokens, 17, 26, false, false)
+        this.mdInlineContent(b.inlineTokens, 17, 26, false, false, constrainToParent)
       } else {
         // MessageRender 已预解析行内 token；流式刷新时不在 ArkUI Builder 内重复分词。
-        this.inlineTokensText(b.inlineTokens, 17, 26, false, false)
+        this.inlineTokensText(b.inlineTokens, 17, 26, false, false, constrainToParent)
       }
     } else if (b.type === 'list') {
       Column({ space: 2 }) {
@@ -9664,7 +9685,8 @@ export struct TaskPageContent {
               if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
                 this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
               } else {
-                this.inlineTokensText(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
+                this.inlineTokensText(
+                  b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false, true)
               }
             }
             // 正文只能占项目符号之后的剩余宽度；内部 Text 的 100% 以此为基准，
@@ -9689,7 +9711,7 @@ export struct TaskPageContent {
         .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
       } else {
         Row() {
-          this.inlineTokensText(b.inlineTokens, 14, 22, false, true)
+          this.inlineTokensText(b.inlineTokens, 14, 22, false, true, true)
         }
           .padding({ left: 10 })
           .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
@@ -9829,7 +9851,8 @@ export struct TaskPageContent {
               if (this.hasImageToken(this.tableHeaderTokens(b, hIndex))) {
                 this.mdInlineContent(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
               } else {
-                this.inlineTokensText(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
+                this.inlineTokensText(
+                  this.tableHeaderTokens(b, hIndex), 17, 26, false, false, true)
               }
             }
             .width(this.tableColumnWidths(b)[hIndex])
@@ -9850,7 +9873,8 @@ export struct TaskPageContent {
                     this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
                 } else {
                   this.inlineTokensText(
-                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
+                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex),
+                    17, 26, false, false, true)
                 }
               }
               .width(this.tableColumnWidths(b)[cellIndex])
@@ -9889,7 +9913,7 @@ export struct TaskPageContent {
   @Builder
   inlineTokensText(
     tokens: InlineToken[], fontSize: number, lineHeight: number,
-    heading: boolean, secondary: boolean,
+    heading: boolean, secondary: boolean, constrainToParent: boolean = false,
   ) {
     Text() {
       ForEach(tokens, (t: InlineToken) => {
@@ -9937,8 +9961,10 @@ export struct TaskPageContent {
     .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
     .fontColor(secondary ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
     .textAlign(TextAlign.Start)
-    // 与列表行一致，避免 ArkUI 在定宽气泡内把 100% 按外层消息区测量：
+    // 与列表行一致，避免 ArkUI 在定宽气泡内把正文按单行自然宽度测量：
     // Text 在父内容区内拉伸后，长段落会按气泡宽度换行而不是在右边界被裁切。
+    .width(constrainToParent ? '100%' : 'auto')
+    .wordBreak(WordBreak.BREAK_ALL)
     .alignSelf(ItemAlign.Stretch)
   }
 

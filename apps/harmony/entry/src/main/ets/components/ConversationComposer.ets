@@ -800,7 +800,10 @@ export struct ConversationComposer {
         .transition(uiRevealTransition())
       }
 
-      Column({ space: 6 }) {
+      // 系统沉浸材质是增强层，不是唯一的可见背景。外层 Stack 保留语义化底色，
+      // 当设备或嵌套详情栏无法合成 ImmersiveMaterial 时，输入区仍然保持可见。
+      Stack({ alignContent: Alignment.TopStart }) {
+        Column({ space: 6 }) {
         if (this.images.length > 0) {
           Row() {
             Row()
@@ -970,30 +973,37 @@ export struct ConversationComposer {
           .width('100%')
           .alignItems(VerticalAlign.Center)
         }
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 36 })
+        .padding({
+          left: 10,
+          right: 10,
+          // 浮动收起态与左侧 HdsTabs/miniBar 共用 52vp：40vp 内容 + 6vp × 2。
+          top: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
+          bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
+        })
+        // 只让系统材质作用于内容层；透明或不支持材质时由 Stack 底层兜底。
+        .backgroundColor(Color.Transparent)
+        .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
+        .clip(true)
+        // 与工具栏 Popup 共用 THIN 沉浸光感；系统负责双模式与光感强度。
+        .systemMaterial(this.floatingGlass
+          ? this.floatingGlassMaterial
+          : uiMaterial.Material.empty)
       }
       .width('100%')
       .constraintSize({ minHeight: 36 })
-      .padding({
-        left: 10,
-        right: 10,
-        // 浮动收起态与左侧 HdsTabs/miniBar 共用 52vp：40vp 内容 + 6vp × 2。
-        top: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
-        bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
-      })
-      // 官方沉浸光感材质必须透出底层内容；普通 Composer 继续使用原有语义表面色。
       .backgroundColor(this.floatingGlass
-        ? Color.Transparent : $r('app.color.composer_surface'))
+        ? $r('app.color.composer_glass_surface') : $r('app.color.composer_surface'))
       .border({
-        width: this.floatingGlass ? 0 : 1,
-        color: $r('app.color.composer_hairline'),
+        width: 1,
+        color: this.floatingGlass
+          ? $r('app.color.composer_hairline') : $r('app.color.composer_border'),
       })
       // 收起态使用实际高度的一半做胶囊圆角，避免动画在 999→12 间插值抖动。
       .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
       .clip(true)
-      // 与工具栏 Popup 共用 THIN 沉浸光感；系统负责双模式、光感强度与低算力降级。
-      .systemMaterial(this.floatingGlass
-        ? this.floatingGlassMaterial
-        : uiMaterial.Material.empty)
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')
