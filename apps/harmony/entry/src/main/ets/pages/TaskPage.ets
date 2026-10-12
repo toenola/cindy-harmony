@@ -65,6 +65,7 @@ import {
 } from '../core/interactions/InteractionPresentation';
 import { DlError, DlInvokeOptions } from '../core/device-link/DlClient';
 import { UsageLimitWaitState } from '../core/messages/UsageLimitWait';
+import { isRemoteBusyError, isRemoteBusyMessage } from '../core/device-link/RemoteInvokePresentation';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
@@ -1125,7 +1126,8 @@ export struct TaskPageContent {
     const projection = AppServices.instance.inputQueue.getProjection(this.sessionId, this.deviceId);
     this.queueBubbles = AppServices.instance.inputQueue.getBubbles(this.sessionId, this.deviceId);
     this.queuePaused = projection.queuePaused;
-    this.queueProjectionError = projection.error;
+    this.queueProjectionError = isRemoteBusyMessage(projection.error)
+      ? this.v12String('v132_remote_busy') : projection.error;
     this.queueErrorRetryText = projection.errorRetryText;
     this.queueCredentialWaiting = projection.credentialSwitchWaiting;
     this.queueCredentialBlockedCount = projection.credentialSwitchBlockedBy.length;
@@ -1463,6 +1465,10 @@ export struct TaskPageContent {
     return unwrapInvokeResult(envelope);
   }
 
+  private invokeFailureText(error: Object | undefined, fallback: string): string {
+    return isRemoteBusyError(error) ? this.v12String('v132_remote_busy') : fallback;
+  }
+
   /**
    * 按会话解析真实 Git HEAD。返回的 workdir 可能来自 agent 遥测、
    * live worktree 或 SSH 主机，因此不在 Harmony 端自行对 workingDir 做本地探测。
@@ -1547,7 +1553,7 @@ export struct TaskPageContent {
       this.planModeEnabled = next;
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '计划模式更新失败，请重试' });
+        promptAction.showToast({ message: this.invokeFailureText(e, '计划模式更新失败，请重试') });
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -1996,7 +2002,7 @@ export struct TaskPageContent {
       this.closeContextSheet();
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '权限模式更新失败，请重试' });
+        promptAction.showToast({ message: this.invokeFailureText(e, '权限模式更新失败，请重试') });
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2124,7 +2130,7 @@ export struct TaskPageContent {
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         this.pendingModelSelectionKey = '';
-        promptAction.showToast({ message: '模型切换失败，请重试' });
+        promptAction.showToast({ message: this.invokeFailureText(e, '模型切换失败，请重试') });
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2150,7 +2156,7 @@ export struct TaskPageContent {
       }
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '推理强度更新失败，请重试' });
+        promptAction.showToast({ message: this.invokeFailureText(e, '推理强度更新失败，请重试') });
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2177,7 +2183,7 @@ export struct TaskPageContent {
       }
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: 'Fast 模式更新失败，请重试' });
+        promptAction.showToast({ message: this.invokeFailureText(e, 'Fast 模式更新失败，请重试') });
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -6838,7 +6844,7 @@ export struct TaskPageContent {
       selected: this.modelOptionIsCurrent(option),
       subscription: option.subscription,
       paymentRequired: option.availability === 'requires_payment',
-      disabled: this.contextRpcBusy,
+      disabled: this.contextRpcBusy || this.runtimeRouteLocked(),
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
       effortPickerOpen: this.modelEffortPickerKey === composerModelKey(option),

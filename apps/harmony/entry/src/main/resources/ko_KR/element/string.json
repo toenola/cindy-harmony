@@ -99,6 +99,7 @@
     {"name":"v132_usage_limit_resume","value":"%1$s에 자동으로 계속됩니다"},
     {"name":"v132_usage_limit_cancel","value":"자동 계속 취소"},
     {"name":"v132_usage_limit_cancel_failed","value":"자동 계속을 취소하지 못했습니다"},
-    {"name":"v132_defaults_retry","value":"컴퓨터 설정 다시 불러오기"}
+    {"name":"v132_defaults_retry","value":"컴퓨터 설정 다시 불러오기"},
+    {"name":"v132_remote_busy","value":"컴퓨터가 사용 중입니다"}
   ]
 }

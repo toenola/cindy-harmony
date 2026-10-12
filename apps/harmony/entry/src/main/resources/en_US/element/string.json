@@ -99,6 +99,7 @@
     {"name":"v132_usage_limit_resume","value":"Will continue automatically at %1$s"},
     {"name":"v132_usage_limit_cancel","value":"Cancel automatic continuation"},
     {"name":"v132_usage_limit_cancel_failed","value":"Could not cancel automatic continuation"},
-    {"name":"v132_defaults_retry","value":"Reload computer settings"}
+    {"name":"v132_defaults_retry","value":"Reload computer settings"},
+    {"name":"v132_remote_busy","value":"Computer is busy"}
   ]
 }

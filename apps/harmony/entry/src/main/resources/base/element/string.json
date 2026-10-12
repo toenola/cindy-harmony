@@ -503,6 +503,7 @@
     {"name":"v132_usage_limit_resume","value":"将于 %1$s 自动继续"},
     {"name":"v132_usage_limit_cancel","value":"取消自动继续"},
     {"name":"v132_usage_limit_cancel_failed","value":"未能取消自动继续"},
-    {"name":"v132_defaults_retry","value":"重新读取电脑设置"}
+    {"name":"v132_defaults_retry","value":"重新读取电脑设置"},
+    {"name":"v132_remote_busy","value":"电脑繁忙"}
   ]
 }

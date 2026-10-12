@@ -19,24 +19,16 @@ import {
   HANDSHAKE_TIMEOUT_MS, RECONNECT_STABLE_RESET_MS,
   RECONNECT_CONGESTION_STABLE_RESET_MS, ReconnectStability,
   CONTROLLER_CAPABILITIES, encodeEnvelope, decodeEnvelope,
+  DlError,
 } from './DlProtocol';
 import { safeErrorMessage } from '../tasks/TaskModels';
+import { ConnectionAttemptState } from './ConnectionAttemptState';
+import { InvokeScheduler, isBackgroundInvoke, bypassInvokeScheduling } from './InvokeScheduler';
+
+export { DlError } from './DlProtocol';
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyDl';
-
-export class DlError extends Error {
-  readonly code: string;
-  /** true 表示请求帧可能已经交给 WebSocket，ACK 丢失时禁止调用方盲重。 */
-  readonly inFlight: boolean;
-
-  constructor(code: string, message: string, inFlight: boolean = false) {
-    super(message);
-    this.name = 'DlError';
-    this.code = code;
-    this.inFlight = inFlight;
-  }
-}
 
 /** 只有能证明请求尚未发出的连接错误，才允许进入本地 outbox 自动续发。 */
 export function isSafeUnsentDlError(value: Object | undefined): boolean {
@@ -163,6 +155,7 @@ class PendingRequest {
   timer: number = 0;
   label: string = '';
   inFlight: boolean = false;
+  deviceId: string = '';
 }
 
 export class DlClient {
@@ -171,6 +164,10 @@ export class DlClient {
   private wsCallbacks: WsCallbacks = new WsCallbacks();
   private status: string = 'stopped'; // 'stopped' | 'connecting' | 'online'
   private transportEpoch: number = 0;
+  private lifecycleEpoch: number = 0;
+  private connectGeneration: number = 0;
+  private connectionAttempt: ConnectionAttemptState = new ConnectionAttemptState();
+  private invokeScheduler: InvokeScheduler = new InvokeScheduler();
   private peerEpochs: Map<string, number> = new Map();
 
   connectionIdentity(deviceId: string): string {
@@ -178,6 +175,14 @@ export class DlClient {
   }
 
   private invalidatePeer(deviceId: string): void {
+    const error = new DlError('LINK_NOT_OPEN', 'peer link changed');
+    this.invokeScheduler.cancel(deviceId, error);
+    this.pending.forEach((request: PendingRequest, requestId: string) => {
+      if (request.deviceId !== deviceId) return;
+      this.pending.delete(requestId);
+      this.clearTimer(request.timer);
+      request.reject(new DlError(error.code, error.message, request.inFlight));
+    });
     this.peerCapabilities.delete(deviceId);
     this.peerEpochs.set(deviceId, (this.peerEpochs.get(deviceId) ?? 0) + 1);
   }
@@ -242,8 +247,11 @@ export class DlClient {
   }
 
   /** 前台恢复可显式绕过当前 1013 timer；普通请求不能打穿拥塞冷却。 */
-  connectNow(reason: string, overrideCongestionCooldown: boolean = false): void {
+  connectNow(reason: string, overrideCongestionCooldown: boolean = false,
+    keepInFlightAttempt: boolean = false): void {
     if (this.status === 'online') return;
+    if (reason === 'foreground' && keepInFlightAttempt && !this.stopped
+      && this.connectionAttempt.shouldKeep(this.status, this.reconnectTimer >= 0, Date.now())) return;
     if (this.stopped) {
       this.stability.reset();
     } else if (this.stability.getCongestionStreak() > 0 && this.reconnectTimer >= 0
@@ -262,6 +270,8 @@ export class DlClient {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.lifecycleEpoch += 1;
+    this.connectGeneration += 1;
     this.clearAllTimers();
     this.failAllPending(new DlError('NOT_CONNECTED', 'client stopped'));
     if (this.ws) this.ws.terminate();
@@ -271,14 +281,19 @@ export class DlClient {
 
   private async connect(reason: string): Promise<void> {
     if (this.stopped) return;
+    this.connectGeneration += 1;
+    const generation = this.connectGeneration;
+    this.transportEpoch += 1;
+    this.clearTimer(this.handshakeTimer);
+    this.handshakeTimer = -1;
+    this.connectionAttempt.clear();
     this.setStatus('connecting');
     this.helloAcked = false;
     // 丢弃旧 socket 与在途请求
     this.failAllPending(new DlError('NOT_CONNECTED', `reconnect (${reason})`));
-    if (this.ws) {
-      this.ws.terminate();
-      this.ws = undefined;
-    }
+    const previousWs = this.ws;
+    this.ws = undefined;
+    previousWs?.terminate();
 
     let token: string | null = null;
     try {
@@ -286,6 +301,7 @@ export class DlClient {
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'getToken failed: %{public}s', safeErrorMessage(e));
     }
+    if (this.stopped || generation !== this.connectGeneration) return;
     if (token === null || token.length === 0) {
       hilog.warn(DOMAIN, TAG, 'no token, schedule reconnect');
       this.scheduleReconnect('no-token');
@@ -301,10 +317,17 @@ export class DlClient {
     const headers: Record<string, string> = {};
     headers['Authorization'] = `Bearer ${token}`;
     hilog.info(DOMAIN, TAG, 'connecting %{public}s (reason=%{public}s)', url, reason);
+    this.armHandshakeTimer(ws);
     ws.connect(url, headers);
+  }
 
+  private armHandshakeTimer(ws: WsAdapter): void {
     this.clearTimer(this.handshakeTimer);
+    this.connectionAttempt.arm(Date.now(), HANDSHAKE_TIMEOUT_MS);
     this.handshakeTimer = setTimeout(() => {
+      if (this.ws !== ws) return;
+      this.handshakeTimer = -1;
+      this.connectionAttempt.clear();
       if (!this.helloAcked && this.ws === ws) {
         hilog.warn(DOMAIN, TAG, 'handshake timeout');
         this.failAllPending(new DlError('NOT_CONNECTED', 'handshake timeout'));
@@ -319,6 +342,7 @@ export class DlClient {
     const cb = new WsCallbacks();
     cb.onOpen = () => {
       if (this.ws !== ws) return;
+      this.armHandshakeTimer(ws);
       hilog.info(DOMAIN, TAG, 'ws open, send hello');
       const hello = this.opts.getHello();
       const env = new Envelope();
@@ -436,6 +460,8 @@ export class DlClient {
     this.userId = ack.userId;
     this.helloAcked = true;
     this.clearTimer(this.handshakeTimer);
+    this.handshakeTimer = -1;
+    this.connectionAttempt.clear();
     this.setStatus('online');
     this.startHeartbeat();
     // 稳定在线后清零普通退避；1013 拥塞历史走独立的更长稳定窗。
@@ -528,13 +554,35 @@ export class DlClient {
   // ─── 对外能力 ───────────────────────────────────────────────────────────────
 
   /** 向目标设备发 invoke，返回原始响应帧（调用方解析 invoke-result payload）。 */
-  invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
-    options.preSend?.();
+  async invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
     const timeout = options.timeoutMs !== undefined && options.timeoutMs > 0
       ? options.timeoutMs
       : REQUEST_TIMEOUT_MS;
-    return this.requestEnvelope(EnvelopeKind.INVOKE, deviceId, options.channel,
-      options.args, timeout);
+    const lifecycle = this.lifecycleEpoch;
+    const account = this.userId;
+    options.preSend?.();
+    if (this.status !== 'online' && !await this.waitUntilOnline(timeout)) {
+      throw new DlError('NOT_CONNECTED', 'wait online timeout');
+    }
+    if (lifecycle !== this.lifecycleEpoch || (account.length > 0 && account !== this.userId)) {
+      throw new DlError('NOT_CONNECTED', 'invoke owner changed while waiting online');
+    }
+    const owner = this.connectionIdentity(deviceId);
+    const userId = this.userId;
+    const send = (): Promise<Envelope> => {
+      const preSend = (): void => {
+        if (lifecycle !== this.lifecycleEpoch || userId !== this.userId
+          || owner !== this.connectionIdentity(deviceId) || this.status !== 'online') {
+          throw new DlError('NOT_CONNECTED', 'invoke owner changed before dispatch');
+        }
+        options.preSend?.();
+      };
+      return this.requestEnvelope(EnvelopeKind.INVOKE, deviceId, options.channel,
+        options.args, timeout, preSend);
+    };
+    return bypassInvokeScheduling(options.channel, options.args) ? send()
+      : this.invokeScheduler.run<Envelope>(deviceId, isBackgroundInvoke(options.channel),
+        Math.min(timeout, 30_000), send);
   }
 
   /** 建立控制链路（link-open → 等 link-accept）。 */
@@ -609,11 +657,13 @@ export class DlClient {
     channel: string,
     args: Object[],
     timeoutMs: number,
+    preSend: (() => void) | undefined = undefined,
   ): Promise<Envelope> {
     const doSend = (): Promise<Envelope> => {
       if (this.status !== 'online') {
         return Promise.reject(new DlError('NOT_CONNECTED', 'not online'));
       }
+      preSend?.();
       const id = this.nextId();
       const env = new Envelope();
       env.kind = kind;
@@ -629,6 +679,7 @@ export class DlClient {
       }
       return new Promise<Envelope>((resolve, reject) => {
         const req = new PendingRequest();
+        req.deviceId = dst;
         req.resolve = resolve;
         req.reject = reject;
         req.label = `${kind}:${channel}`;
@@ -685,6 +736,7 @@ export class DlClient {
   }
 
   private failAllPending(err: DlError): void {
+    this.invokeScheduler.clear(err);
     this.pending.forEach((req: PendingRequest, id: string) => {
       this.clearTimer(req.timer);
       req.reject(new DlError(err.code, err.message, err.inFlight || req.inFlight));
@@ -764,6 +816,7 @@ export class DlClient {
     this.clearTimer(this.handshakeTimer);
     this.handshakeTimer = -1;
     this.clearTimer(this.heartbeatTimer);
+    this.connectionAttempt.clear();
     this.heartbeatTimer = -1;
     this.clearTimer(this.stableTimer);
     this.stableTimer = -1;

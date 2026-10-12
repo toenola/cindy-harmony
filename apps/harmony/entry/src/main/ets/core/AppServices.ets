@@ -368,7 +368,7 @@ export class AppServices {
   /** App 回到前台：已登录才立即重连（未登录不启动网络重试循环）。 */
   onAppForeground(): void {
     if (this.auth.isLoggedIn) {
-      this.client.connectNow('foreground', true);
+      this.client.connectNow('foreground', true, true);
     }
   }
 

@@ -11,6 +11,18 @@
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 
+export class DlError extends Error {
+  readonly code: string;
+  readonly inFlight: boolean;
+
+  constructor(code: string, message: string, inFlight: boolean = false) {
+    super(message);
+    this.name = 'DlError';
+    this.code = code;
+    this.inFlight = inFlight;
+  }
+}
+
 /** 心跳间隔（client→server ping，20s）。 */
 export const PING_INTERVAL_MS = 20_000;
 /** 连续无 pong 判定僵死的周期数。 */

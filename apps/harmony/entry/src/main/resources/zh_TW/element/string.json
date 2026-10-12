@@ -99,6 +99,7 @@
     {"name":"v132_usage_limit_resume","value":"將於 %1$s 自動繼續"},
     {"name":"v132_usage_limit_cancel","value":"取消自動繼續"},
     {"name":"v132_usage_limit_cancel_failed","value":"未能取消自動繼續"},
-    {"name":"v132_defaults_retry","value":"重新讀取電腦設定"}
+    {"name":"v132_defaults_retry","value":"重新讀取電腦設定"},
+    {"name":"v132_remote_busy","value":"電腦忙碌中"}
   ]
 }

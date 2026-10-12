@@ -99,6 +99,7 @@
     {"name":"v132_usage_limit_resume","value":"%1$s に自動的に続行します"},
     {"name":"v132_usage_limit_cancel","value":"自動続行をキャンセル"},
     {"name":"v132_usage_limit_cancel_failed","value":"自動続行をキャンセルできませんでした"},
-    {"name":"v132_defaults_retry","value":"コンピューターの設定を再読み込み"}
+    {"name":"v132_defaults_retry","value":"コンピューターの設定を再読み込み"},
+    {"name":"v132_remote_busy","value":"コンピューターがビジーです"}
   ]
 }
