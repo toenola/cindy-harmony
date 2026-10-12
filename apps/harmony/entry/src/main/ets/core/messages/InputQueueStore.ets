@@ -64,7 +64,13 @@ class LocalInputDelivery {
   cancelled: boolean = false;
   historyConfirmed: boolean = false;
   hostObserved: boolean = false;
+  /**
+   * 新版电脑在没有任何投递在途时、对本条明确回了 unknown：它先等队列落盘再查快照与历史，
+   * 并按 clientId 对远程入队去重，所以可用原 clientId 重新投递。新一轮投递开始即作废。
+   */
+  hostConfirmedAbsent: boolean = false;
   attemptToken: number = 0;
+  sendingAttempts: number = 0;
   activeReferences: number = 0;
 }
 
@@ -449,6 +455,40 @@ export class InputQueueStore {
     return [sessionId, options];
   }
 
+  /** 记下本次查询覆盖、且查询前没有投递在途的条目及其投递代次。 */
+  private captureAbsenceCandidates(deviceId: string, sessionId: string, args: Object[]): Map<string, number> {
+    const candidates = new Map<string, number>();
+    const options = args.length > 1 ? args[1] : undefined;
+    if (options === undefined || options === null || typeof options !== 'object' || Array.isArray(options)) {
+      return candidates;
+    }
+    const deliveries = this.localDeliveries.get(sessionId);
+    for (const clientId of readStringArray((options as Record<string, Object>)['deliveryClientIds'])) {
+      const delivery = deliveries?.get(clientId);
+      if (delivery === undefined || delivery.deviceId !== deviceId || delivery.sendingAttempts > 0
+        || this.enqueueingClientIds.has(clientId)) continue;
+      candidates.set(clientId, delivery.attemptToken);
+    }
+    return candidates;
+  }
+
+  /** 只有明确的 unknown 回执、且查询前后都没有新投递，才算电脑确认未收到。 */
+  private noteHostConfirmedAbsence(deviceId: string, sessionId: string, candidates: Map<string, number>,
+    projection: InputProjectionState): void {
+    if (projection.inputDeliveryVersion !== 1 || candidates.size === 0) return;
+    const deliveries = this.localDeliveries.get(sessionId);
+    for (const receipt of projection.deliveryReceipts) {
+      if (receipt.state !== 'unknown') continue;
+      const token = candidates.get(receipt.clientId);
+      const delivery = deliveries?.get(receipt.clientId);
+      if (token === undefined || delivery === undefined || delivery.deviceId !== deviceId
+        || delivery.attemptToken !== token || delivery.sendingAttempts > 0 || delivery.state !== 'unknown'
+        || delivery.cancelled || delivery.hostObserved || delivery.historyConfirmed
+        || this.enqueueingClientIds.has(receipt.clientId)) continue;
+      delivery.hostConfirmedAbsent = true;
+    }
+  }
+
   private ownInputDelivery(deviceId: string, sessionId: string, clientId: string): void {
     if ((this.remoteEvidenceBySession.get(sessionId)?.get(clientId) ?? 0) < 0) return;
     let deliveries = this.localDeliveries.get(sessionId);
@@ -471,7 +511,8 @@ export class InputQueueStore {
       return this.getProjection(sessionId, deviceId).inputDeliveryVersion !== 1;
     }
     if (delivery.cancelled || delivery.historyConfirmed || delivery.hostObserved) return false;
-    return !delivery.versionKnown || inputDeliveryResendAllowed(delivery.state, delivery.locallyProvenUnsent);
+    return !delivery.versionKnown || inputDeliveryResendAllowed(delivery.state,
+      delivery.locallyProvenUnsent || delivery.hostConfirmedAbsent);
   }
 
   private pruneConfirmedInputDeliveries(sessionId: string): void {
@@ -1016,8 +1057,9 @@ export class InputQueueStore {
           throw new DlError('CANCELLED', 'Input projection scope changed', false);
         }
       };
-      const result = await this.invoke(deviceId, 'maker:input:get-projection',
-        this.inputProjectionQueryArgs(deviceId, sessionId), preSend);
+      const queryArgs = this.inputProjectionQueryArgs(deviceId, sessionId);
+      const absenceCandidates = this.captureAbsenceCandidates(deviceId, sessionId, queryArgs);
+      const result = await this.invoke(deviceId, 'maker:input:get-projection', queryArgs, preSend);
       if (expectedDispatchEpoch >= 0
         && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
       if (connection !== this.client?.connectionIdentity(deviceId)) return false;
@@ -1027,6 +1069,7 @@ export class InputQueueStore {
       const accepted = this.applyProjectionIfCurrent(
         sessionId, projection, expectedEpoch, deviceId);
       if (accepted) {
+        this.noteHostConfirmedAbsence(deviceId, sessionId, absenceCandidates, projection);
         this.readRetries.cancel(sessionId);
         this.notify();
       }
@@ -1339,7 +1382,8 @@ export class InputQueueStore {
     if (!this.canSendInputDelivery(deviceId, sessionId, clientId)) return;
     let item = this.findItem(sessionId, clientId, deviceId);
     const delivery = this.localDeliveries.get(sessionId)?.get(clientId);
-    if (item === null && delivery?.deviceId === deviceId && delivery.locallyProvenUnsent) {
+    if (item === null && delivery?.deviceId === deviceId
+      && (delivery.locallyProvenUnsent || delivery.hostConfirmedAbsent)) {
       const settling = this.settlingBySession.get(sessionId) ?? [];
       item = settling.find((candidate: QueuedInputItem) => candidate.clientId === clientId) ?? null;
       if (item !== null) {
@@ -2453,6 +2497,7 @@ export class InputQueueStore {
     options.args = args;
     const connection = client.connectionIdentity(deviceId);
     const wasProvenUnsent = delivery?.locallyProvenUnsent ?? false;
+    const wasConfirmedAbsent = delivery?.hostConfirmedAbsent ?? false;
     let attemptToken = 0;
     if (delivery !== undefined) {
       if (scopeGeneration !== this.usageLimitScopeGeneration || client !== this.client
@@ -2463,6 +2508,8 @@ export class InputQueueStore {
       }
       attemptToken = ++delivery.attemptToken;
       delivery.locallyProvenUnsent = false;
+      delivery.hostConfirmedAbsent = false;
+      delivery.sendingAttempts += 1;
     }
     const guardedPreSend = (): void => {
       if (preSend !== undefined) preSend();
@@ -2493,8 +2540,18 @@ export class InputQueueStore {
         && this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
         delivery.locallyProvenUnsent = true;
       }
+      // 本轮能证明请求没发出时，电脑此前“确认未收到”的结论仍然成立。
+      if (delivery !== undefined && wasConfirmedAbsent && isSafeUnsentDlError(error)
+        && scopeGeneration === this.usageLimitScopeGeneration
+        && this.localDeliveries.get(sessionId)?.get(clientId) === delivery
+        && delivery.attemptToken === attemptToken && !delivery.hostObserved
+        && this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
+        delivery.hostConfirmedAbsent = true;
+      }
       if (error instanceof DlError) throw new DlError(error.code, error.message, error.inFlight);
       throw new Error(safeErrorMessage(error));
+    } finally {
+      if (delivery !== undefined && attemptToken > 0) delivery.sendingAttempts -= 1;
     }
   }
 }

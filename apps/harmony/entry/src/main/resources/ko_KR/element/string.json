@@ -156,6 +156,7 @@
     {"name":"v132_delivery_accepted","value":"컴퓨터가 이 메시지를 저장하고 수신했습니다."},
     {"name":"v132_delivery_pending","value":"컴퓨터 대기열에 있습니다. 저장 여부는 아직 확인되지 않았습니다."},
     {"name":"v132_delivery_removed","value":"컴퓨터 대기열에서 이 메시지가 제거되었습니다."},
+    {"name":"v132_delivery_absent","value":"컴퓨터가 이 메시지를 받지 않았음을 확인했습니다. 다시 보낼 수 있습니다."},
     {"name":"v132_delivery_check_done","value":"전송 상태를 업데이트했습니다."},
     {"name":"v132_delivery_check_failed","value":"전송 상태를 확인하지 못했습니다. 연결을 확인한 후 다시 시도하세요."},
     {"name":"v132_delivery_send_failed","value":"전송이 완료되지 않았습니다. 연결을 확인한 후 다시 시도하세요."}

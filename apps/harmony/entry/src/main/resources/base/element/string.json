@@ -560,6 +560,7 @@
     {"name":"v132_delivery_accepted","value":"电脑已保存并接收这条消息。"},
     {"name":"v132_delivery_pending","value":"电脑已排队，尚未确认已保存。"},
     {"name":"v132_delivery_removed","value":"这条消息已从电脑队列移除。"},
+    {"name":"v132_delivery_absent","value":"电脑确认没有收到这条消息，可以重试发送。"},
     {"name":"v132_delivery_check_done","value":"投递状态已更新。"},
     {"name":"v132_delivery_check_failed","value":"暂时无法核对投递状态，请检查连接后重试。"},
     {"name":"v132_delivery_send_failed","value":"发送暂未完成，请检查连接后重试。"}

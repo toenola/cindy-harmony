@@ -2708,7 +2708,7 @@ export struct TaskPageContent {
       const safe = AppServices.instance.inputQueue.canRetryInputDelivery(scope.sessionId, clientId, scope.deviceId);
       const key = state === 'accepted' ? 'v132_delivery_accepted' : state === 'pending'
         ? 'v132_delivery_pending' : state === 'removed' ? 'v132_delivery_removed'
-          : safe ? 'v132_delivery_check_done' : 'v132_delivery_unknown';
+          : safe ? (state === 'unknown' ? 'v132_delivery_absent' : 'v132_delivery_check_done') : 'v132_delivery_unknown';
       this.getUIContext().getPromptAction().showToast({ message: this.v12String(key) });
     } catch (error) {
       if (this.isCurrentPresentationScope(scope)) {

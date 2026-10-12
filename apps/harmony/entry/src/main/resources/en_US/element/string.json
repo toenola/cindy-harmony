@@ -156,6 +156,7 @@
     {"name":"v132_delivery_accepted","value":"The computer has durably accepted this message."},
     {"name":"v132_delivery_pending","value":"Queued on the computer; durable receipt is not yet confirmed."},
     {"name":"v132_delivery_removed","value":"This message was removed from the computer queue."},
+    {"name":"v132_delivery_absent","value":"Your computer confirmed it did not receive this message. You can retry sending it."},
     {"name":"v132_delivery_check_done","value":"Delivery status updated."},
     {"name":"v132_delivery_check_failed","value":"Could not check delivery status. Check the connection and try again."},
     {"name":"v132_delivery_send_failed","value":"Sending did not complete. Check the connection and try again."}

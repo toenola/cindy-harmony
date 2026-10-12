@@ -156,6 +156,7 @@
     {"name":"v132_delivery_accepted","value":"コンピューターがこのメッセージを保存して受信しました。"},
     {"name":"v132_delivery_pending","value":"コンピューターで待機中です。保存済みの受信は未確認です。"},
     {"name":"v132_delivery_removed","value":"このメッセージはコンピューターのキューから削除されました。"},
+    {"name":"v132_delivery_absent","value":"コンピュータはこのメッセージを受信していないことを確認しました。再送信できます。"},
     {"name":"v132_delivery_check_done","value":"配信状態を更新しました。"},
     {"name":"v132_delivery_check_failed","value":"配信状態を確認できません。接続を確認して再試行してください。"},
     {"name":"v132_delivery_send_failed","value":"送信が完了しませんでした。接続を確認して再試行してください。"}

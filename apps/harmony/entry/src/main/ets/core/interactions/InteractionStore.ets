@@ -363,8 +363,6 @@ export class InteractionStore {
     const requestKey = interactionRequestKey(scope, requestId);
     if (this.resolvingRequestIds.has(requestKey)) return;
     const stateGeneration = this.stateGeneration;
-    const mutationGeneration = this.mutationGenerations.get(scope) ?? 0;
-    const connection = client.connectionIdentity(deviceId);
     const resolveSequence = ++this.nextResolveSequence;
     this.resolvingRequestIds.set(requestKey, resolveSequence);
     this.resolveErrors.delete(requestKey);
@@ -402,26 +400,24 @@ export class InteractionStore {
 
       // 超时 / ack 丢失不能直接判失败：pending 权威列表里已经没有该 requestId
       // 就说明决定已生效，避免诱导用户重复提交。
+      // 超时多因断线重连而起，快照基准必须在查询发出前重新取，而不是沿用提交开始时的连接；
+      // 查询期间连接或本作用域的推送变化说明快照可能过期，换新快照再判，有限次后保留原错误。
       if (!resolved) {
         try {
-          const pending = await this.queryPending(client, deviceId, sessionId);
-          if (stateGeneration !== this.stateGeneration
-            || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
-          if (connection !== client.connectionIdentity(deviceId)
-            || (this.mutationGenerations.get(scope) ?? 0) !== mutationGeneration) {
-            throw new Error(lastError);
-          }
-          let stillPending = false;
-          for (let index = 0; index < pending.length; index++) {
-            if (pending[index].requestId === requestId) {
-              stillPending = true;
+          for (let snapshotAttempt = 0; snapshotAttempt < 3 && !resolved; snapshotAttempt++) {
+            const mutationGeneration = this.mutationGenerations.get(scope) ?? 0;
+            const connection = client.connectionIdentity(deviceId);
+            const pending = await this.queryPending(client, deviceId, sessionId);
+            if (stateGeneration !== this.stateGeneration
+              || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
+            if (connection !== client.connectionIdentity(deviceId)
+              || (this.mutationGenerations.get(scope) ?? 0) !== mutationGeneration) continue;
+            if (!pending.some((item: PendingInteraction) => item.requestId === requestId)) {
+              resolved = true;
+            } else {
+              this.pendingByScope.set(scope, pending);
               break;
             }
-          }
-          if (!stillPending) {
-            resolved = true;
-          } else {
-            this.pendingByScope.set(scope, pending);
           }
         } catch (error) {
           // 权威查询也失败，保留原始错误与原卡片供重试。

@@ -45,6 +45,8 @@ class MockDlClient extends DlClient {
   pendingCalls: number = 0;
   devices: string[] = [];
   epoch: number = 1;
+  epochAfterResolveFailure: boolean = false;
+  epochDuringPending: boolean = false;
   deferredResolves: Map<string, DeferredValue<Envelope>> = new Map();
   deferredPending: DeferredValue<Envelope> | undefined = undefined;
   resolveStarted: DeferredValue<boolean> = new DeferredValue<boolean>();
@@ -66,13 +68,17 @@ class MockDlClient extends DlClient {
       const deferred = this.deferredResolves.get(deviceId);
       if (deferred !== undefined) return deferred.promise;
       if (this.resolveCalls <= this.transientFailures) return Promise.reject(new Error('NOT_CONNECTED'));
-      if (this.resolveError.length > 0) return Promise.reject(new Error(this.resolveError));
+      if (this.resolveError.length > 0) {
+        if (this.epochAfterResolveFailure) this.epoch += 1;
+        return Promise.reject(new Error(this.resolveError));
+      }
       return Promise.resolve(success(this.resolveResult));
     }
     if (options.channel === 'maker:get-pending-interactions') {
       this.pendingCalls += 1;
       this.pendingStarted.resolve(true);
       if (this.deferredPending !== undefined) return this.deferredPending.promise;
+      if (this.epochDuringPending) this.epoch += 1;
       if (this.pendingError.length > 0) return Promise.reject(new Error(this.pendingError));
       return Promise.resolve(success(this.pendingResult));
     }
@@ -243,8 +249,12 @@ export default function v132InteractionTests(): void {
       await client.pendingStarted.promise;
       addInteraction(store);
       saveDrafts(store, 'device', 'new draft');
-      client.deferredPending.resolve(success([]));
+      const late = client.deferredPending as DeferredValue<Envelope>;
+      client.deferredPending = undefined;
+      client.pendingResult = rawFixture('[{"request":{"requestId":"request","kind":"ask_user_question"}}]');
+      late.resolve(success([]));
       expect(await operation).assertEqual('INVOKE_TIMEOUT');
+      expect(client.pendingCalls).assertEqual(2);
       expect(store.getPending('session', 'device').length).assertEqual(1);
       expect(store.readAskDraft('request', 'device', 'session')?.customInput).assertEqual('new draft');
     });
@@ -257,8 +267,36 @@ export default function v132InteractionTests(): void {
       const operation = rejectedMessage(store.resolve('device', 'session', 'request', {}));
       await client.pendingStarted.promise;
       client.epoch += 1;
-      client.deferredPending.resolve(success([]));
+      const late = client.deferredPending as DeferredValue<Envelope>;
+      client.deferredPending = undefined;
+      client.pendingResult = rawFixture('[{"request":{"requestId":"request","kind":"ask_user_question"}}]');
+      late.resolve(success([]));
       expect(await operation).assertEqual('INVOKE_TIMEOUT');
+      expect(client.pendingCalls).assertEqual(2);
+      expect(store.getPending('session', 'device').length).assertEqual(1);
+    });
+
+    it('reconciles_with_a_fresh_snapshot_after_the_transport_failure_reconnected', 0, async () => {
+      const client = new MockDlClient();
+      client.resolveError = 'INVOKE_TIMEOUT';
+      client.epochAfterResolveFailure = true;
+      client.pendingResult = rawFixture('[{"request":{"requestId":"other","kind":"permission"}}]');
+      const store = attachStore(client);
+      saveDrafts(store);
+      expect(await rejectedMessage(store.resolve('device', 'session', 'request', {}))).assertEqual('');
+      expect(client.pendingCalls).assertEqual(1);
+      expect(store.getPending('session', 'device').length).assertEqual(0);
+      expect(store.readAskDraft('request', 'device', 'session')).assertEqual(null);
+      expect(store.resolveError('request', 'device', 'session')).assertEqual('');
+    });
+
+    it('keeps_the_original_error_when_every_fresh_snapshot_is_superseded', 0, async () => {
+      const client = new MockDlClient();
+      client.resolveError = 'INVOKE_TIMEOUT';
+      client.epochDuringPending = true;
+      const store = attachStore(client);
+      expect(await rejectedMessage(store.resolve('device', 'session', 'request', {}))).assertEqual('INVOKE_TIMEOUT');
+      expect(client.pendingCalls).assertEqual(3);
       expect(store.getPending('session', 'device').length).assertEqual(1);
     });
 

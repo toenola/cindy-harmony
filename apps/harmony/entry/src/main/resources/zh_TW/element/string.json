@@ -156,6 +156,7 @@
     {"name":"v132_delivery_accepted","value":"電腦已儲存並接收這則訊息。"},
     {"name":"v132_delivery_pending","value":"電腦已排隊，尚未確認已儲存。"},
     {"name":"v132_delivery_removed","value":"這則訊息已從電腦佇列移除。"},
+    {"name":"v132_delivery_absent","value":"電腦確認沒有收到這則訊息，可以重試傳送。"},
     {"name":"v132_delivery_check_done","value":"投遞狀態已更新。"},
     {"name":"v132_delivery_check_failed","value":"暫時無法核對投遞狀態，請檢查連線後重試。"},
     {"name":"v132_delivery_send_failed","value":"傳送暫未完成，請檢查連線後重試。"}

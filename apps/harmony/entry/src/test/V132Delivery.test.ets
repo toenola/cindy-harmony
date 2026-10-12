@@ -11,9 +11,13 @@ import {
 class DeliveryDeferred<T> {
   promise: Promise<T>;
   resolve: (value: T) => void = (_value: T): void => {};
+  reject: (error: Object) => void = (_error: Object): void => {};
 
   constructor() {
-    this.promise = new Promise<T>((resolve) => { this.resolve = resolve; });
+    this.promise = new Promise<T>((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+    });
   }
 }
 
@@ -285,6 +289,64 @@ export default function v132DeliveryTests(): void {
         expect(store.getInputDeliveryState('session', 'own', 'device')).assertEqual('unknown');
         store.clearAll();
       }
+    });
+
+    it('explicit_unknown_from_an_idle_recheck_allows_manual_resend_with_the_same_client_id', 0, async () => {
+      const client = new DeliveryClient();
+      client.projection = deliveryProjection('own', 'unknown');
+      client.enqueueFailure = new DlError('TIMEOUT', 'uncertain delivery', true);
+      const store = ownedDeliveryStore(client);
+      await failedDelivery(store);
+      expect(store.canRetryInputDelivery('session', 'own', 'device')).assertFalse();
+      expect(await store.refresh('device', 'session')).assertTrue();
+      expect(store.canRetryInputDelivery('session', 'own', 'device')).assertTrue();
+      const bubble = store.getBubbles('session', 'device').find((item: PendingQueueBubble) => item.clientId === 'own');
+      expect(bubble?.deliveryRetryAllowed).assertTrue();
+      client.enqueueFailure = undefined;
+      client.enqueueResult = deliveryProjection('own', 'accepted');
+      await store.retry('device', 'session', 'own');
+      expect(client.writes()).assertEqual(2);
+      const sends = client.calls.filter((call: DeliveryCall) => call.channel === 'maker:input:enqueue');
+      expect((sends[1].args[1] as Record<string, Object>)['clientId']).assertEqual('own');
+      expect(store.canRetryInputDelivery('session', 'own', 'device')).assertFalse();
+      store.clearAll();
+    });
+
+    it('missing_receipt_or_legacy_projection_never_counts_as_host_confirmed_absence', 0, async () => {
+      for (const version of [1, 0]) {
+        const client = new DeliveryClient();
+        client.projection = deliveryProjection(version === 1 ? '' : 'own', 'unknown', version);
+        client.enqueueFailure = new DlError('TIMEOUT', 'uncertain delivery', true);
+        const store = ownedDeliveryStore(client);
+        await failedDelivery(store);
+        await store.refresh('device', 'session');
+        if (version === 1) expect(store.canRetryInputDelivery('session', 'own', 'device')).assertFalse();
+        client.enqueueFailure = undefined;
+        await store.resyncDevice('device');
+        expect(client.writes()).assertEqual(1);
+        store.clearAll();
+      }
+    });
+
+    it('unknown_read_while_a_send_is_in_flight_does_not_authorize_resend', 0, async () => {
+      const client = new DeliveryClient();
+      client.projection = deliveryProjection('own', 'unknown');
+      client.enqueueFailure = new DlError('TIMEOUT', 'uncertain delivery', true);
+      const store = ownedDeliveryStore(client);
+      await failedDelivery(store);
+      await store.refresh('device', 'session');
+      expect(store.canRetryInputDelivery('session', 'own', 'device')).assertTrue();
+      client.enqueueFailure = undefined;
+      client.sendStarted = new DeliveryDeferred<boolean>();
+      client.delayedEnqueue = new DeliveryDeferred<Envelope>();
+      const sending = failedDelivery(store);
+      await client.sendStarted.promise;
+      await store.refresh('device', 'session');
+      client.delayedEnqueue.reject(new DlError('TIMEOUT', 'second uncertain delivery', true));
+      await sending;
+      expect(client.writes()).assertEqual(2);
+      expect(store.canRetryInputDelivery('session', 'own', 'device')).assertFalse();
+      store.clearAll();
     });
 
     it('positive_receipt_after_lost_enqueue_ack_does_not_become_a_retryable_failure', 0, async () => {
