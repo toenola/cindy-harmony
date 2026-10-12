@@ -8,6 +8,8 @@ HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 Har
 
 当前为 [v1.3.1 候选版本](./docs/version/v1.3.1/README.md)：四项 Mobile 对齐实现与 Harmony Local Test 已完成，可构建签名 HAP；API 26 设备交互验收待完成。
 
+[v1.3.2 开发资料](./docs/version/v1.3.2/README.md)已建立：上游合并及 Mobile 增量评估完成，功能范围待确认；当前应用内版本仍为 1.3.1。
+
 ## 文档
 
 - [文档索引](./docs/README.md)
