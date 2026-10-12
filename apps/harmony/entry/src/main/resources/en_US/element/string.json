@@ -87,6 +87,18 @@
     {
       "name": "v131_catalog_retry",
       "value": "The model catalog is not ready. Refreshing it now; try sending again shortly."
-    }
+    },
+    {"name":"v132_agent_location","value":"Agent runs on %1$s"},
+    {"name":"v132_remote_runtime_read_only","value":"The Agent runs on another computer. Change the model or Agent on Desktop."},
+    {"name":"v132_choose_drive","value":"Choose a drive"},
+    {"name":"v132_defaults_loading","value":"Reading the computer’s default model"},
+    {"name":"v132_model_required","value":"Choose a model first"},
+    {"name":"v132_model_reselect","value":"This model is disabled. Choose another model."},
+    {"name":"v132_model_reselection_required","value":"This model is disabled. Choose another model."},
+    {"name":"v132_interaction_not_accepted","value":"This decision was not accepted."},
+    {"name":"v132_usage_limit_resume","value":"Will continue automatically at %1$s"},
+    {"name":"v132_usage_limit_cancel","value":"Cancel automatic continuation"},
+    {"name":"v132_usage_limit_cancel_failed","value":"Could not cancel automatic continuation"},
+    {"name":"v132_defaults_retry","value":"Reload computer settings"}
   ]
 }

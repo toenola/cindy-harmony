@@ -2880,6 +2880,16 @@ struct TaskListPage {
         }
         .width('100%')
 
+        if (entry.session.agentDeviceId.length > 0) {
+          Text(harmonyV12String(this.getUIContext().getHostContext(), 'v132_agent_location',
+            this.devices.find((device: PresenceSnapshot) => device.deviceId === entry.session.agentDeviceId)?.deviceName
+              || entry.session.agentDeviceId))
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .lineHeight(16)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
         if (taskPreviewText(entry.session.preview).length > 0) {
           Text(taskPreviewText(entry.session.preview))
             .fontSize(12)

@@ -12,6 +12,10 @@ import { RemoteSession, readBool, readObj, readStr, safeErrorMessage } from '../
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { buildPersistedUserContent } from './MessageStore';
 import { SerializedComposerDocument } from './ComposerDocument';
+import {
+  UsageLimitWait, UsageLimitWaitState, readUsageLimitWait,
+  shouldShowUsageLimitWait, usageLimitWaitCancelUnsupported,
+} from './UsageLimitWait';
 
 const SETTLING_WINDOW_MS = 10000;
 const REMOTE_EVIDENCE_LIMIT = 256;
@@ -42,6 +46,17 @@ export class InputProjectionState {
   autoResumePending: Record<string, Object> | undefined = undefined;
   continuationTurnClientId: string = '';
   continuationInFlightProjectionCapability: string = 'unknown';
+  usageLimitWait: UsageLimitWait | undefined = undefined;
+}
+
+class UsageLimitWaitCancellation {
+  deviceId: string = '';
+  connectionScope: string = '';
+  dispatchEpoch: number = 0;
+  authorityEpoch: number = 0;
+  resumeAt: number = 0;
+  cancelling: boolean = true;
+  error: string = '';
 }
 
 class ActiveInputTarget {
@@ -220,6 +235,7 @@ export function parseInputProjection(
   state.queueAbortPending = readBool(raw, 'queueAbortPending', false);
   state.error = readStr(raw, 'error');
   state.errorRetryText = readStr(raw, 'errorRetryText');
+  state.usageLimitWait = readUsageLimitWait(raw['usageLimitWait']);
   const autoResumePending = raw['autoResumePending'];
   if (autoResumePending !== undefined && autoResumePending !== null
     && typeof autoResumePending === 'object' && !Array.isArray(autoResumePending)) {
@@ -293,8 +309,16 @@ export class InputQueueStore {
   /** 同一任务的恢复拉取 single-flight；authority epoch 负责隔离清理后的旧结果。 */
   private refreshOperations: Map<string, Promise<boolean>> = new Map();
   private sendSequence: number = 0;
+  private usageLimitScopeGeneration: number = 0;
+  private usageLimitCancelUnsupportedScopes: Map<string, string> = new Map();
+  private usageLimitCancellations: Map<string, UsageLimitWaitCancellation> = new Map();
 
   attach(client: DlClient): void {
+    if (this.client !== client) {
+      this.usageLimitScopeGeneration += 1;
+      this.usageLimitCancelUnsupportedScopes.clear();
+      this.usageLimitCancellations.clear();
+    }
     this.client = client;
   }
 
@@ -321,6 +345,27 @@ export class InputQueueStore {
       return empty;
     }
     return this.projections.get(sessionId) ?? new InputProjectionState();
+  }
+
+  getUsageLimitWaitState(sessionId: string, deviceId: string): UsageLimitWaitState {
+    const state = new UsageLimitWaitState();
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return state;
+    const projection = this.getProjection(sessionId, deviceId);
+    state.resumeAt = projection.usageLimitWait?.resumeAt ?? 0;
+    state.visible = shouldShowUsageLimitWait(projection.error, projection.usageLimitWait);
+    state.cancelSupported = this.client !== undefined
+      && this.usageLimitCancelUnsupportedScopes.get(deviceId) !== this.usageLimitConnectionScope(deviceId);
+    const operation = this.usageLimitCancellations.get(sessionId);
+    if (operation !== undefined && this.usageLimitCancellationIsCurrent(sessionId, operation)
+      && operation.deviceId === deviceId) {
+      state.cancelling = operation.cancelling;
+      if (operation.resumeAt === state.resumeAt
+        && operation.authorityEpoch === this.captureAuthorityEpoch(sessionId)) {
+        state.cancelError = operation.error;
+      }
+    }
+    state.canCancel = state.visible && state.cancelSupported && !state.cancelling;
+    return state;
   }
 
   isLocallyFailed(clientId: string): boolean {
@@ -928,6 +973,9 @@ export class InputQueueStore {
 
   /** 全局登出/账号切换使用的代次地板；旧请求不能给重建后的同名任务灌回数据。 */
   clearAll(): void {
+    this.usageLimitScopeGeneration += 1;
+    this.usageLimitCancelUnsupportedScopes.clear();
+    this.usageLimitCancellations.clear();
     this.readRetries.clear();
     this.projections.clear();
     this.settlingBySession.clear();
@@ -1349,6 +1397,74 @@ export class InputQueueStore {
     this.notify();
   }
 
+  async cancelUsageLimitWait(deviceId: string, sessionId: string): Promise<void> {
+    if (deviceId.length === 0 || sessionId.length === 0) return;
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.rememberSessionDevice(deviceId, sessionId);
+    const state = this.getUsageLimitWaitState(sessionId, deviceId);
+    if (!state.canCancel) return;
+    const operation = new UsageLimitWaitCancellation();
+    operation.deviceId = deviceId;
+    operation.connectionScope = this.usageLimitConnectionScope(deviceId);
+    operation.dispatchEpoch = this.captureDispatchEpoch(sessionId);
+    operation.authorityEpoch = this.captureAuthorityEpoch(sessionId);
+    operation.resumeAt = state.resumeAt;
+    this.usageLimitCancellations.set(sessionId, operation);
+    this.notify();
+    let cancelAccepted = false;
+    try {
+      const preSend = (): void => {
+        if (!this.usageLimitCancellationIsCurrent(sessionId, operation)) {
+          throw new DlError('CANCELLED', 'Usage limit cancellation scope changed', false);
+        }
+      };
+      const result = await this.invoke(deviceId, 'maker:input:cancel-usage-limit-wait', [sessionId], preSend);
+      if (!this.usageLimitCancellationIsCurrent(sessionId, operation)) return;
+      if (result === false || (result !== undefined && result !== null && typeof result === 'object'
+        && !Array.isArray(result) && (result as Record<string, Object>)['accepted'] === false)) {
+        throw new Error('USAGE_LIMIT_CANCEL_REJECTED');
+      }
+      cancelAccepted = true;
+      operation.authorityEpoch = this.captureAuthorityEpoch(sessionId);
+      const snapshot = await this.invoke(deviceId, 'maker:input:get-projection', [sessionId], preSend);
+      if (!this.usageLimitCancellationIsCurrent(sessionId, operation)) return;
+      if (snapshot === undefined || snapshot === null || typeof snapshot !== 'object'
+        || Array.isArray(snapshot) || !Array.isArray((snapshot as Record<string, Object>)['pendingQueue'])) {
+        throw new Error('INVALID_INPUT_PROJECTION');
+      }
+      const projection = parseInputProjection(snapshot, sessionId);
+      if (projection.sessionId !== sessionId) throw new Error('INVALID_INPUT_PROJECTION');
+      this.applyProjectionIfCurrent(sessionId, projection, operation.authorityEpoch, deviceId);
+    } catch (error) {
+      if (!this.usageLimitCancellationIsCurrent(sessionId, operation)) return;
+      const message = safeErrorMessage(error);
+      const capabilityError = error instanceof DlError ? error.code + ' ' + message : message;
+      if (!cancelAccepted && usageLimitWaitCancelUnsupported(capabilityError)) {
+        this.usageLimitCancelUnsupportedScopes.set(deviceId, operation.connectionScope);
+      } else if (operation.authorityEpoch === this.captureAuthorityEpoch(sessionId)) {
+        operation.error = message;
+        throw error instanceof Error ? error : new Error(message);
+      }
+    } finally {
+      if (this.usageLimitCancellations.get(sessionId) === operation) {
+        operation.cancelling = false;
+        this.notify();
+      }
+    }
+  }
+
+  private usageLimitConnectionScope(deviceId: string): string {
+    return JSON.stringify([this.usageLimitScopeGeneration, deviceId,
+      this.client?.connectionIdentity(deviceId) ?? '']);
+  }
+
+  private usageLimitCancellationIsCurrent(sessionId: string, operation: UsageLimitWaitCancellation): boolean {
+    return this.usageLimitCancellations.get(sessionId) === operation
+      && this.usageLimitConnectionScope(operation.deviceId) === operation.connectionScope
+      && this.dispatchEpochIsCurrent(sessionId, operation.dispatchEpoch)
+      && this.sessionDeviceMatches(sessionId, operation.deviceId);
+  }
+
   private applyProjectionResultIfCurrent(
     sessionId: string,
     result: Object | undefined,
@@ -1479,6 +1595,7 @@ export class InputQueueStore {
   }
 
   private dropProjection(sessionId: string): void {
+    this.usageLimitCancellations.delete(sessionId);
     const projection = this.projections.get(sessionId);
     if (projection !== undefined) {
       for (let i = 0; i < projection.pendingQueue.length; i++) {
@@ -2016,6 +2133,7 @@ export class InputQueueStore {
     deviceId: string,
     channel: string,
     args: Object[],
+    preSend: (() => void) | undefined = undefined,
   ): Promise<Object | undefined> {
     const client = this.client;
     if (!client) throw new Error('Device Link 未连接');
@@ -2032,6 +2150,8 @@ export class InputQueueStore {
     const options = new DlInvokeOptions();
     options.channel = channel;
     options.args = args;
+    options.preSend = preSend;
+    if (preSend !== undefined) preSend();
     const envelope = await client.invoke(deviceId, options);
     return unwrapInvokeResult(envelope);
   }

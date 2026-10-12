@@ -150,6 +150,7 @@ export class RemoteSession {
   extraDirs: string[] = [];
   /** SSH 会话的被控端 host alias；本地会话为空。 */
   remoteHostId: string = '';
+  agentDeviceId: string = '';
   workspaceKind: string = 'project';
   model: string = '';
   /** 当前模型显式使用的供应商来源；空值表示跟随主机默认路由。 */
@@ -203,6 +204,7 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
     }
   }
   s.remoteHostId = readStr(raw, 'remoteHostId');
+  s.agentDeviceId = readStr(raw, 'agentDeviceId');
   s.workspaceKind = readStr(raw, 'workspaceKind');
   if (s.workspaceKind.length === 0) s.workspaceKind = 'project';
   s.model = readStr(raw, 'model');

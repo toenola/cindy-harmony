@@ -14,6 +14,8 @@ import { Envelope } from '../device-link/DlProtocol';
 import { readStr, readObj, safeErrorMessage } from '../tasks/TaskModels';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 
+export const INTERACTION_DECISION_NOT_ACCEPTED: string = 'v132_interaction_not_accepted';
+
 /** 挂起的交互请求。 */
 export class PendingInteraction {
   sessionId: string = '';
@@ -61,7 +63,6 @@ export class InteractionStore {
   private listeners: Array<() => void> = [];
   /** deviceId + sessionId 复合键，避免跨设备同名任务共享 pending。 */
   private pendingByScope: Map<string, PendingInteraction[]> = new Map();
-  /** resolve RPC 也跨越账号/连接生命周期；值是启动时的 Store 代次。 */
   private resolvingRequestIds: Map<string, number> = new Map();
   private resolveErrors: Map<string, string> = new Map();
   private askDrafts: Map<string, AskUserDraft> = new Map();
@@ -71,6 +72,7 @@ export class InteractionStore {
   /** 同一任务可并发补拉；只允许最后启动的一次快照提交。 */
   private refreshSequences: Map<string, number> = new Map();
   private nextRefreshSequence: number = 0;
+  private nextResolveSequence: number = 0;
   /** 当前真正打开的任务；重连后只补拉这些交互，避免扩大故障半径。 */
   private activeTargets: Map<string, ActiveInteractionTarget> = new Map();
   /** 同一任务的 pending 快照 single-flight；push/dismiss 代次继续负责裁决结果。 */
@@ -112,34 +114,63 @@ export class InteractionStore {
     return list !== undefined && list.length > 0;
   }
 
-  isResolving(requestId: string): boolean {
-    return this.resolvingRequestIds.has(requestId);
+  isResolving(requestId: string, deviceId: string = '', sessionId: string = ''): boolean {
+    return this.resolvingRequestIds.has(this.requestStateKey(requestId, deviceId, sessionId));
   }
 
-  resolveError(requestId: string): string {
-    return this.resolveErrors.get(requestId) ?? '';
+  resolveError(requestId: string, deviceId: string = '', sessionId: string = ''): string {
+    return this.resolveErrors.get(this.requestStateKey(requestId, deviceId, sessionId)) ?? '';
   }
 
-  readAskDraft(requestId: string): AskUserDraft | null {
-    const draft = this.askDrafts.get(requestId);
+  readAskDraft(requestId: string, deviceId: string = '', sessionId: string = ''): AskUserDraft | null {
+    const draft = this.askDrafts.get(this.requestStateKey(requestId, deviceId, sessionId));
     return draft === undefined ? null : cloneAskDraft(draft);
   }
 
-  saveAskDraft(requestId: string, draft: AskUserDraft): void {
+  saveAskDraft(requestId: string, draft: AskUserDraft, deviceId: string = '', sessionId: string = ''): void {
     if (requestId.length === 0) return;
-    this.askDrafts.set(requestId, cloneAskDraft(draft));
+    this.askDrafts.set(this.requestStateKey(requestId, deviceId, sessionId), cloneAskDraft(draft));
     this.notify();
   }
 
-  readPlanDraft(requestId: string): PlanReviewDraft | null {
-    const draft = this.planDrafts.get(requestId);
+  readPlanDraft(requestId: string, deviceId: string = '', sessionId: string = ''): PlanReviewDraft | null {
+    const draft = this.planDrafts.get(this.requestStateKey(requestId, deviceId, sessionId));
     return draft === undefined ? null : clonePlanDraft(draft);
   }
 
-  savePlanDraft(requestId: string, draft: PlanReviewDraft): void {
+  savePlanDraft(requestId: string, draft: PlanReviewDraft, deviceId: string = '', sessionId: string = ''): void {
     if (requestId.length === 0) return;
-    this.planDrafts.set(requestId, clonePlanDraft(draft));
+    this.planDrafts.set(this.requestStateKey(requestId, deviceId, sessionId), clonePlanDraft(draft));
     this.notify();
+  }
+
+  private requestStateKey(requestId: string, deviceId: string, sessionId: string): string {
+    if (deviceId.length > 0 || sessionId.length > 0) {
+      return interactionRequestKey(interactionScopeKey(deviceId, sessionId), requestId);
+    }
+    const scopes: string[] = [];
+    this.pendingByScope.forEach((items: PendingInteraction[], scope: string) => {
+      if (items.some((item: PendingInteraction) => item.requestId === requestId)) scopes.push(scope);
+    });
+    return scopes.length === 1 ? interactionRequestKey(scopes[0], requestId) : requestId;
+  }
+
+  private clearRequestState(scope: string, requestId: string): void {
+    const key = interactionRequestKey(scope, requestId);
+    this.resolvingRequestIds.delete(key);
+    this.resolveErrors.delete(key);
+    this.askDrafts.delete(key);
+    this.planDrafts.delete(key);
+    let stillPending = false;
+    this.pendingByScope.forEach((items: PendingInteraction[]) => {
+      if (items.some((item: PendingInteraction) => item.requestId === requestId)) stillPending = true;
+    });
+    if (!stillPending) {
+      this.resolvingRequestIds.delete(requestId);
+      this.resolveErrors.delete(requestId);
+      this.askDrafts.delete(requestId);
+      this.planDrafts.delete(requestId);
+    }
   }
 
   private bumpMutationGeneration(deviceId: string, sessionId: string): void {
@@ -215,13 +246,10 @@ export class InteractionStore {
       this.pendingByScope.set(scope, filtered);
       const parts = splitInteractionScope(scope);
       this.bumpMutationGeneration(parts.deviceId, parts.sessionId);
+      this.clearRequestState(scope, requestId);
       changed = true;
     }
     if (changed) {
-      this.resolvingRequestIds.delete(requestId);
-      this.resolveErrors.delete(requestId);
-      this.askDrafts.delete(requestId);
-      this.planDrafts.delete(requestId);
       this.notify();
     }
   }
@@ -331,30 +359,45 @@ export class InteractionStore {
   ): Promise<void> {
     const client = this.client;
     if (!client) throw new Error('Device Link 未连接');
-    if (this.resolvingRequestIds.has(requestId)) return;
+    const scope = interactionScopeKey(deviceId, sessionId);
+    const requestKey = interactionRequestKey(scope, requestId);
+    if (this.resolvingRequestIds.has(requestKey)) return;
     const stateGeneration = this.stateGeneration;
-    this.resolvingRequestIds.set(requestId, stateGeneration);
-    this.resolveErrors.delete(requestId);
+    const mutationGeneration = this.mutationGenerations.get(scope) ?? 0;
+    const connection = client.connectionIdentity(deviceId);
+    const resolveSequence = ++this.nextResolveSequence;
+    this.resolvingRequestIds.set(requestKey, resolveSequence);
+    this.resolveErrors.delete(requestKey);
     this.notify();
     try {
       let lastError = '';
       let resolved = false;
       for (let attempt = 0; attempt <= 3; attempt++) {
+        let receipt: Object | undefined = undefined;
         try {
           const opts = new DlInvokeOptions();
           opts.channel = 'maker:resolve-interaction';
           opts.args = [requestId, decision];
           const envelope = await client.invoke(deviceId, opts);
-          unwrapInvokeResult(envelope);
-          if (stateGeneration !== this.stateGeneration) return;
-          resolved = true;
-          break;
-        } catch (e) {
-          if (stateGeneration !== this.stateGeneration) return;
-          lastError = errorMessage(e);
+          receipt = unwrapInvokeResult(envelope);
+        } catch (error) {
+          if (stateGeneration !== this.stateGeneration
+            || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
+          lastError = errorMessage(error);
           if (attempt >= 3 || !isRetryableResolveError(lastError)) break;
           await interactionDelay(300 * Math.pow(2, attempt));
+          if (stateGeneration !== this.stateGeneration
+            || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
+          continue;
         }
+        if (receipt !== undefined && receipt !== null && typeof receipt === 'object'
+          && !Array.isArray(receipt) && (receipt as Record<string, Object>)['accepted'] === false) {
+          throw new Error(INTERACTION_DECISION_NOT_ACCEPTED);
+        }
+        if (stateGeneration !== this.stateGeneration
+          || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
+        resolved = true;
+        break;
       }
 
       // 超时 / ack 丢失不能直接判失败：pending 权威列表里已经没有该 requestId
@@ -362,10 +405,15 @@ export class InteractionStore {
       if (!resolved) {
         try {
           const pending = await this.queryPending(client, deviceId, sessionId);
-          if (stateGeneration !== this.stateGeneration) return;
+          if (stateGeneration !== this.stateGeneration
+            || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
+          if (connection !== client.connectionIdentity(deviceId)
+            || (this.mutationGenerations.get(scope) ?? 0) !== mutationGeneration) {
+            throw new Error(lastError);
+          }
           let stillPending = false;
-          for (let i = 0; i < pending.length; i++) {
-            if (pending[i].requestId === requestId) {
+          for (let index = 0; index < pending.length; index++) {
+            if (pending[index].requestId === requestId) {
               stillPending = true;
               break;
             }
@@ -373,34 +421,32 @@ export class InteractionStore {
           if (!stillPending) {
             resolved = true;
           } else {
-            this.pendingByScope.set(interactionScopeKey(deviceId, sessionId), pending);
+            this.pendingByScope.set(scope, pending);
           }
-        } catch (e) {
+        } catch (error) {
           // 权威查询也失败，保留原始错误与原卡片供重试。
         }
       }
-      if (stateGeneration !== this.stateGeneration) return;
+      if (stateGeneration !== this.stateGeneration
+        || this.resolvingRequestIds.get(requestKey) !== resolveSequence) return;
       if (!resolved) throw new Error(lastError.length > 0 ? lastError : '提交失败');
 
       // 成功提交后本地移除（桌面端也会推 dismiss，双保险）。
-      const scope = interactionScopeKey(deviceId, sessionId);
       const list = this.pendingByScope.get(scope) ?? [];
-      const filtered = list.filter((x: PendingInteraction) => x.requestId !== requestId);
+      const filtered = list.filter((item: PendingInteraction) => item.requestId !== requestId);
       if (filtered.length !== list.length) {
         this.pendingByScope.set(scope, filtered);
         this.bumpMutationGeneration(deviceId, sessionId);
       }
-      this.askDrafts.delete(requestId);
-      this.planDrafts.delete(requestId);
-      this.resolveErrors.delete(requestId);
-    } catch (e) {
-      if (stateGeneration !== this.stateGeneration) return;
-      const message = errorMessage(e);
-      this.resolveErrors.set(requestId, message);
+      this.clearRequestState(scope, requestId);
+    } catch (error) {
+      const message = errorMessage(error);
+      if (stateGeneration === this.stateGeneration
+        && this.resolvingRequestIds.get(requestKey) === resolveSequence) this.resolveErrors.set(requestKey, message);
       throw new Error(message);
     } finally {
-      if (this.resolvingRequestIds.get(requestId) === stateGeneration) {
-        this.resolvingRequestIds.delete(requestId);
+      if (this.resolvingRequestIds.get(requestKey) === resolveSequence) {
+        this.resolvingRequestIds.delete(requestKey);
       }
       this.notify();
     }
@@ -415,7 +461,9 @@ export class InteractionStore {
     opts.channel = 'maker:get-pending-interactions';
     opts.args = [sessionId];
     const env = await client.invoke(deviceId, opts);
-    return parsePendingList(unwrapInvokeResult(env), deviceId, sessionId);
+    const result = unwrapInvokeResult(env);
+    if (!Array.isArray(result)) throw new Error('INVALID_PENDING_INTERACTIONS');
+    return parsePendingList(result, deviceId, sessionId);
   }
 }
 
@@ -447,6 +495,10 @@ function parsePendingList(
 
 function interactionScopeKey(deviceId: string, sessionId: string): string {
   return `${deviceId}\u0000${sessionId}`;
+}
+
+function interactionRequestKey(scope: string, requestId: string): string {
+  return scope + '\u0000' + requestId;
 }
 
 function splitInteractionScope(scope: string): InteractionScopeParts {

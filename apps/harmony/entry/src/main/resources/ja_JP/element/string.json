@@ -87,6 +87,18 @@
     {
       "name": "v131_catalog_retry",
       "value": "モデル一覧を再読み込みしています。しばらくしてから再送信してください。"
-    }
+    },
+    {"name":"v132_agent_location","value":"Agent は %1$s で実行中"},
+    {"name":"v132_remote_runtime_read_only","value":"Agent は別のコンピューターで実行中です。モデルと Agent はデスクトップで変更してください。"},
+    {"name":"v132_choose_drive","value":"ドライブを選択"},
+    {"name":"v132_defaults_loading","value":"コンピューターの既定モデルを読み込み中"},
+    {"name":"v132_model_required","value":"先にモデルを選択してください"},
+    {"name":"v132_model_reselect","value":"このモデルは無効です。別のモデルを選択してください。"},
+    {"name":"v132_model_reselection_required","value":"このモデルは無効です。別のモデルを選択してください。"},
+    {"name":"v132_interaction_not_accepted","value":"この決定は受け付けられませんでした。"},
+    {"name":"v132_usage_limit_resume","value":"%1$s に自動的に続行します"},
+    {"name":"v132_usage_limit_cancel","value":"自動続行をキャンセル"},
+    {"name":"v132_usage_limit_cancel_failed","value":"自動続行をキャンセルできませんでした"},
+    {"name":"v132_defaults_retry","value":"コンピューターの設定を再読み込み"}
   ]
 }

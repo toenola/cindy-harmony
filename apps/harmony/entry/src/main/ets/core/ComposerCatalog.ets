@@ -52,10 +52,26 @@ export class ProviderListOptions {
   capabilities: string[] = [];
 }
 
-/** 会话内切换模型时的目标 provider；新建任务页按最近会话回读。 */
 export interface ModelSelectionHint {
   model: string;
   providerId: string;
+}
+
+export function modelNeedsReselection(
+  visibility: Map<string, boolean> | null | undefined,
+  agent: string,
+  model: string,
+  providerId: string | null | undefined,
+): boolean {
+  if (visibility === null || visibility === undefined || model.length === 0) return false;
+  if (providerId) return visibility.get(agent + ':' + providerId + ':' + model) === false;
+  let offerings = 0;
+  for (const key of visibility.keys()) {
+    if (!key.startsWith(agent + ':') || !key.endsWith(':' + model)) continue;
+    offerings += 1;
+    if (visibility.get(key) !== false) return false;
+  }
+  return offerings > 0;
 }
 
 export function permissionModeLabel(id: string, fallback: string): string {

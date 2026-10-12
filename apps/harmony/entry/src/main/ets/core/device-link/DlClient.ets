@@ -102,6 +102,7 @@ export class DlInvokeOptions {
   args: Object[] = [];
   /** 0/缺省 = 使用默认 30s 超时。 */
   timeoutMs: number | undefined = undefined;
+  preSend: (() => void) | undefined = undefined;
 }
 
 /** openLink 参数。 */
@@ -528,6 +529,7 @@ export class DlClient {
 
   /** 向目标设备发 invoke，返回原始响应帧（调用方解析 invoke-result payload）。 */
   invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    options.preSend?.();
     const timeout = options.timeoutMs !== undefined && options.timeoutMs > 0
       ? options.timeoutMs
       : REQUEST_TIMEOUT_MS;

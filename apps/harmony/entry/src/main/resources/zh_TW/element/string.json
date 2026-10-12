@@ -87,6 +87,18 @@
     {
       "name": "v131_catalog_retry",
       "value": "模型目錄尚未就緒，正在重新讀取，請稍後傳送。"
-    }
+    },
+    {"name":"v132_agent_location","value":"Agent 在 %1$s 執行"},
+    {"name":"v132_remote_runtime_read_only","value":"Agent 在其他電腦執行，請在桌面調整模型和 Agent。"},
+    {"name":"v132_choose_drive","value":"選擇磁碟"},
+    {"name":"v132_defaults_loading","value":"正在讀取電腦的預設模型"},
+    {"name":"v132_model_required","value":"請先選擇模型"},
+    {"name":"v132_model_reselect","value":"目前模型已關閉，請重新選擇"},
+    {"name":"v132_model_reselection_required","value":"目前模型已關閉，請重新選擇"},
+    {"name":"v132_interaction_not_accepted","value":"這份決定未被接受。"},
+    {"name":"v132_usage_limit_resume","value":"將於 %1$s 自動繼續"},
+    {"name":"v132_usage_limit_cancel","value":"取消自動繼續"},
+    {"name":"v132_usage_limit_cancel_failed","value":"未能取消自動繼續"},
+    {"name":"v132_defaults_retry","value":"重新讀取電腦設定"}
   ]
 }

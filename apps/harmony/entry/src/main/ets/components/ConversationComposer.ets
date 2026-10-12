@@ -64,6 +64,7 @@ export struct ConversationComposer {
   @Prop contextBusy: boolean = false;
   /** 运行时能力与 provider 目录全部落定后再一次性展示工具栏，避免按钮分批插入跳动。 */
   @Prop toolbarReady: boolean = true;
+  @Prop runtimeRouteLocked: boolean = false;
   @Prop hasPermissionOptions: boolean = false;
   @Prop hasAgentOptions: boolean = false;
   @Prop hasModelOptions: boolean = false;
@@ -449,8 +450,9 @@ export struct ConversationComposer {
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
-    .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
     // 读屏播报完整元信息：视觉可能省略，但强度不能只靠看。
+    .enabled(!this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
+    .opacity(this.runtimeRouteLocked ? 0.4 : 1)
     .accessibilityText(this.effortLabel.length > 0
       ? `模型：${this.modelLabel}，思考强度：${this.effortLabel}`
       : `模型：${this.modelLabel}`)
@@ -502,7 +504,8 @@ export struct ConversationComposer {
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
-    .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
+    .enabled(!this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
+    .opacity(this.runtimeRouteLocked ? 0.4 : 1)
     .accessibilityText(`Agent：${this.agentLabel}`)
     .onClick(() => this.onAgent())
     .bindPopup(this.agentPopupPresented, {

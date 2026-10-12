@@ -62,6 +62,7 @@ export function taskListEntryPresentationState(
     session.title,
     taskPreviewText(session.preview),
     session.agentKind,
+    session.agentDeviceId,
     session.status,
     session.pinnedAt,
     taskActivityAt(session),

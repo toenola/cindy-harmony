@@ -40,13 +40,13 @@ import {
   groupComposerModelOptions,
   hasProviderCatalog,
   modelProviderKind,
+  modelNeedsReselection,
   parseModelOptions,
   parseModelVisibilityOverrides,
   parseProviderModelOptions as parseComposerProviderModelOptions,
   permissionModeDescription,
   permissionModeLabel,
   reconcileModelEffort,
-  resolveNewSessionDefaultModel,
   selectedPermissionModeLabel,
 } from '../core/ComposerCatalog';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
@@ -60,6 +60,19 @@ import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readObj, readStr } from '../core/tasks/TaskModels';
+import {
+  NewSessionDirectoryDrive,
+  NewSessionDraftPrefWriter,
+  NewSessionRuntime,
+  NewSessionRuntimeChoices,
+  newSessionDraftPref,
+  newSessionRuntimeCanCreate,
+  normalizeRemoteDirectoryDrives,
+  pickNewSessionRuntime,
+  readNewSessionRuntimeDefaults,
+  runtimeDefaultsScope,
+  shouldRetryRemoteBrowseDrives,
+} from '../core/tasks/NewSessionRuntimeDefaults';
 import {
   NewSessionCreationParams,
   NewSessionEditDraft,
@@ -134,11 +147,6 @@ function agentMark(kind: NewAgentKind): string {
   return 'CC';
 }
 
-function fallbackModel(kind: NewAgentKind): string {
-  if (kind === 'codex' || kind === 'pi') return 'gpt-5.4';
-  return 'claude-sonnet-4-6';
-}
-
 function directoryTitle(path: string): string {
   const normalized = path.trim().replace(/\\/g, '/').replace(/\/+$/, '');
   if (normalized.length === 0) return '项目目录';
@@ -206,6 +214,7 @@ export struct NewSessionPageContent {
   @State browsePath: string = '';
   @State browseParent: string = '';
   @State browseEntries: RemoteDirectory[] = [];
+  @State browseDrives: NewSessionDirectoryDrive[] = [];
   @State browseLoading: boolean = false;
   @State browseError: string = '';
   @State showHiddenDirectories: boolean = false;
@@ -226,6 +235,7 @@ export struct NewSessionPageContent {
   @State permissionOptions: RuntimeChoiceOption[] = [];
   @State fastModeCapability: boolean = false;
   @State composerToolbarReady: boolean = false;
+  @State runtimeDefaultsSettled: boolean = false;
   @State creating: boolean = false;
   @State error: string = '';
   @State taskRevision: number = 0;
@@ -253,6 +263,8 @@ export struct NewSessionPageContent {
   private workspaceEditRevision: number = 0;
   private runtimeCatalogReady: boolean = false;
   private runtimeCatalogScope: string = '';
+  private runtimeChoices: NewSessionRuntimeChoices = new NewSessionRuntimeChoices();
+  private runtimePrefWriter: NewSessionDraftPrefWriter = new NewSessionDraftPrefWriter();
   private workspaceRestoreGeneration: number = 0;
   private preserveWorkspaceDraft: boolean = false;
   /** 使系统图片选择器的迟到回包不能写入已离开的新建任务页。 */
@@ -306,6 +318,11 @@ export struct NewSessionPageContent {
     }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
+    }));
+    this.unsubs.push(AppServices.instance.auth.onChanged(() => {
+      if (this.runtimeCatalogScope !== this.currentRuntimeScope()) {
+        void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
+      }
     }));
     this.refreshDevices();
     void this.restoreWorkspacePreference();
@@ -558,6 +575,11 @@ export struct NewSessionPageContent {
   }
 
   private selectModel(option: RuntimeModelOption): void {
+    if (option.suspended || modelNeedsReselection(
+      this.modelVisibilityOverrides, this.selectedAgentKind, option.id, option.providerId)) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
+      return;
+    }
     if (this.creating || option.availability === 'requires_payment') {
       if (option.availability === 'requires_payment') {
         promptAction.showToast({ message: '该模型需要付费后才能使用' });
@@ -575,6 +597,7 @@ export struct NewSessionPageContent {
     this.effort = nextEffort;
     this.fastMode = nextFastMode;
     this.error = '';
+    this.writeRuntimeChoice(true);
   }
 
   private togglePlanMode(): void {
@@ -591,6 +614,7 @@ export struct NewSessionPageContent {
     if (!this.fastModeCapability || model === undefined || !model.supportsFastMode || this.creating) return;
     this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
     this.fastMode = !this.fastMode;
+    this.writeRuntimeChoice(false);
   }
 
   private selectDialogue(): void {
@@ -1004,6 +1028,9 @@ export struct NewSessionPageContent {
 
   private canSend(): boolean {
     if (this.creating || this.pickingImages || this.pickingFiles) return false;
+    if (this.runtimeCatalogScope !== this.currentRuntimeScope()
+      || !newSessionRuntimeCanCreate(this.runtimeDefaultsSettled, this.runtimeCatalogReady,
+        this.selectedAgentKind, this.currentRuntimeChoice(), this.modelVisibilityOverrides)) return false;
     let readyCount = 0;
     for (let i = 0; i < this.composerImages.length; i++) {
       const image = this.composerImages[i];
@@ -1035,8 +1062,8 @@ export struct NewSessionPageContent {
     }).catch(() => {});
   }
 
-  private resetRuntimeDefaults(agent: NewAgentKind): void {
-    this.model = fallbackModel(agent);
+  private resetRuntimeDefaults(): void {
+    this.model = '';
     this.providerId = '';
     this.effort = 'medium';
     this.permissionMode = 'auto';
@@ -1086,9 +1113,56 @@ export struct NewSessionPageContent {
    * 同名模型必须保留 providerId，否则新任务可能被路由到错误的凭证来源。
    */
   private parseProviderModelOptions(value: Object | undefined, agent: NewAgentKind): RuntimeModelOption[] {
-    const selected = this.latestSessionForAgent(agent);
     return parseComposerProviderModelOptions(value, agent, this.modelVisibilityOverrides,
-      selected === undefined ? undefined : { model: selected.model, providerId: selected.providerId });
+      this.model.length === 0 ? undefined : { model: this.model, providerId: this.providerId });
+  }
+
+  private currentRuntimeScope(): string {
+    return runtimeDefaultsScope(AppServices.instance.auth.cacheAccountId, this.selectedDeviceId, this.selectedAgentKind);
+  }
+
+  private runtimeRequestIsCurrent(deviceId: string, agent: NewAgentKind, generation: number): boolean {
+    return this.pageActive && generation === this.runtimeLoadGeneration
+      && deviceId === this.selectedDeviceId && agent === this.selectedAgentKind
+      && this.runtimeCatalogScope === this.currentRuntimeScope();
+  }
+
+  private currentRuntimeChoice(): NewSessionRuntime {
+    const runtime = new NewSessionRuntime();
+    runtime.model = this.model;
+    runtime.providerId = this.providerId;
+    runtime.effort = this.effort;
+    runtime.fastMode = this.fastMode;
+    return runtime;
+  }
+
+  private writeRuntimeChoice(markModelChoice: boolean, option: RuntimeModelOption | undefined = undefined): void {
+    if (this.selectedDeviceId.length === 0) return;
+    const active = option === undefined || this.modelOptionIsCurrent(option);
+    const runtime = this.currentRuntimeChoice();
+    if (option !== undefined) {
+      runtime.model = option.id;
+      runtime.providerId = option.providerId;
+      runtime.effort = this.modelEffortForRow(option);
+      runtime.fastMode = this.modelFastForRow(option);
+    }
+    if (runtime.model.length === 0 || (!active && runtime.providerId.length === 0)) return;
+    const deviceId = this.selectedDeviceId;
+    const agent = this.selectedAgentKind;
+    const accountId = AppServices.instance.auth.cacheAccountId;
+    const authEpoch = AppServices.instance.auth.sessionEpoch;
+    const scope = runtimeDefaultsScope(accountId, deviceId, agent);
+    if (active) this.runtimeChoices.remember(scope, runtime);
+    const pref = newSessionDraftPref(agent, runtime, active, markModelChoice);
+    void this.runtimePrefWriter.enqueue(scope, async (): Promise<void> => {
+      if (AppServices.instance.auth.cacheAccountId !== accountId || AppServices.instance.auth.sessionEpoch !== authEpoch) return;
+      await AppServices.instance.openLink(deviceId);
+      if (AppServices.instance.auth.cacheAccountId !== accountId || AppServices.instance.auth.sessionEpoch !== authEpoch) return;
+      const options = new DlInvokeOptions();
+      options.channel = 'maker:apply-new-maker-draft-pref';
+      options.args = [pref];
+      await AppServices.instance.client.invoke(deviceId, options);
+    });
   }
 
   private latestSessionForAgent(agent: NewAgentKind): RemoteSession | undefined {
@@ -1109,14 +1183,14 @@ export struct NewSessionPageContent {
   ): Promise<void> {
     try {
       await AppServices.instance.openLink(deviceId);
-      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) return;
       const options = new DlInvokeOptions();
       options.channel = 'maker:provider:list';
       const request = new ProviderListOptions();
       request.capabilities = ['provider-logo-kinds-v2'];
       options.args = [request];
       const envelope = await AppServices.instance.client.invoke(deviceId, options);
-      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) return;
       const result = unwrapInvokeResult(envelope);
       if (!hasProviderCatalog(result)) throw new Error('Invalid provider catalog');
       this.runtimeCatalogReady = true;
@@ -1130,9 +1204,9 @@ export struct NewSessionPageContent {
         this.providerModelOptions = this.parseProviderModelOptions(result, agent);
         this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       }
-    } catch (e) {
-      if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
-      const unsupported = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
+    } catch (failure) {
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) return;
+      const unsupported = providerCatalogUnavailable(failure instanceof Error ? failure.message : String(failure));
       if (unsupported || this.providerModelAgent !== agent) this.providerModelOptions = [];
       this.providerModelAgent = unsupported ? '' : agent;
       this.runtimeCatalogReady = unsupported;
@@ -1186,7 +1260,7 @@ export struct NewSessionPageContent {
   }
 
   private modelRuntimeKey(option: RuntimeModelOption): string {
-    return `${this.selectedAgentKind}:${this.modelOptionKey(option)}`;
+    return this.currentRuntimeScope() + ':' + this.modelOptionKey(option);
   }
 
   private modelOptionIsCurrent(option: RuntimeModelOption): boolean {
@@ -1229,6 +1303,7 @@ export struct NewSessionPageContent {
       this.effort = effort;
     }
     this.error = '';
+    this.writeRuntimeChoice(false, option);
   }
 
   private setModelRowFast(option: RuntimeModelOption, enabled: boolean): void {
@@ -1241,6 +1316,7 @@ export struct NewSessionPageContent {
       this.fastMode = enabled;
     }
     this.error = '';
+    this.writeRuntimeChoice(false, option);
   }
 
   private choiceExists(options: RuntimeChoiceOption[], id: string): boolean {
@@ -1286,6 +1362,9 @@ export struct NewSessionPageContent {
   }
 
   private currentModelLabel(): string {
+    if (modelNeedsReselection(this.modelVisibilityOverrides, this.selectedAgentKind, this.model, this.providerId)) {
+      return harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselect');
+    }
     const model = this.findModelOption(this.model, this.providerId);
     return model === undefined ? (this.model || '选择模型') : model.label;
   }
@@ -1307,10 +1386,12 @@ export struct NewSessionPageContent {
 
   private async loadRuntimeDefaults(deviceId: string, agent: NewAgentKind): Promise<void> {
     const previousGeneration = this.runtimeLoadGeneration;
-    const sameScope = this.runtimeCatalogScope === JSON.stringify([deviceId, agent]);
-    this.runtimeCatalogScope = JSON.stringify([deviceId, agent]);
+    const scope = runtimeDefaultsScope(AppServices.instance.auth.cacheAccountId, deviceId, agent);
+    const sameScope = this.runtimeCatalogScope === scope;
+    this.runtimeCatalogScope = scope;
     const generation = ++this.runtimeLoadGeneration;
     this.runtimeCatalogReady = false;
+    this.runtimeDefaultsSettled = false;
     this.runtimeToolbarLoadActive = true;
     this.composerToolbarReady = false;
     if (deviceId.length === 0) {
@@ -1318,7 +1399,17 @@ export struct NewSessionPageContent {
       this.composerToolbarReady = true;
       return;
     }
-    if (!sameScope) this.resetRuntimeDefaults(agent);
+    if (!sameScope) this.resetRuntimeDefaults();
+    const localChoice = this.runtimeChoices.read(scope);
+    if (localChoice !== null) {
+      this.model = localChoice.model;
+      this.providerId = localChoice.providerId;
+      this.effort = localChoice.effort;
+      this.fastMode = localChoice.fastMode;
+      this.runtimeModelTouchedGeneration = generation;
+      this.runtimeEffortTouchedGeneration = generation;
+      this.runtimeFastTouchedGeneration = generation;
+    }
     if (sameScope && previousGeneration > 0) {
       if (this.runtimeModelTouchedGeneration === previousGeneration) this.runtimeModelTouchedGeneration = generation;
       if (this.runtimeEffortTouchedGeneration === previousGeneration) this.runtimeEffortTouchedGeneration = generation;
@@ -1330,13 +1421,14 @@ export struct NewSessionPageContent {
     this.applyPendingEditRuntime(deviceId, agent, false);
     try {
       await AppServices.instance.openLink(deviceId);
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) return;
       const options = new DlInvokeOptions();
       options.channel = 'maker:get-capabilities';
       options.args = [agent];
       const envelope = await AppServices.instance.client.invoke(deviceId, options);
       const result = unwrapInvokeResult(envelope);
-      if (generation !== this.runtimeLoadGeneration
-        || result === undefined || typeof result !== 'object' || Array.isArray(result)) return;
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)
+        || result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) return;
       const capabilities = result as Record<string, Object>;
       this.modelOptions = parseModelOptions(capabilities['availableModels']);
       this.effortOptions = this.parseRuntimeChoices(capabilities['effortLevels'], false);
@@ -1345,8 +1437,24 @@ export struct NewSessionPageContent {
 
       this.planModeNative = this.capabilityHasNativePlan(capabilities);
       this.planModeSupported = this.planModeNative || this.capabilityHasLegacyPlan(capabilities);
+      const hostRuntime = await readNewSessionRuntimeDefaults(
+        async (): Promise<Object | undefined> => {
+          const defaultsOptions = new DlInvokeOptions();
+          defaultsOptions.channel = 'maker:get-new-maker-defaults';
+          defaultsOptions.args = [agent];
+          return unwrapInvokeResult(await AppServices.instance.client.invoke(deviceId, defaultsOptions));
+        },
+        (): boolean => this.runtimeRequestIsCurrent(deviceId, agent, generation),
+        (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+      );
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) return;
+      const preferredRuntime = this.runtimeChoices.read(scope) ?? hostRuntime;
+      if (this.runtimeModelTouchedGeneration !== generation && preferredRuntime !== null) {
+        this.model = preferredRuntime.model;
+        this.providerId = preferredRuntime.providerId;
+      }
       await this.loadProviderModelOptions(agent, deviceId, generation);
-      if (generation !== this.runtimeLoadGeneration || !this.runtimeCatalogReady) return;
+      if (!this.runtimeRequestIsCurrent(deviceId, agent, generation) || !this.runtimeCatalogReady) return;
 
       const recent = this.latestSessionForAgent(agent);
       const modelTouched = this.runtimeModelTouchedGeneration === generation;
@@ -1365,29 +1473,12 @@ export struct NewSessionPageContent {
       const source = this.visibleModelOptions();
       let selectedModel: RuntimeModelOption | undefined = undefined;
       if (!modelTouched) {
-        if (recent !== undefined && recent.model.length > 0) {
-          selectedModel = this.findModelOption(recent.model, recent.providerId);
-          if (selectedModel !== undefined && selectedModel.availability === 'requires_payment') {
-            selectedModel = undefined;
-          }
-        }
-        // 用户没选过时才用远端默认标记（model-access v3 newSessionDefault）：
-        // 它优先于写死的 fallbackModel，但不得覆盖用户最近的显式选择，
-        // 也不得因目录刷新把手动选择改回默认（由 modelTouched 保护）。
-        if (selectedModel === undefined) {
-          const marked = resolveNewSessionDefaultModel(source, agent);
-          if (marked !== null) selectedModel = marked;
-        }
-        if (selectedModel === undefined) {
-          const fallback = fallbackModel(agent);
-          selectedModel = this.findModelOption(fallback);
-        }
-        if (selectedModel === undefined) selectedModel = source.find((row: RuntimeModelOption) =>
-          row.availability !== 'requires_payment' && !row.suspended);
-        if (selectedModel !== undefined) {
-          this.model = selectedModel.id;
-          this.providerId = selectedModel.providerId;
-        }
+        const runtime = pickNewSessionRuntime(agent, preferredRuntime, source, this.modelVisibilityOverrides);
+        this.model = runtime.model;
+        this.providerId = runtime.providerId;
+        if (!effortTouched) this.effort = runtime.effort;
+        if (!fastTouched) this.fastMode = this.fastModeCapability && runtime.fastMode;
+        selectedModel = this.findModelOption(this.model, this.providerId);
       }
       if (!effortTouched) {
         if (selectedModel !== undefined) {
@@ -1408,13 +1499,12 @@ export struct NewSessionPageContent {
           ? 'auto' : this.permissionOptions[0].id;
         this.permissionModeBeforePlan = this.permissionMode;
       }
-      if (!fastTouched) this.fastMode = false;
-    } catch (e) {
-      if (generation === this.runtimeLoadGeneration) {
-        this.runtimeCatalogReady = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
+    } catch (failure) {
+      if (this.runtimeRequestIsCurrent(deviceId, agent, generation)) {
+        this.runtimeCatalogReady = false;
       }
     } finally {
-      if (generation === this.runtimeLoadGeneration) {
+      if (this.runtimeRequestIsCurrent(deviceId, agent, generation)) {
         const runtimeTouched = this.runtimeModelTouchedGeneration === generation
           || this.runtimeEffortTouchedGeneration === generation
           || this.runtimePermissionTouchedGeneration === generation
@@ -1428,6 +1518,14 @@ export struct NewSessionPageContent {
         }
         this.runtimeToolbarLoadActive = false;
         this.composerToolbarReady = true;
+        this.runtimeDefaultsSettled = true;
+        if (!this.runtimeCatalogReady) {
+          this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
+        } else if (modelNeedsReselection(this.modelVisibilityOverrides, agent, this.model, this.providerId)) {
+          this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
+        } else if (this.model.trim().length === 0) {
+          this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_required');
+        }
       }
     }
   }
@@ -1436,30 +1534,56 @@ export struct NewSessionPageContent {
     if (this.selectedDeviceId.length === 0 || this.creating) return;
     const generation = ++this.browseGeneration;
     const deviceId = this.selectedDeviceId;
+    const accountId = AppServices.instance.auth.cacheAccountId;
+    const isCurrent = (): boolean => this.pageActive && generation === this.browseGeneration
+      && deviceId === this.selectedDeviceId && accountId === AppServices.instance.auth.cacheAccountId;
     this.browseLoading = true;
     this.browseError = '';
+    this.browseDrives = [];
     try {
       await AppServices.instance.openLink(deviceId);
-      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
+      if (!isCurrent()) return;
       const options = new DlInvokeOptions();
       options.channel = DlChannels.FS_LIST_DIR;
       const request: Record<string, Object> = {};
       request['path'] = targetPath.trim().length > 0 ? targetPath.trim() : '~';
       options.args = [request];
       const envelope = await AppServices.instance.client.invoke(deviceId, options);
-      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
+      if (!isCurrent()) return;
       const result = unwrapInvokeResult(envelope);
-      if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
+      if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error('目录返回格式无效');
       }
       const record = result as Record<string, Object>;
       this.browsePath = readStr(record, 'resolvedPath');
       this.browseParent = readStr(record, 'parent');
       this.browseEntries = this.parseDirectories(record['entries']);
-    } catch (e) {
-      if (!this.pageActive || generation !== this.browseGeneration || deviceId !== this.selectedDeviceId) return;
+      this.browseDrives = normalizeRemoteDirectoryDrives(record['drives']);
+      this.browseLoading = false;
+      let drivesPending = record['drivesPending'];
+      for (let attempt = 0; shouldRetryRemoteBrowseDrives(drivesPending, attempt); attempt += 1) {
+        if (!isCurrent()) return;
+        try {
+          const retryOptions = new DlInvokeOptions();
+          retryOptions.channel = DlChannels.FS_LIST_DIR;
+          const retryRequest: Record<string, Object> = {};
+          retryRequest['path'] = this.browsePath;
+          retryOptions.args = [retryRequest];
+          const retryEnvelope = await AppServices.instance.client.invoke(deviceId, retryOptions);
+          if (!isCurrent()) return;
+          const retryResult = unwrapInvokeResult(retryEnvelope);
+          if (retryResult === undefined || retryResult === null || typeof retryResult !== 'object' || Array.isArray(retryResult)) return;
+          const retryRecord = retryResult as Record<string, Object>;
+          this.browseDrives = normalizeRemoteDirectoryDrives(retryRecord['drives']);
+          drivesPending = retryRecord['drivesPending'];
+        } catch {
+          return;
+        }
+      }
+    } catch (failure) {
+      if (!isCurrent()) return;
       this.browseEntries = [];
-      this.browseError = e instanceof Error ? e.message : '无法读取远端目录';
+      this.browseError = failure instanceof Error ? failure.message : '无法读取远端目录';
     } finally {
       if (generation === this.browseGeneration) this.browseLoading = false;
     }
@@ -1490,6 +1614,22 @@ export struct NewSessionPageContent {
     return this.browseEntries.filter((entry: RemoteDirectory) => !entry.name.startsWith('.'));
   }
 
+  private browseDriveMenuItems(): MenuElement[] {
+    const items: MenuElement[] = [];
+    for (const drive of this.browseDrives) {
+      items.push({
+        value: drive.name,
+        action: (): void => { void this.loadBrowsePath(drive.path); },
+      });
+    }
+    return items;
+  }
+
+  private browseDriveLabel(): string {
+    const current = this.browseDrives.find((drive: NewSessionDirectoryDrive): boolean => drive.current);
+    return current?.name ?? harmonyV12String(this.getUIContext().getHostContext(), 'v132_choose_drive');
+  }
+
   private openProjectBrowse(): void {
     this.workspaceEditRevision += 1;
     if (this.selectedDeviceId.length === 0) {
@@ -1515,7 +1655,7 @@ export struct NewSessionPageContent {
     const options: Record<string, Object> = {};
     options['agentKind'] = this.selectedAgentKind;
     options['workspaceKind'] = this.workspaceKind;
-    options['model'] = this.model.trim() || fallbackModel(this.selectedAgentKind);
+    options['model'] = this.model.trim();
     options['permissionMode'] = !this.planModeNative && this.planModeEnabled
       ? 'plan' : this.permissionMode;
     options['planMode'] = this.planModeNative && this.planModeEnabled;
@@ -1537,7 +1677,7 @@ export struct NewSessionPageContent {
     session.id = sessionId;
     session.workspaceKind = this.workspaceKind;
     session.workingDir = this.workspaceKind === 'project' ? this.workingDir : '';
-    session.model = this.model.trim() || fallbackModel(this.selectedAgentKind);
+    session.model = this.model.trim();
     session.providerId = this.providerId.trim();
     session.effort = this.effort.trim();
     session.permissionMode = !this.planModeNative && this.planModeEnabled ? 'plan' : this.permissionMode;
@@ -1602,9 +1742,37 @@ export struct NewSessionPageContent {
       this.error = '请选择一台在线且允许远程控制的电脑';
       return;
     }
+    if (!this.runtimeDefaultsSettled || this.runtimeCatalogScope !== this.currentRuntimeScope()) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_defaults_loading');
+      return;
+    }
     if (!this.runtimeCatalogReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       if (!this.runtimeToolbarLoadActive) void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
+      return;
+    }
+    const generation = this.runtimeLoadGeneration;
+    const deviceId = this.selectedDeviceId;
+    const agent = this.selectedAgentKind;
+    this.creating = true;
+    await this.loadProviderModelOptions(agent, deviceId, generation);
+    if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) {
+      this.creating = false;
+      return;
+    }
+    this.creating = false;
+    if (!this.runtimeCatalogReady) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
+      return;
+    }
+    if (modelNeedsReselection(this.modelVisibilityOverrides, agent, this.model, this.providerId)) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
+      return;
+    }
+    const selectedModel = this.findModelOption(this.model, this.providerId);
+    if (this.model.trim().length === 0 || selectedModel === undefined
+      || selectedModel.suspended || selectedModel.availability === 'requires_payment') {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_required');
       return;
     }
     if (this.workspaceKind === 'project' && this.workingDir.trim().length === 0) {
@@ -2042,6 +2210,18 @@ export struct NewSessionPageContent {
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
+        if (this.browseDrives.length > 1) {
+          Button(this.browseDriveLabel())
+            .type(ButtonType.Normal)
+            .constraintSize({ minWidth: 44, minHeight: 44, maxWidth: 96 })
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor(Color.Transparent)
+            .borderRadius(UI_RADIUS_CONTROL)
+            .enabled(!this.creating && !this.browseLoading)
+            .bindMenu(this.browseDriveMenuItems())
+            .accessibilityText(harmonyV12String(this.getUIContext().getHostContext(), 'v132_choose_drive'))
+        }
         if (this.browseLoading) {
           LoadingProgress()
             .width(16)
@@ -2050,7 +2230,7 @@ export struct NewSessionPageContent {
         }
       }
       .width('100%')
-      .height(36)
+      .height(this.browseDrives.length > 1 ? 44 : 36)
       Scroll() {
         Column() {
           ForEach(this.visibleBrowseEntries(), (entry: RemoteDirectory) => {
@@ -2508,6 +2688,21 @@ export struct NewSessionPageContent {
           .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .padding({ left: 12, right: 12 })
+      }
+      if (this.runtimeDefaultsSettled && !this.runtimeCatalogReady && !this.runtimeToolbarLoadActive
+        && !this.creating && this.canCreateOnDevice(this.selectedDeviceId)) {
+        Button(harmonyV12String(this.getUIContext().getHostContext(), 'v132_defaults_retry'))
+          .type(ButtonType.Normal)
+          .constraintSize({ minHeight: 44 })
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor(Color.Transparent)
+          .borderRadius(UI_RADIUS_CONTROL)
+          .clickEffect(UI_LIST_CLICK_EFFECT)
+          .onClick(() => {
+            this.error = '';
+            void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
+          })
       }
       ConversationComposer({
         input: this.input,

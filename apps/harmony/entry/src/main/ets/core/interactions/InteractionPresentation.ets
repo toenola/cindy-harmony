@@ -47,9 +47,9 @@ export function askOptionPresentations(question: Record<string, Object>): AskOpt
   const out: AskOptionPresentation[] = [];
   if (!Array.isArray(raw)) return out;
   const rows = raw as Object[];
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i] === null || typeof rows[i] !== 'object' || Array.isArray(rows[i])) continue;
-    const record = rows[i] as Record<string, Object>;
+  for (let index = 0; index < rows.length; index++) {
+    if (rows[index] === null || typeof rows[index] !== 'object' || Array.isArray(rows[index])) continue;
+    const record = rows[index] as Record<string, Object>;
     const label = readString(record, 'label').trim();
     if (label.length === 0) continue;
     const option = new AskOptionPresentation();
@@ -57,7 +57,30 @@ export function askOptionPresentations(question: Record<string, Object>): AskOpt
     option.description = readString(record, 'description').trim();
     out.push(option);
   }
-  return out;
+  return visibleAskOptions(out);
+}
+
+export function isFreeTextAskOptionLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  if (normalized.length === 0) return false;
+  return /^(?:其他(?:答案|选项)?|其它(?:答案|选项)?|other|others|something else|その他|기타)(?=$|\s*[（(【[：:，,、.。\-—－…])/.test(normalized);
+}
+
+export function visibleAskOptions(options: AskOptionPresentation[] | undefined): AskOptionPresentation[] {
+  return (options ?? []).filter((option: AskOptionPresentation) => !isFreeTextAskOptionLabel(option.label));
+}
+
+export function permissionSourceDescription(request: Record<string, Object>): string {
+  return readString(readRecord(request, 'metadata'), 'imSourceDescription');
+}
+
+export function permissionDescription(request: Record<string, Object>): string {
+  const source = permissionSourceDescription(request);
+  const description = readString(request, 'description');
+  if (source.length === 0) return description;
+  if (description === source) return '';
+  if (description.startsWith(source + '\n\n')) return description.slice(source.length + 2);
+  return description;
 }
 
 export function interactionPriority(kind: string): number {

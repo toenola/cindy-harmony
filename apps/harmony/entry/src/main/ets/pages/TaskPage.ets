@@ -59,9 +59,12 @@ import {
   permissionRequestFingerprint,
   permissionRiskSummary,
   permissionAutoReviewUnavailableNotice,
+  permissionSourceDescription,
+  permissionDescription,
   sortPendingInteractions,
 } from '../core/interactions/InteractionPresentation';
-import { DlInvokeOptions } from '../core/device-link/DlClient';
+import { DlError, DlInvokeOptions } from '../core/device-link/DlClient';
+import { UsageLimitWaitState } from '../core/messages/UsageLimitWait';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
 import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
@@ -123,6 +126,9 @@ import {
 } from '../core/tasks/PiSessionTree';
 import {
   SessionAgentSwitchIntent,
+  agentLocationLabel,
+  runtimeRouteNeedsRemoteCatalog,
+  isRuntimeRouteMutation,
   parseSessionAgentSwitchIntent,
   supportsSessionAgentSwitch,
 } from '../core/tasks/SessionAgentSwitch';
@@ -697,6 +703,7 @@ export struct TaskPageContent {
   @State sessionAgentSwitchSupported: boolean = false;
   /** 被控端公开的 pending intent；仅用于提示，不提前改任务行的 agent/model。 */
   @State pendingAgentSwitchIntent: SessionAgentSwitchIntent | null = null;
+  @State usageLimitWaitState: UsageLimitWaitState = new UsageLimitWaitState();
   @State contextRpcBusy: boolean = false;
   @State goalState: GoalModeState | null = null;
   @State goalObjective: string = '';
@@ -1042,7 +1049,7 @@ export struct TaskPageContent {
     const askDraftSnapshots: Map<string, AskUserDraft> = new Map();
     for (let i = 0; i < sorted.length; i++) {
       if (sorted[i].kind !== 'ask_user_question') continue;
-      const draft = AppServices.instance.interactions.readAskDraft(sorted[i].requestId);
+      const draft = AppServices.instance.interactions.readAskDraft(sorted[i].requestId, this.deviceId, this.sessionId);
       if (draft !== null) askDraftSnapshots.set(sorted[i].requestId, draft);
     }
     this.askDraftSnapshots = askDraftSnapshots;
@@ -1123,12 +1130,25 @@ export struct TaskPageContent {
     this.queueCredentialWaiting = projection.credentialSwitchWaiting;
     this.queueCredentialBlockedCount = projection.credentialSwitchBlockedBy.length;
     this.queueAbortPending = projection.queueAbortPending;
+    this.usageLimitWaitState = AppServices.instance.inputQueue.getUsageLimitWaitState(this.sessionId, this.deviceId);
     this.queueInteractionLocked = projection.queueInteractionLocks.length > 0;
   }
 
   private queueActionBlocked(): boolean {
     return this.queueBusy || this.isCreationBlockingRemoteOps() || this.deviceDisabled
       || this.queueAbortPending || this.queueInteractionLocked;
+  }
+
+  private async cancelUsageLimitWait(): Promise<void> {
+    if (!this.usageLimitWaitState.canCancel || this.queueActionBlocked()) return;
+    const lifecycle = this.pageLifecycleGeneration;
+    try {
+      await AppServices.instance.inputQueue.cancelUsageLimitWait(this.deviceId, this.sessionId);
+    } catch (_error) {
+      if (this.isCurrentPageLifecycle(lifecycle)) {
+        promptAction.showToast({ message: this.v12String('v132_usage_limit_cancel_failed') });
+      }
+    }
   }
 
   /**
@@ -1316,7 +1336,7 @@ export struct TaskPageContent {
       if (generation !== this.composerCapabilitiesGeneration) return;
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
       this.modelAgentTab = this.currentAgentTab();
-      void this.loadPendingAgentSwitchIntent();
+      await this.loadPendingAgentSwitchIntent();
       if (this.session()?.permissionMode === 'plan') {
         let rememberedSupported = false;
         for (let i = 0; i < this.permissionOptions.length; i++) {
@@ -1357,13 +1377,25 @@ export struct TaskPageContent {
   }
 
   private canSwitchSessionAgent(): boolean {
-    return supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
+    return !this.runtimeRouteLocked()
+      && supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
+  }
+
+  private runtimeRouteLocked(): boolean {
+    return runtimeRouteNeedsRemoteCatalog(this.session(), this.pendingAgentSwitchIntent);
+  }
+
+  private agentLocationText(): string {
+    const names = new Map<string, string>();
+    for (const device of AppServices.instance.tasks.deviceList) names.set(device.deviceId, device.deviceName);
+    const location = agentLocationLabel(this.session(), this.pendingAgentSwitchIntent, names);
+    return location.length > 0 ? this.v12String('v132_agent_location', location) : '';
   }
 
   private async loadPendingAgentSwitchIntent(): Promise<void> {
     const session = this.session();
     const generation = ++this.agentSwitchReadGeneration;
-    if (!supportsSessionAgentSwitch(session, this.sessionAgentSwitchSupported) || session === undefined) {
+    if (session === undefined || session.remoteHostId.length > 0) {
       this.pendingAgentSwitchIntent = null;
       return;
     }
@@ -1406,11 +1438,28 @@ export struct TaskPageContent {
       throw new Error('任务创建完成后才能修改任务设置');
     }
     const deviceId = this.deviceId;
-    await AppServices.instance.openLink(deviceId);
     const options = new DlInvokeOptions();
     options.channel = channel;
     options.args = args;
+    const sessionId = this.sessionId;
+    const lifecycle = this.pageLifecycleGeneration;
+    const accountId = AppServices.instance.auth.cacheAccountId;
+    options.preSend = (): void => {
+      if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== deviceId
+        || this.sessionId !== sessionId || AppServices.instance.auth.cacheAccountId !== accountId) {
+        throw new DlError('CANCELLED', 'Task scope changed');
+      }
+      if (isRuntimeRouteMutation(channel) && this.runtimeRouteLocked()) {
+        throw new DlError('CANCELLED', this.v12String('v132_remote_runtime_read_only'));
+      }
+    };
+    await AppServices.instance.openLink(deviceId);
+    options.preSend();
     const envelope = await AppServices.instance.client.invoke(deviceId, options);
+    if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== deviceId
+      || this.sessionId !== sessionId || AppServices.instance.auth.cacheAccountId !== accountId) {
+      throw new DlError('CANCELLED', 'Task scope changed');
+    }
     return unwrapInvokeResult(envelope);
   }
 
@@ -1648,7 +1697,7 @@ export struct TaskPageContent {
   }
 
   private setModelRowEffort(option: ComposerModelOption, effort: ComposerChoiceOption): void {
-    if (this.contextRpcBusy) return;
+    if (this.contextRpcBusy || this.runtimeRouteLocked()) return;
     if (this.modelOptionIsCurrent(option)) {
       void this.selectComposerEffort(effort);
       return;
@@ -1669,7 +1718,8 @@ export struct TaskPageContent {
   }
 
   private setModelRowFast(option: ComposerModelOption, enabled: boolean): void {
-    if (this.contextRpcBusy || !this.visibleFastModeCapability() || !option.supportsFastMode) return;
+    if (this.contextRpcBusy || this.runtimeRouteLocked()
+      || !this.visibleFastModeCapability() || !option.supportsFastMode) return;
     if (this.modelOptionIsCurrent(option)) {
       void this.setFastMode(enabled);
       return;
@@ -1777,6 +1827,10 @@ export struct TaskPageContent {
   }
 
   private openComposerControlPopup(page: string): void {
+    if ((page === 'model' || page === 'agent') && this.runtimeRouteLocked()) {
+      promptAction.showToast({ message: this.v12String('v132_remote_runtime_read_only') });
+      return;
+    }
     if (this.sending || this.contextRpcBusy || this.deviceDisabled
       || this.isCreationBlockingRemoteOps()) return;
     if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
@@ -1895,6 +1949,7 @@ export struct TaskPageContent {
   }
 
   private async selectComposerAgent(kind: string): Promise<void> {
+    if (this.runtimeRouteLocked()) return;
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const loaded = await this.browseModelAgent(kind);
     if (loaded && this.isCurrentPageLifecycle(lifecycleGeneration)) this.closeContextSheet();
@@ -1949,6 +2004,7 @@ export struct TaskPageContent {
   }
 
   private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false): Promise<void> {
+    if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
       return;
@@ -2076,6 +2132,7 @@ export struct TaskPageContent {
   }
 
   private async selectComposerEffort(option: ComposerChoiceOption): Promise<void> {
+    if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy || session.effort === option.id) {
       return;
@@ -2101,6 +2158,7 @@ export struct TaskPageContent {
   }
 
   private async setFastMode(enabled: boolean): Promise<void> {
+    if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy || !this.currentModelSupportsFastMode()
       || session.fastMode === enabled) {
@@ -5122,7 +5180,8 @@ export struct TaskPageContent {
   private currentUsageRoute(): string {
     const session = this.session();
     return session === undefined ? '' : JSON.stringify([this.deviceId, session.id,
-      this.effectiveModelId(session), this.effectiveProviderId(session)]);
+      this.effectiveModelId(session), this.effectiveProviderId(session),
+      session.agentDeviceId, this.pendingAgentSwitchIntent?.agentDeviceId]);
   }
 
   private async loadAccountUsage(): Promise<void> {
@@ -5134,13 +5193,14 @@ export struct TaskPageContent {
     const session = this.session();
     this.accountUsage = new AccountUsageSummary();
     this.accountUsageLoading = false;
-    if (session === undefined || session.remoteHostId.length > 0) return;
+    if (session === undefined || session.remoteHostId.length > 0 || this.runtimeRouteLocked()) return;
     const provider = this.effectiveProviderId(session);
     const model = this.effectiveModelId(session);
     const current = (): boolean => {
       const active = this.session();
       return generation === this.accountUsageGeneration && this.isCurrentPageLifecycle(lifecycle)
         && active !== undefined && active.id === session.id
+        && !this.runtimeRouteLocked()
         && this.effectiveProviderId(active) === provider && this.effectiveModelId(active) === model;
     };
     this.accountUsageLoading = true;
@@ -5255,7 +5315,22 @@ export struct TaskPageContent {
           .width('100%')
           .padding({ bottom: 4 })
 
-          this.accountUsageSection()
+          if (!this.runtimeRouteLocked()) {
+            this.accountUsageSection()
+          }
+          if (this.agentLocationText().length > 0) {
+            Text(this.agentLocationText())
+              .fontSize(uiFontSize(12))
+              .fontColor($r('app.color.text_secondary'))
+              .copyOption(CopyOptions.LocalDevice)
+              .width('100%')
+          }
+          if (this.runtimeRouteLocked()) {
+            Text(this.v12String('v132_remote_runtime_read_only'))
+              .fontSize(uiFontSize(12))
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+          }
 
           if (this.sessionActionInfoMode) {
             if ((this.session()?.workingDir ?? '').length > 0) {
@@ -5947,6 +6022,21 @@ export struct TaskPageContent {
             () => this.clearQueueError())
         }
         .width('100%')
+        if (this.usageLimitWaitState.visible) {
+          Row({ space: 8 }) {
+            Text(this.v12String('v132_usage_limit_resume',
+              new Date(this.usageLimitWaitState.resumeAt).toLocaleString()))
+              .fontSize(uiFontSize(12))
+              .fontColor($r('app.color.text_secondary'))
+              .layoutWeight(1)
+            if (this.usageLimitWaitState.cancelSupported) {
+              this.queueBannerAction(this.v12String('v132_usage_limit_cancel'),
+                this.usageLimitWaitState.canCancel && !this.queueActionBlocked(),
+                () => { void this.cancelUsageLimitWait(); })
+            }
+          }
+          .width('100%')
+        }
       } else if (this.queueCredentialWaiting) {
         Row({ space: 8 }) {
           LoadingProgress()
@@ -6316,9 +6406,11 @@ export struct TaskPageContent {
       pickingFiles: this.pickingFiles,
       contextBusy: this.contextRpcBusy,
       toolbarReady: this.composerToolbarReady,
+      runtimeRouteLocked: this.runtimeRouteLocked(),
       hasPermissionOptions: this.permissionOptions.length > 0,
-      hasAgentOptions: this.canSwitchSessionAgent(),
-      hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
+      hasAgentOptions: supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported),
+      hasModelOptions: (this.runtimeRouteLocked() || this.visibleModelOptions().length > 0)
+        && this.currentModelLabel().length > 0,
       permissionMode: this.effectivePermissionMode(),
       permissionLabel: this.currentPermissionModeLabel(),
       planModeEnabled: this.planModeEnabled,
@@ -8203,12 +8295,12 @@ export struct TaskPageContent {
           Row().layoutWeight(1)
           this.interactionSecondaryButton('取消请求', true,
             () => this.resolveInteraction(item, this.pluginSetupCancelDecision(item)),
-            !AppServices.instance.interactions.isResolving(item.requestId))
+            !AppServices.instance.interactions.isResolving(item.requestId, this.deviceId, item.sessionId))
         }
         .width('100%')
       }
-      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
-        Text(AppServices.instance.interactions.resolveError(item.requestId))
+      if (this.interactionResolveError(item).length > 0) {
+        Text(this.interactionResolveError(item))
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
@@ -8305,6 +8397,21 @@ export struct TaskPageContent {
   permissionCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.lock'), '权限请求')
+      if (permissionSourceDescription(item.raw).length > 0) {
+        Text(permissionSourceDescription(item.raw))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(17))
+          .fontColor($r('app.color.text_secondary'))
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+      }
+      if (permissionDescription(item.raw).length > 0) {
+        Text(permissionDescription(item.raw))
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_secondary'))
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+      }
       if (this.permissionAutoReviewNoticeText(item).length > 0) {
         Text(this.permissionAutoReviewNoticeText(item))
           .fontSize(uiFontSize(12))
@@ -8350,8 +8457,8 @@ export struct TaskPageContent {
         }
       }
       .width('100%')
-      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
-        Text(AppServices.instance.interactions.resolveError(item.requestId))
+      if (this.interactionResolveError(item).length > 0) {
+        Text(this.interactionResolveError(item))
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
@@ -8462,8 +8569,8 @@ export struct TaskPageContent {
           .borderRadius(UI_RADIUS_PILL)
           .enabled(!this.interactionBusy(item))
 
-        if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
-          Text(AppServices.instance.interactions.resolveError(item.requestId))
+        if (this.interactionResolveError(item).length > 0) {
+          Text(this.interactionResolveError(item))
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.danger'))
             .width('100%')
@@ -8625,8 +8732,8 @@ export struct TaskPageContent {
           .onChange((value: string) => this.updatePlanFeedback(item, value))
       }
 
-      if (AppServices.instance.interactions.resolveError(item.requestId).length > 0) {
-        Text(AppServices.instance.interactions.resolveError(item.requestId))
+      if (this.interactionResolveError(item).length > 0) {
+        Text(this.interactionResolveError(item))
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
@@ -11094,7 +11201,12 @@ export struct TaskPageContent {
   }
 
   private interactionBusy(item: PendingInteraction): boolean {
-    return AppServices.instance.interactions.isResolving(item.requestId);
+    return AppServices.instance.interactions.isResolving(item.requestId, this.deviceId, item.sessionId);
+  }
+
+  private interactionResolveError(item: PendingInteraction): string {
+    const message = AppServices.instance.interactions.resolveError(item.requestId, this.deviceId, item.sessionId);
+    return message === 'v132_interaction_not_accepted' ? this.v12String(message) : message;
   }
 
   private requestStr(item: PendingInteraction, key: string): string {
@@ -11226,13 +11338,13 @@ export struct TaskPageContent {
 
   /** 点击处理使用 Store 返回的副本，避免原地修改 @State Map 中的快照对象。 */
   private mutableAskDraft(item: PendingInteraction): AskUserDraft {
-    return AppServices.instance.interactions.readAskDraft(item.requestId) ?? new AskUserDraft();
+    return AppServices.instance.interactions.readAskDraft(item.requestId, this.deviceId, item.sessionId) ?? new AskUserDraft();
   }
 
   private saveAskDraft(item: PendingInteraction, draft: AskUserDraft): void {
-    AppServices.instance.interactions.saveAskDraft(item.requestId, draft);
+    AppServices.instance.interactions.saveAskDraft(item.requestId, draft, this.deviceId, item.sessionId);
     // Store notify 会同步所有 TaskPage；这里再显式换 Map 引用，保证本次点击当帧可见。
-    const snapshot = AppServices.instance.interactions.readAskDraft(item.requestId);
+    const snapshot = AppServices.instance.interactions.readAskDraft(item.requestId, this.deviceId, item.sessionId);
     const next = new Map(this.askDraftSnapshots);
     if (snapshot === null) next.delete(item.requestId);
     else next.set(item.requestId, snapshot);
@@ -11378,16 +11490,7 @@ export struct TaskPageContent {
   private askOptionsAt(item: PendingInteraction, index: number): string[] {
     const questions = this.askQuestions(item);
     if (index < 0 || index >= questions.length) return [];
-    const raw = questions[index]['options'];
-    const out: string[] = [];
-    if (!Array.isArray(raw)) return out;
-    const options = raw as Object[];
-    for (let i = 0; i < options.length; i++) {
-      if (options[i] === null || typeof options[i] !== 'object' || Array.isArray(options[i])) continue;
-      const label = (options[i] as Record<string, Object>)['label'];
-      if (typeof label === 'string' && label.length > 0) out.push(label);
-    }
-    return out;
+    return askOptionPresentations(questions[index]).map((option: AskOptionPresentation) => option.label);
   }
 
   private moveAskQuestion(item: PendingInteraction, delta: number): void {
@@ -11450,7 +11553,7 @@ export struct TaskPageContent {
 
   // ── Plan Review ──
   private planDraft(item: PendingInteraction): PlanReviewDraft {
-    const existing = AppServices.instance.interactions.readPlanDraft(item.requestId);
+    const existing = AppServices.instance.interactions.readPlanDraft(item.requestId, this.deviceId, item.sessionId);
     if (existing !== null) return existing;
     const draft = new PlanReviewDraft();
     draft.planText = this.requestStr(item, 'plan');
@@ -11474,32 +11577,32 @@ export struct TaskPageContent {
     const draft = this.planDraft(item);
     draft.editMode = !draft.editMode;
     if (draft.editMode) draft.expanded = true;
-    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft, this.deviceId, item.sessionId);
   }
 
   private togglePlanExpanded(item: PendingInteraction): void {
     const draft = this.planDraft(item);
     draft.expanded = !draft.expanded;
-    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft, this.deviceId, item.sessionId);
   }
 
   private updatePlanText(item: PendingInteraction, value: string): void {
     const draft = this.planDraft(item);
     draft.planText = value;
-    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft, this.deviceId, item.sessionId);
   }
 
   private updatePlanFeedback(item: PendingInteraction, value: string): void {
     const draft = this.planDraft(item);
     draft.feedback = value;
-    AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+    AppServices.instance.interactions.savePlanDraft(item.requestId, draft, this.deviceId, item.sessionId);
   }
 
   private requestPlanFeedback(item: PendingInteraction): void {
     const draft = this.planDraft(item);
     if (!draft.feedbackOpen) {
       draft.feedbackOpen = true;
-      AppServices.instance.interactions.savePlanDraft(item.requestId, draft);
+      AppServices.instance.interactions.savePlanDraft(item.requestId, draft, this.deviceId, item.sessionId);
       return;
     }
     if (draft.feedback.trim().length === 0) return;
