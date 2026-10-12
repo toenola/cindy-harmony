@@ -2679,17 +2679,45 @@ export struct TaskPageContent {
 
   private retryQueueItem(clientId: string): void {
     if (this.queueActionBlocked()) return;
-    const lifecycleGeneration = this.pageLifecycleGeneration;
-    const deviceId = this.deviceId;
-    const sessionId = this.sessionId;
+    if (!AppServices.instance.inputQueue.canRetryInputDelivery(this.sessionId, clientId, this.deviceId)) {
+      void this.recheckQueueDelivery(clientId);
+      return;
+    }
+    const scope = this.presentationScope();
     this.queueBusy = true;
-    AppServices.instance.inputQueue.retry(deviceId, sessionId, clientId).catch(() => {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '消息仍未发送，请检查连接' });
+    AppServices.instance.inputQueue.retry(scope.deviceId, scope.sessionId, clientId).catch((error: Error) => {
+      if (this.isCurrentPresentationScope(scope)) {
+        const safe = AppServices.instance.inputQueue.canRetryInputDelivery(scope.sessionId, clientId, scope.deviceId);
+        this.getUIContext().getPromptAction().showToast({ message: this.v12String(isRemoteBusyError(error)
+          ? 'v132_remote_busy' : safe ? 'v132_delivery_send_failed' : 'v132_delivery_unknown') });
       }
     }).finally(() => {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
+      if (this.isCurrentPresentationScope(scope)) this.queueBusy = false;
     });
+  }
+
+  private async recheckQueueDelivery(clientId: string): Promise<void> {
+    if (this.queueActionBlocked()) return;
+    const scope = this.presentationScope();
+    this.queueBusy = true;
+    try {
+      const refreshed = await AppServices.instance.inputQueue.refresh(scope.deviceId, scope.sessionId);
+      if (!this.isCurrentPresentationScope(scope)) return;
+      if (!refreshed) throw new Error('Input delivery status unavailable');
+      const state = AppServices.instance.inputQueue.getInputDeliveryState(scope.sessionId, clientId, scope.deviceId);
+      const safe = AppServices.instance.inputQueue.canRetryInputDelivery(scope.sessionId, clientId, scope.deviceId);
+      const key = state === 'accepted' ? 'v132_delivery_accepted' : state === 'pending'
+        ? 'v132_delivery_pending' : state === 'removed' ? 'v132_delivery_removed'
+          : safe ? 'v132_delivery_check_done' : 'v132_delivery_unknown';
+      this.getUIContext().getPromptAction().showToast({ message: this.v12String(key) });
+    } catch (error) {
+      if (this.isCurrentPresentationScope(scope)) {
+        this.getUIContext().getPromptAction().showToast({ message: this.v12String(isRemoteBusyError(error)
+          ? 'v132_remote_busy' : 'v132_delivery_check_failed') });
+      }
+    } finally {
+      if (this.isCurrentPresentationScope(scope)) this.queueBusy = false;
+    }
   }
 
   private resumeQueue(): void {
@@ -6096,6 +6124,14 @@ export struct TaskPageContent {
           .width('100%')
       }
 
+      if (item.phase === 'failed' && !this.isCreateFailureBubble(item) && !item.deliveryRetryAllowed) {
+        Text(this.v12String('v132_delivery_unknown'))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+      }
+
       if (this.isCreateFailureBubble(item)
         || (!this.isCreationBlockingRemoteOps()
           && (this.selectedQueueClientId === item.clientId || item.phase === 'failed'))) {
@@ -6106,8 +6142,13 @@ export struct TaskPageContent {
             this.queueInlineAction('返回编辑', $r('sys.symbol.square_and_pencil'), false, !this.queueBusy,
               () => void this.returnNewSessionToEdit())
           } else if (item.phase === 'failed') {
-            this.queueInlineAction('重试发送', $r('sys.symbol.arrow_clockwise'), true, !this.queueBusy,
-              () => this.retryQueueItem(item.clientId))
+            if (item.deliveryRetryAllowed) {
+              this.queueInlineAction(this.v12String('v132_delivery_retry'), $r('sys.symbol.arrow_clockwise'), true, !this.queueBusy,
+                () => this.retryQueueItem(item.clientId))
+            } else {
+              this.queueInlineAction(this.v12String('v132_delivery_check'), $r('sys.symbol.arrow_clockwise'), false, !this.queueBusy,
+                () => void this.recheckQueueDelivery(item.clientId))
+            }
           } else if (item.phase === 'queued' || item.phase === 'paused') {
             this.queueInlineAction('上移', $r('sys.symbol.chevron_up'), false,
               item.queueIndex > 1 && !this.queueBusy,

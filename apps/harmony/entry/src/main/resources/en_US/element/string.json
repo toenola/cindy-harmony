@@ -149,6 +149,15 @@
     {"name":"v132_message_delete_one","value":"Delete this message"},
     {"name":"v132_message_delete_title","value":"Delete this message?"},
     {"name":"v132_message_delete_body","value":"Deleting a user message removes only that message; deleting an AI message removes the entire turn generated after the previous user input. Later messages are kept. On your next send, the AI context is rebuilt from the remaining records."},
-    {"name":"v132_message_delete_busy","value":"Wait for the current response to finish before deleting a message."}
+    {"name":"v132_message_delete_busy","value":"Wait for the current response to finish before deleting a message."},
+    {"name":"v132_delivery_retry","value":"Retry sending"},
+    {"name":"v132_delivery_check","value":"Check delivery status"},
+    {"name":"v132_delivery_unknown","value":"Delivery is unconfirmed, so resending is paused. Check delivery status or the computer first."},
+    {"name":"v132_delivery_accepted","value":"The computer has durably accepted this message."},
+    {"name":"v132_delivery_pending","value":"Queued on the computer; durable receipt is not yet confirmed."},
+    {"name":"v132_delivery_removed","value":"This message was removed from the computer queue."},
+    {"name":"v132_delivery_check_done","value":"Delivery status updated."},
+    {"name":"v132_delivery_check_failed","value":"Could not check delivery status. Check the connection and try again."},
+    {"name":"v132_delivery_send_failed","value":"Sending did not complete. Check the connection and try again."}
   ]
 }

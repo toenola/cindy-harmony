@@ -553,6 +553,15 @@
     {"name":"v132_message_delete_one","value":"删除本条消息"},
     {"name":"v132_message_delete_title","value":"删除本条消息？"},
     {"name":"v132_message_delete_body","value":"用户消息只删除本条；AI 消息会删除上一次用户输入之后产生的整轮输出。之后的消息继续保留。下次发送时，AI 上下文会从剩余记录重建。"},
-    {"name":"v132_message_delete_busy","value":"请等当前回复结束后再删除消息"}
+    {"name":"v132_message_delete_busy","value":"请等当前回复结束后再删除消息"},
+    {"name":"v132_delivery_retry","value":"重试发送"},
+    {"name":"v132_delivery_check","value":"核对投递状态"},
+    {"name":"v132_delivery_unknown","value":"暂时无法确认是否已送达，已暂停重发。请先核对投递状态或检查电脑端。"},
+    {"name":"v132_delivery_accepted","value":"电脑已保存并接收这条消息。"},
+    {"name":"v132_delivery_pending","value":"电脑已排队，尚未确认已保存。"},
+    {"name":"v132_delivery_removed","value":"这条消息已从电脑队列移除。"},
+    {"name":"v132_delivery_check_done","value":"投递状态已更新。"},
+    {"name":"v132_delivery_check_failed","value":"暂时无法核对投递状态，请检查连接后重试。"},
+    {"name":"v132_delivery_send_failed","value":"发送暂未完成，请检查连接后重试。"}
   ]
 }
