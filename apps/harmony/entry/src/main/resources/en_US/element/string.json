@@ -100,6 +100,19 @@
     {"name":"v132_usage_limit_cancel","value":"Cancel automatic continuation"},
     {"name":"v132_usage_limit_cancel_failed","value":"Could not cancel automatic continuation"},
     {"name":"v132_defaults_retry","value":"Reload computer settings"},
-    {"name":"v132_remote_busy","value":"Computer is busy"}
+    {"name":"v132_remote_busy","value":"Computer is busy"},
+    {"name":"v132_history_action_read","value":"Read %s"},
+    {"name":"v132_history_action_list","value":"List %s"},
+    {"name":"v132_history_action_search","value":"Search %s"},
+    {"name":"v132_history_action_fetch","value":"Fetch %s"},
+    {"name":"v132_history_action_run_command","value":"Run command"},
+    {"name":"v132_history_action_edit","value":"Edit %s"},
+    {"name":"v132_history_action_create","value":"Create %s"},
+    {"name":"v132_history_action_delete","value":"Delete %s"},
+    {"name":"v132_history_action_rename","value":"Rename %s"},
+    {"name":"v132_history_action_update","value":"Update %s"},
+    {"name":"v132_history_action_update_todos","value":"Update plan"},
+    {"name":"v132_history_action_use","value":"Use %s"},
+    {"name":"v132_history_updated_files","value":"Updated %s files"}
   ]
 }

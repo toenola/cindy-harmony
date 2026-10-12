@@ -17,13 +17,17 @@ import { SnapshotReadPool } from './SnapshotReadPool';
  */
 
 import { common } from '@kit.AbilityKit';
-import { HistoryViewAdapter, historyViewUnavailable, HISTORY_PLACEHOLDER_PREFIX } from './HistoryViewAdapter';
+import { HistoryViewAdapter, historyViewUnavailable, parseHistoryProjection, HISTORY_PLACEHOLDER_PREFIX } from './HistoryViewAdapter';
+import {
+  canApplyHistoryWorkPatch, historyDetailWindow, historyWorkReferenceIdentity, historyWorkSummary,
+  HistoryWorkPresentation, projectHistoryWorkPresentation,
+} from './HistoryWorkPresentation';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
 import {
   RemoteMessage, RemoteSession, parseMessage, parseSession, sortMessagesAsc,
-  readStr, readObj, readBool, readNum, mergeAgentTaskTerminalStatus, safeErrorMessage,
+  readStr, readObj, readBool, readNum, recordOrEmpty, mergeAgentTaskTerminalStatus, safeErrorMessage,
 } from '../tasks/TaskModels';
 import { RemoteImageRef, RemoteMediaFetchResult } from '../attachments/AttachmentModels';
 import {
@@ -165,6 +169,8 @@ class LivePlanSnapshot {
 /** history:messages 一页响应（messages:list 复用）。 */
 class HistoryPage {
   projected: boolean = false;
+  projectionLease: string = '';
+  projectionPatchRevision: number = 0;
   authorityRevision: number = -1;
   projectionCursor: string = '';
   items: RemoteMessage[] = [];
@@ -200,6 +206,11 @@ class CreateOptsArgs {
   fastMode: boolean = false;
 }
 
+class HistoryRefreshOperation {
+  promise: Promise<boolean> = Promise.resolve(false);
+  requestedVersion: number = 1;
+}
+
 export class MessageStore {
   private historyRetries: RemoteReadRetries = new RemoteReadRetries();
   private snapshotReads: SnapshotReadPool<HistoryPage> = new SnapshotReadPool();
@@ -210,13 +221,142 @@ export class MessageStore {
   private historyDetailsLoading: Set<string> = new Set();
   private historyDetailsComplete: Set<string> = new Set();
   private historyDetailsFailed: Set<string> = new Set();
+  private historyExpandedDetails: Set<string> = new Set();
+  private historyDetailDisplays: Map<string, RemoteMessage[]> = new Map();
+  private historyDetailDisplayReferences: Map<string, Record<string, Object>> = new Map();
+  private historyProjectionReads: Map<string, number> = new Map();
+  private historyProjectedLeases: Map<string, string> = new Map();
+  private historyWorkPatchRevisions: Map<string, number> = new Map();
+  private historyProjectionSourceIds: Map<string, Set<string>> = new Map();
+  private historyDetailRuns: Map<string, number> = new Map();
+  private historyDetailRunSequence: number = 0;
+  private historyAccountScope: string = '';
+  private historyRefreshOperations: Map<string, HistoryRefreshOperation> = new Map();
+
+  private historyDetailOwnerKey(deviceId: string, sessionId: string, id: string): string {
+    return JSON.stringify([deviceId, sessionId, id, this.snapshotResetEpoch,
+      this.sessionLeaseRevisions.get(sessionId) ?? -1, this.historyHealGenerations.get(sessionId) ?? 0,
+      this.client?.connectionIdentity(deviceId) ?? '', this.recoveryGeneration, this.historyAccountScope]);
+  }
 
   private historyDetailKey(deviceId: string, sessionId: string, id: string): string {
     const message = (this.messagesBySession.get(sessionId) ?? []).find((row: RemoteMessage) => row.id === id);
-    const revision = message === undefined ? '' : readStr(readObj(message.agentMeta, 'historyWork'), 'revision');
+    const revision = message === undefined ? '' : historyWorkReferenceIdentity(historyWorkSummary(message));
     return JSON.stringify([deviceId, sessionId, id, revision, this.snapshotResetEpoch,
       this.sessionLeaseRevisions.get(sessionId) ?? -1, this.historyHealGenerations.get(sessionId) ?? 0,
-      this.client?.connectionIdentity(deviceId) ?? '']);
+      this.client?.connectionIdentity(deviceId) ?? '', this.recoveryGeneration, this.historyAccountScope]);
+  }
+
+  historyReadLease(deviceId: string, sessionId: string): string {
+    return this.isSessionOpen(sessionId, deviceId) && this.sessionReadAllowed(sessionId, deviceId)
+      ? this.snapshotIdentity(deviceId, sessionId) : '';
+  }
+
+  refreshHistoryView(deviceId: string, sessionId: string, lease: string): Promise<boolean> {
+    if (!lease || lease !== this.historyReadLease(deviceId, sessionId)) return Promise.resolve(false);
+    const existing = this.historyRefreshOperations.get(lease);
+    if (existing !== undefined) {
+      existing.requestedVersion += 1;
+      return existing.promise;
+    }
+    const operation = new HistoryRefreshOperation();
+    this.historyRefreshOperations.set(lease, operation);
+    operation.promise = Promise.resolve().then(() => this.readRefreshedHistoryView(deviceId, sessionId, lease, operation));
+    return operation.promise;
+  }
+
+  private async readRefreshedHistoryView(deviceId: string, sessionId: string, lease: string,
+    operation: HistoryRefreshOperation): Promise<boolean> {
+    const current = (): boolean => lease === this.historyReadLease(deviceId, sessionId)
+      && this.historyRefreshOperations.get(lease) === operation;
+    let followPendingRead = (this.historyProjectionReads.get(lease) ?? 0) > 0;
+    try {
+      while (current()) {
+        const version = operation.requestedVersion;
+        const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
+        const patchRevision = this.historyWorkPatchRevisions.get(sessionId) ?? 0;
+        const unchanged = (): boolean => current() && operation.requestedVersion === version
+          && messageRevision === (this.authoritativeMessageRevisions.get(sessionId) ?? 0)
+          && patchRevision === (this.historyWorkPatchRevisions.get(sessionId) ?? 0);
+        const inheritedRead = followPendingRead;
+        followPendingRead = false;
+        const result = await this.loadInitial(deviceId, sessionId, this.currentSessionLease(deviceId, sessionId),
+          (): boolean => unchanged() && !inheritedRead);
+        if (!current()) return false;
+        if (unchanged() && !inheritedRead) return result;
+      }
+      return false;
+    } finally {
+      if (this.historyRefreshOperations.get(lease) === operation) this.historyRefreshOperations.delete(lease);
+    }
+  }
+
+  historyWorkPresentation(deviceId: string, sessionId: string, id: string): HistoryWorkPresentation | undefined {
+    if (!this.sessionReadAllowed(sessionId, deviceId)) return undefined;
+    const rows = this.messagesBySession.get(sessionId) ?? [];
+    let message = rows.find((row: RemoteMessage) => row.id === id);
+    if (message === undefined) {
+      const anchors = rows.filter((row: RemoteMessage): boolean => {
+        if (!readBool(row.agentMeta, 'historyWorkDeferred', false)) return false;
+        const summary = historyWorkSummary(row);
+        const parent = readStr(summary, 'parentToolUseId');
+        return id === (readStr(summary, 'anchorClientId') || row.clientId)
+          || (parent.length > 0 && (id === parent || id === 'subagent-' + parent))
+          || id === 'subagent-' + row.id;
+      });
+      if (anchors.length === 1) message = anchors[0];
+    }
+    if (message === undefined || !readStr(historyWorkSummary(message), 'key')) return undefined;
+    const owner = this.historyDetailOwnerKey(deviceId, sessionId, message.id);
+    return projectHistoryWorkPresentation(message, this.historyDetailState(deviceId, sessionId, message.id),
+      this.historyExpandedDetails.has(owner), this.retainedHistoryDetails(deviceId, sessionId, message));
+  }
+
+  handleHistoryWorkPatch(deviceId: string, value: Object, lease: string): boolean {
+    const patch = recordOrEmpty(value);
+    const sessionId = readStr(patch, 'sessionId');
+    if (!lease || lease !== this.historyReadLease(deviceId, sessionId)
+      || lease !== this.historyProjectedLeases.get(sessionId)
+      || !this.client?.supportsHistoryView(deviceId)
+      || (this.historyProjectionReads.get(lease) ?? 0) > 0) return false;
+    const rows = this.messagesBySession.get(sessionId) ?? [];
+    const summary = readObj(readObj(patch, 'item'), 'summary');
+    const id = HISTORY_PLACEHOLDER_PREFIX + readStr(summary, 'key');
+    const index = rows.findIndex((row: RemoteMessage) => row.id === id);
+    if (index < 0 || !canApplyHistoryWorkPatch(rows[index], value)) return false;
+    const root: Record<string, Object> = {};
+    root['version'] = 1;
+    root['items'] = [patch['item']];
+    let replacement: RemoteMessage | undefined = undefined;
+    try { replacement = parseHistoryProjection(root, sessionId).messages[0]; }
+    catch (error) { return false; }
+    if (replacement === undefined) return false;
+    const previousBody = this.retainedHistoryDetails(deviceId, sessionId, rows[index]);
+    const retained = historyDetailWindow(summary, previousBody);
+    const previousIds = new Set(previousBody.map((row: RemoteMessage): string => row.id));
+    const sourceIds = this.historyProjectionSourceIds.get(sessionId) ?? new Set<string>();
+    const updated = rows.filter((row: RemoteMessage) => !previousIds.has(row.id) || sourceIds.has(row.id));
+    const owner = this.historyDetailOwnerKey(deviceId, sessionId, id);
+    this.historyDetailDisplays.set(owner, retained);
+    this.historyDetailDisplayReferences.set(owner, summary);
+    const replacementIndex = updated.findIndex((row: RemoteMessage) => row.id === id);
+    updated[replacementIndex] = replacement;
+    const merged = this.mergeWithoutDuplicates(retained, updated);
+    merged.sort(sortMessagesAsc);
+    this.setSessionMessages(sessionId, merged);
+    this.pruneHistoryDetails(deviceId, sessionId, merged);
+    this.historyWorkPatchRevisions.set(sessionId, (this.historyWorkPatchRevisions.get(sessionId) ?? 0) + 1);
+    this.notify();
+    if (this.historyExpandedDetails.has(owner)) void this.loadHistoryDetails(deviceId, sessionId, id);
+    return true;
+  }
+
+  private retainedHistoryDetails(deviceId: string, sessionId: string, message: RemoteMessage): RemoteMessage[] {
+    const owner = this.historyDetailOwnerKey(deviceId, sessionId, message.id);
+    const previous = this.historyDetailDisplayReferences.get(owner);
+    const summary = historyWorkSummary(message);
+    if (previous === undefined || readStr(previous, 'parentToolUseId') !== readStr(summary, 'parentToolUseId')) return [];
+    return historyDetailWindow(summary, this.historyDetailDisplays.get(owner) ?? []);
   }
 
   historyDetailState(deviceId: string, sessionId: string, id: string): string {
@@ -226,58 +366,105 @@ export class MessageStore {
   }
 
   hideHistoryDetails(deviceId: string, sessionId: string, id: string): void {
-    if (this.client) void this.historyViews.release(this.client, deviceId, sessionId,
-      id.slice(HISTORY_PLACEHOLDER_PREFIX.length)).catch(() => {});
+    this.historyExpandedDetails.delete(this.historyDetailOwnerKey(deviceId, sessionId, id));
+    const key = this.historyDetailKey(deviceId, sessionId, id);
+    this.historyDetailRuns.delete(key);
+    this.historyDetailsLoading.delete(key);
+    const message = (this.messagesBySession.get(sessionId) ?? []).find((row: RemoteMessage) => row.id === id);
+    const workKey = message === undefined ? (id.startsWith(HISTORY_PLACEHOLDER_PREFIX)
+      ? id.slice(HISTORY_PLACEHOLDER_PREFIX.length) : '') : readStr(historyWorkSummary(message), 'key');
+    if (this.client && workKey) void this.historyViews.release(this.client, deviceId, sessionId, workKey).catch(() => {});
+    this.notify();
   }
 
   async loadHistoryDetails(deviceId: string, sessionId: string, id: string): Promise<void> {
     const client = this.client;
-    if (!client || !this.sessionReadAllowed(sessionId, deviceId)) return;
-    const state = this.historyDetailState(deviceId, sessionId, id);
-    if (state === 'loading' || state === 'complete') return;
+    if (!client || !this.isSessionOpen(sessionId, deviceId) || !this.sessionReadAllowed(sessionId, deviceId)) return;
     const message = (this.messagesBySession.get(sessionId) ?? []).find((row: RemoteMessage) => row.id === id);
     if (message === undefined) return;
     const summary = readObj(message.agentMeta, 'historyWork');
+    if (!readStr(summary, 'key')) return;
     const generation = this.historyHealGenerations.get(sessionId) ?? 0;
     const key = this.historyDetailKey(deviceId, sessionId, id);
+    const owner = this.historyDetailOwnerKey(deviceId, sessionId, id);
+    this.historyExpandedDetails.add(owner);
+    const state = this.historyDetailState(deviceId, sessionId, id);
+    if (state === 'loading') return;
+    if (state === 'complete') {
+      await this.historyViews.retain(client, deviceId, sessionId, summary,
+        (): boolean => this.historyDetailKey(deviceId, sessionId, id) === key && this.historyExpandedDetails.has(owner)).catch(() => {});
+      this.notify();
+      return;
+    }
+    const token = ++this.historyDetailRunSequence;
+    this.historyDetailRuns.set(key, token);
     const current = (): boolean => this.subscribed.get(sessionId) === deviceId
       && (this.historyHealGenerations.get(sessionId) ?? 0) === generation
       && this.historyDetailKey(deviceId, sessionId, id) === key
+      && this.historyExpandedDetails.has(owner)
+      && this.historyDetailRuns.get(key) === token
       && (this.messagesBySession.get(sessionId) ?? []).some((row: RemoteMessage) => row.id === id);
+    let collected: RemoteMessage[] = [];
+    const requestRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     this.historyDetailsLoading.add(key);
     this.historyDetailsFailed.delete(key);
     this.notify();
     try {
       await this.historyViews.details(client, deviceId, sessionId, summary, current, (rows: RemoteMessage[]): void => {
         if (!current()) return;
-        const body = this.mergeWithoutDuplicates(this.historyDetailBodies.get(key) ?? [], rows);
-        this.historyDetailBodies.set(key, body);
-        const merged = this.mergeWithoutDuplicates(rows, this.messagesBySession.get(sessionId) ?? []);
+        collected = this.mergeWithoutDuplicates(collected, rows);
+      });
+      if (current()) {
+        const latest = this.messagesBySession.get(sessionId) ?? [];
+        const previousIds = new Set((this.historyDetailDisplays.get(owner) ?? []).map((row: RemoteMessage): string => row.id));
+        const sourceIds = this.historyProjectionSourceIds.get(sessionId) ?? new Set<string>();
+        const newerRows = latest.filter((row: RemoteMessage) =>
+          (this.messagePushRevisions.get(sessionId)?.get(row.id) ?? 0) > requestRevision);
+        collected = this.mergeWithoutDuplicates(collected, newerRows.filter((row: RemoteMessage) =>
+          collected.some((candidate: RemoteMessage) => candidate.id === row.id)));
+        this.historyDetailBodies.set(key, collected);
+        this.historyDetailDisplays.set(owner, collected);
+        this.historyDetailDisplayReferences.set(owner, summary);
+        const retained = latest.filter((row: RemoteMessage) => !previousIds.has(row.id)
+          || sourceIds.has(row.id) || newerRows.indexOf(row) >= 0);
+        const merged = this.mergeWithoutDuplicates(collected, retained);
         merged.sort(sortMessagesAsc);
         this.setSessionMessages(sessionId, merged);
-        this.notify();
-      });
-      if (current()) this.historyDetailsComplete.add(key);
+        this.historyDetailsComplete.add(key);
+      }
     } catch (e) { if (current()) this.historyDetailsFailed.add(key); }
-    finally { this.historyDetailsLoading.delete(key); this.notify(); }
+    finally {
+      const stillCurrent = current();
+      if (this.historyDetailRuns.get(key) === token) {
+        this.historyDetailRuns.delete(key);
+        this.historyDetailsLoading.delete(key);
+      }
+      if (stillCurrent) this.notify();
+    }
   }
 
   private snapshotIdentity(deviceId: string, sessionId: string, includeAuthority: boolean = false): string {
     return JSON.stringify([deviceId, sessionId, this.snapshotResetEpoch,
       this.client?.connectionIdentity(deviceId) ?? '', this.recoveryGeneration,
       this.sessionLeaseRevisions.get(sessionId) ?? -1, this.historyHealGenerations.get(sessionId) ?? 0,
-      includeAuthority ? this.authoritativeMessageRevisions.get(sessionId) ?? 0 : 0]);
+      includeAuthority ? this.authoritativeMessageRevisions.get(sessionId) ?? 0 : 0, this.historyAccountScope]);
   }
 
   private async requestVisibleHistory(deviceId: string, sessionId: string, older: boolean,
     before: string = ''): Promise<HistoryPage> {
+    const scope = JSON.stringify([this.snapshotResetEpoch, this.historyAccountScope,
+      this.sessionLeaseRevisions.get(sessionId) ?? -1]);
     // LINK_ACCEPT carries the Host capability list; socket-online alone is insufficient.
     if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    if (scope !== JSON.stringify([this.snapshotResetEpoch, this.historyAccountScope,
+      this.sessionLeaseRevisions.get(sessionId) ?? -1])) throw new Error('History read superseded');
     const client = this.client;
     if (client && this.historyViews.available(client, deviceId, sessionId)) {
+      const fence = this.snapshotIdentity(deviceId, sessionId);
+      this.historyProjectionReads.set(fence, (this.historyProjectionReads.get(fence) ?? 0) + 1);
       try {
-        const fence = this.snapshotIdentity(deviceId, sessionId);
         const revision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
+        const patchRevision = this.historyWorkPatchRevisions.get(sessionId) ?? 0;
         const projection = await this.historyViews.page(client, deviceId, sessionId, older,
           this.snapshotIdentity(deviceId, sessionId, true),
           (): boolean => fence === this.snapshotIdentity(deviceId, sessionId));
@@ -285,6 +472,8 @@ export class MessageStore {
         page.items = projection.messages;
         page.hasMore = projection.hasMore;
         page.projected = true;
+        page.projectionLease = fence;
+        page.projectionPatchRevision = patchRevision;
         page.authorityRevision = revision;
         page.projectionCursor = projection.nextCursor;
         return page;
@@ -292,6 +481,10 @@ export class MessageStore {
         if (!(e instanceof Error) || !historyViewUnavailable(e.message)) {
           throw e instanceof Error ? e : new Error('History read failed');
         }
+      } finally {
+        const count = (this.historyProjectionReads.get(fence) ?? 1) - 1;
+        if (count > 0) this.historyProjectionReads.set(fence, count);
+        else this.historyProjectionReads.delete(fence);
       }
     }
     return this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, before);
@@ -375,6 +568,22 @@ export class MessageStore {
   }
 
   setCacheAccountScope(accountId: string): void {
+    if (this.historyAccountScope !== accountId) {
+      this.historyAccountScope = accountId;
+      this.snapshotResetEpoch += 1;
+      this.historyViews.clear();
+      this.historyDetailBodies.clear();
+      this.historyDetailDisplays.clear();
+      this.historyDetailDisplayReferences.clear();
+      this.historyDetailsLoading.clear();
+      this.historyDetailsComplete.clear();
+      this.historyDetailsFailed.clear();
+      this.historyExpandedDetails.clear();
+      this.historyDetailRuns.clear();
+      this.historyProjectedLeases.clear();
+      this.historyProjectionSourceIds.clear();
+      this.historyRefreshOperations.clear();
+    }
     this.sessionMessageCache.setAccountScope(accountId);
   }
 
@@ -389,6 +598,15 @@ export class MessageStore {
     this.historyDetailsLoading.clear();
     this.historyDetailsComplete.clear();
     this.historyDetailsFailed.clear();
+    this.historyDetailDisplays.clear();
+    this.historyDetailDisplayReferences.clear();
+    this.historyExpandedDetails.clear();
+    this.historyDetailRuns.clear();
+    this.historyProjectionReads.clear();
+    this.historyProjectedLeases.clear();
+    this.historyWorkPatchRevisions.clear();
+    this.historyProjectionSourceIds.clear();
+    this.historyRefreshOperations.clear();
     // 先推进恢复代次，再等待旧订阅的 best-effort 退订；等待期间若仍有旧回包，
     // 不能把已经清空的账号状态重新种回内存。
     this.recoveryGeneration += 1;
@@ -2273,6 +2491,7 @@ export class MessageStore {
     deviceId: string,
     sessionId: string,
     expectedLease: number,
+    canApplyRead: (() => boolean) | undefined = undefined,
   ): Promise<boolean> {
     const client = this.client;
     if (!client) return false;
@@ -2280,7 +2499,7 @@ export class MessageStore {
     try {
       // 对齐 iOS：历史走 local-db:messages:list（返回完整行含 clientId，最新在前）。
       const page = await this.requestVisibleHistory(deviceId, sessionId, false);
-      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) {
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease) || (canApplyRead !== undefined && !canApplyRead())) {
         return false;
       }
       page.items.sort(sortMessagesAsc);
@@ -2300,7 +2519,7 @@ export class MessageStore {
       this.notify();
       return true;
     } catch (e) {
-      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) {
+      if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease) || (canApplyRead !== undefined && !canApplyRead())) {
         return false;
       }
       // 加载失败：标记失败（页面提供重试），不保持空列表假装成功。
@@ -2382,6 +2601,8 @@ export class MessageStore {
       const page = await this.requestVisibleHistory(deviceId, sessionId, true, before);
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
         || this.subscribed.get(sessionId) !== deviceId) return 0;
+      if (page.projected && (page.projectionLease !== this.snapshotIdentity(deviceId, sessionId)
+        || page.projectionPatchRevision !== (this.historyWorkPatchRevisions.get(sessionId) ?? 0))) return 0;
       page.items.sort(sortMessagesAsc);
 
       // 请求期间可能有实时尾部 push；最终 merge 使用最新窗口且只 notify 一次。
@@ -2389,6 +2610,12 @@ export class MessageStore {
       const merged = this.mergeWithoutDuplicates(page.items, latestCurrent);
       merged.sort(sortMessagesAsc);
       this.setSessionMessages(sessionId, merged);
+      if (page.projected) {
+        const sourceIds = this.historyProjectionSourceIds.get(sessionId) ?? new Set<string>();
+        for (const row of page.items) if (!row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)) sourceIds.add(row.id);
+        this.historyProjectionSourceIds.set(sessionId, sourceIds);
+        this.pruneHistoryDetails(deviceId, sessionId, merged);
+      }
       const coverage = extendCoverageEarlier(
         this.historyCoverageBySession.get(sessionId) ?? null,
         page.items,
@@ -2981,6 +3208,10 @@ export class MessageStore {
   }
 
   private applyLatestWindow(sessionId: string, page: HistoryPage): RemoteMessage[] {
+    if (page.projected && (page.projectionLease !== this.snapshotIdentity(this.subscribed.get(sessionId) ?? '', sessionId)
+      || page.projectionPatchRevision !== (this.historyWorkPatchRevisions.get(sessionId) ?? 0))) {
+      throw new Error('History read superseded');
+    }
     // 最新窗重拉会重新裁定连续区间；已上翻的连续旧窗由 reconcile 保留。
     if (page.items.length === 0) {
       const streaming = this.streamingBySession.get(sessionId);
@@ -3007,12 +3238,11 @@ export class MessageStore {
       page.items.sort(sortMessagesAsc);
     }
     if (page.projected) {
-      // Preserve a placeholder object only for the same revision, so in-flight detail reads stay valid.
       page.items = page.items.map((row: RemoteMessage): RemoteMessage => {
-        if (!row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)) return row;
+        if (!readStr(historyWorkSummary(row), 'key')) return row;
         const old = current.find((candidate: RemoteMessage) => candidate.id === row.id);
-        return old !== undefined && readStr(readObj(old.agentMeta, 'historyWork'), 'revision')
-          === readStr(readObj(row.agentMeta, 'historyWork'), 'revision') ? old : row;
+        return old !== undefined && JSON.stringify(old) === JSON.stringify(row)
+          ? old : row;
       });
     }
     if (page.projected) {
@@ -3024,17 +3254,33 @@ export class MessageStore {
         page.hasMore = this.hasMoreBySession.get(sessionId) ?? page.hasMore;
       }
       let projected = this.mergeWithoutDuplicates(prefix, page.items);
+      this.historyProjectedLeases.set(sessionId, page.projectionLease);
+      const previousSources = this.historyProjectionSourceIds.get(sessionId) ?? new Set<string>();
+      const sourceIds = new Set(page.items.filter((row: RemoteMessage) =>
+        !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)).map((row: RemoteMessage): string => row.id));
+      for (const row of prefix) if (previousSources.has(row.id)) sourceIds.add(row.id);
+      this.historyProjectionSourceIds.set(sessionId, sourceIds);
       for (const row of projected.slice()) {
-        if (!row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX) || current.indexOf(row) < 0) continue;
-        const body = this.historyDetailBodies.get(this.historyDetailKey(deviceId, sessionId, row.id));
-        if (body !== undefined) projected = this.mergeWithoutDuplicates(body, projected);
+        if (!readStr(historyWorkSummary(row), 'key')) continue;
+        const body = this.historyDetailBodies.get(this.historyDetailKey(deviceId, sessionId, row.id))
+          ?? this.retainedHistoryDetails(deviceId, sessionId, row);
+        projected = this.mergeWithoutDuplicates(body, projected);
       }
       projected = this.mergeWithoutDuplicates(localOnly, projected);
       projected.sort(sortMessagesAsc);
       this.setSessionMessages(sessionId, projected);
+      this.pruneHistoryDetails(deviceId, sessionId, projected);
+      for (const row of projected) {
+        if (this.historyExpandedDetails.has(this.historyDetailOwnerKey(deviceId, sessionId, row.id))
+          && this.historyDetailState(deviceId, sessionId, row.id) !== 'complete') {
+          void this.loadHistoryDetails(deviceId, sessionId, row.id);
+        }
+      }
       this.historyCoverageBySession.delete(sessionId);
       return projected;
     }
+    this.historyProjectedLeases.delete(sessionId);
+    this.historyProjectionSourceIds.delete(sessionId);
     const reconciled = reconcileLatestMessageWindow(
       current,
       page.items,
@@ -3055,9 +3301,49 @@ export class MessageStore {
 
   private clearHistoryDetailStates(deviceId: string, sessionId: string): void {
     const prefix = JSON.stringify([deviceId, sessionId]).slice(0, -1) + ',';
+    for (const key of this.historyRefreshOperations.keys()) if (key.startsWith(prefix)) this.historyRefreshOperations.delete(key);
     for (const key of this.historyDetailBodies.keys()) if (key.startsWith(prefix)) this.historyDetailBodies.delete(key);
     for (const key of this.historyDetailsComplete) if (key.startsWith(prefix)) this.historyDetailsComplete.delete(key);
     for (const key of this.historyDetailsFailed) if (key.startsWith(prefix)) this.historyDetailsFailed.delete(key);
+    for (const key of this.historyDetailsLoading) if (key.startsWith(prefix)) this.historyDetailsLoading.delete(key);
+    for (const key of this.historyExpandedDetails) if (key.startsWith(prefix)) this.historyExpandedDetails.delete(key);
+    for (const key of this.historyDetailDisplays.keys()) if (key.startsWith(prefix)) this.historyDetailDisplays.delete(key);
+    for (const key of this.historyDetailDisplayReferences.keys()) if (key.startsWith(prefix)) this.historyDetailDisplayReferences.delete(key);
+    for (const key of this.historyDetailRuns.keys()) if (key.startsWith(prefix)) this.historyDetailRuns.delete(key);
+    this.historyProjectedLeases.delete(sessionId);
+    this.historyWorkPatchRevisions.delete(sessionId);
+    this.historyProjectionSourceIds.delete(sessionId);
+  }
+
+  private pruneHistoryDetails(deviceId: string, sessionId: string, rows: RemoteMessage[]): void {
+    const prefix = JSON.stringify([deviceId, sessionId]).slice(0, -1) + ',';
+    const references = rows.filter((row: RemoteMessage) => readStr(historyWorkSummary(row), 'key').length > 0);
+    const owners = new Set(references.map((row: RemoteMessage): string => this.historyDetailOwnerKey(deviceId, sessionId, row.id)));
+    const states = new Set(references.map((row: RemoteMessage): string => this.historyDetailKey(deviceId, sessionId, row.id)));
+    for (const key of this.historyDetailBodies.keys()) {
+      if (key.startsWith(prefix) && !states.has(key)) this.historyDetailBodies.delete(key);
+    }
+    for (const key of this.historyDetailsComplete) {
+      if (key.startsWith(prefix) && !states.has(key)) this.historyDetailsComplete.delete(key);
+    }
+    for (const key of this.historyDetailsFailed) {
+      if (key.startsWith(prefix) && !states.has(key)) this.historyDetailsFailed.delete(key);
+    }
+    for (const key of this.historyDetailsLoading) {
+      if (key.startsWith(prefix) && !states.has(key)) this.historyDetailsLoading.delete(key);
+    }
+    for (const key of this.historyDetailRuns.keys()) {
+      if (key.startsWith(prefix) && !states.has(key)) this.historyDetailRuns.delete(key);
+    }
+    for (const key of this.historyExpandedDetails) {
+      if (key.startsWith(prefix) && !owners.has(key)) this.historyExpandedDetails.delete(key);
+    }
+    for (const key of this.historyDetailDisplays.keys()) {
+      if (key.startsWith(prefix) && !owners.has(key)) this.historyDetailDisplays.delete(key);
+    }
+    for (const key of this.historyDetailDisplayReferences.keys()) {
+      if (key.startsWith(prefix) && !owners.has(key)) this.historyDetailDisplayReferences.delete(key);
+    }
   }
 }
 

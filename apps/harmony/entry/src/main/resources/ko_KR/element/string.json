@@ -100,6 +100,19 @@
     {"name":"v132_usage_limit_cancel","value":"자동 계속 취소"},
     {"name":"v132_usage_limit_cancel_failed","value":"자동 계속을 취소하지 못했습니다"},
     {"name":"v132_defaults_retry","value":"컴퓨터 설정 다시 불러오기"},
-    {"name":"v132_remote_busy","value":"컴퓨터가 사용 중입니다"}
+    {"name":"v132_remote_busy","value":"컴퓨터가 사용 중입니다"},
+    {"name":"v132_history_action_read","value":"%s 읽기"},
+    {"name":"v132_history_action_list","value":"%s 목록"},
+    {"name":"v132_history_action_search","value":"%s 검색"},
+    {"name":"v132_history_action_fetch","value":"%s 가져오기"},
+    {"name":"v132_history_action_run_command","value":"명령 실행"},
+    {"name":"v132_history_action_edit","value":"%s 편집"},
+    {"name":"v132_history_action_create","value":"%s 생성"},
+    {"name":"v132_history_action_delete","value":"%s 삭제"},
+    {"name":"v132_history_action_rename","value":"%s 이름 변경"},
+    {"name":"v132_history_action_update","value":"%s 업데이트"},
+    {"name":"v132_history_action_update_todos","value":"계획 업데이트"},
+    {"name":"v132_history_action_use","value":"%s 사용"},
+    {"name":"v132_history_updated_files","value":"파일 %s개 업데이트"}
   ]
 }

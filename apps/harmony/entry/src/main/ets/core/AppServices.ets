@@ -26,7 +26,7 @@ import { TaskStore, unwrapInvokeResult } from './tasks/TaskStore';
 import { TaskSearchStore } from './tasks/TaskSearchStore';
 import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
-import { DeviceView, parseDeviceView, readStr, safeErrorMessage } from './tasks/TaskModels';
+import { DeviceView, parseDeviceView, readStr, recordOrEmpty, safeErrorMessage } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
@@ -700,6 +700,18 @@ export class AppServices {
       case 'local-db:messages:deleted':
         this.messages.handleSessionPush(deviceId, channel, payload);
         break;
+      case 'maker:history-work-patch':
+      case 'maker:history-view-changed': {
+        const historyPayload = recordOrEmpty(payload);
+        const sessionId = readStr(historyPayload, 'sessionId');
+        const lease = this.messages.historyReadLease(deviceId, sessionId);
+        if (!lease) break;
+        if (channel === 'maker:history-view-changed'
+          || !this.messages.handleHistoryWorkPatch(deviceId, historyPayload, lease)) {
+          void this.messages.refreshHistoryView(deviceId, sessionId, lease);
+        }
+        break;
+      }
       case 'maker:event': {
         this.dispatchMakerEventPayload(payload, deviceId);
         break;

@@ -504,6 +504,19 @@
     {"name":"v132_usage_limit_cancel","value":"取消自动继续"},
     {"name":"v132_usage_limit_cancel_failed","value":"未能取消自动继续"},
     {"name":"v132_defaults_retry","value":"重新读取电脑设置"},
-    {"name":"v132_remote_busy","value":"电脑繁忙"}
+    {"name":"v132_remote_busy","value":"电脑繁忙"},
+    {"name":"v132_history_action_read","value":"读取 %s"},
+    {"name":"v132_history_action_list","value":"列出 %s"},
+    {"name":"v132_history_action_search","value":"搜索 %s"},
+    {"name":"v132_history_action_fetch","value":"获取 %s"},
+    {"name":"v132_history_action_run_command","value":"运行命令"},
+    {"name":"v132_history_action_edit","value":"编辑 %s"},
+    {"name":"v132_history_action_create","value":"创建 %s"},
+    {"name":"v132_history_action_delete","value":"删除 %s"},
+    {"name":"v132_history_action_rename","value":"重命名 %s"},
+    {"name":"v132_history_action_update","value":"更新 %s"},
+    {"name":"v132_history_action_update_todos","value":"更新计划"},
+    {"name":"v132_history_action_use","value":"使用 %s"},
+    {"name":"v132_history_updated_files","value":"更新了 %s 个文件"}
   ]
 }

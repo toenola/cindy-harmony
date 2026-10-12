@@ -2,6 +2,7 @@
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { RemoteMessage, parseMessage, readBool, readNum, readObj, readStr, recordOrEmpty } from '../tasks/TaskModels';
+import { hasHistoryWorkReference } from './HistoryWorkPresentation';
 
 export const HISTORY_PLACEHOLDER_PREFIX = 'history-work:';
 
@@ -36,22 +37,35 @@ export function parseHistoryProjection(value: Object | undefined, sessionId: str
   return page;
 }
 
-function appendProjectionItems(value: Object, sessionId: string, rows: RemoteMessage[], depth: number = 0): void {
+function appendProjectionItems(value: Object, sessionId: string, rows: RemoteMessage[], depth: number = 0,
+  parents: Object[] = []): void {
   if (!Array.isArray(value) || depth > 32) throw new Error('Invalid history items');
   for (const raw of value as Object[]) {
     const item = recordOrEmpty(raw);
     if (item['type'] === 'messages' && Array.isArray(item['messages'])) {
-      for (const message of item['messages'] as Object[]) rows.push(parseMessage(recordOrEmpty(message)));
+      const messages = (item['messages'] as Object[]).map((message: Object): RemoteMessage => parseMessage(recordOrEmpty(message)));
+      const deferred = readObj(item, 'deferred');
+      if (readStr(deferred, 'key')) {
+        const anchor = readStr(deferred, 'anchorClientId') || readStr(item, 'key');
+        const owner = messages.find((message: RemoteMessage) => message.clientId === anchor || message.id === anchor) ?? messages[0];
+        if (owner !== undefined) {
+          owner.agentMeta['historyWork'] = deferred;
+          owner.agentMeta['historyWorkDeferred'] = true;
+        }
+      }
+      for (const message of messages) {
+        if (parents.length > 0) message.agentMeta['historyWorkParents'] = parents;
+        rows.push(message);
+      }
     } else if (item['type'] === 'work') {
+      const summary = readObj(item, 'summary');
       if (Array.isArray(item['children'])) {
-        appendProjectionItems(item['children'], sessionId, rows, depth + 1);
+        const ancestors = readStr(summary, 'key') ? parents.concat([summary]) : parents;
+        appendProjectionItems(item['children'], sessionId, rows, depth + 1, ancestors);
         continue;
       }
-      const summary = readObj(item, 'summary');
       const key = readStr(summary, 'key');
-      if (!key || !readStr(summary, 'firstMessageId') || !readStr(summary, 'lastMessageId')) {
-        throw new Error('Invalid history work reference');
-      }
+      if (!key) throw new Error('Invalid history work summary');
       const row = new RemoteMessage();
       row.id = HISTORY_PLACEHOLDER_PREFIX + key;
       row.clientId = row.id;
@@ -64,8 +78,17 @@ function appendProjectionItems(value: Object, sessionId: string, rows: RemoteMes
       content['durationMs'] = Math.max(0, readNum(summary, 'endedAtMs', start) - start);
       row.content = content;
       row.agentMeta['historyWork'] = summary;
+      row.agentMeta['historyWorkPatchable'] = depth === 0;
+      if (parents.length > 0) row.agentMeta['historyWorkParents'] = parents;
+      if (readStr(summary, 'parentToolUseId')) row.agentMeta['parentUuid'] = readStr(summary, 'parentToolUseId');
       rows.push(row);
     } else throw new Error('Unsupported history item');
+  }
+}
+
+function validateHistoryReference(summary: Record<string, Object>): void {
+  if (!hasHistoryWorkReference(summary)) {
+    throw new Error('Invalid history work reference');
   }
 }
 
@@ -77,6 +100,7 @@ export class HistoryViewAdapter {
   private connectionIds: Map<string, string> = new Map();
   private intents: Map<string, Map<string, Record<string, Object>>> = new Map();
   private intentWrites: Map<string, Promise<void>> = new Map();
+  private intentEpoch: number = 0;
   private key(deviceId: string, sessionId: string): string { return JSON.stringify([deviceId, sessionId]); }
 
   replaceCursor(deviceId: string, sessionId: string, cursor: string): void {
@@ -89,9 +113,10 @@ export class HistoryViewAdapter {
     if (intents === undefined) return;
     if (workKey) intents.delete(workKey); else intents.clear();
     const connection = client.connectionIdentity(deviceId);
+    const epoch = this.intentEpoch;
     const previous = this.intentWrites.get(key) ?? Promise.resolve();
     const write = previous.catch(() => {}).then(async (): Promise<void> => {
-      if (connection !== client.connectionIdentity(deviceId)) return;
+      if (connection !== client.connectionIdentity(deviceId) || epoch !== this.intentEpoch) return;
       const refs: Object[] = [];
       (this.intents.get(key) ?? new Map<string, Record<string, Object>>())
         .forEach((ref: Record<string, Object>) => refs.push(ref));
@@ -121,6 +146,7 @@ export class HistoryViewAdapter {
   }
 
   clear(): void {
+    this.intentEpoch += 1;
     this.generations.forEach((generation: number, key: string) => this.generations.set(key, generation + 1));
     this.cursors.clear();
     this.disabled.clear();
@@ -147,24 +173,34 @@ export class HistoryViewAdapter {
   private async readPage(client: DlClient, deviceId: string, sessionId: string, before: string,
     generation: number, older: boolean, isCurrent: () => boolean): Promise<HistoryProjectionPage> {
     const key = this.key(deviceId, sessionId);
+    const connection = client.connectionIdentity(deviceId);
     const options: Record<string, Object> = {};
     if (before) options['before'] = before;
+    options['lazyDetails'] = true;
+    options['workLines'] = true;
     try {
       const page = parseHistoryProjection(await this.invoke(client, deviceId, 'local-db:messages:view', [sessionId, options]), sessionId);
-      if (!isCurrent() || (this.generations.get(key) ?? 0) !== generation) throw new Error('History read superseded');
+      if (!isCurrent() || (this.generations.get(key) ?? 0) !== generation
+        || connection !== client.connectionIdentity(deviceId)) throw new Error('History read superseded');
       if (older && page.hasMore && page.nextCursor === before) throw new Error('History cursor did not advance');
       if (older || !this.cursors.has(key)) this.cursors.set(key, page.nextCursor);
       return page;
     } catch (e) {
       if (e instanceof Error && historyViewUnavailable(e.message)
-        && isCurrent() && (this.generations.get(key) ?? 0) === generation) this.disabled.add(key);
-      throw e instanceof Error ? e : new Error('History read failed');
+        && isCurrent() && (this.generations.get(key) ?? 0) === generation
+        && connection === client.connectionIdentity(deviceId)) this.disabled.add(key);
+      if (e instanceof Error) {
+        throw e;
+      } else {
+        throw new Error('History read failed');
+      }
     }
   }
 
-  async details(client: DlClient, deviceId: string, sessionId: string,
-    summary: Record<string, Object>, isCurrent: () => boolean, onPage: (rows: RemoteMessage[]) => void): Promise<void> {
+  async retain(client: DlClient, deviceId: string, sessionId: string,
+    summary: Record<string, Object>, isCurrent: () => boolean): Promise<void> {
     if (!isCurrent()) return;
+    validateHistoryReference(summary);
     const key = this.key(deviceId, sessionId);
     const intents = this.intents.get(key) ?? new Map<string, Record<string, Object>>();
     intents.set(readStr(summary, 'key'), summary);
@@ -178,14 +214,33 @@ export class HistoryViewAdapter {
     });
     this.intentWrites.set(key, write);
     try { await write; }
+    catch (error) {
+      if (error instanceof Error) {
+        if (!historyViewUnavailable(error.message)) throw error;
+      } else {
+        throw new Error('History intent failed');
+      }
+    }
     finally { if (this.intentWrites.get(key) === write) this.intentWrites.delete(key); }
+  }
+
+  async details(client: DlClient, deviceId: string, sessionId: string,
+    summary: Record<string, Object>, isCurrent: () => boolean, onPage: (rows: RemoteMessage[]) => void): Promise<void> {
+    if (!isCurrent()) return;
+    validateHistoryReference(summary);
+    const key = this.key(deviceId, sessionId);
+    const generation = this.generations.get(key) ?? 0;
+    const connection = client.connectionIdentity(deviceId);
+    const current = (): boolean => isCurrent() && generation === (this.generations.get(key) ?? 0)
+      && connection === client.connectionIdentity(deviceId);
+    await this.retain(client, deviceId, sessionId, summary, current);
     let after = '';
     const seen = new Set<string>();
-    while (isCurrent()) {
+    while (current()) {
       const options: Record<string, Object> = {};
       if (after) options['after'] = after;
       const root = recordOrEmpty(await this.invoke(client, deviceId, 'local-db:messages:work-details', [sessionId, summary, options]));
-      if (!isCurrent()) return;
+      if (!current()) return;
       if (root['version'] !== 1 || !Array.isArray(root['messages'])) throw new Error('Invalid history details');
       const rows: RemoteMessage[] = [];
       for (const raw of root['messages'] as Object[]) rows.push(parseMessage(recordOrEmpty(raw)));

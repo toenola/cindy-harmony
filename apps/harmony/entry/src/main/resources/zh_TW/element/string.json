@@ -100,6 +100,19 @@
     {"name":"v132_usage_limit_cancel","value":"取消自動繼續"},
     {"name":"v132_usage_limit_cancel_failed","value":"未能取消自動繼續"},
     {"name":"v132_defaults_retry","value":"重新讀取電腦設定"},
-    {"name":"v132_remote_busy","value":"電腦忙碌中"}
+    {"name":"v132_remote_busy","value":"電腦忙碌中"},
+    {"name":"v132_history_action_read","value":"讀取 %s"},
+    {"name":"v132_history_action_list","value":"列出 %s"},
+    {"name":"v132_history_action_search","value":"搜尋 %s"},
+    {"name":"v132_history_action_fetch","value":"取得 %s"},
+    {"name":"v132_history_action_run_command","value":"執行命令"},
+    {"name":"v132_history_action_edit","value":"編輯 %s"},
+    {"name":"v132_history_action_create","value":"建立 %s"},
+    {"name":"v132_history_action_delete","value":"刪除 %s"},
+    {"name":"v132_history_action_rename","value":"重新命名 %s"},
+    {"name":"v132_history_action_update","value":"更新 %s"},
+    {"name":"v132_history_action_update_todos","value":"更新計畫"},
+    {"name":"v132_history_action_use","value":"使用 %s"},
+    {"name":"v132_history_updated_files","value":"更新了 %s 個檔案"}
   ]
 }

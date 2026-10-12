@@ -28,6 +28,8 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
 import { AccountUsageSummary, projectAccountUsage } from '../core/messages/AccountUsage';
+import { HistoryWorkPresentation } from '../core/messages/HistoryWorkPresentation';
+import { formatHistoryWorkLine } from '../core/messages/HistoryLinePresentation';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { HarmonyHttp } from '../network/HarmonyHttp';
 import { isTextFileReference, splitFileReferenceLocation } from '../core/files/FileReference';
@@ -201,6 +203,7 @@ import {
 import {
   COMPOSER_SCROLL_ACTION_HIDE,
   COMPOSER_SCROLL_ACTION_SHOW,
+  canFollowLatest,
   ComposerScrollUpdate,
   firstVisibleMessageRenderIndex,
   FOLLOW_LATEST_RETRY_DELAYS,
@@ -3038,10 +3041,8 @@ export struct TaskPageContent {
       }
       if (sessionGeneration !== this.initialScrollGeneration
         || followGeneration !== this.followScrollGeneration
-        || !this.followingLatest
-        || this.listTouchActive
-        || this.loadingOlder
-        || (this.items.length === 0 && this.queueBubbles.length === 0)) return;
+        || !canFollowLatest(this.followingLatest, this.listTouchActive, this.loadingOlder,
+          this.items.length > 0 || this.queueBubbles.length > 0)) return;
       this.listScroller.scrollToIndex(this.bottomSentinelListIndex(), false, ScrollAlign.END);
     };
     for (let i = 0; i < FOLLOW_LATEST_RETRY_DELAYS.length; i++) {
@@ -4292,10 +4293,9 @@ export struct TaskPageContent {
 
   private loadDeferredWorkChildren(items: RenderItem[], expanded: boolean): void {
     for (const item of items) {
-      if (item.type === 'work_group') this.loadDeferredWorkChildren((item as RenderWorkGroupItem).children, expanded);
-      else if (item.key.startsWith('history-work:')) {
-        if (expanded) void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, item.key);
-        else AppServices.instance.messages.hideHistoryDetails(this.deviceId, this.sessionId, item.key);
+      for (const work of this.historyPresentations(item)) {
+        if (expanded) void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, work.messageId);
+        else AppServices.instance.messages.hideHistoryDetails(this.deviceId, this.sessionId, work.messageId);
       }
     }
   }
@@ -4305,10 +4305,15 @@ export struct TaskPageContent {
   }
 
   private openSubagentDetail(item: RenderSubagentGroupItem): void {
-    if (item.key.length > 0) this.subagentDetailKey = item.key;
+    if (item.key.length > 0) {
+      this.subagentDetailKey = item.key;
+      this.loadDeferredWorkChildren([item], true);
+    }
   }
 
   private closeSubagentDetail(): void {
+    const current = this.currentSubagentDetail();
+    if (current !== null) this.loadDeferredWorkChildren([current], false);
     this.subagentDetailKey = '';
   }
 
@@ -4442,8 +4447,59 @@ export struct TaskPageContent {
       `${prefix}${item.key}`,
       item.type,
       streaming,
-      messageListItemPresentationState(item),
+      messageListItemPresentationState(item) + this.historyPresentationState(item),
     );
+  }
+
+  private historyPresentations(item: RenderItem): HistoryWorkPresentation[] {
+    const direct = AppServices.instance.messages.historyWorkPresentation(this.deviceId, this.sessionId, item.key);
+    if (direct !== undefined) return [direct];
+    if (item.type === 'tool_group') {
+      const works: HistoryWorkPresentation[] = [];
+      for (const tool of (item as RenderToolGroupItem).tools) {
+        const work = AppServices.instance.messages.historyWorkPresentation(this.deviceId, this.sessionId, tool.toolUseId);
+        if (work !== undefined && !works.some((candidate: HistoryWorkPresentation) => candidate.messageId === work.messageId)) {
+          works.push(work);
+        }
+      }
+      return works;
+    }
+    const children = item.type === 'work_group' ? (item as RenderWorkGroupItem).children
+      : item.type === 'subagent_group' ? (item as RenderSubagentGroupItem).children : [];
+    const presentations: HistoryWorkPresentation[] = [];
+    for (const child of children) presentations.push(...this.historyPresentations(child));
+    return presentations;
+  }
+
+  private historyPresentationState(item: RenderItem): string {
+    return JSON.stringify(this.historyPresentations(item).map((work: HistoryWorkPresentation): Object[] =>
+      [work.key, work.revision, work.lines, work.artifacts, work.model, work.loading, work.failed,
+        work.complete, work.awaitingDetails]));
+  }
+
+  private historyPreviewLines(item: RenderItem): Record<string, Object>[] {
+    const lines: Record<string, Object>[] = [];
+    for (const work of this.historyPresentations(item)) lines.push(...work.lines);
+    return lines.slice(-3);
+  }
+
+  private historyLineText(line: Record<string, Object>): string {
+    return formatHistoryWorkLine(line, (key: string, args: string[]): string => this.v12String(key, ...args));
+  }
+
+  private historyArtifacts(item: RenderItem): Record<string, Object>[] {
+    const artifacts: Record<string, Object>[] = [];
+    const seen = new Set<string>();
+    for (const work of this.historyPresentations(item)) {
+      for (const artifact of work.artifacts) {
+        const path = readStr(artifact, 'path');
+        if (!path || seen.has(path) || artifact['ready'] === false || artifact['exclude'] === 'all'
+          || (artifact['exclude'] === 'command' && artifact['source'] === 'command')) continue;
+        seen.add(path);
+        artifacts.push(artifact);
+      }
+    }
+    return artifacts;
   }
 
   private renderItemIndexContainingAnchor(anchor: string): number {
@@ -7508,6 +7564,11 @@ export struct TaskPageContent {
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
 
+        ForEach(this.historyPresentations(item), (work: HistoryWorkPresentation) => {
+          this.historyWorkContent(item, work)
+        }, (work: HistoryWorkPresentation) => work.messageId + work.revision)
+        this.historyArtifactButtons(item)
+
         Scroll() {
           Column({ space: 6 }) {
             if (item.children.length === 0 && item.summary.length === 0) {
@@ -7518,7 +7579,7 @@ export struct TaskPageContent {
                 .padding({ top: 12, bottom: 12 })
             }
             ForEach(item.children, (child: RenderItem) => {
-              this.renderItem(child)
+              this.workGroupChild(child)
             }, (child: RenderItem) => this.renderItemNodeKey(child, `${item.key}-detail-`))
             if (item.summary.length > 0) {
               Column({ space: 4 }) {
@@ -7795,7 +7856,20 @@ export struct TaskPageContent {
       })
       .width('100%')
 
+      this.historyArtifactButtons(item)
+
       if (item.isStreaming
+        && !this.isIn(this.expandedWorkGroups, item.key)
+        && this.historyPreviewLines(item).length > 0) {
+        Column({ space: 2 }) {
+          ForEach(this.historyPreviewLines(item), (line: Record<string, Object>) => {
+            this.historyActivityLine(line)
+          }, (line: Record<string, Object>) => JSON.stringify(line))
+        }
+        .width('100%')
+        .padding({ left: 10, top: 2, bottom: 2 })
+        .border({ width: { left: 2 }, color: { left: $r('app.color.border') } })
+      } else if (item.isStreaming
         && !this.isIn(this.expandedWorkGroups, item.key)
         && workPreviewRows(item).length > 0) {
         Column() {
@@ -7860,25 +7934,82 @@ export struct TaskPageContent {
 
   @Builder
   workGroupChild(child: RenderItem) {
-    if (child.key.startsWith('history-work:')) {
-      if (AppServices.instance.messages.historyDetailState(this.deviceId, this.sessionId, child.key) !== 'complete') {
-        Button(AppServices.instance.messages.historyDetailState(this.deviceId, this.sessionId, child.key) === 'loading'
+    if (child.type !== 'work_group' && this.historyPresentations(child).length > 0) {
+      ForEach(this.historyPresentations(child), (work: HistoryWorkPresentation) => {
+        this.historyWorkContent(child, work)
+      }, (work: HistoryWorkPresentation) => work.messageId + work.revision)
+      if (!child.key.startsWith('history-work:')) this.renderItem(child)
+    } else if (child.type === 'work_group') {
+      ForEach((child as RenderWorkGroupItem).children, (nested: RenderItem) => {
+        this.workGroupChild(nested)
+      }, (nested: RenderItem) => this.renderItemNodeKey(nested, child.key))
+    } else {
+      this.renderItem(child)
+    }
+  }
+
+  @Builder
+  historyActivityLine(line: Record<string, Object>) {
+    Text(this.historyLineText(line))
+      .fontSize(uiFontSize(14))
+      .lineHeight(uiLineHeight(20))
+      .fontColor($r('app.color.chat_text_secondary'))
+      .maxLines(1)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+  }
+
+  @Builder
+  historyWorkContent(child: RenderItem, work: HistoryWorkPresentation) {
+    Column({ space: 4 }) {
+      if (work.model.length > 0) {
+        Text(work.model)
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.text_tertiary'))
+          .copyOption(CopyOptions.LocalDevice)
+      }
+      if (work.awaitingDetails) {
+        ForEach(work.lines, (line: Record<string, Object>) => {
+          this.historyActivityLine(line)
+        }, (line: Record<string, Object>) => JSON.stringify(line))
+      }
+      if (!work.complete) {
+        Button(work.loading
           ? this.v12String('v131_work_loading') : this.v12String('v131_work_load'))
           .fontSize(uiFontSize(13))
           .fontColor($r('app.color.text_secondary'))
           .backgroundColor($r('app.color.bg_chip'))
-          .borderRadius(9999)
+          .borderRadius(UI_RADIUS_PILL)
+          .constraintSize({ minHeight: 44 })
+          .enabled(!work.loading)
           .onClick(() => {
-            void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, child.key);
+            void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, work.messageId);
           })
       }
-    } else if (child.type === 'work_group') {
-      ForEach((child as RenderWorkGroupItem).children, (nested: RenderItem) => {
-        this.workGroupChild(nested)
-      }, (nested: RenderItem) => `${child.key}-${nested.key}`)
-    } else {
-      this.renderItem(child)
     }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  historyArtifactButtons(item: RenderItem) {
+    Column({ space: 4 }) {
+      ForEach(this.historyArtifacts(item), (artifact: Record<string, Object>) => {
+        Button(fileTitleOf(readStr(artifact, 'path')))
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_PILL)
+          .constraintSize({ minHeight: 44, maxWidth: '100%' })
+          .onClick(() => {
+            const path = readStr(artifact, 'path');
+            void this.openGeneratedFile(path, fileTitleOf(path));
+          })
+      }, (artifact: Record<string, Object>) => readStr(artifact, 'path'))
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
   }
 
   private autoResumePresentation(item: RenderMessageItem): AutoResumePresentation {
