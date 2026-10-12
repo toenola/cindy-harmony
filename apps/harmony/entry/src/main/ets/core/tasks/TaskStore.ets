@@ -34,6 +34,8 @@ export class TaskStore {
   private client: DlClient | undefined = undefined;
   private listeners: Array<() => void> = [];
   private devices: Map<string, PresenceSnapshot> = new Map();
+  private sourceDeviceNames: Map<string, string> = new Map();
+  messageSourceDirectoryLoaded: boolean = false;
   private sessionsByDevice: Map<string, RemoteSession[]> = new Map();
   private sessionLoadRevisions: Map<string, number> = new Map();
   /** 同一设备的列表恢复 single-flight；代次仍负责拒绝清理后的旧结果。 */
@@ -101,12 +103,21 @@ export class TaskStore {
     return snap ? snap.deviceName : deviceId.slice(0, 8);
   }
 
+  get messageSourceDeviceNames(): Map<string, string> {
+    return new Map(this.sourceDeviceNames);
+  }
+
   /**
    * 合并 REST /api/device-link/devices 的全量快照（登录连接后的初始设备列表）。
    * presence-changed 继续做增量补丁；这里的快照可能旧于在途 presence 补丁，
    * 用「presence 已见过的设备不降级」策略避免把刚上线的设备打回离线。
    */
   mergeServerDevices(views: DeviceView[]): void {
+    this.sourceDeviceNames.clear();
+    for (const view of views) {
+      if (view.deviceId.length > 0) this.sourceDeviceNames.set(view.deviceId, view.name);
+    }
+    this.messageSourceDirectoryLoaded = true;
     const serverDeviceIds: Set<string> = new Set();
     for (let i = 0; i < views.length; i++) serverDeviceIds.add(views[i].deviceId);
     const staleCachedDeviceIds: string[] = [];
@@ -151,8 +162,11 @@ export class TaskStore {
 
   handlePresence(snap: PresenceSnapshot): void {
     if (snap.deviceId.length === 0) return;
-    if (snap.deviceId === this.selfDeviceId) return; // 自己不进设备列表
-    if (!isDesktopPlatform(snap.platform)) return; // 只展示桌面电脑
+    this.sourceDeviceNames.set(snap.deviceId, snap.deviceName);
+    if (snap.deviceId === this.selfDeviceId || !isDesktopPlatform(snap.platform)) {
+      this.notify();
+      return;
+    }
     this.devices.set(snap.deviceId, snap);
     if (!snap.remoteControlEnabled) {
       // 显式关闭远程控制立即丢弃任务镜像；短暂离线仍保留最近快照。
@@ -239,6 +253,8 @@ export class TaskStore {
   clearAll(): void {
     this.stateGeneration += 1;
     this.devices.clear();
+    this.sourceDeviceNames.clear();
+    this.messageSourceDirectoryLoaded = false;
     this.sessionsByDevice.clear();
     this.sessionLoadRevisions.clear();
     this.sessionLoadOperations.clear();

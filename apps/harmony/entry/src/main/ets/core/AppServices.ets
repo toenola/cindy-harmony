@@ -612,6 +612,7 @@ export class AppServices {
         if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
         hilog.info(DOMAIN, TAG, 'load devices ok count=%{public}d', views.length);
         const ownDeviceId = await this.auth.ensureDeviceId();
+        if (authEpoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return false;
         for (let i = 0; i < views.length; i++) {
           if (views[i].isSelf || views[i].deviceId === ownDeviceId) {
             const serverName = views[i].name.trim();

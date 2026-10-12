@@ -16,7 +16,7 @@ import {
   RemoteMessage, readStr, readObj, readAny,
 } from '../tasks/TaskModels';
 import { parseMarkdown, MdBlock } from './MarkdownParser';
-import { sanitizeInternalOutput } from './InternalOutputSanitizer';
+import { sanitizeInternalOutput, stripGoalVerdictBlock } from './InternalOutputSanitizer';
 import { parseToolResultCompactionMarker, toolResultCompactionPreview } from './ToolResultCompaction';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
 import {
@@ -33,7 +33,12 @@ import {
   isAgentTaskToolName,
 } from './AgentTaskStore';
 import { isAutoResumeRowInFlight } from './AutoResumePresentation';
-import { findErrorTailClientId } from './SessionTailPresentation';
+import { sanitizeSourceName } from './MessageSourcePresentation';
+import {
+  CONTINUE_AFTER_APP_EXIT_PROMPT,
+  CONTINUE_AFTER_ERROR_PROMPT,
+  findErrorTailClientId,
+} from './SessionTailPresentation';
 
 const MAX_MARKDOWN_PARSE_CACHE_ENTRIES = 2048;
 
@@ -144,6 +149,125 @@ export class RenderMessageItem extends RenderItem {
   hidden: boolean = false;
   /** 旧历史缺 turn seal 时，由用户轮次边界推导出的最终 assistant。 */
   isTurnFinalAssistant: boolean = false;
+  orcaCard: OrcaCollabPresentation | null = null;
+}
+
+export class OrcaCollabPresentation {
+  variant: string = '';
+  titleKey: string = '';
+  titleArgs: Record<string, Object> = {};
+  body: string = '';
+  bodyKey: string = '';
+  bodyArgs: Record<string, Object> = {};
+  defaultExpanded: boolean = false;
+}
+
+function renderRecord(value: Object | undefined): Record<string, Object> {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed) as Object;
+    } catch (error) {
+      return {};
+    }
+  }
+  return parsed !== undefined && parsed !== null && typeof parsed === 'object'
+    && !Array.isArray(parsed) ? parsed as Record<string, Object> : {};
+}
+
+export function projectOrcaPersistedMessage(message: RemoteMessage): OrcaCollabPresentation | null {
+  if (message.role !== 'user') return null;
+  const record = renderRecord(message.content);
+  const source = readStr(record, 'orcaSource');
+  if (source !== 'worker' && source !== 'lead') return null;
+  const card = new OrcaCollabPresentation();
+  card.variant = source === 'lead' ? 'lead' : 'report';
+  const origin = readObj(message.agentMeta, 'origin');
+  const senderLabel = readStr(origin, 'kind') === 'orca'
+    ? sanitizeSourceName(readStr(origin, 'senderLabel')) : '';
+  const namedWorker = senderLabel.length > 0 && !/^(lead|worker)$/i.test(senderLabel);
+  card.titleKey = source === 'lead' ? 'interaction.collab.fromLead'
+    : namedWorker ? 'interaction.collab.fromWorkerNamed' : 'interaction.collab.fromWorker';
+  if (namedWorker) card.titleArgs['role'] = senderLabel;
+  card.body = readStr(record, 'content').trim();
+  if (card.body.length === 0) card.bodyKey = 'interaction.collab.emptyMessageBody';
+  return card;
+}
+
+export function projectOrcaDispatchCard(toolName: string, input: Object | undefined): OrcaCollabPresentation | null {
+  const normalized = toolName.replace(/^mcp__/, 'mcp:').replace(/__/g, ':');
+  const kind = normalized === 'create_workers' || normalized.endsWith(':create_workers') ? 'batch'
+    : normalized === 'create_worker' || normalized.endsWith(':create_worker') ? 'create'
+      : normalized === 'send_to_worker' || normalized.endsWith(':send_to_worker') ? 'send' : '';
+  if (kind.length === 0) return null;
+  const record = renderRecord(input);
+  const card = new OrcaCollabPresentation();
+  card.variant = 'dispatch';
+  if (kind === 'batch') {
+    const workers = record['workers'];
+    const summaries: string[] = [];
+    if (Array.isArray(workers)) {
+      for (let workerIndex = 0; workerIndex < workers.length; workerIndex++) {
+        const worker = renderRecord(workers[workerIndex] as Object);
+        const label = readStr(worker, 'label').trim() || readStr(worker, 'role').trim() || 'worker ' + (workerIndex + 1);
+        const task = readStr(worker, 'initial_task').trim();
+        summaries.push(task.length > 0 ? label + ': ' + task : label);
+      }
+    }
+    card.titleKey = summaries.length > 0 ? 'interaction.collab.batchTitle' : 'interaction.collab.batchTitleGeneric';
+    card.titleArgs['count'] = summaries.length;
+    card.body = summaries.join('\n');
+    if (card.body.length === 0) card.bodyKey = 'interaction.collab.batchBodyFallback';
+  } else if (kind === 'create') {
+    card.titleKey = 'interaction.collab.dispatchTitle';
+    card.titleArgs['who'] = readStr(record, 'label').trim() || readStr(record, 'role').trim() || 'worker';
+    card.body = readStr(record, 'initial_task').trim();
+    if (card.body.length === 0) {
+      const meta = [readStr(record, 'role').trim(), readStr(record, 'agent').trim()]
+        .filter((value: string) => value.length > 0).join(' · ');
+      card.bodyKey = meta.length > 0 ? 'interaction.collab.dispatchRole' : 'interaction.collab.dispatchBodyFallback';
+      card.bodyArgs['meta'] = meta;
+    }
+  } else {
+    card.titleKey = 'interaction.collab.sendTitle';
+    card.body = readStr(record, 'message').trim();
+    const target = readStr(record, 'target_session_id').trim();
+    if (card.body.length === 0 && target.length > 0) card.body = '→ ' + target;
+    if (card.body.length === 0) card.bodyKey = 'interaction.collab.sendBodyFallback';
+  }
+  return card;
+}
+
+export function orcaCollabCanExpand(card: OrcaCollabPresentation): boolean {
+  return card.body.trim().length > 0 || card.bodyKey.length > 0;
+}
+
+export function orcaCollabExpansionKey(accountIdentity: string, deviceId: string, item: RenderMessageItem): string {
+  return 'orca-expanded-' + JSON.stringify([accountIdentity, deviceId, item.message?.sessionId ?? '',
+    item.key, item.orcaCard?.variant ?? '']);
+}
+
+function assistantDisplayBody(message: RemoteMessage): string {
+  return stripGoalVerdictBlock(contentPreview(message.content));
+}
+
+export function isRenderContinuation(message: RemoteMessage | undefined): boolean {
+  if (message === undefined || message.role !== 'user') return false;
+  if (message.agentMeta['autoResume'] === true || message.systemCardType === 'auto-resume') return true;
+  const record = renderRecord(message.content);
+  const text = readStr(record, 'text')
+    || (typeof message.content === 'string' ? message.content as string : '');
+  return text === CONTINUE_AFTER_APP_EXIT_PROMPT || text === CONTINUE_AFTER_ERROR_PROMPT
+    || text.startsWith(CONTINUE_AFTER_APP_EXIT_PROMPT + '\n\n[CINDY_RECOVERY_CHECKPOINT v1]')
+    || text.startsWith(CONTINUE_AFTER_ERROR_PROMPT + '\n\n[CINDY_RECOVERY_CHECKPOINT v1]');
+}
+
+function isWorkRunUserBoundary(item: RenderItem): boolean {
+  if (item.type !== 'message') return false;
+  const messageItem = item as RenderMessageItem;
+  return messageItem.orcaCard?.variant !== 'report'
+    && readStr(messageItem.message?.agentMeta, 'delivery') !== 'steer'
+    && (messageItem.kind === 'user' || messageItem.message?.role === 'user');
 }
 
 /** thinking 折叠块。 */
@@ -214,7 +338,7 @@ export function turnFinalAssistantIds(
     }
     if (message.role !== 'assistant' || message.systemCardType.length > 0
       || readStr(message.agentMeta, 'parentUuid').length > 0
-      || contentPreview(message.content).trim().length === 0) continue;
+      || assistantDisplayBody(message).trim().length === 0) continue;
     candidate = message.id.length > 0 ? message.id : message.clientId;
     if (message.turnCompleted && candidate.length > 0) {
       result.add(candidate);
@@ -280,7 +404,8 @@ function hasActiveLoadedTail(messages: RemoteMessage[]): boolean {
 
 function isTurnUserBoundary(message: RemoteMessage): boolean {
   return message.role === 'user' && message.systemCardType.length === 0
-    && !message.isSyntheticTrigger && !message.presentedAsAgent;
+    && !message.isSyntheticTrigger && !message.presentedAsAgent
+    && projectOrcaPersistedMessage(message)?.variant !== 'report';
 }
 
 /** 计划归属只把用户真正开启的新一轮视作边界；续跑、Hook、steer 与子代理行都属于原轮。 */
@@ -1589,6 +1714,20 @@ function buildLinearRenderItems(
 
     if (role === 'tool_use') {
       const tool = parseToolUse(m);
+      const dispatchCard = projectOrcaDispatchCard(tool.toolName, tool.inputRaw);
+      if (dispatchCard !== null) {
+        flushTools();
+        const dispatch = new RenderMessageItem();
+        dispatch.type = 'message';
+        dispatch.key = m.id;
+        dispatch.kind = 'system';
+        dispatch.label = 'Cindy';
+        dispatch.body = dispatchCard.body;
+        dispatch.message = m;
+        dispatch.orcaCard = dispatchCard;
+        items.push(dispatch);
+        continue;
+      }
       if (isAgentTaskToolName(tool.toolName)) {
         flushTools();
         const task = new RenderToolItem();
@@ -1735,6 +1874,16 @@ function buildLinearRenderItems(
         items.push(item);
         continue;
       }
+      const orcaCard = projectOrcaPersistedMessage(m);
+      if (orcaCard !== null) {
+        item.kind = orcaCard.variant === 'lead' ? 'user' : 'system';
+        item.label = 'Cindy';
+        item.body = orcaCard.body;
+        item.message = m;
+        item.orcaCard = orcaCard;
+        items.push(item);
+        continue;
+      }
       if (m.presentedAsAgent) {
         item.kind = 'system';
         item.label = m.originLabel.length > 0 ? m.originLabel : 'Cindy';
@@ -1768,7 +1917,7 @@ function buildLinearRenderItems(
     item.key = m.id;
     item.kind = normalizeKind(role);
     item.label = labelOf(role);
-    item.body = contentPreview(m.content);
+    item.body = item.kind === 'assistant' ? assistantDisplayBody(m) : contentPreview(m.content);
     // 空的 assistant 是协议占位，不应在真实答复下方制造一条空消息。
     if (item.kind === 'assistant' && item.body.trim().length === 0) continue;
     const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
@@ -2053,7 +2202,7 @@ function collectRenderedTaskKeys(items: RenderItem[], out: Set<string>): void {
 function scopeUnsettledToolsToActiveTail(items: RenderItem[]): void {
   let lastUserIndex = -1;
   for (let i = items.length - 1; i >= 0; i--) {
-    if (items[i].type === 'message' && (items[i] as RenderMessageItem).kind === 'user') {
+    if (isWorkRunUserBoundary(items[i])) {
       lastUserIndex = i;
       break;
     }
@@ -2096,13 +2245,29 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
   // 本轮用户消息时间：完成态工作过程的时长起点优先锚它，而不是段内首个 activity，
   // 否则用户发送到首个动作之间的等待时间被吞掉（与共享投影 turnStartMs 同口径）。
   let turnStartMs = 0;
-  const flushTurn = (activeTail: boolean): void => {
+  const flushTurn = (activeTail: boolean, resumed: boolean = false): void => {
     if (currentTurn.length === 0) return;
     if (activeTail && isSessionStreaming) {
-      const active = groupActiveWorkRuns(currentTurn, turnStartMs);
+      let completedIndex = -1;
+      for (let itemIndex = currentTurn.length - 1; itemIndex >= 0; itemIndex--) {
+        const item = currentTurn[itemIndex];
+        if (isAssistantAnswerCandidate(item) && (item as RenderMessageItem).message?.turnCompleted) {
+          completedIndex = itemIndex;
+          break;
+        }
+      }
+      let activeStartMs = turnStartMs;
+      if (completedIndex >= 0) {
+        const completed = currentTurn.slice(0, completedIndex + 1);
+        const answered = groupAnsweredTurnItems(completed, turnStartMs);
+        const grouped = answered.handled ? answered.items : completed;
+        for (let itemIndex = 0; itemIndex < grouped.length; itemIndex++) out.push(grouped[itemIndex]);
+        activeStartMs = boundaryTimestamp(currentTurn[completedIndex]);
+      }
+      const active = groupActiveWorkRuns(currentTurn.slice(completedIndex + 1), activeStartMs);
       for (let i = 0; i < active.length; i++) out.push(active[i]);
     } else {
-      const answered = groupAnsweredTurnItems(currentTurn, turnStartMs);
+      const answered = groupAnsweredTurnItems(currentTurn, turnStartMs, resumed);
       const grouped = answered.handled ? answered.items
         : groupLegacyWorkRuns(currentTurn, turnStartMs);
       for (let i = 0; i < grouped.length; i++) out.push(grouped[i]);
@@ -2113,9 +2278,13 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
     const item = items[i];
     if (item.type === 'message' && (item as RenderMessageItem).hidden
       && (item as RenderMessageItem).kind !== 'user') continue;
-    if (item.type === 'message' && ((item as RenderMessageItem).kind === 'user'
-      || (item as RenderMessageItem).message?.role === 'user')) {
+    const start = itemStartTimestamp(item);
+    if (hasPrevEnd && start > 0 && start - prevEndMs > HISTORY_GAP_SPLIT_MS) {
       flushTurn(false);
+      turnStartMs = 0;
+    }
+    if (isWorkRunUserBoundary(item)) {
+      flushTurn(false, isRenderContinuation((item as RenderMessageItem).message));
       if (!(item as RenderMessageItem).hidden) out.push(item);
       const userEnd = itemEndTimestamp(item);
       if (userEnd > 0) {
@@ -2124,13 +2293,6 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
       }
       turnStartMs = itemStartTimestamp(item);
       continue;
-    }
-    const start = itemStartTimestamp(item);
-    if (hasPrevEnd && start > 0 && start - prevEndMs > HISTORY_GAP_SPLIT_MS) {
-      flushTurn(false);
-      // 空洞切开的新段没有已知 turn 开场边界：旧 user 行在空洞另一侧或未加载。
-      // 清零后与窗口截断同义，退回首个活动时间，避免把空洞计入时长。
-      turnStartMs = 0;
     }
     currentTurn.push(item);
     const end = itemEndTimestamp(item);
@@ -2143,10 +2305,11 @@ function groupMessageWorkRuns(items: RenderItem[], isSessionStreaming: boolean):
   return out;
 }
 
-function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0): GroupedTurnResult {
+function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0,
+  resumed: boolean = false): GroupedTurnResult {
   const result = new GroupedTurnResult();
-  const sealed: boolean[] = [];
-  let sealedCount = 0;
+  const answers = new Set<number>();
+  const sealed: number[] = [];
   let lastAnswerIndex = -1;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -2154,40 +2317,45 @@ function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0): G
       lastAnswerIndex = i;
       const message = (item as RenderMessageItem).message;
       if (message !== undefined && message.turnCompleted) {
-        sealed[i] = true;
-        sealedCount += 1;
+        sealed.push(i);
       }
     }
   }
-  if (lastAnswerIndex < 0) {
+  if (lastAnswerIndex < 0 && !resumed) {
     result.items = items.slice();
     result.handled = false;
     return result;
   }
 
-  if (sealedCount > 0) {
+  if (sealed.length > 0) {
     let segmentStart = 0;
-    for (let i = 0; i < items.length; i++) {
-      if (!sealed[i]) continue;
+    for (let sealIndex = 0; sealIndex < sealed.length; sealIndex++) {
+      const sealedIndex = sealed[sealIndex];
       let lastWork = -1;
-      for (let j = i - 1; j >= segmentStart; j--) {
-        if (isWorkActivityItem(items[j])) {
-          lastWork = j;
+      for (let itemIndex = sealedIndex - 1; itemIndex >= segmentStart; itemIndex--) {
+        if (isWorkActivityItem(items[itemIndex])) {
+          lastWork = itemIndex;
           break;
         }
       }
-      let answerStart = i;
+      let answerStart = sealedIndex;
       while (answerStart > lastWork + 1
         && answerStart > segmentStart
         && isAssistantAnswerCandidate(items[answerStart - 1])) {
         answerStart -= 1;
       }
-      for (let j = answerStart; j <= i; j++) {
-        if (isAssistantAnswerCandidate(items[j])) sealed[j] = true;
+      let keep = !resumed && sealIndex === sealed.length - 1;
+      for (let itemIndex = answerStart; itemIndex <= sealedIndex && !keep; itemIndex++) {
+        keep = isAssistantAnswerCandidate(items[itemIndex]) && isDeliveryProseItem(items[itemIndex]);
       }
-      segmentStart = i + 1;
+      if (keep) {
+        for (let itemIndex = answerStart; itemIndex <= sealedIndex; itemIndex++) {
+          if (isAssistantAnswerCandidate(items[itemIndex])) answers.add(itemIndex);
+        }
+      }
+      segmentStart = sealedIndex + 1;
     }
-  } else {
+  } else if (!resumed) {
     let hasWorkAfter = false;
     for (let i = lastAnswerIndex + 1; i < items.length; i++) {
       if (isWorkActivityItem(items[i])) hasWorkAfter = true;
@@ -2210,7 +2378,7 @@ function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0): G
       answerStart -= 1;
     }
     for (let i = answerStart; i <= lastAnswerIndex; i++) {
-      if (isAssistantAnswerCandidate(items[i])) sealed[i] = true;
+      if (isAssistantAnswerCandidate(items[i])) answers.add(i);
     }
   }
 
@@ -2224,7 +2392,7 @@ function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0): G
   };
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (!sealed[i] && !isDeliveryProseItem(item) && isWorkChild(item)) {
+    if (!answers.has(i) && !isDeliveryProseItem(item) && isWorkChild(item)) {
       run.push(item);
     } else {
       flushRun(item);
@@ -2339,6 +2507,8 @@ function isDeliveryProseItem(item: RenderItem): boolean {
   const body = ((item as RenderMessageItem).body).trim();
   if (body.length >= DELIVERY_PROSE_MIN_LENGTH) return true;
   if (MARKDOWN_HEADING_RE.test(body) || MARKDOWN_TABLE_DIVIDER_RE.test(body)) return true;
+  if (/!\[[^\]\n]*\]\([^)\s]+(?:\s[^)]*)?\)/.test(body)
+    || /<img(?=[\s/>])[^<>]*\ssrc\s*=\s*["']?[^\s"'<>]+[^<>]*>/i.test(body)) return true;
   const listItems = body.match(MARKDOWN_LIST_ITEM_RE);
   return listItems !== null && listItems.length >= 3;
 }

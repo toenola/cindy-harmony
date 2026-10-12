@@ -6,6 +6,7 @@
  */
 
 import { RemoteSession, readBool, readStr } from './TaskModels';
+import { modelNeedsReselection } from '../ComposerCatalog';
 
 export const SESSION_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
 
@@ -40,6 +41,28 @@ export function runtimeRouteNeedsRemoteCatalog(
 ): boolean {
   if ((session?.remoteHostId.length ?? 0) > 0) return false;
   return (session?.agentDeviceId.length ?? 0) > 0 || effectiveAgentDeviceId(session, intent) !== null;
+}
+
+export function sessionAgentSwitchIntentApplied(session: RemoteSession,
+  intent: SessionAgentSwitchIntent): boolean {
+  const profile = session.runtimeEffective ?? session;
+  const agentKind = session.agentKind === 'codex' || session.agentKind === 'pi'
+    ? session.agentKind : 'claude-code';
+  const currentLocation = session.agentDeviceId.length > 0 ? session.agentDeviceId : null;
+  return intent.targetAgentKind === agentKind && intent.model === profile.model
+    && (intent.agentDeviceId === undefined || intent.agentDeviceId === currentLocation)
+    && (!intent.hasProviderId || intent.providerId === profile.providerId)
+    && (intent.effort.length === 0 || intent.effort === profile.effort)
+    && (!intent.hasFastMode || intent.fastMode === profile.fastMode);
+}
+
+export function sessionSendNeedsModelReselection(visibility: Map<string, boolean>,
+  session: RemoteSession, intent: SessionAgentSwitchIntent | null): boolean {
+  if (runtimeRouteNeedsRemoteCatalog(session, intent)) return false;
+  const agentKind = session.agentKind === 'codex' || session.agentKind === 'pi'
+    ? session.agentKind : 'claude-code';
+  return modelNeedsReselection(visibility, intent?.targetAgentKind ?? agentKind,
+    intent?.model ?? session.model, intent?.providerId ?? session.providerId);
 }
 
 export function agentLocationLabel(

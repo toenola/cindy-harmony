@@ -6,6 +6,15 @@
 
 const MODEL_STOP_TOKENS: string[] = ['<|endoftext|>', '<|eot_id|>', '<|im_end|>', '<|eos|>'];
 const LONGEST_MODEL_STOP_TOKEN: number = 13;
+const TRAILING_GOAL_FENCED: RegExp = /\n?\s*\x60\x60\x60(?:json|jsonc)?\s*\{[^{}]*"goal_(?:status|setup)"[^{}]*\}\s*\x60\x60\x60\s*$/i;
+const TRAILING_GOAL_BARE: RegExp = /\n?\s*\{[^{}]*"goal_(?:status|setup)"[^{}]*\}\s*$/i;
+
+export function stripGoalVerdictBlock(content: string): string {
+  if (!content.includes('goal_status') && !content.includes('goal_setup')) return content;
+  if (TRAILING_GOAL_FENCED.test(content)) return content.replace(TRAILING_GOAL_FENCED, '').trimEnd();
+  if (TRAILING_GOAL_BARE.test(content)) return content.replace(TRAILING_GOAL_BARE, '').trimEnd();
+  return content;
+}
 const WEB_CITATION_OPEN: string = '\uE200cite\uE202';
 const WEB_CITATION_CLOSE: string = '\uE201';
 

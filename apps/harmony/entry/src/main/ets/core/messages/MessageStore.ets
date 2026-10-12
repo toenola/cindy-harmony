@@ -23,7 +23,7 @@ import {
   HistoryWorkPresentation, projectHistoryWorkPresentation,
 } from './HistoryWorkPresentation';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
+import { DlClient, DlError, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
 import {
   RemoteMessage, RemoteSession, parseMessage, parseSession, sortMessagesAsc,
@@ -3146,11 +3146,18 @@ export class MessageStore {
   async deleteMessage(deviceId: string, sessionId: string, clientId: string): Promise<string[]> {
     const client = this.client;
     if (!client) return [];
+    const lease = this.historyReadLease(deviceId, sessionId);
+    if (!lease || !clientId) return [];
     const opts = new DlInvokeOptions();
     opts.channel = 'maker:message:delete';
     opts.args = [sessionId, clientId];
-    const result = unwrapInvokeResult(await client.invoke(deviceId, opts)) as Record<string, Object>;
-    if (!this.sessionReadAllowed(sessionId, deviceId)) return [];
+    opts.preSend = (): void => {
+      if (client !== this.client || lease !== this.historyReadLease(deviceId, sessionId)) {
+        throw new DlError('CANCELLED', 'Message deletion scope changed', false);
+      }
+    };
+    const result = recordOrEmpty(unwrapInvokeResult(await client.invoke(deviceId, opts)));
+    if (client !== this.client || lease !== this.historyReadLease(deviceId, sessionId)) return [];
     const deleted: string[] = [];
     const rawIds = result['clientIds'];
     if (Array.isArray(rawIds)) {

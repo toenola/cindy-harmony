@@ -246,7 +246,7 @@ function collectWorkShareText(
 
 /** 与页面选择态及 Mobile isShareableMessage 保持同一过滤边界。 */
 function isShareableMessage(message: RenderMessageItem): boolean {
-  if (message.hidden || !isShareableMessageKind(message.kind)) return false;
+  if (message.hidden || message.orcaCard !== null || !isShareableMessageKind(message.kind)) return false;
   const source = message.message;
   // 纯逻辑单测可构造没有原始消息的 RenderMessageItem；其 kind 已足够表达分享边界。
   if (source === undefined) return true;

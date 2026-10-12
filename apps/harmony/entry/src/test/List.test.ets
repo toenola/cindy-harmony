@@ -6,6 +6,9 @@ import v132QueueTests from './V132Queue.test';
 import v132SessionTests from './V132Session.test';
 import v132LinkTests from './V132Link.test';
 import v132HistoryTests from './V132History.test';
+import v132RenderingTests from './V132Rendering.test';
+import v132PresentationTests from './V132Presentation.test';
+import v132DeletionTests from './V132Deletion.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -16,4 +19,7 @@ export default function testsuite() {
   v132SessionTests();
   v132LinkTests();
   v132HistoryTests();
+  v132RenderingTests();
+  v132PresentationTests();
+  v132DeletionTests();
 }

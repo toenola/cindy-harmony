@@ -131,6 +131,8 @@ import {
   SessionAgentSwitchIntent,
   agentLocationLabel,
   runtimeRouteNeedsRemoteCatalog,
+  sessionAgentSwitchIntentApplied,
+  sessionSendNeedsModelReselection,
   isRuntimeRouteMutation,
   parseSessionAgentSwitchIntent,
   supportsSessionAgentSwitch,
@@ -140,9 +142,15 @@ import {
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
+  orcaCollabCanExpand, orcaCollabExpansionKey,
   latestTaskPlanWindowResolved,
   todoCardContentSignature, todoCardIndexAtRankFromTail, todoCardRankFromTail,
 } from '../core/messages/MessageRender';
+import {
+  MessageSourceBadge, formatWorkDuration, messageSourceBadges,
+} from '../core/messages/MessageSourcePresentation';
+import { sentSessionMessageChipLabel } from '../core/messages/SentQuotePresentation';
+import { parseSessionDeepLink } from '../core/navigation/SessionDeepLink';
 import {
   RenderDiffPayload,
   RenderDiffSegment,
@@ -151,6 +159,7 @@ import {
 import {
   MdBlock, InlineToken, InlineTokenGroup, MdSelectableBlockGroup, MdSelectableTextBlock,
   groupInlineTokens, groupMarkdownSelectableBlocks,
+  tokenizeInline,
 } from '../core/messages/MarkdownParser';
 import { ThinkingTextToken, tokenizeThinkingText } from '../core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
@@ -454,6 +463,29 @@ class RenderItemDataSource implements IDataSource {
 }
 
 
+class TaskPresentationScope {
+  lifecycleGeneration: number = 0;
+  accountEpoch: number = 0;
+  accountId: string = '';
+  deviceId: string = '';
+  sessionId: string = '';
+}
+
+const ORCA_PRESENTATION_RESOURCES: Record<string, string> = {
+  'interaction.collab.batchTitle': 'v132_orca_batch_title',
+  'interaction.collab.batchTitleGeneric': 'v132_orca_batch_title_generic',
+  'interaction.collab.batchBodyFallback': 'v132_orca_batch_body_fallback',
+  'interaction.collab.dispatchTitle': 'v132_orca_dispatch_title',
+  'interaction.collab.dispatchRole': 'v132_orca_dispatch_role',
+  'interaction.collab.dispatchBodyFallback': 'v132_orca_dispatch_body_fallback',
+  'interaction.collab.sendTitle': 'v132_orca_send_title',
+  'interaction.collab.sendBodyFallback': 'v132_orca_send_body_fallback',
+  'interaction.collab.fromLead': 'v132_orca_from_lead',
+  'interaction.collab.fromWorkerNamed': 'v132_orca_from_worker_named',
+  'interaction.collab.fromWorker': 'v132_orca_from_worker',
+  'interaction.collab.emptyMessageBody': 'v132_orca_empty_message_body',
+};
+
 @Component
 export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
@@ -535,6 +567,14 @@ export struct TaskPageContent {
   @State tailBannerBusy: boolean = false;
   /** thinking 展开的 key（默认折叠）。 */
   @State expandedThinking: string[] = [];
+  @State expandedOrcaCards: string[] = [];
+  @State sourceDeviceNames: Map<string, string> = new Map();
+  @State sourceDeviceDirectoryLoaded: boolean = false;
+  @State sourceViewerDeviceId: string = '';
+  @State presentationAccountKey: string = '';
+  private sentInlineTokenCache: Map<InlineToken[], InlineToken[]> = new Map();
+  private sentMessageChipCache: Map<RemoteMessage, string> = new Map();
+  private sentInlineTokenSeq: number = -1;
   /**
    * 会话分享：服务持有 PixelMap / 临时文件 / 面板订阅的账本，页面只驱动流程。
    * 生成中、预览、失败重试都读 shareStage，退页与退后台统一走 release()。
@@ -767,6 +807,36 @@ export struct TaskPageContent {
     return generation === this.pageLifecycleGeneration && !this.leavingDetailPage;
   }
 
+  private presentationScope(): TaskPresentationScope {
+    const scope = new TaskPresentationScope();
+    scope.lifecycleGeneration = this.pageLifecycleGeneration;
+    scope.accountEpoch = AppServices.instance.auth.sessionEpoch;
+    scope.accountId = AppServices.instance.auth.cacheAccountId;
+    scope.deviceId = this.deviceId;
+    scope.sessionId = this.sessionId;
+    return scope;
+  }
+
+  private isCurrentPresentationScope(scope: TaskPresentationScope): boolean {
+    return this.isCurrentPageLifecycle(scope.lifecycleGeneration)
+      && scope.accountEpoch === AppServices.instance.auth.sessionEpoch
+      && scope.accountId === AppServices.instance.auth.cacheAccountId
+      && scope.deviceId === this.deviceId && scope.sessionId === this.sessionId;
+  }
+
+  private syncMessagePresentationSources(): void {
+    this.sourceDeviceNames = AppServices.instance.tasks.messageSourceDeviceNames;
+    this.sourceDeviceDirectoryLoaded = AppServices.instance.tasks.messageSourceDirectoryLoaded;
+    this.sourceViewerDeviceId = AppServices.instance.client.getDeviceId();
+    const accountKey = JSON.stringify([AppServices.instance.auth.cacheAccountId, AppServices.instance.auth.sessionEpoch]);
+    if (this.presentationAccountKey !== accountKey) {
+      this.presentationAccountKey = accountKey;
+      this.expandedOrcaCards = [];
+      this.messageActionItemKey = '';
+      this.sentMessageChipCache.clear();
+    }
+  }
+
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
     this.leavingDetailPage = false;
@@ -891,6 +961,12 @@ export struct TaskPageContent {
     this.localImagePreviews = new Map();
     this.imageStates = new Map();
     this.imageResolutions.clear();
+    this.sentInlineTokenCache.clear();
+    this.sentMessageChipCache.clear();
+    this.sentInlineTokenSeq = -1;
+    this.syncMessagePresentationSources();
+    this.unsubs.push(AppServices.instance.onStatus(() => this.syncMessagePresentationSources()));
+    this.unsubs.push(AppServices.instance.auth.onChanged(() => this.syncMessagePresentationSources()));
 
     this.unsubs.push(AppServices.instance.messages.onChanged(() => {
       this.scheduleItemsRefresh();
@@ -917,6 +993,7 @@ export struct TaskPageContent {
 
     // 撤权检查：设备关闭远程控制时只读。
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
+      this.syncMessagePresentationSources();
       this.deviceDisabled = this.checkDeviceDisabled();
       this.syncMessageCount();
       this.syncComposerContextState();
@@ -1242,8 +1319,7 @@ export struct TaskPageContent {
       this.permissionModeBeforePlan = session.permissionMode;
     }
     if (this.pendingAgentSwitchIntent !== null
-      && this.pendingAgentSwitchIntent.targetAgentKind === this.currentAgentTab()
-      && this.pendingAgentSwitchIntent.model === this.effectiveModelId(session)) {
+      && sessionAgentSwitchIntentApplied(session, this.pendingAgentSwitchIntent)) {
       this.pendingAgentSwitchIntent = null;
     }
   }
@@ -2332,7 +2408,6 @@ export struct TaskPageContent {
       this.sendLearnCommand(learn);
       return;
     }
-    this.selectedLearnRoute = '';
     if (this.deviceDisabled) {
       promptAction.showToast({ message: '设备已关闭远程控制，仅可查看' });
       return;
@@ -2361,6 +2436,13 @@ export struct TaskPageContent {
       this.error = '任务信息缺失，请返回列表重新进入';
       return;
     }
+    if (!this.composerModelReselectionExempt(text, false)
+      && sessionSendNeedsModelReselection(this.modelVisibilityOverrides, s, this.pendingAgentSwitchIntent)) {
+      this.error = this.v12String('v132_model_reselection_required');
+      this.openComposerControlPopup('model');
+      return;
+    }
+    this.selectedLearnRoute = '';
     // 只把稳定 localId 交给附件队列；@State/@Prop 镜像可能不是同一对象引用。
     const sentImageIds = this.imageQueue.images.map((image: ComposerImage) => image.localId);
     const sentSources = new Map(this.imageSources);
@@ -3087,7 +3169,8 @@ export struct TaskPageContent {
   private isShareableMessageItem(item: RenderItem): boolean {
     if (item.type !== 'message') return false;
     const message = item as RenderMessageItem;
-    if (message.hidden || (message.kind !== 'user' && message.kind !== 'assistant')) return false;
+    if (message.hidden || message.orcaCard !== null
+      || (message.kind !== 'user' && message.kind !== 'assistant')) return false;
     if (message.message === undefined) return message.key.length > 0;
     const source = message.message;
     if (source.systemCardType.length > 0 || source.isSyntheticTrigger || source.presentedAsAgent) {
@@ -4237,21 +4320,7 @@ export struct TaskPageContent {
 
   /** 时长格式化（对齐 shared formatDuration：Xs / Xm Ys / Xh Ym）。 */
   private formatDuration(ms: number): string {
-    if (ms <= 0) {
-      return '1s';
-    }
-    const totalSeconds = Math.max(1, Math.round(ms / 1000));
-    if (totalSeconds < 60) {
-      return `${totalSeconds}s`;
-    }
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    if (minutes < 60) {
-      return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
-    }
-    const hours = Math.floor(minutes / 60);
-    const restMinutes = minutes % 60;
-    return restMinutes > 0 ? `${hours}h ${restMinutes}m` : `${hours}h`;
+    return formatWorkDuration(ms);
   }
 
   private toggleExpanded(list: string[], key: string): string[] {
@@ -4752,8 +4821,21 @@ export struct TaskPageContent {
     if (this.sending || this.deviceDisabled || this.pickingImages || this.pickingFiles) return false;
     if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) return false;
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) return false;
+    if (this.composerNeedsModelReselection()) return false;
     return composerDocumentHasContent(this.composerDocument)
       || this.imageQueue.readyImages().length > 0 || this.fileQueue.readyFiles().length > 0;
+  }
+
+  private composerModelReselectionExempt(text: string, allowLearn: boolean): boolean {
+    if (this.imageQueue.images.length > 0 || this.fileQueue.files.length > 0) return false;
+    return allowLearn && parseLearnCommand(text, this.selectedLearnRoute === 'agent-skill').matched;
+  }
+
+  private composerNeedsModelReselection(): boolean {
+    const session = this.session();
+    return session !== undefined && this.editingQueueClientId.length === 0
+      && !this.composerModelReselectionExempt(serializeComposerDocument(this.composerDocument).text, true)
+      && sessionSendNeedsModelReselection(this.modelVisibilityOverrides, session, this.pendingAgentSwitchIntent);
   }
 
   private restoreComposerDraft(): void {
@@ -6450,93 +6532,106 @@ export struct TaskPageContent {
 
   @Builder
   composerBar() {
-    ConversationComposer({
-      input: this.input,
-      focused: this.composerFocused,
-      surfaceExpanded: this.composerSurfaceVisible,
-      images: this.composerImages,
-      files: this.composerFiles,
-      atoms: composerAtomPresentations(this.composerDocument),
-      sending: this.sending,
-      streaming: this.sessionStreaming,
-      streamingElapsedText: this.sessionActivityElapsedText(),
-      hasContent: this.hasComposerContent(),
-      canSend: this.canSend(),
-      composerEnabled: !this.deviceDisabled && !this.leavingForCreationEdit
-        && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions),
-      pickingImages: this.pickingImages,
-      pickingFiles: this.pickingFiles,
-      contextBusy: this.contextRpcBusy,
-      toolbarReady: this.composerToolbarReady,
-      runtimeRouteLocked: this.runtimeRouteLocked(),
-      hasPermissionOptions: this.permissionOptions.length > 0,
-      hasAgentOptions: supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported),
-      hasModelOptions: (this.runtimeRouteLocked() || this.visibleModelOptions().length > 0)
-        && this.currentModelLabel().length > 0,
-      permissionMode: this.effectivePermissionMode(),
-      permissionLabel: this.currentPermissionModeLabel(),
-      planModeEnabled: this.planModeEnabled,
-      agentLabel: modelAgentLabel(this.composerAgentKind()),
-      modelLabel: this.currentModelLabel(),
-      effortLabel: this.currentModelEffortLabel(),
-      permissionPopupVisible: this.composerPermissionPopupOpen,
-      agentPopupVisible: this.composerAgentPopupOpen,
-      modelPopupVisible: this.composerModelPopupOpen,
-      showAddButton: true,
-      showStreamingStatus: true,
-      floatingGlass: true,
-      compactToolbar: true,
-      floatingBottomInset: this.paneComposerBottomInset,
-      inputId: 'task-composer-input',
-      onInputChange: (value: string): void => {
-        if (this.leavingForCreationEdit) return;
-        this.applyComposerTextChange(value);
-      },
-      onFocusChange: (focused: boolean): void => {
-        this.handleComposerFocusChange(focused);
-      },
-      onAdd: (): void => this.openContextSheet(),
-      onPermission: (): void => this.openComposerControlPopup('permission'),
-      onAgent: (): void => this.openComposerControlPopup('agent'),
-      onModel: (): void => this.openComposerControlPopup('model'),
-      onPermissionPopupDismiss: (): void => {
-        this.dismissComposerControlPopup('permission');
-      },
-      onAgentPopupDismiss: (): void => {
-        this.dismissComposerControlPopup('agent');
-      },
-      onModelPopupDismiss: (): void => {
-        this.dismissComposerControlPopup('model');
-      },
-      permissionPopupContent: (): void => {
-        this.permissionContextView();
-      },
-      agentPopupContent: (): void => {
-        this.agentContextView();
-      },
-      modelPopupContent: (): void => {
-        this.modelContextView();
-      },
-      onPlanToggle: (): void => {
-        void this.togglePlanMode();
-      },
-      onExpand: (): void => this.expandComposerForEditing(true),
-      onSend: (): void => this.send(),
-      onAbort: (): void => this.abort(),
-      onPreviewImage: (image: ComposerImage): void => {
-        if (image.status !== 'ready' || image.uri.length === 0) return;
-        uiAnimateFastState(this.getUIContext(), () => {
-          this.previewImageUrl = image.uri;
-        });
-      },
-      onRemoveImage: (localId: string): void => this.imageQueue.remove(localId),
-      onRetryImage: (localId: string): void => this.imageQueue.retry(localId),
-      onRemoveFile: (localId: string): void => this.fileQueue.remove(localId),
-      onRetryFile: (localId: string): void => this.fileQueue.retry(localId),
-      onRemoveAtom: (atom: ComposerAtomPresentation): void => {
-        this.setComposerDocument(removeComposerNode(this.composerDocument, atom.index));
-      },
-    })
+    Column({ space: 4 }) {
+      if (this.composerNeedsModelReselection()
+        && (this.composerSurfaceVisible || this.composerFocused || composerDocumentHasContent(this.composerDocument)
+          || this.composerImages.length > 0 || this.composerFiles.length > 0)) {
+        Text(this.v12String('v132_model_reselection_required'))
+          .fontSize(uiFontSize(12))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.danger'))
+          .width('calc(100% - 24vp)')
+          .alignSelf(ItemAlign.Center)
+      }
+      ConversationComposer({
+        input: this.input,
+        focused: this.composerFocused,
+        surfaceExpanded: this.composerSurfaceVisible,
+        images: this.composerImages,
+        files: this.composerFiles,
+        atoms: composerAtomPresentations(this.composerDocument),
+        sending: this.sending,
+        streaming: this.sessionStreaming,
+        streamingElapsedText: this.sessionActivityElapsedText(),
+        hasContent: this.hasComposerContent(),
+        canSend: this.canSend(),
+        composerEnabled: !this.deviceDisabled && !this.leavingForCreationEdit
+          && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions),
+        pickingImages: this.pickingImages,
+        pickingFiles: this.pickingFiles,
+        contextBusy: this.contextRpcBusy,
+        toolbarReady: this.composerToolbarReady,
+        runtimeRouteLocked: this.runtimeRouteLocked(),
+        hasPermissionOptions: this.permissionOptions.length > 0,
+        hasAgentOptions: supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported),
+        hasModelOptions: (this.runtimeRouteLocked() || this.visibleModelOptions().length > 0)
+          && this.currentModelLabel().length > 0,
+        permissionMode: this.effectivePermissionMode(),
+        permissionLabel: this.currentPermissionModeLabel(),
+        planModeEnabled: this.planModeEnabled,
+        agentLabel: modelAgentLabel(this.composerAgentKind()),
+        modelLabel: this.currentModelLabel(),
+        effortLabel: this.currentModelEffortLabel(),
+        permissionPopupVisible: this.composerPermissionPopupOpen,
+        agentPopupVisible: this.composerAgentPopupOpen,
+        modelPopupVisible: this.composerModelPopupOpen,
+        showAddButton: true,
+        showStreamingStatus: true,
+        floatingGlass: true,
+        compactToolbar: true,
+        floatingBottomInset: this.paneComposerBottomInset,
+        inputId: 'task-composer-input',
+        onInputChange: (value: string): void => {
+          if (this.leavingForCreationEdit) return;
+          this.applyComposerTextChange(value);
+        },
+        onFocusChange: (focused: boolean): void => {
+          this.handleComposerFocusChange(focused);
+        },
+        onAdd: (): void => this.openContextSheet(),
+        onPermission: (): void => this.openComposerControlPopup('permission'),
+        onAgent: (): void => this.openComposerControlPopup('agent'),
+        onModel: (): void => this.openComposerControlPopup('model'),
+        onPermissionPopupDismiss: (): void => {
+          this.dismissComposerControlPopup('permission');
+        },
+        onAgentPopupDismiss: (): void => {
+          this.dismissComposerControlPopup('agent');
+        },
+        onModelPopupDismiss: (): void => {
+          this.dismissComposerControlPopup('model');
+        },
+        permissionPopupContent: (): void => {
+          this.permissionContextView();
+        },
+        agentPopupContent: (): void => {
+          this.agentContextView();
+        },
+        modelPopupContent: (): void => {
+          this.modelContextView();
+        },
+        onPlanToggle: (): void => {
+          void this.togglePlanMode();
+        },
+        onExpand: (): void => this.expandComposerForEditing(true),
+        onSend: (): void => this.send(),
+        onAbort: (): void => this.abort(),
+        onPreviewImage: (image: ComposerImage): void => {
+          if (image.status !== 'ready' || image.uri.length === 0) return;
+          uiAnimateFastState(this.getUIContext(), () => {
+            this.previewImageUrl = image.uri;
+          });
+        },
+        onRemoveImage: (localId: string): void => this.imageQueue.remove(localId),
+        onRetryImage: (localId: string): void => this.imageQueue.retry(localId),
+        onRemoveFile: (localId: string): void => this.fileQueue.remove(localId),
+        onRetryFile: (localId: string): void => this.fileQueue.retry(localId),
+        onRemoveAtom: (atom: ComposerAtomPresentation): void => {
+          this.setComposerDocument(removeComposerNode(this.composerDocument, atom.index));
+        },
+      })
+    }
+    .width('100%')
   }
 
   /** 分栏详情内的 Composer 选择层；模型使用紧凑弹窗，其它选择仍沿用底部面板。 */
@@ -7232,7 +7327,9 @@ export struct TaskPageContent {
   @Builder
   renderItem(item: RenderItem) {
     if (item.type === 'message') {
-      if ((item as RenderMessageItem).kind === 'system'
+      if ((item as RenderMessageItem).orcaCard !== null) {
+        this.orcaCollabBlock(item as RenderMessageItem)
+      } else if ((item as RenderMessageItem).kind === 'system'
         && (item as RenderMessageItem).message !== undefined
         && (item as RenderMessageItem).message?.systemCardType === 'compact') {
         this.compactBoundaryBlock(item as RenderMessageItem)
@@ -7259,6 +7356,97 @@ export struct TaskPageContent {
     } else if (item.type === 'work_group') {
       this.workGroupBlock(item as RenderWorkGroupItem)
     }
+  }
+
+  private orcaPresentationText(key: string, args: Record<string, Object>): string {
+    const name = ORCA_PRESENTATION_RESOURCES[key];
+    if (name === undefined) return '';
+    switch (key) {
+      case 'interaction.collab.batchTitle': return this.v12String(name, String(readNum(args, 'count', 0)));
+      case 'interaction.collab.dispatchTitle': return this.v12String(name, readStr(args, 'who'));
+      case 'interaction.collab.dispatchRole': return this.v12String(name, readStr(args, 'meta'));
+      case 'interaction.collab.fromWorkerNamed': return this.v12String(name, readStr(args, 'role'));
+      default: return this.v12String(name);
+    }
+  }
+
+  private orcaTitle(item: RenderMessageItem): string {
+    const card = item.orcaCard;
+    return card === null ? '' : this.orcaPresentationText(card.titleKey, card.titleArgs);
+  }
+
+  private orcaBody(item: RenderMessageItem): string {
+    const card = item.orcaCard;
+    return card === null ? '' : card.bodyKey.length > 0
+      ? this.orcaPresentationText(card.bodyKey, card.bodyArgs) : card.body;
+  }
+
+  private orcaCanExpand(item: RenderMessageItem): boolean {
+    return item.orcaCard !== null && orcaCollabCanExpand(item.orcaCard);
+  }
+
+  private orcaExpansionKey(item: RenderMessageItem): string {
+    return orcaCollabExpansionKey(this.presentationAccountKey, this.deviceId, item);
+  }
+
+  private toggleOrcaCard(item: RenderMessageItem): void {
+    if (!this.orcaCanExpand(item) || this.shareSelectionActive) return;
+    const key = this.orcaExpansionKey(item);
+    uiAnimateFastState(this.getUIContext(), () => {
+      this.expandedOrcaCards = this.toggleExpanded(this.expandedOrcaCards, key).slice(-256);
+    });
+  }
+
+  @Builder
+  orcaCollabBlock(item: RenderMessageItem) {
+    Column({ space: 6 }) {
+      Button() {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.ellipsis_message'))
+            .fontSize(uiFontSize(16))
+            .fontColor([$r('app.color.text_secondary')])
+          Text(this.orcaTitle(item))
+            .fontSize(uiFontSize(14))
+            .lineHeight(uiLineHeight(20))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+            .textAlign(TextAlign.Start)
+          if (this.orcaCanExpand(item)) {
+            this.disclosureChevron(this.isIn(this.expandedOrcaCards, this.orcaExpansionKey(item)),
+              $r('app.color.text_tertiary'))
+          }
+        }
+        .width('100%')
+      }
+      .type(ButtonType.Normal)
+      .width('100%')
+      .constraintSize({ minHeight: 44 })
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .borderRadius(UI_RADIUS_CONTROL)
+      .clickEffect(this.orcaCanExpand(item) ? UI_LIST_CLICK_EFFECT : undefined)
+      .accessibilityText(this.orcaTitle(item) + ' ' + this.v12String(
+        this.isIn(this.expandedOrcaCards, this.orcaExpansionKey(item))
+          ? 'v12_collapse_subagent_content' : 'v12_expand_subagent_content'))
+      .onClick(() => this.toggleOrcaCard(item))
+      if (this.orcaCanExpand(item) && this.isIn(this.expandedOrcaCards, this.orcaExpansionKey(item))) {
+        Text(this.orcaBody(item))
+          .fontSize(uiFontSize(13))
+          .lineHeight(uiLineHeight(20))
+          .fontColor($r('app.color.text_secondary'))
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+      }
+    }
+    .width('100%')
+    .padding(10)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 0.5, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .alignItems(HorizontalAlign.Start)
   }
 
   private agentTaskStatus(item: RenderAgentTaskItem): string {
@@ -9191,6 +9379,107 @@ export struct TaskPageContent {
     .onClick(action)
   }
 
+  private findPresentationMessage(items: RenderItem[], key: string): RenderMessageItem | null {
+    for (const item of items) {
+      if (item.type === 'message' && item.key === key) return item as RenderMessageItem;
+      if (item.type === 'work_group' || item.type === 'subagent_group') {
+        const children = item.type === 'work_group'
+          ? (item as RenderWorkGroupItem).children : (item as RenderSubagentGroupItem).children;
+        const found = this.findPresentationMessage(children, key);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  }
+
+  private isCurrentPresentationItem(item: RenderMessageItem): boolean {
+    const current = this.findPresentationMessage(this.items, item.key);
+    return item.message !== undefined && current?.message === item.message
+      && (item.message.sessionId.length === 0 || item.message.sessionId === this.sessionId);
+  }
+
+  private presentationSourceBadges(item: RenderMessageItem): MessageSourceBadge[] {
+    return item.message?.role === 'user' && !item.message.isSyntheticTrigger
+      ? messageSourceBadges(item.message.agentMeta, this.sourceViewerDeviceId, this.sourceDeviceNames) : [];
+  }
+
+  private sourceBadgeLabel(badge: MessageSourceBadge): string {
+    if (badge.kind === 'mobile' || badge.kind === 'desktop') {
+      const name = badge.kind === 'mobile' ? 'v132_source_device_mobile' : 'v132_source_device_desktop';
+      return badge.name.length > 0 ? this.v12String(name + '_named', badge.name) : this.v12String(name);
+    }
+    const name = badge.kind === 'plugin' ? 'v132_source_plugin' : 'v132_session_origin';
+    return badge.name.length > 0 ? this.v12String(name + '_named', badge.name) : this.v12String(name);
+  }
+
+  private sourceBadgeIdLabel(badge: MessageSourceBadge): string {
+    const name = badge.kind === 'plugin' ? 'v132_source_plugin_id'
+      : badge.kind === 'session' ? 'v132_source_session_id' : 'v132_source_device_id';
+    return badge.id.length > 0 ? this.v12String(name, badge.id) : '';
+  }
+
+  private showSourceBadgeActions(item: RenderMessageItem, badge: MessageSourceBadge): void {
+    if (this.shareSelectionActive || !this.isCurrentPresentationItem(item) || badge.id.length === 0) return;
+    const scope = this.presentationScope();
+    const copyAction = (): void => {
+      if (!this.isCurrentPresentationScope(scope)) return;
+      this.copyPlainText(badge.id, this.v12String('v132_source_id_copied'), scope);
+    };
+    if (badge.kind === 'mobile' || badge.kind === 'desktop') {
+      this.getUIContext().showActionSheet({
+        title: this.sourceBadgeLabel(badge),
+        message: this.sourceBadgeIdLabel(badge),
+        sheets: [{ title: this.v12String('v132_source_copy_id'), action: copyAction }, {
+          title: this.v12String('v132_source_open_settings'),
+          action: () => {
+            if (!this.isCurrentPresentationScope(scope)) return;
+            if (this.sourceDeviceDirectoryLoaded && !this.sourceDeviceNames.has(badge.id)) {
+              this.getUIContext().getPromptAction().showToast({ message: this.v12String('v132_source_device_removed') });
+              return;
+            }
+            void this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsPage' });
+          },
+        }],
+      });
+    } else {
+      this.getUIContext().showActionSheet({
+        title: this.sourceBadgeLabel(badge),
+        message: this.sourceBadgeIdLabel(badge),
+        sheets: [{ title: this.v12String('v132_source_copy_id'), action: copyAction }],
+      });
+    }
+  }
+
+  @Builder
+  messageSourceLabels(item: RenderMessageItem) {
+    Column() {
+      ForEach(this.presentationSourceBadges(item), (badge: MessageSourceBadge) => {
+        Button() {
+          Text(this.sourceBadgeLabel(badge))
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(16))
+            .fontColor($r('app.color.text_tertiary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(item.kind === 'user' ? TextAlign.End : TextAlign.Start)
+            .width('100%')
+        }
+        .type(ButtonType.Normal)
+        .constraintSize({ minHeight: 44 })
+        .width('100%')
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .clickEffect(badge.id.length > 0 ? UI_LIST_CLICK_EFFECT : undefined)
+        .accessibilityText(this.sourceBadgeLabel(badge) + ' ' + this.sourceBadgeIdLabel(badge))
+        .onClick(() => this.showSourceBadgeActions(item, badge))
+      }, (badge: MessageSourceBadge) => JSON.stringify([
+        this.presentationAccountKey, this.deviceId, this.sessionId, item.key, badge.kind, badge.id, badge.name]))
+    }
+    .width(item.kind === 'user' ? '86%' : '100%')
+    .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
+  }
+
   @Builder
   messageBlock(item: RenderMessageItem) {
     if (this.shareSelectionActive && this.isShareableMessageItem(item)) {
@@ -9243,9 +9532,14 @@ export struct TaskPageContent {
   @Builder
   messageBlockContent(item: RenderMessageItem, reserveSelectionSpace: boolean) {
     Column({ space: 2 }) {
+      if (!reserveSelectionSpace && this.presentationSourceBadges(item).length > 0) {
+        this.messageSourceLabels(item)
+      }
       if (item.kind === 'user'
         && item.message !== undefined
-        && item.message.automationOrigin) {
+        && item.message.automationOrigin
+        && !this.presentationSourceBadges(item).some((badge: MessageSourceBadge) =>
+          badge.kind === 'plugin' || badge.kind === 'session')) {
         Row({ space: 4 }) {
           SymbolGlyph($r('sys.symbol.timer'))
             .fontSize(uiFontSize(12))
@@ -10040,7 +10334,7 @@ export struct TaskPageContent {
   selectableInlineTokenSpans(
     tokens: InlineToken[], fontSize: number, lineHeight: number, heading: boolean,
   ) {
-    ForEach(tokens, (t: InlineToken) => {
+    ForEach(this.sentInlineTokens(tokens), (t: InlineToken) => {
       if (t.kind === 'code') {
         Span(t.value)
           .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
@@ -10068,6 +10362,14 @@ export struct TaskPageContent {
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontFamily('serif').fontStyle(FontStyle.Italic)
           .fontColor($r('app.color.code_text'))
+      } else if (t.kind === 'link' && parseSessionDeepLink(this.normalizedSessionLink(t.url)) !== null) {
+        Span(this.sentInlineLinkLabel(t))
+          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
+          .fontColor($r('app.color.text_primary'))
+          .textBackgroundStyle({ color: $r('app.color.bg_chip') })
+          .decoration({ type: TextDecorationType.Underline })
+          .onClick(() => this.openUrl(this.normalizedSessionLink(t.url)))
       } else if (t.kind === 'link' && this.isLocalReference(t.url)) {
         Span(t.value)
           .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
@@ -10350,7 +10652,7 @@ export struct TaskPageContent {
     heading: boolean, secondary: boolean, constrainToParent: boolean = false,
   ) {
     Text() {
-      ForEach(tokens, (t: InlineToken) => {
+      ForEach(this.sentInlineTokens(tokens), (t: InlineToken) => {
         if (t.kind === 'code') {
           Span(t.value)
             .fontFamily('monospace')
@@ -10370,6 +10672,12 @@ export struct TaskPageContent {
             .fontFamily('serif')
             .fontStyle(FontStyle.Italic)
             .fontColor($r('app.color.code_text'))
+        } else if (t.kind === 'link' && parseSessionDeepLink(this.normalizedSessionLink(t.url)) !== null) {
+          Span(this.sentInlineLinkLabel(t))
+            .fontColor($r('app.color.text_primary'))
+            .textBackgroundStyle({ color: $r('app.color.bg_chip') })
+            .decoration({ type: TextDecorationType.Underline })
+            .onClick(() => this.openUrl(this.normalizedSessionLink(t.url)))
         } else if (t.kind === 'link' && this.isLocalReference(t.url)) {
           // Desktop 将文件路径、代码文件名等本地引用显示为中性的 code chip，
           // 只有真正的外部链接使用 accent；这样不会把 .ets / HAP 误染成蓝色。
@@ -10404,9 +10712,102 @@ export struct TaskPageContent {
 
   // ─── 样式/工具 ──────────────────────────────────────────────────────────────
 
+  private normalizedSessionLink(url: string): string {
+    return url.replace(/^xdt-maker:\/\//i, 'cindy://');
+  }
+
+  private sentInlineViewToken(source: InlineToken, kind: string, value: string, url: string = ''): InlineToken {
+    const token = new InlineToken();
+    token.seq = this.sentInlineTokenSeq--;
+    token.kind = kind;
+    token.value = value;
+    token.url = url;
+    token.width = source.width;
+    token.height = source.height;
+    return token;
+  }
+
+  private appendSentInlineTokens(source: InlineToken, output: InlineToken[], depth: number = 0): void {
+    if (source.kind !== 'text' && source.kind !== 'strong'
+      && source.kind !== 'emphasis' && source.kind !== 'strikethrough') {
+      output.push(source);
+      return;
+    }
+    if (!/(?:cindy|xdt-maker):\/\/session\//i.test(source.value)) {
+      output.push(source);
+      return;
+    }
+    if (source.kind !== 'text' && depth < 4) {
+      const nested = tokenizeInline(source.value);
+      if (nested.some((token: InlineToken) => token.kind === 'link'
+        && parseSessionDeepLink(this.normalizedSessionLink(token.url)) !== null)) {
+        for (const token of nested) {
+          const view = token.kind === 'text'
+            ? this.sentInlineViewToken(token, source.kind, token.value) : token;
+          this.appendSentInlineTokens(view, output, depth + 1);
+        }
+        return;
+      }
+    }
+    const pattern = /(?:cindy|xdt-maker):\/\/session\/[A-Za-z0-9%~_-]+(?:\?[A-Za-z0-9%&=~._-]*)?/gi;
+    let cursor = 0;
+    let match: RegExpExecArray | null = pattern.exec(source.value);
+    while (match !== null) {
+      const url = match[0].replace(/[.,;:!?]+$/, '');
+      if (parseSessionDeepLink(this.normalizedSessionLink(url)) !== null) {
+        if (match.index > cursor) output.push(this.sentInlineViewToken(source, source.kind, source.value.slice(cursor, match.index)));
+        output.push(this.sentInlineViewToken(source, 'link', url, url));
+        cursor = match.index + url.length;
+        pattern.lastIndex = cursor;
+      }
+      match = pattern.exec(source.value);
+    }
+    if (cursor === 0) output.push(source);
+    else if (cursor < source.value.length) output.push(this.sentInlineViewToken(source, source.kind, source.value.slice(cursor)));
+  }
+
+  private sentInlineTokens(tokens: InlineToken[]): InlineToken[] {
+    const cached = this.sentInlineTokenCache.get(tokens);
+    if (cached !== undefined) return cached;
+    const output: InlineToken[] = [];
+    for (const token of tokens) this.appendSentInlineTokens(token, output);
+    if (this.sentInlineTokenCache.size >= 256) this.sentInlineTokenCache.clear();
+    this.sentInlineTokenCache.set(tokens, output);
+    return output;
+  }
+
+  private sentInlineLinkLabel(token: InlineToken): string {
+    const target = parseSessionDeepLink(this.normalizedSessionLink(token.url));
+    if (target === null) return token.value;
+    if (target.messageClientId.length === 0) {
+      if (token.value.trim().length > 0 && token.value.trim() !== token.url) return token.value;
+      return AppServices.instance.tasks.findSessionById(target.sessionId, this.deviceId)?.title
+        || this.v12String('v132_session_chip_fallback');
+    }
+    const message = AppServices.instance.messages.getMessages(target.sessionId, this.deviceId)
+      .find((row: RemoteMessage) => row.clientId === target.messageClientId || row.id === target.messageClientId);
+    if (message === undefined || (message.role !== 'user' && message.role !== 'assistant')
+      || message.isSyntheticTrigger || message.systemCardType.length > 0) return this.v12String('v132_message_chip_fallback');
+    const cached = this.sentMessageChipCache.get(message);
+    if (cached !== undefined && !message.isStreaming) return cached;
+    const projected = buildRenderItems([message]).find((item: RenderItem) => item.type === 'message'
+      && ((item as RenderMessageItem).kind === 'user' || (item as RenderMessageItem).kind === 'assistant'));
+    let text = projected === undefined ? '' : (projected as RenderMessageItem).body;
+    if (readBool(recordOrEmpty(message.content), 'quotesEncoded', false)) {
+      text = text.split('\n').filter((line: string) => line.trimStart() !== '> <!-- cindy-composer-quote -->').join('\n');
+    }
+    const label = sentSessionMessageChipLabel(text) || this.v12String('v132_message_chip_fallback');
+    if (!message.isStreaming) {
+      if (this.sentMessageChipCache.size >= 256) this.sentMessageChipCache.clear();
+      this.sentMessageChipCache.set(message, label);
+    }
+    return label;
+  }
+
   private isLocalReference(url: string): boolean {
     const lower = url.toLowerCase();
     return !lower.startsWith('http://')
+      && !lower.startsWith('cindy://') && !lower.startsWith('xdt-maker://')
       && !lower.startsWith('https://')
       && !lower.startsWith('mailto:')
       && !lower.startsWith('#');
@@ -10499,16 +10900,16 @@ export struct TaskPageContent {
     return false;
   }
 
-  private copyPlainText(value: string, successMessage: string): void {
-    if (value.length === 0) return;
+  private copyPlainText(value: string, successMessage: string,
+    scope: TaskPresentationScope = this.presentationScope()): void {
+    if (value.length === 0 || !this.isCurrentPresentationScope(scope)) return;
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, value);
-    const lifecycleGeneration = this.pageLifecycleGeneration;
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
+      if (this.isCurrentPresentationScope(scope)) {
         promptAction.showToast({ message: successMessage });
       }
     }).catch(() => {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
+      if (this.isCurrentPresentationScope(scope)) {
         promptAction.showToast({ message: '复制失败' });
       }
     });
@@ -10722,13 +11123,7 @@ export struct TaskPageContent {
   }
 
   private messageActionItem(): RenderMessageItem | null {
-    for (let i = 0; i < this.items.length; i++) {
-      const candidate = this.items[i];
-      if (candidate.type === 'message' && candidate.key === this.messageActionItemKey) {
-        return candidate as RenderMessageItem;
-      }
-    }
-    return null;
+    return this.findPresentationMessage(this.items, this.messageActionItemKey);
   }
 
   private closeMessageActions(): void {
@@ -10738,11 +11133,11 @@ export struct TaskPageContent {
   }
 
   private selectMessageAction(action: () => void): void {
+    const scope = this.presentationScope();
     this.closeMessageActions();
     // 与 iOS 一致先完成 Sheet 退场，再执行 toast / 二次确认，避免两层弹窗叠在一起。
-    const lifecycleGeneration = this.pageLifecycleGeneration;
     setTimeout(() => {
-      if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+      if (!this.isCurrentPresentationScope(scope)) return;
       action();
     }, UI_MOTION_FAST);
   }
@@ -10757,49 +11152,63 @@ export struct TaskPageContent {
     this.copyPlainText(link, '已复制消息链接');
   }
 
+  private canDeleteMessage(item: RenderMessageItem): boolean {
+    return (item.kind === 'user' || item.kind === 'assistant') && item.orcaCard === null
+      && (item.message?.clientId.length ?? 0) > 0 && this.isCurrentPresentationItem(item)
+      && !this.deviceDisabled && !this.isCreationBlockingRemoteOps();
+  }
+
   private confirmDeleteMessage(item: RenderMessageItem): void {
     const clientId = item.message?.clientId ?? '';
-    if (clientId.length === 0 || this.sessionStreaming || this.messageActionBusyId.length > 0) return;
-    const lifecycleGeneration = this.pageLifecycleGeneration;
-    const deviceId = this.deviceId;
-    const sessionId = this.sessionId;
+    if (!this.canDeleteMessage(item) || this.messageActionBusyId.length > 0) return;
+    const scope = this.presentationScope();
     this.getUIContext().showAlertDialog({
-      title: '删除消息？',
-      message: item.kind === 'assistant' ? '这会删除同一轮中的全部 AI 输出。' : '这条消息将从任务记录中移除。',
-      primaryButton: { value: '取消', action: () => {} },
+      title: this.v12String('v132_message_delete_title'),
+      message: this.v12String('v132_message_delete_body'),
+      primaryButton: { value: this.v12String('v131_cancel'), action: () => {} },
       secondaryButton: {
-        value: '删除',
+        value: this.v12String('v132_message_delete_one'),
         fontColor: $r('app.color.danger'),
-        action: () => void this.deleteMessage(clientId, lifecycleGeneration, deviceId, sessionId),
+        action: () => void this.deleteMessage(clientId, item.key, scope),
       },
     });
   }
 
   private async deleteMessage(
     clientId: string,
-    lifecycleGeneration: number,
-    deviceId: string,
-    sessionId: string,
+    messageKey: string,
+    scope: TaskPresentationScope,
   ): Promise<void> {
-    if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+    if (!this.isCurrentPresentationScope(scope) || this.messageActionBusyId.length > 0) return;
+    const target = this.findPresentationMessage(this.items, messageKey);
+    if (target === null || target.message?.clientId !== clientId || !this.canDeleteMessage(target)) return;
     this.messageActionBusyId = clientId;
     try {
       const deleted = await AppServices.instance.messages.deleteMessage(
-        deviceId, sessionId, clientId);
+        scope.deviceId, scope.sessionId, clientId);
+      if (!this.isCurrentPresentationScope(scope)) return;
       if (deleted.length === 0) throw new Error('empty delete result');
-      await AppServices.instance.messages.reloadSession(deviceId, sessionId);
-      if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-      promptAction.showToast({ message: deleted.length > 1 ? `已删除 ${deleted.length} 条消息` : '消息已删除' });
-    } catch (e) {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '删除失败，请稍后重试' });
+      await AppServices.instance.messages.reloadSession(scope.deviceId, scope.sessionId);
+      if (!this.isCurrentPresentationScope(scope)) return;
+      this.getUIContext().getPromptAction().showToast({ message: deleted.length > 1
+        ? this.v12String('v132_message_delete_success_many', String(deleted.length))
+        : this.v12String('v132_message_delete_success') });
+    } catch (error) {
+      if (this.isCurrentPresentationScope(scope)) {
+        const detail = error instanceof Error ? error.message : '';
+        const running = (error instanceof DlError && error.code === 'SESSION_RUNNING')
+          || detail.startsWith('[SESSION_RUNNING]');
+        this.getUIContext().getPromptAction().showToast({ message: this.v12String(running
+          ? 'v132_message_delete_busy' : isRemoteBusyError(error)
+            ? 'v132_remote_busy' : 'v132_message_delete_failed') });
       }
     } finally {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.messageActionBusyId = '';
+      if (this.isCurrentPresentationScope(scope)) this.messageActionBusyId = '';
     }
   }
 
   private showMessageActions(item: RenderMessageItem): void {
+    if (!this.isCurrentPresentationItem(item)) return;
     uiAnimateState(this.getUIContext(), () => {
       this.messageActionItemKey = item.key;
     });
@@ -10837,11 +11246,11 @@ export struct TaskPageContent {
               if (item !== null) this.selectMessageAction(() => this.confirmRewind(item));
             })
           }
-          if (!this.sessionStreaming) {
+          if (this.messageActionItem() !== null && this.canDeleteMessage(this.messageActionItem() as RenderMessageItem)) {
             Divider()
               .strokeWidth(0.5)
               .color($r('app.color.message_action_border'))
-            this.messageActionOption('删除本条消息', $r('sys.symbol.trash'), true, () => {
+            this.messageActionOption(this.v12String('v132_message_delete_one'), $r('sys.symbol.trash'), true, () => {
               const item = this.messageActionItem();
               if (item !== null) this.selectMessageAction(() => this.confirmDeleteMessage(item));
             })
