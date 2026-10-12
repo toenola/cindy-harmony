@@ -55,6 +55,8 @@ function wrap<T>(p: Promise<T>): Promise<T> {
 const getInFlight = new Map<string, Promise<Session>>();
 
 export type SessionListOptions = {
+  /** Local list continuation; does not change the default capped query. */
+  before?: { updatedAt: number; id: string };
   includePinned?: boolean;
   /** forceRefresh / status 重拉：绕开 main 侧 in-flight 合并。 */
   fresh?: boolean;
@@ -94,6 +96,7 @@ export async function list(
 
 export async function create(body?: {
   id?: string;
+  title?: string;
   workingDir?: string;
   workspaceKind?: WorkspaceKind;
   model?: string;
@@ -111,11 +114,21 @@ export async function create(body?: {
    *  远端绝对路径; codex agent 跑在远端机器, 本地不 spawn。 */
   remoteHostId?: string;
   /**
+   * Agent 在同账号另一台电脑上运行:那台电脑的 deviceId。任务、项目文件与命令仍在本机,
+   * 模型来源由那台电脑解析。与 remoteHostId 互斥。
+   */
+  agentDeviceId?: string;
+  /**
    * per-session 来源(供应商)显式选择,落盘 sessions.provider_id(与 update 同列、同语义)。
    * null/undefined = 跟随默认路由。草稿态发送建会话时透传用户在草稿里选定的来源,
    * 让新会话与「会话内切来源」行为一致(首个请求即走对供应商)。
    */
   providerId?: string | null;
+  /**
+   * Cindy Make code task marker. Main only accepts it for the managed source
+   * checkout; the persisted source later drives the `cindy_make` tool injection.
+   */
+  source?: 'cindy-make';
 }): Promise<Session> {
   return wrap(window.electronAPI.localDb.sessions.create(body));
 }
@@ -338,7 +351,7 @@ export async function rewindPreview(
 export async function rewindCommit(
   sessionId: string,
   clientId: string,
-  opts?: { requireLatestUser?: boolean; stopIfRunning?: boolean },
+  opts?: { requireLatestUser?: boolean; stopIfRunning?: boolean; allowFileRestore?: boolean },
 ): Promise<Session> {
   return wrap(
     makerApiFor(sessionId).rewindCommit(sessionId, clientId, opts) as Promise<Session>,

@@ -7,7 +7,8 @@
  *      向导**不得**挂载即自关:codexAuth 是整机凭证态,不含按账号的 native binding,
  *      自关会既不弹 UI 也不补绑定,「去授权」从此点不出任何效果(回归:换账号死循环)。
  *   2. 本向导内点「授权」发起登录并成功 → 正常收口 onDone('openai')。
- *   3. anthropic entry 直达 → 授权步正常渲染(对照组,证明弹窗结构本身可用)。
+ *   3. anthropic entry 直达 → 授权步正常渲染(对照组,证明弹窗结构本身可用);
+ *      只提供内置 Claude Code 登录,不提供独立账号。
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -96,6 +97,7 @@ beforeEach(() => {
   delete codexState.authSource;
   (window as unknown as { electronAPI: unknown }).electronAPI = {
     maker: {
+      auth: { triggerLogin: vi.fn(async () => ({ authenticated: true, authSource: 'oauth', credentialScope: 'system-shared' })) },
       listProviderPresets: vi.fn(async () => ({ presets: [] })),
       localModelList: vi.fn(async () => ({
         status: { runtime: 'ollama', kind: 'absent', appInstalled: false },
@@ -104,6 +106,7 @@ beforeEach(() => {
       })),
       providerOAuthLogin: vi.fn(async () => ({ ok: true })),
       providerOAuthCancel: vi.fn(),
+      onProviderOAuthProgress: vi.fn(() => () => undefined),
       scanLocalCli: vi.fn(async () => ({ detections: [] })),
     },
   };
@@ -125,6 +128,15 @@ describe('AddProviderWizard — OpenAI 检测建议直达', () => {
     expect(screen.getByText('settings.providers.openai.addIndependentAccount')).not.toBeNull();
     expect(onDone).not.toHaveBeenCalled();
     expect(screen.getByText('settings.providers.openai.useLocalAccount')).not.toBeNull();
+  });
+
+  it('explicitly reconnects the existing local account without browser authorization', async () => {
+    const onDone = vi.fn();
+    renderWizard('openai', onDone);
+    fireEvent.click(screen.getByText('settings.providers.openai.useLocalAccount'));
+    await waitFor(() => expect(onDone).toHaveBeenCalledWith('openai'));
+    expect(window.electronAPI.maker.auth.triggerLogin).toHaveBeenCalledWith('codex', { mode: 'local', ownerId: expect.any(String) });
+    expect(window.electronAPI.maker.providerOAuthLogin).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -160,7 +172,9 @@ describe('AddProviderWizard — OpenAI 检测建议直达', () => {
     renderWizard('anthropic', onDone);
 
     expect(screen.getByText('settings.providers.wizard.titleWith')).not.toBeNull();
-    expect(screen.getByText('settings.providers.button.authorize')).not.toBeNull();
+    // Claude 订阅只经内置 Claude Code 自己的登录使用:不再提供独立 Claude 账号入口。
+    expect(screen.queryByText('settings.providers.openai.addIndependentAccount')).toBeNull();
+    expect(screen.getByText('settings.providers.localAccount.useClaude')).not.toBeNull();
     expect(onDone).not.toHaveBeenCalled();
   });
 });

@@ -3,7 +3,7 @@ import {
   projectScheduleEvent,
   type ScheduleEventProjection,
 } from '@cindy/maker-shared/schedule-events';
-import { invalidateScheduleIndexForDevice } from '@/session/scheduleIndex';
+import { noteScheduleEventInIndexCache } from '@/session/scheduleIndex';
 
 export interface RemoteScheduleEventSnapshot {
   lastProjection: ScheduleEventProjection | null;
@@ -36,6 +36,8 @@ const snapshots = new Map<string, RemoteScheduleEventSnapshot>();
 // `clearDevice()` so mounted screens can observe a presence-offline cleanup even when
 // that device had not emitted a schedule event in the current process.
 const mirrorInvalidationVersions = new Map<string, number>();
+// Keep generations monotonic across recovery/clear without retaining per-device counters.
+let nextMirrorInvalidationGeneration = 0;
 let mirrorInvalidationSnapshot: ReadonlyMap<string, number> = new Map();
 const subs = new Set<() => void>();
 
@@ -47,14 +49,26 @@ export const remoteScheduleEventStore = {
   apply(deviceId: string, payload?: unknown): void {
     if (!deviceId) return;
     const projection = projectScheduleEvent(payload);
-    const prev = snapshots.get(deviceId) ?? emptySnapshot;
     const clearsUnread = projection.unreadImpact === 'may-clear-schedule'
       || projection.unreadImpact === 'clear-all';
+    // 不要求任何刷新、也不带 run 状态的事件(runtime-state 高频诊断)不换快照:否则挂载屏
+    // 每次都重渲染,且会覆盖上一个可操作事件(如 completed)的 lastProjection。
+    if (
+      projection.refresh.runRefresh.mode === 'none'
+      && !projection.refresh.scheduleList
+      && !projection.refresh.sessionIndex
+      && !projection.refresh.unreadSummary
+      && projection.unreadImpact === 'none'
+      && projection.runPatch.status === 'unknown'
+    ) return;
+    const prev = snapshots.get(deviceId) ?? emptySnapshot;
     // Invalidate once before notifying all screens. Consumer-local force loads
     // otherwise launch competing scans for the same authoritative event.
-    if (projection.refresh.sessionIndex || projection.refresh.scheduleList || clearsUnread) {
-      invalidateScheduleIndexForDevice(deviceId);
-    }
+    noteScheduleEventInIndexCache(deviceId, {
+      invalidate: projection.refresh.sessionIndex || projection.refresh.scheduleList || clearsUnread,
+      sessionId: projection.runPatch.sessionId,
+      scheduleListChanged: projection.refresh.scheduleList,
+    });
     snapshots.set(deviceId, {
       lastProjection: projection,
       runsVersion: prev.runsVersion + (projection.refresh.runRefresh.mode === 'none' ? 0 : 1),
@@ -73,12 +87,29 @@ export const remoteScheduleEventStore = {
   },
 
   invalidateDeviceMirror(deviceId: string): void {
-    if (!deviceId) return;
-    snapshots.delete(deviceId);
-    mirrorInvalidationVersions.set(
-      deviceId,
-      (mirrorInvalidationVersions.get(deviceId) ?? 0) + 1,
-    );
+    remoteScheduleEventStore.invalidateDeviceMirrors([deviceId]);
+  },
+
+  /**
+   * 批量失效:同一波(如 presence 整批离线)只 emit 一次。逐台失效时每台各
+   * notify 一轮,所有挂载屏被同步重渲染 N 次,设备数超过 React 嵌套更新上限
+   * 即致命退出(2026-09-10 Android 冷启动,40/80 台隔离复现)。
+   */
+  invalidateDeviceMirrors(deviceIds: readonly string[]): void {
+    let changed = false;
+    for (const deviceId of new Set(deviceIds)) {
+      if (!deviceId) continue;
+      // Presence and Home may report the same offline state independently. Only
+      // publish again after recovery clears the marker or a fresh event arrives.
+      if (mirrorInvalidationVersions.has(deviceId) && !snapshots.has(deviceId)) continue;
+      snapshots.delete(deviceId);
+      mirrorInvalidationVersions.set(
+        deviceId,
+        ++nextMirrorInvalidationGeneration,
+      );
+      changed = true;
+    }
+    if (!changed) return;
     mirrorInvalidationSnapshot = new Map(mirrorInvalidationVersions);
     emit();
   },
@@ -126,12 +157,5 @@ export function useRemoteScheduleEventSnapshot(deviceId: string): RemoteSchedule
   return useSyncExternalStore(
     remoteScheduleEventStore.subscribe,
     () => remoteScheduleEventStore.getSnapshot(deviceId),
-  );
-}
-
-export function useRemoteScheduleEventVersion(deviceId: string): number {
-  return useSyncExternalStore(
-    remoteScheduleEventStore.subscribe,
-    () => remoteScheduleEventStore.getVersion(deviceId),
   );
 }

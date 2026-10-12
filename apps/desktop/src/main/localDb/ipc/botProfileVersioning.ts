@@ -1,5 +1,5 @@
-import { normalizeBotModelChain } from '../../../shared/botModelChain.js';
-import { reconcileBotCapabilityList } from '../../../shared/botCapabilitySelection.js';
+import { normalizeBotModelChain, readBotTaskModelOverride } from '../../../shared/botModelChain.js';
+import { normalizeBotToolCapabilities, reconcileBotCapabilityList } from '../../../shared/botCapabilitySelection.js';
 import { throwIpcError } from '../../utils/ipcValidate.js';
 
 export function botProfileContentChanged(input: {
@@ -14,6 +14,12 @@ export function botProfileContentChanged(input: {
   );
 }
 
+/** A saved model selection supersedes an earlier runtime-only fallback. */
+export function botProfileModelSelectionChanged(previous: Record<string, unknown>, next: Record<string, unknown>): boolean {
+  return ['modelChainOverride', 'modelOverride', 'modelChain', 'harness', 'model', 'providerId', 'effort', 'fastMode']
+    .some((key) => JSON.stringify(previous[key] ?? null) !== JSON.stringify(next[key] ?? null));
+}
+
 export function mergeBotProfileCapabilities(input: {
   previous: Record<string, unknown>;
   capabilities?: Record<string, unknown>;
@@ -21,9 +27,10 @@ export function mergeBotProfileCapabilities(input: {
   hasSkills: boolean;
   capabilityBaseline?: unknown;
 }): Record<string, unknown> {
+  const previous = normalizeBotToolCapabilities(input.previous);
   const next = input.capabilities
-    ? { ...input.previous, ...input.capabilities }
-    : { ...input.previous };
+    ? { ...previous, ...input.capabilities }
+    : { ...previous };
   if (input.hasSkills) {
     next.skills = Array.isArray(input.skills)
       ? input.skills
@@ -53,7 +60,7 @@ export function mergeBotProfileCapabilities(input: {
         Array.isArray(current) ? current.filter((id): id is string => typeof id === 'string') : []);
     }
   }
-  return next;
+  return normalizeBotToolCapabilities(next);
 }
 
 /** Main-owned persistence boundary for the ordered Bot runtime routes. */
@@ -61,6 +68,9 @@ export function normalizeBotProfileModelChain(
   value: Record<string, unknown>,
 ): Record<string, unknown> {
   const next = { ...value };
+  if (Object.prototype.hasOwnProperty.call(next, 'taskModelOverride')) {
+    next.taskModelOverride = readBotTaskModelOverride(next.taskModelOverride);
+  }
   if (Object.prototype.hasOwnProperty.call(next, 'modelChain')) {
     const chain = normalizeBotModelChain(next.modelChain);
     if (chain.length === 0 && next.modelChainOverride !== null && next.modelOverride !== null) {
