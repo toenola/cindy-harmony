@@ -1,0 +1,92 @@
+{
+  "string": [
+    {
+      "name": "v131_window_blocked_title",
+      "value": "Cannot switch to a smaller context window"
+    },
+    {
+      "name": "v131_window_confirm_title",
+      "value": "Confirm model switch"
+    },
+    {
+      "name": "v131_window_blocked_message",
+      "value": "This remote task is approaching the target model’s context limit. Reduce its context before switching."
+    },
+    {
+      "name": "v131_window_confirm_message",
+      "value": "The current context has reached the target model’s limit. Switching may require reducing the history. Continue?"
+    },
+    {
+      "name": "v131_account_usage",
+      "value": "Account quota and usage"
+    },
+    {
+      "name": "v131_usage_loading",
+      "value": "Loading…"
+    },
+    {
+      "name": "v131_usage_unavailable",
+      "value": "Unavailable"
+    },
+    {
+      "name": "v131_usage_updated",
+      "value": "Updated"
+    },
+    {
+      "name": "v131_work_loading",
+      "value": "Loading work details…"
+    },
+    {
+      "name": "v131_work_load",
+      "value": "Load work details"
+    },
+    {
+      "name": "v131_cancel",
+      "value": "Cancel"
+    },
+    {
+      "name": "v131_close",
+      "value": "Close"
+    },
+    {
+      "name": "v131_continue",
+      "value": "Continue"
+    },
+    {
+      "name": "v131_offline",
+      "value": "Offline"
+    },
+    {
+      "name": "v131_usage_period",
+      "value": "Period usage: %s / %s %s"
+    },
+    {
+      "name": "v131_usage_today",
+      "value": "Today: %s %s"
+    },
+    {
+      "name": "v131_usage_minutes",
+      "value": "%s minutes"
+    },
+    {
+      "name": "v131_usage_primary",
+      "value": "Primary quota"
+    },
+    {
+      "name": "v131_usage_secondary",
+      "value": "Secondary quota"
+    },
+    {
+      "name": "v131_usage_remaining",
+      "value": "%s: %s remaining"
+    },
+    {
+      "name": "v131_usage_reset",
+      "value": "Resets %s"
+    },
+    {
+      "name": "v131_catalog_retry",
+      "value": "The model catalog is not ready. Refreshing it now; try sending again shortly."
+    }
+  ]
+}

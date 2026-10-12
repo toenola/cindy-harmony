@@ -1,3 +1,4 @@
+import { LocalAttachmentPreviews } from './attachments/LocalAttachmentPreviews';
 /**
  * 应用服务组装（单例）。
  *
@@ -33,6 +34,7 @@ import { SecurityObservabilityAdapter } from './observability/SecurityObservabil
 import { InputQueueStore, isTerminalMakerInputEvent } from './messages/InputQueueStore';
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
+import { NewSessionPreferenceStore } from './tasks/NewSessionPreferenceStore';
 import { NewSessionCreationStore } from './tasks/NewSessionCreationStore';
 import { SessionDeepLinkIntent, parseSessionDeepLink } from './navigation/SessionDeepLink';
 import { TaskCompletionPushPreferenceStore } from './notifications/TaskCompletionPushPreferenceStore';
@@ -52,6 +54,7 @@ function delay(ms: number): Promise<void> {
 }
 
 export class AppServices {
+  readonly localAttachmentPreviews: LocalAttachmentPreviews = new LocalAttachmentPreviews();
   static readonly instance: AppServices = new AppServices();
 
   readonly auth: AuthStore = new AuthStore();
@@ -62,6 +65,7 @@ export class AppServices {
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
+  readonly newSessionPreferences: NewSessionPreferenceStore = new NewSessionPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
   readonly taskCompletionPushPreference: TaskCompletionPushPreferenceStore =
     new TaskCompletionPushPreferenceStore();
@@ -131,12 +135,14 @@ export class AppServices {
     this.auth.setLogoutCleanup(async (): Promise<void> => {
       // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
       this.securityObservability.clearUser();
+      await this.newSessionPreferences.setAccountScope('');
       // 自动 token 失效路径不会经过 SettingsPage 的 client.stop()；这里也必须
       // 断开旧账号链路并清掉队列、交互和新建任务，避免下一账号读取旧投影。
       this.client.stop();
       // 这次是账号级清理；旧账号临时 topic 的补偿退订不能跨过
       // stop/新账号复用同一 deviceId，避免误伤新账号的同名会话。
       this.newSessionCreations.clearAll(false);
+      this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
       this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
@@ -249,6 +255,7 @@ export class AppServices {
       this.auth.init(context),
       this.composerDrafts.init(context),
       this.taskListPreferences.init(context),
+      this.newSessionPreferences.init(context),
       this.taskListSnapshot.init(context),
       this.taskCompletionPushPreference.init(context),
       this.voiceDictionary.init(context),
@@ -256,12 +263,14 @@ export class AppServices {
       this.messages.initCache(context),
     ]);
     this.selfDeviceName = (await this.settingsStore.get(KEY_SELF_DEVICE_NAME, '')).trim();
+    await this.newSessionPreferences.setAccountScope(this.auth.cacheAccountId);
     await this.taskCompletionPush.init(context);
   }
 
   /** 登录态确认后、网络握手前恢复可丢弃的任务列表首屏快照。 */
   restoreTaskListSnapshot(): void {
     const accountId = this.auth.cacheAccountId;
+    void this.newSessionPreferences.setAccountScope(accountId);
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
     this.voiceDictionary.setAccountScope(accountId);
@@ -460,6 +469,7 @@ export class AppServices {
         this.messages.invalidateLiveTailTrust();
         if (status === 'stopped') {
           this.newSessionCreations.clearAll();
+          this.localAttachmentPreviews.clear();
           this.inputQueue.clearAll();
           this.interactions.clearAll();
           this.goals.clearAll();
@@ -637,6 +647,7 @@ export class AppServices {
   }
 
   private async switchTaskListAccountScope(previousAccountId: string, accountId: string): Promise<void> {
+    const preferencesReady = this.newSessionPreferences.setAccountScope(accountId);
     if (previousAccountId.length > 0 && previousAccountId !== accountId) {
       // hello-ack 发现账号变化时未必经过 SettingsPage.logout；清理所有带
       // 账号语义的运行投影和应用级 sessions 订阅，不能只清任务/消息列表。
@@ -646,6 +657,7 @@ export class AppServices {
       // hello-ack 发现账号变化时同样丢弃旧账号 topic lease；当前连接可能已
       // 属于新账号，不能把旧账号的 pending unsubscribe 发到新账号。
       this.newSessionCreations.clearAll(false);
+      this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
       this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
@@ -659,6 +671,7 @@ export class AppServices {
     this.voiceDictionary.setAccountScope(accountId);
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);
+    await preferencesReady;
     void this.loadDevices();
   }
 

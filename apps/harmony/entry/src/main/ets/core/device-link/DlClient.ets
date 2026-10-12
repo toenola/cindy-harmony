@@ -169,6 +169,23 @@ export class DlClient {
   private ws: WsAdapter | undefined = undefined;
   private wsCallbacks: WsCallbacks = new WsCallbacks();
   private status: string = 'stopped'; // 'stopped' | 'connecting' | 'online'
+  private transportEpoch: number = 0;
+  private peerEpochs: Map<string, number> = new Map();
+
+  connectionIdentity(deviceId: string): string {
+    return `${this.transportEpoch}:${this.peerEpochs.get(deviceId) ?? 0}`;
+  }
+
+  private invalidatePeer(deviceId: string): void {
+    this.peerCapabilities.delete(deviceId);
+    this.peerEpochs.set(deviceId, (this.peerEpochs.get(deviceId) ?? 0) + 1);
+  }
+
+  private peerCapabilities: Map<string, string[]> = new Map();
+
+  supportsHistoryView(deviceId: string): boolean {
+    return (this.peerCapabilities.get(deviceId) ?? []).indexOf('history-view-v1') >= 0;
+  }
   private stopped = true;
   /**
    * 重连退避与 1013 拥塞稳定性状态（纯逻辑，单测覆盖计时语义与代次竞态）。
@@ -469,11 +486,21 @@ export class DlClient {
   private handleLinkAccept(env: Envelope): void {
     const req = this.takePending(env.id);
     if (req === undefined) return;
+    const capabilities = this.payloadObj(env)['capabilities'];
+    const supported: string[] = [];
+    if (Array.isArray(capabilities)) {
+      for (const value of capabilities as Object[]) {
+        if (typeof value === 'string') supported.push(value);
+      }
+    }
+    this.invalidatePeer(env.src);
+    this.peerCapabilities.set(env.src, supported);
     this.clearTimer(req.timer);
     req.resolve(env);
   }
 
   private handleLinkClose(env: Envelope): void {
+    this.invalidatePeer(env.src);
     const p = this.payloadObj(env);
     const reason = this.readStr(p, 'reason');
     this.opts.events.onLinkClosed(env.src, reason);
@@ -521,6 +548,7 @@ export class DlClient {
 
   /** 显式关闭控制链路。 */
   closeLink(deviceId: string, reason: string): void {
+    this.invalidatePeer(deviceId);
     const close = new LinkClosePayload();
     close.reason = reason;
     const env = new Envelope();
@@ -706,6 +734,10 @@ export class DlClient {
   private setStatus(s: string): void {
     if (this.status === s) return;
     this.status = s;
+    if (s !== 'online') {
+      this.transportEpoch += 1;
+      this.peerCapabilities.clear();
+    }
     this.opts.events.onStatus(s);
   }
 

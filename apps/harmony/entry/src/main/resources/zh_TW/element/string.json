@@ -1,0 +1,92 @@
+{
+  "string": [
+    {
+      "name": "v131_window_blocked_title",
+      "value": "無法切換至較小上下文模型"
+    },
+    {
+      "name": "v131_window_confirm_title",
+      "value": "切換模型前確認"
+    },
+    {
+      "name": "v131_window_blocked_message",
+      "value": "目前遠端任務的上下文已接近目標模型視窗，請先整理上下文再切換。"
+    },
+    {
+      "name": "v131_window_confirm_message",
+      "value": "目前上下文已達到目標模型視窗，切換後可能需要整理歷史。是否繼續？"
+    },
+    {
+      "name": "v131_account_usage",
+      "value": "帳戶配額與用量"
+    },
+    {
+      "name": "v131_usage_loading",
+      "value": "正在讀取…"
+    },
+    {
+      "name": "v131_usage_unavailable",
+      "value": "暫時無法取得"
+    },
+    {
+      "name": "v131_usage_updated",
+      "value": "更新時間"
+    },
+    {
+      "name": "v131_work_loading",
+      "value": "正在載入工作詳情…"
+    },
+    {
+      "name": "v131_work_load",
+      "value": "載入工作詳情"
+    },
+    {
+      "name": "v131_cancel",
+      "value": "取消"
+    },
+    {
+      "name": "v131_close",
+      "value": "關閉"
+    },
+    {
+      "name": "v131_continue",
+      "value": "繼續"
+    },
+    {
+      "name": "v131_offline",
+      "value": "離線"
+    },
+    {
+      "name": "v131_usage_period",
+      "value": "週期用量：%s / %s %s"
+    },
+    {
+      "name": "v131_usage_today",
+      "value": "今日用量：%s %s"
+    },
+    {
+      "name": "v131_usage_minutes",
+      "value": "%s 分鐘"
+    },
+    {
+      "name": "v131_usage_primary",
+      "value": "主要額度"
+    },
+    {
+      "name": "v131_usage_secondary",
+      "value": "次要額度"
+    },
+    {
+      "name": "v131_usage_remaining",
+      "value": "%s剩餘 %s"
+    },
+    {
+      "name": "v131_usage_reset",
+      "value": "%s重設"
+    },
+    {
+      "name": "v131_catalog_retry",
+      "value": "模型目錄尚未就緒，正在重新讀取，請稍後傳送。"
+    }
+  ]
+}

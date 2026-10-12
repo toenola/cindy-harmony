@@ -1,3 +1,4 @@
+import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachineIdentity';
 /**
  * 任务聚合首页。
  *
@@ -1834,7 +1835,7 @@ struct TaskListPage {
   private projectGroupRenderKey(group: TaskProjectGroup): string {
     // 外层项目节点也会捕获旧 entries；成员不仅新增/移除，任一行的可见状态变化
     // 都必须进入外层 key，否则内部 ForEach 连重新计算 key 的机会都没有。
-    let key = `project:${group.key}`;
+    let key = `project:${group.key}:${this.projectMachineLabel(group)}`;
     for (let i = 0; i < group.entries.length; i++) {
       key += `:${this.sessionEntryRenderKey('member', group.entries[i])}`;
     }
@@ -3017,6 +3018,19 @@ struct TaskListPage {
     }
   }
 
+  private projectMachineLabel(group: TaskProjectGroup): string {
+    const visible: ProjectMachine[] = [];
+    for (const project of this.projectGroups()) {
+      if (visible.some((row: ProjectMachine) => row.deviceId === project.deviceId)) continue;
+      const machine = new ProjectMachine();
+      machine.deviceId = project.deviceId;
+      machine.name = AppServices.instance.tasks.getDeviceName(project.deviceId) || project.deviceId;
+      machine.online = this.devices.find((row: PresenceSnapshot) => row.deviceId === project.deviceId)?.online ?? false;
+      visible.push(machine);
+    }
+    return projectMachineLabel(group.deviceId, this.selectedDeviceId, visible, harmonyV12String(this.getUIContext().getHostContext(), 'v131_offline'));
+  }
+
   @Builder
   projectGroupHeader(group: TaskProjectGroup) {
     Row({ space: 8 }) {
@@ -3030,6 +3044,14 @@ struct TaskListPage {
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
+      if (this.projectMachineLabel(group).length > 0) {
+        Text(this.projectMachineLabel(group))
+          .fontSize(11)
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
+          .constraintSize({ maxWidth: '38%' })
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
       Text(`${group.entries.length}`)
         .fontSize(12)
         .fontColor($r('app.color.text_tertiary'))

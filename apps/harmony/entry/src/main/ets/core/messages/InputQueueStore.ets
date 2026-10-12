@@ -1,3 +1,4 @@
+import { RemoteReadRetries } from './RemoteReadRetries';
 /**
  * Harmony 输入队列。
  *
@@ -234,6 +235,7 @@ export function parseInputProjection(
 }
 
 export class InputQueueStore {
+  private readRetries: RemoteReadRetries = new RemoteReadRetries();
   private client: DlClient | undefined = undefined;
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
   private listeners: Array<() => void> = [];
@@ -727,7 +729,8 @@ export class InputQueueStore {
       && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
     this.rememberSessionDevice(deviceId, sessionId);
     if (!this.sessionDeviceMatches(sessionId, deviceId)) return false;
-    const operationKey = inputQueueScopeKey(deviceId, sessionId);
+    const operationKey = JSON.stringify([this.client?.connectionIdentity(deviceId) ?? '',
+      this.captureAuthorityEpoch(sessionId), expectedDispatchEpoch]) + '\u0001' + inputQueueScopeKey(deviceId, sessionId);
     const existing = this.refreshOperations.get(operationKey);
     if (existing !== undefined) {
       return await existing;
@@ -748,21 +751,30 @@ export class InputQueueStore {
     sessionId: string,
     expectedDispatchEpoch: number = -1,
   ): Promise<boolean> {
+    const expectedEpoch = this.captureAuthorityEpoch(sessionId);
     try {
       if (expectedDispatchEpoch >= 0
         && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
-      const expectedEpoch = this.captureAuthorityEpoch(sessionId);
+      if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+      if (expectedEpoch !== this.captureAuthorityEpoch(sessionId)) return false;
+      const connection = this.client?.connectionIdentity(deviceId);
       const result = await this.invoke(deviceId, 'maker:input:get-projection', [sessionId]);
       if (expectedDispatchEpoch >= 0
         && !this.dispatchEpochIsCurrent(sessionId, expectedDispatchEpoch)) return false;
+      if (connection !== this.client?.connectionIdentity(deviceId)) return false;
       const projection = parseInputProjection(result, sessionId);
       const accepted = this.applyProjectionIfCurrent(
         sessionId, projection, expectedEpoch, deviceId);
       if (accepted) {
+        this.readRetries.cancel(sessionId);
         this.notify();
       }
       return accepted;
     } catch (e) {
+      this.readRetries.schedule(sessionId, (): boolean => this.client?.getStatus() === 'online'
+        && this.activeTargets.get(sessionId)?.deviceId === deviceId
+        && this.captureAuthorityEpoch(sessionId) === expectedEpoch,
+        (): void => { void this.refreshThenPumpConnection(deviceId, sessionId); });
       return false;
     }
   }
@@ -784,7 +796,7 @@ export class InputQueueStore {
     this.refreshOperations.forEach((_operation: Promise<boolean>, key: string) => {
       if (deviceId.length === 0
         ? key.endsWith(refreshSuffix)
-        : key === inputQueueScopeKey(deviceId, sessionId)) {
+        : key.endsWith('\u0001' + inputQueueScopeKey(deviceId, sessionId))) {
         this.refreshOperations.delete(key);
       }
     });
@@ -821,6 +833,7 @@ export class InputQueueStore {
 
   /** Relay 重连后补拉当前打开任务的输入投影。 */
   async resyncActiveSessions(): Promise<void> {
+    this.readRetries.clear();
     const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInputTarget, sessionId: string) => {
       pending.push(this.refreshThenPumpConnection(target.deviceId, sessionId));
@@ -915,6 +928,7 @@ export class InputQueueStore {
 
   /** 全局登出/账号切换使用的代次地板；旧请求不能给重建后的同名任务灌回数据。 */
   clearAll(): void {
+    this.readRetries.clear();
     this.projections.clear();
     this.settlingBySession.clear();
     this.settlingAddedAtByClientId.clear();

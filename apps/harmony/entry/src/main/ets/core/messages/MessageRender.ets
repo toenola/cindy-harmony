@@ -183,7 +183,8 @@ export function parseThinkingPresentation(message: RemoteMessage): ThinkingPrese
   const duration = record['durationMs'];
   if (typeof duration === 'number' && Number.isFinite(duration)) out.durationMs = Math.max(0, duration);
   out.redacted = record['isRedacted'] === true;
-  if (!out.redacted && out.body.trim().length === 0 && out.durationMs <= 0) return null;
+  if (!out.redacted && out.body.trim().length === 0 && out.durationMs <= 0
+    && Object.keys(readObj(message.agentMeta, 'historyWork')).length === 0) return null;
   let finishedAtMs = 0;
   const finishedAt = record['finishedAt'];
   if (typeof finishedAt === 'number' && Number.isFinite(finishedAt)) finishedAtMs = finishedAt;

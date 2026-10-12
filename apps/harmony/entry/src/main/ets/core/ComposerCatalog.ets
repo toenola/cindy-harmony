@@ -5,7 +5,7 @@
  * 解析规则集中在这里，避免两页各自维护一份漂移的拷贝。
  */
 
-import { readBool, readObj, readStr } from './tasks/TaskModels';
+import { readBool, readNum, readObj, readStr, recordOrEmpty } from './tasks/TaskModels';
 
 export class ComposerChoiceOption {
   id: string = '';
@@ -29,6 +29,10 @@ export class ComposerModelOption {
   subscription: boolean = false;
   /** Server entitlement state. Paid models stay visible for discovery but are not routable. */
   availability: string = 'available';
+  contextWindow: number = 0;
+  suspended: boolean = false;
+  selectedRoute: boolean = false;
+  openAiSubscription: boolean = false;
   /**
    * 该模型被远端标记为哪些 agent 的新任务默认种子（model-access v3 `newSessionDefault`）。
    * 客户端不跨 agent 投影；缺省表示不作为默认。
@@ -123,6 +127,9 @@ export function groupComposerModelOptions(source: ComposerModelOption[]): Compos
     }
     group.options.push(option);
   }
+  const names = new Map<string, number>();
+  for (const group of groups) names.set(group.name, (names.get(group.name) ?? 0) + 1);
+  for (const group of groups) if ((names.get(group.name) ?? 0) > 1) group.name += ' · ' + group.key;
   return groups;
 }
 
@@ -206,6 +213,7 @@ export function parseModelOptions(value: Object | undefined): ComposerModelOptio
       option.defaultEffort = readStr(record, 'defaultEffort');
       option.supportsFastMode = readBool(record, 'supportsFastMode', false);
       option.availability = readAvailability(record);
+      option.contextWindow = readNum(record, 'contextWindow', 0);
       readNewSessionDefaults(record, option);
       readEffortDisplayNames(record, option);
       const rawEfforts = record['efforts'];
@@ -298,6 +306,7 @@ export function parseProviderModelOptions(
   agent: string,
   visibilityOverrides: Map<string, boolean>,
   selectionHint: ModelSelectionHint | undefined,
+  existingSessionRoute: boolean = false,
 ): ComposerModelOption[] {
   if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
     return [];
@@ -307,11 +316,34 @@ export function parseProviderModelOptions(
   if (!Array.isArray(rawProvidersValue)) return [];
   const rawProviders = rawProvidersValue as Object[];
   const out: ComposerModelOption[] = [];
+  const candidates: string[] = [];
+  if (selectionHint !== undefined) {
+    for (const raw of rawProviders) {
+      const provider = recordOrEmpty(raw);
+      if (!readBool(provider, 'connected', false) || !stringArrayHas(provider['agents'], agent)
+        || (!existingSessionRoute && readBool(provider, 'suspended', false))) continue;
+      const models = readObj(provider, 'models')[agent];
+      if (!Array.isArray(models)) continue;
+      for (const rawModel of models as Object[]) {
+        const model = recordOrEmpty(rawModel);
+        if (readStr(model, 'id') === selectionHint.model
+          && (existingSessionRoute || (!readBool(model, 'disabled', false)
+            && readStr(model, 'status') !== 'retired'
+            && readAvailability(model) !== 'requires_payment'))) candidates.push(readStr(provider, 'id'));
+      }
+    }
+  }
+  const explicit = selectionHint?.providerId ?? '';
+  const activeSource = explicit ? (candidates.indexOf(explicit) >= 0 ? explicit : '')
+    : agent === 'codex' && candidates.indexOf('openai') >= 0 ? 'openai'
+      : candidates.indexOf('xd') >= 0 ? 'xd' : candidates[0] ?? '';
+  const hasVisibility = root['modelVisibilityOverrides'] !== undefined && root['modelVisibilityOverrides'] !== null;
   for (let i = 0; i < rawProviders.length; i++) {
     const rawProvider: Object = rawProviders[i];
     if (rawProvider === null || typeof rawProvider !== 'object' || Array.isArray(rawProvider)) continue;
     const provider = rawProvider as Record<string, Object>;
-    if (!readBool(provider, 'connected', false) || readBool(provider, 'suspended', false)) continue;
+    if (!readBool(provider, 'connected', false)) continue;
+    const suspended = readBool(provider, 'suspended', false);
     const providerId = readStr(provider, 'id');
     if (providerId.length === 0 || !stringArrayHas(provider['agents'], agent)) continue;
     const modelsByAgent = readObj(provider, 'models');
@@ -319,7 +351,9 @@ export function parseProviderModelOptions(
     if (!Array.isArray(rawModelsValue)) continue;
     const access = readObj(provider, 'access');
     const subscription = readStr(access, 'kind') === 'subscription';
-    const providerName = readStr(provider, 'name') || providerId;
+    const identity = readStr(readObj(provider, 'subscriptionAccount'), 'identity')
+      || readStr(readObj(provider, 'openAiAccount'), 'identity');
+    const providerName = (readStr(provider, 'name') || providerId) + (identity ? ' · ' + identity : '');
     const providerLogoKind = readStr(provider, 'logoKind');
     const rawModels = rawModelsValue as Object[];
     for (let j = 0; j < rawModels.length; j++) {
@@ -327,13 +361,15 @@ export function parseProviderModelOptions(
       if (rawModel === null || typeof rawModel !== 'object' || Array.isArray(rawModel)) continue;
       const model = rawModel as Record<string, Object>;
       const id = readStr(model, 'id');
-      if (id.length === 0 || readBool(model, 'disabled', false)) continue;
+      if (id.length === 0) continue;
       const visibilityKey = `${agent}:${providerId}:${id}`;
       const visibility = visibilityOverrides.get(visibilityKey);
       const isSelected = selectionHint !== undefined
-        && selectionHint.model === id && selectionHint.providerId === providerId;
+        && selectionHint.model === id && activeSource === providerId;
+      if ((suspended || readBool(model, 'disabled', false) || readStr(model, 'status') === 'retired')
+        && !(existingSessionRoute && isSelected)) continue;
       if (visibility === false && !isSelected) continue;
-      if (visibility === undefined && !readBool(model, 'defaultEnabled', true) && !isSelected) continue;
+      if (hasVisibility && visibility === undefined && !readBool(model, 'defaultEnabled', true) && !isSelected) continue;
       const option = new ComposerModelOption();
       option.id = id;
       option.label = readStr(model, 'name') || readStr(model, 'displayName') || id;
@@ -348,6 +384,12 @@ export function parseProviderModelOptions(
       option.modelIcon = readStr(model, 'icon');
       option.subscription = subscription;
       option.availability = readAvailability(model);
+      option.contextWindow = readNum(model, 'contextWindow', 0);
+      option.suspended = suspended || readBool(model, 'disabled', false) || readStr(model, 'status') === 'retired';
+      option.selectedRoute = isSelected;
+      const auth = readObj(provider, 'auth');
+      option.openAiSubscription = readStr(auth, 'method') === 'oauth'
+        && (providerId === 'openai' || readStr(auth, 'native') === 'codex');
       const rawEfforts = model['efforts'];
       if (Array.isArray(rawEfforts)) {
         const efforts = rawEfforts as Object[];
@@ -359,6 +401,19 @@ export function parseProviderModelOptions(
     }
   }
   return out;
+}
+
+/** A valid empty catalog is authoritative; only unsupported hosts use the flat list. */
+export function hasProviderCatalog(value: Object | undefined): boolean {
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Array.isArray((value as Record<string, Object>)['providers']);
+}
+
+/** Same thresholds as Mobile modelWindowSwitchConfirmation; no guessed window values. */
+export function modelWindowSwitchDecision(used: number, target: number, remoteHostId: string): string {
+  if (!Number.isFinite(used) || !Number.isFinite(target) || used <= 0 || target <= 0) return 'allow';
+  if (remoteHostId.length > 0 && used / target >= 0.9) return 'blocked';
+  return used >= target ? 'confirm' : 'allow';
 }
 
 function readAvailability(record: Record<string, Object>): string {
@@ -398,4 +453,8 @@ export function modelProviderKind(option: ComposerModelOption): string {
     return 'openai';
   }
   return 'other';
+}
+
+export function providerCatalogUnavailable(error: string): boolean {
+  return /CHANNEL_NOT_ALLOWED|UNSUPPORTED_CAPABILITY|not registered|No handler/i.test(error);
 }

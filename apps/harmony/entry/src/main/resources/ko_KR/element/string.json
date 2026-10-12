@@ -1,0 +1,92 @@
+{
+  "string": [
+    {
+      "name": "v131_window_blocked_title",
+      "value": "더 작은 컨텍스트 창으로 전환할 수 없습니다"
+    },
+    {
+      "name": "v131_window_confirm_title",
+      "value": "모델 전환 확인"
+    },
+    {
+      "name": "v131_window_blocked_message",
+      "value": "이 원격 작업의 컨텍스트가 대상 모델의 한도에 가까워졌습니다. 컨텍스트를 줄인 후 전환하세요."
+    },
+    {
+      "name": "v131_window_confirm_message",
+      "value": "현재 컨텍스트가 대상 모델의 한도에 도달했습니다. 전환 후 기록을 정리해야 할 수 있습니다. 계속할까요?"
+    },
+    {
+      "name": "v131_account_usage",
+      "value": "계정 할당량 및 사용량"
+    },
+    {
+      "name": "v131_usage_loading",
+      "value": "불러오는 중…"
+    },
+    {
+      "name": "v131_usage_unavailable",
+      "value": "사용할 수 없음"
+    },
+    {
+      "name": "v131_usage_updated",
+      "value": "업데이트 시간"
+    },
+    {
+      "name": "v131_work_loading",
+      "value": "작업 세부 정보 불러오는 중…"
+    },
+    {
+      "name": "v131_work_load",
+      "value": "작업 세부 정보 불러오기"
+    },
+    {
+      "name": "v131_cancel",
+      "value": "취소"
+    },
+    {
+      "name": "v131_close",
+      "value": "닫기"
+    },
+    {
+      "name": "v131_continue",
+      "value": "계속"
+    },
+    {
+      "name": "v131_offline",
+      "value": "오프라인"
+    },
+    {
+      "name": "v131_usage_period",
+      "value": "기간 사용량: %s / %s %s"
+    },
+    {
+      "name": "v131_usage_today",
+      "value": "오늘 사용량: %s %s"
+    },
+    {
+      "name": "v131_usage_minutes",
+      "value": "%s분"
+    },
+    {
+      "name": "v131_usage_primary",
+      "value": "기본 할당량"
+    },
+    {
+      "name": "v131_usage_secondary",
+      "value": "추가 할당량"
+    },
+    {
+      "name": "v131_usage_remaining",
+      "value": "%s: %s 남음"
+    },
+    {
+      "name": "v131_usage_reset",
+      "value": "%s에 초기화"
+    },
+    {
+      "name": "v131_catalog_retry",
+      "value": "모델 목록을 다시 불러오는 중입니다. 잠시 후 다시 전송하세요."
+    }
+  ]
+}

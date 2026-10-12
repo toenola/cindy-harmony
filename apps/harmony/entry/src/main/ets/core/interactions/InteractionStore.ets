@@ -1,3 +1,4 @@
+import { RemoteReadRetries } from '../messages/RemoteReadRetries';
 /**
  * 交互确认 Store（Permission / Ask User / Plan Review）。
  *
@@ -54,6 +55,7 @@ class InteractionScopeParts {
 }
 
 export class InteractionStore {
+  private readRetries: RemoteReadRetries = new RemoteReadRetries();
   private client: DlClient | undefined = undefined;
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
   private listeners: Array<() => void> = [];
@@ -226,7 +228,9 @@ export class InteractionStore {
 
   /** 打开会话时拉挂起交互快照（对齐 mobile getPendingInteractions）。 */
   async refreshPending(deviceId: string, sessionId: string): Promise<void> {
-    const scope = interactionScopeKey(deviceId, sessionId);
+    const source = interactionScopeKey(deviceId, sessionId);
+    const scope = JSON.stringify([source, this.stateGeneration, this.mutationGenerations.get(source) ?? 0,
+      this.client?.connectionIdentity(deviceId) ?? '']);
     const existing = this.refreshOperations.get(scope);
     if (existing !== undefined) {
       await existing;
@@ -256,14 +260,19 @@ export class InteractionStore {
     try {
       if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
       if (stateGeneration !== this.stateGeneration) return;
+      const connection = client.connectionIdentity(deviceId);
       const list = await this.queryPending(client, deviceId, sessionId);
+      if (connection !== client.connectionIdentity(deviceId)) return;
       if (stateGeneration !== this.stateGeneration) return;
       if (this.refreshSequences.get(scope) !== sequence) return;
       if ((this.mutationGenerations.get(scope) ?? 0) !== generation) return;
+      this.readRetries.cancel(scope);
       this.pendingByScope.set(scope, list);
       this.notify();
     } catch (e) {
-      // 拉取失败：保留现状（push 会继续补充）。
+      this.readRetries.schedule(scope, (): boolean => stateGeneration === this.stateGeneration
+        && this.activeTargets.has(scope) && client.getStatus() === 'online',
+        (): void => { void this.refreshPending(deviceId, sessionId); });
     }
   }
 
@@ -288,6 +297,7 @@ export class InteractionStore {
 
   /** Relay 重连后只补拉当前打开任务的 pending interactions。 */
   async resyncActiveSessions(): Promise<void> {
+    this.readRetries.clear();
     const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInteractionTarget) => {
       pending.push(this.refreshPending(target.deviceId, target.sessionId));
@@ -297,6 +307,7 @@ export class InteractionStore {
 
   /** 登出/连接显式停止时清理账号级交互状态。 */
   clearAll(): void {
+    this.readRetries.clear();
     this.stateGeneration += 1;
     this.pendingByScope.clear();
     this.resolvingRequestIds.clear();

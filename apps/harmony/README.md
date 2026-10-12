@@ -6,7 +6,7 @@ HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 Har
 
 ## 当前阶段
 
-已完成 DevEco Studio 工程初始化，空工程 `assembleHap` 已构建成功；尚未完成 HarmonyOS 模拟器或真机安装验证。
+当前为 [v1.3.1 候选版本](./docs/version/v1.3.1/README.md)：四项 Mobile 对齐实现与 Harmony Local Test 已完成，可构建签名 HAP；API 26 设备交互验收待完成。
 
 ## 文档
 

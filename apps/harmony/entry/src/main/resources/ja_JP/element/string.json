@@ -1,0 +1,92 @@
+{
+  "string": [
+    {
+      "name": "v131_window_blocked_title",
+      "value": "小さいコンテキストウィンドウに切り替えられません"
+    },
+    {
+      "name": "v131_window_confirm_title",
+      "value": "モデル切り替えの確認"
+    },
+    {
+      "name": "v131_window_blocked_message",
+      "value": "このリモートタスクのコンテキストは切り替え先モデルの上限に近づいています。コンテキストを減らしてから切り替えてください。"
+    },
+    {
+      "name": "v131_window_confirm_message",
+      "value": "現在のコンテキストは切り替え先モデルの上限に達しています。切り替え後に履歴の整理が必要になる場合があります。続行しますか？"
+    },
+    {
+      "name": "v131_account_usage",
+      "value": "アカウントの利用枠と使用量"
+    },
+    {
+      "name": "v131_usage_loading",
+      "value": "読み込み中…"
+    },
+    {
+      "name": "v131_usage_unavailable",
+      "value": "取得できません"
+    },
+    {
+      "name": "v131_usage_updated",
+      "value": "更新日時"
+    },
+    {
+      "name": "v131_work_loading",
+      "value": "作業の詳細を読み込み中…"
+    },
+    {
+      "name": "v131_work_load",
+      "value": "作業の詳細を読み込む"
+    },
+    {
+      "name": "v131_cancel",
+      "value": "キャンセル"
+    },
+    {
+      "name": "v131_close",
+      "value": "閉じる"
+    },
+    {
+      "name": "v131_continue",
+      "value": "続行"
+    },
+    {
+      "name": "v131_offline",
+      "value": "オフライン"
+    },
+    {
+      "name": "v131_usage_period",
+      "value": "期間使用量：%s / %s %s"
+    },
+    {
+      "name": "v131_usage_today",
+      "value": "本日の使用量：%s %s"
+    },
+    {
+      "name": "v131_usage_minutes",
+      "value": "%s 分"
+    },
+    {
+      "name": "v131_usage_primary",
+      "value": "主要利用枠"
+    },
+    {
+      "name": "v131_usage_secondary",
+      "value": "追加利用枠"
+    },
+    {
+      "name": "v131_usage_remaining",
+      "value": "%s：残り %s"
+    },
+    {
+      "name": "v131_usage_reset",
+      "value": "%sにリセット"
+    },
+    {
+      "name": "v131_catalog_retry",
+      "value": "モデル一覧を再読み込みしています。しばらくしてから再送信してください。"
+    }
+  ]
+}

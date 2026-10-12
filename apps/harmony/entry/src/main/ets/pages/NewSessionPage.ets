@@ -1,3 +1,5 @@
+import { harmonyV12String } from '../core/HarmonyStrings';
+import { providerCatalogUnavailable } from '../core/ComposerCatalog';
 /**
  * 新建任务页：选择 Agent、对话类型和项目目录，然后用同款 Composer 发送首条消息。
  *
@@ -36,6 +38,7 @@ import {
   composerModelKey,
   effortLevelLabel,
   groupComposerModelOptions,
+  hasProviderCatalog,
   modelProviderKind,
   parseModelOptions,
   parseModelVisibilityOverrides,
@@ -247,6 +250,11 @@ export struct NewSessionPageContent {
   private attachmentsHandedOff: boolean = false;
   private attachmentsDisposed: boolean = false;
   private pageActive: boolean = false;
+  private workspaceEditRevision: number = 0;
+  private runtimeCatalogReady: boolean = false;
+  private runtimeCatalogScope: string = '';
+  private workspaceRestoreGeneration: number = 0;
+  private preserveWorkspaceDraft: boolean = false;
   /** 使系统图片选择器的迟到回包不能写入已离开的新建任务页。 */
   private imagePickerGeneration: number = 0;
   /** 目录浏览切换路径、设备或页面后，旧目录回包不能覆盖当前浏览位置。 */
@@ -274,6 +282,7 @@ export struct NewSessionPageContent {
     this.routeDeviceId = this.paneDeviceId.length > 0
       ? this.paneDeviceId : readStr(params, 'deviceId');
     const editDraft = AppServices.instance.newSessionCreations.consumeEditDraft();
+    this.preserveWorkspaceDraft = editDraft !== null;
     if (editDraft !== null) {
       this.pendingEditDraft = editDraft;
       this.routeDeviceId = editDraft.deviceId;
@@ -299,6 +308,7 @@ export struct NewSessionPageContent {
       this.refreshDevices();
     }));
     this.refreshDevices();
+    void this.restoreWorkspacePreference();
     this.applyPendingEditRuntime(this.routeDeviceId, this.selectedAgentKind, false);
   }
 
@@ -446,6 +456,20 @@ export struct NewSessionPageContent {
     if (consume) this.pendingEditDraft = null;
   }
 
+  private async restoreWorkspacePreference(): Promise<void> {
+    const generation = ++this.workspaceRestoreGeneration;
+    const revision = this.workspaceEditRevision;
+    const owner = AppServices.instance.auth.cacheAccountId;
+    await AppServices.instance.newSessionPreferences.setAccountScope(owner);
+    if (!this.pageActive || generation !== this.workspaceRestoreGeneration || revision !== this.workspaceEditRevision
+      || this.preserveWorkspaceDraft || this.pendingEditDraft !== null
+      || AppServices.instance.auth.cacheAccountId !== owner) return;
+    const preferences = AppServices.instance.newSessionPreferences.read();
+    if (preferences.workspaceKind.length === 0) return;
+    this.workspaceKind = preferences.workspaceKind === 'project' ? 'project' : 'dialogue';
+    this.workingDir = preferences.workingDirByDevice[this.selectedDeviceId] ?? '';
+  }
+
   private refreshDevices(): void {
     this.devices = AppServices.instance.tasks.deviceList;
     this.taskRevision += 1;
@@ -464,6 +488,13 @@ export struct NewSessionPageContent {
     }
     if (nextDeviceId !== this.selectedDeviceId) {
       this.selectedDeviceId = nextDeviceId;
+      if (this.pendingEditDraft === null && !this.preserveWorkspaceDraft) {
+        const preferences = AppServices.instance.newSessionPreferences.read();
+        if (preferences.workspaceKind.length > 0) {
+          this.workspaceKind = preferences.workspaceKind === 'project' ? 'project' : 'dialogue';
+          this.workingDir = preferences.workingDirByDevice[nextDeviceId] ?? '';
+        }
+      }
       if (!this.agentTouched) {
         const sessions = AppServices.instance.tasks.getSessions(nextDeviceId);
         if (sessions.length > 0) {
@@ -493,7 +524,7 @@ export struct NewSessionPageContent {
     const out: RecentProject[] = [];
     for (let i = 0; i < sessions.length; i++) {
       const session = sessions[i];
-      const path = session.workingDir.trim();
+      const path = session.workingDir;
       if (session.status === 'deleted' || session.workspaceKind === 'dialogue' || path.length === 0) continue;
       let found = false;
       for (let j = 0; j < out.length; j++) {
@@ -563,22 +594,26 @@ export struct NewSessionPageContent {
   }
 
   private selectDialogue(): void {
+    this.workspaceEditRevision += 1;
     this.browseGeneration += 1;
     this.browseLoading = false;
     this.workspaceKind = 'dialogue';
     this.workingDir = '';
+    AppServices.instance.newSessionPreferences.save(this.selectedDeviceId, 'dialogue', '');
     this.workspacePopupOpen = false;
     this.browseOpen = false;
     this.showHiddenDirectories = false;
   }
 
   private selectProject(path: string): void {
-    const value = path.trim();
-    if (value.length === 0) return;
+    this.workspaceEditRevision += 1;
+    const value = path;
+    if (value.trim().length === 0) return;
     this.browseGeneration += 1;
     this.browseLoading = false;
     this.workspaceKind = 'project';
     this.workingDir = value;
+    AppServices.instance.newSessionPreferences.save(this.selectedDeviceId, 'project', value);
     this.workspacePopupOpen = false;
     this.browseOpen = false;
     this.browseError = '';
@@ -1083,20 +1118,24 @@ export struct NewSessionPageContent {
       const envelope = await AppServices.instance.client.invoke(deviceId, options);
       if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
       const result = unwrapInvokeResult(envelope);
+      if (!hasProviderCatalog(result)) throw new Error('Invalid provider catalog');
+      this.runtimeCatalogReady = true;
       const providerOptions = this.parseProviderModelOptions(result, agent);
       this.providerModelOptions = providerOptions;
-      this.providerModelAgent = providerOptions.length > 0 ? agent : '';
+      this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
         this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
         // Visibility overrides are part of the provider response. Reparse once so a
         // hidden model cannot remain in the list produced before the map was loaded.
         this.providerModelOptions = this.parseProviderModelOptions(result, agent);
-        this.providerModelAgent = this.providerModelOptions.length > 0 ? agent : '';
+        this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       }
     } catch (e) {
       if (generation !== this.runtimeLoadGeneration || deviceId !== this.selectedDeviceId) return;
-      this.providerModelOptions = [];
-      this.providerModelAgent = '';
+      const unsupported = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
+      if (unsupported || this.providerModelAgent !== agent) this.providerModelOptions = [];
+      this.providerModelAgent = unsupported ? '' : agent;
+      this.runtimeCatalogReady = unsupported;
       this.modelVisibilityOverrides = new Map();
     }
   }
@@ -1123,6 +1162,7 @@ export struct NewSessionPageContent {
       for (let i = 0; i < source.length; i++) {
         if (source[i].id === modelId && source[i].providerId === preferredProviderId) return source[i];
       }
+      if (this.providerModelAgent === this.selectedAgentKind) return undefined;
     }
     for (let i = 0; i < source.length; i++) {
       if (source[i].id === modelId) return source[i];
@@ -1131,7 +1171,7 @@ export struct NewSessionPageContent {
   }
 
   private visibleModelOptions(): RuntimeModelOption[] {
-    if (this.providerModelOptions.length > 0 && this.providerModelAgent === this.selectedAgentKind) {
+    if (this.providerModelAgent.length > 0 && this.providerModelAgent === this.selectedAgentKind) {
       return this.providerModelOptions;
     }
     return this.modelOptions;
@@ -1266,7 +1306,11 @@ export struct NewSessionPageContent {
   }
 
   private async loadRuntimeDefaults(deviceId: string, agent: NewAgentKind): Promise<void> {
+    const previousGeneration = this.runtimeLoadGeneration;
+    const sameScope = this.runtimeCatalogScope === JSON.stringify([deviceId, agent]);
+    this.runtimeCatalogScope = JSON.stringify([deviceId, agent]);
     const generation = ++this.runtimeLoadGeneration;
+    this.runtimeCatalogReady = false;
     this.runtimeToolbarLoadActive = true;
     this.composerToolbarReady = false;
     if (deviceId.length === 0) {
@@ -1274,7 +1318,14 @@ export struct NewSessionPageContent {
       this.composerToolbarReady = true;
       return;
     }
-    this.resetRuntimeDefaults(agent);
+    if (!sameScope) this.resetRuntimeDefaults(agent);
+    if (sameScope && previousGeneration > 0) {
+      if (this.runtimeModelTouchedGeneration === previousGeneration) this.runtimeModelTouchedGeneration = generation;
+      if (this.runtimeEffortTouchedGeneration === previousGeneration) this.runtimeEffortTouchedGeneration = generation;
+      if (this.runtimePermissionTouchedGeneration === previousGeneration) this.runtimePermissionTouchedGeneration = generation;
+      if (this.runtimePlanTouchedGeneration === previousGeneration) this.runtimePlanTouchedGeneration = generation;
+      if (this.runtimeFastTouchedGeneration === previousGeneration) this.runtimeFastTouchedGeneration = generation;
+    }
     // 编辑失败返回的新建草稿在能力目录加载期间也应保持可见，避免用户看到并操作到临时默认值。
     this.applyPendingEditRuntime(deviceId, agent, false);
     try {
@@ -1295,7 +1346,7 @@ export struct NewSessionPageContent {
       this.planModeNative = this.capabilityHasNativePlan(capabilities);
       this.planModeSupported = this.planModeNative || this.capabilityHasLegacyPlan(capabilities);
       await this.loadProviderModelOptions(agent, deviceId, generation);
-      if (generation !== this.runtimeLoadGeneration) return;
+      if (generation !== this.runtimeLoadGeneration || !this.runtimeCatalogReady) return;
 
       const recent = this.latestSessionForAgent(agent);
       const modelTouched = this.runtimeModelTouchedGeneration === generation;
@@ -1331,7 +1382,8 @@ export struct NewSessionPageContent {
           const fallback = fallbackModel(agent);
           selectedModel = this.findModelOption(fallback);
         }
-        if (selectedModel === undefined && source.length > 0) selectedModel = source[0];
+        if (selectedModel === undefined) selectedModel = source.find((row: RuntimeModelOption) =>
+          row.availability !== 'requires_payment' && !row.suspended);
         if (selectedModel !== undefined) {
           this.model = selectedModel.id;
           this.providerId = selectedModel.providerId;
@@ -1358,7 +1410,9 @@ export struct NewSessionPageContent {
       }
       if (!fastTouched) this.fastMode = false;
     } catch (e) {
-      // 旧版本被控端可能没有 capabilities；内置默认仍可被 create-session 校验。
+      if (generation === this.runtimeLoadGeneration) {
+        this.runtimeCatalogReady = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       if (generation === this.runtimeLoadGeneration) {
         const runtimeTouched = this.runtimeModelTouchedGeneration === generation
@@ -1437,6 +1491,7 @@ export struct NewSessionPageContent {
   }
 
   private openProjectBrowse(): void {
+    this.workspaceEditRevision += 1;
     if (this.selectedDeviceId.length === 0) {
       promptAction.showToast({ message: '请先选择一台在线电脑' });
       return;
@@ -1447,7 +1502,7 @@ export struct NewSessionPageContent {
     this.contextSheetPage = 'workspace';
     this.contextSheetOpen = true;
     this.showHiddenDirectories = false;
-    void this.loadBrowsePath(this.workingDir.trim() || '~');
+    void this.loadBrowsePath((this.workingDir.trim().length > 0 ? this.workingDir : '~'));
   }
 
   private selectCurrentBrowsePath(): void {
@@ -1467,7 +1522,7 @@ export struct NewSessionPageContent {
     options['fastMode'] = this.fastMode;
     if (this.providerId.trim().length > 0) options['providerId'] = this.providerId.trim();
     if (this.effort.trim().length > 0) options['effort'] = this.effort.trim();
-    if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir.trim();
+    if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir;
     if (sessionId.length > 0) options['id'] = sessionId;
     return options;
   }
@@ -1481,7 +1536,7 @@ export struct NewSessionPageContent {
     const session = new RemoteSession();
     session.id = sessionId;
     session.workspaceKind = this.workspaceKind;
-    session.workingDir = this.workspaceKind === 'project' ? this.workingDir.trim() : '';
+    session.workingDir = this.workspaceKind === 'project' ? this.workingDir : '';
     session.model = this.model.trim() || fallbackModel(this.selectedAgentKind);
     session.providerId = this.providerId.trim();
     session.effort = this.effort.trim();
@@ -1547,6 +1602,11 @@ export struct NewSessionPageContent {
       this.error = '请选择一台在线且允许远程控制的电脑';
       return;
     }
+    if (!this.runtimeCatalogReady) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
+      if (!this.runtimeToolbarLoadActive) void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
+      return;
+    }
     if (this.workspaceKind === 'project' && this.workingDir.trim().length === 0) {
       this.error = '请选择项目目录';
       this.workspacePopupOpen = true;
@@ -1567,6 +1627,11 @@ export struct NewSessionPageContent {
     params.planModeArm = this.planModeNative && this.planModeEnabled;
     params.legacyPlanRestore = !this.planModeNative && this.planModeEnabled
       ? (this.permissionModeBeforePlan || this.permissionMode) : '';
+    for (const image of this.composerImages) {
+      if (image.status === 'ready' && image.ref !== null) {
+        AppServices.instance.localAttachmentPreviews.remember(this.selectedDeviceId, image.ref.url, image.uri);
+      }
+    }
     AppServices.instance.newSessionCreations.start(params);
     this.cancelNewSessionDraftCheckpoint();
     AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
@@ -2533,6 +2598,10 @@ export struct NewSessionPageContent {
 struct NewSessionPage {
   @State keyboardHeight: number = 0;
   private pageActive: boolean = false;
+  private workspaceEditRevision: number = 0;
+  private runtimeCatalogReady: boolean = false;
+  private runtimeCatalogScope: string = '';
+  private workspaceRestoreGeneration: number = 0;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {

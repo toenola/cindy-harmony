@@ -1,3 +1,4 @@
+import { providerCatalogUnavailable } from '../core/ComposerCatalog';
 /**
  * 任务详情页：按渲染模型展示消息流 + Composer。
  *
@@ -26,6 +27,7 @@ import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import { AccountUsageSummary, projectAccountUsage } from '../core/messages/AccountUsage';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { HarmonyHttp } from '../network/HarmonyHttp';
 import { isTextFileReference, splitFileReferenceLocation } from '../core/files/FileReference';
@@ -92,6 +94,8 @@ import {
   composerModelKey,
   effortLevelLabel,
   groupComposerModelOptions,
+  hasProviderCatalog,
+  modelWindowSwitchDecision,
   modelProviderKind,
   parseChoiceOptions,
   parseModelOptions,
@@ -647,6 +651,11 @@ export struct TaskPageContent {
   @State contextSelectedUris: string[] = [];
   /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
   @State sessionActionOpen: boolean = false;
+  @State accountUsage: AccountUsageSummary = new AccountUsageSummary();
+  @State accountUsageLoading: boolean = false;
+  private accountUsageGeneration: number = 0;
+  private accountUsageRoute: string = '';
+  private accountUsageRefreshTimer: number = -1;
   /** 主操作与低频会话信息分层展示，避免展开屏菜单被元信息撑成近全屏面板。 */
   @State sessionActionInfoMode: boolean = false;
   @State sessionRenameMode: boolean = false;
@@ -699,11 +708,13 @@ export struct TaskPageContent {
   @State recentPickerController: PickerController = new PickerController();
   private permissionModeBeforePlan: string = 'default';
   private composerCapabilitiesGeneration: number = 0;
+  private providerCatalogGeneration: number = 0;
   private agentSwitchReadGeneration: number = 0;
   private agentSwitchWriteGeneration: number = 0;
   private agentSwitchConfirmed: boolean = false;
   /** 历史图片：ref.url → 可加载的 OSS URL（懒解析 + 缓存）。 */
   @State imageSources: Map<string, string> = new Map();
+  @State localImagePreviews: Map<string, string> = new Map();
   @State imageStates: Map<string, RemoteMediaViewState> = new Map();
   private imageResolutions: Map<string, Promise<string>> = new Map();
   private ossUrlCache: Map<string, string> = new Map();
@@ -866,6 +877,7 @@ export struct TaskPageContent {
     this.composerSurfaceVisible = false;
     this.composerBlurGeneration += 1;
     this.imageSources = new Map();
+    this.localImagePreviews = new Map();
     this.imageStates = new Map();
     this.imageResolutions.clear();
 
@@ -919,6 +931,8 @@ export struct TaskPageContent {
   }
 
   aboutToDisappear(): void {
+    if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+    this.accountUsageRefreshTimer = -1;
     this.pageLifecycleGeneration += 1;
     this.leavingDetailPage = true;
     this.sending = false;
@@ -1249,22 +1263,30 @@ export struct TaskPageContent {
     agent: string,
     capabilityGeneration: number = -1,
   ): Promise<void> {
+    const requestGeneration = ++this.providerCatalogGeneration;
+    const lifecycle = this.pageLifecycleGeneration;
+    const sessionId = this.sessionId;
+    const current = (): boolean => requestGeneration === this.providerCatalogGeneration
+      && this.isCurrentPageLifecycle(lifecycle) && this.sessionId === sessionId;
     try {
       const request = new ProviderListOptions();
       request.capabilities = ['provider-logo-kinds-v2'];
       const result = await this.invokeContextRpc('maker:provider:list', [request]);
+      if (!current()) return;
       if (capabilityGeneration >= 0
         && capabilityGeneration !== this.composerCapabilitiesGeneration) return;
       this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
       this.providerModelOptions = parseProviderModelOptions(
-        result, agent, this.modelVisibilityOverrides, this.currentModelSelectionHint());
-      this.providerModelAgent = agent;
+        result, agent, this.modelVisibilityOverrides, this.currentModelSelectionHint(), true);
+      this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
     } catch (e) {
+      if (!current()) return;
       if (capabilityGeneration >= 0
         && capabilityGeneration !== this.composerCapabilitiesGeneration) return;
       // 旧被控端没有 provider:list 时保持 capabilities 扁平回退，不影响模型页其它能力。
-      this.providerModelOptions = [];
-      this.providerModelAgent = '';
+      const unsupported = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
+      if (unsupported || this.providerModelAgent !== agent) this.providerModelOptions = [];
+      this.providerModelAgent = unsupported ? '' : agent;
     }
   }
 
@@ -1523,7 +1545,7 @@ export struct TaskPageContent {
   }
 
   private visibleModelOptions(): ComposerModelOption[] {
-    if (this.providerModelOptions.length > 0 && this.providerModelAgent === this.modelAgentTab) {
+    if (this.providerModelAgent.length > 0 && this.providerModelAgent === this.composerAgentKind()) {
       return this.providerModelOptions;
     }
     return this.browsingCurrentAgent() ? this.modelOptions : this.alternateModelOptions;
@@ -1552,11 +1574,7 @@ export struct TaskPageContent {
     const providerId = this.effectiveProviderId(session);
     if (providerId.length > 0) return option.providerId === providerId;
     if (option.providerId.length === 0) return true;
-    const source = this.visibleModelOptions();
-    for (let i = 0; i < source.length; i++) {
-      if (source[i].id === this.effectiveModelId(session)) return source[i].providerId === option.providerId;
-    }
-    return false;
+    return option.selectedRoute;
   }
 
   private effortOptionLabel(id: string, fallback: string): string {
@@ -1930,7 +1948,7 @@ export struct TaskPageContent {
     }
   }
 
-  private async selectComposerModel(option: ComposerModelOption): Promise<void> {
+  private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false): Promise<void> {
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
       return;
@@ -1968,6 +1986,26 @@ export struct TaskPageContent {
     }
     if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent) {
       this.returnToComposerAfterModelSheet();
+      return;
+    }
+    if (option.suspended) return;
+    const windowDecision = modelWindowSwitchDecision(session.contextTokens, option.contextWindow, session.remoteHostId);
+    if (windowDecision === 'blocked' || (windowDecision === 'confirm' && !windowConfirmed)) {
+      this.getUIContext().showAlertDialog({
+        title: windowDecision === 'blocked' ? this.v12String('v131_window_blocked_title') : this.v12String('v131_window_confirm_title'),
+        message: windowDecision === 'blocked'
+          ? this.v12String('v131_window_blocked_message')
+          : this.v12String('v131_window_confirm_message'),
+        primaryButton: { value: this.v12String('v131_cancel'), action: (): void => {} },
+        secondaryButton: {
+          value: windowDecision === 'blocked' ? this.v12String('v131_close') : this.v12String('v131_continue'),
+          action: (): void => {
+            if (windowDecision === 'blocked' || !this.isCurrentPageLifecycle(lifecycleGeneration)
+              || this.sessionId !== session.id) return;
+            void this.selectComposerModel(option, true);
+          },
+        },
+      });
       return;
     }
     const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
@@ -2258,6 +2296,14 @@ export struct TaskPageContent {
     }
     // 只把稳定 localId 交给附件队列；@State/@Prop 镜像可能不是同一对象引用。
     const sentImageIds = this.imageQueue.images.map((image: ComposerImage) => image.localId);
+    const sentSources = new Map(this.imageSources);
+    for (const image of this.imageQueue.images) {
+      if (image.status === 'ready' && image.ref !== null && image.ref.url.length > 0 && image.uri.length > 0) {
+        sentSources.set(image.ref.url, image.uri);
+        AppServices.instance.localAttachmentPreviews.remember(this.deviceId, image.ref.url, image.uri);
+      }
+    }
+    this.imageSources = sentSources;
     const sentFileIds = this.fileQueue.files.map((file: ComposerFile) => file.localId);
     const deferForCreation = this.isCreationBlockingRemoteOps()
       || AppServices.instance.inputQueue.shouldDeferNewInput(this.sessionId);
@@ -4168,6 +4214,26 @@ export struct TaskPageContent {
     uiAnimateState(this.getUIContext(), () => {
       this.expandedWorkGroups = this.toggleExpanded(this.expandedWorkGroups, key);
     });
+    this.loadDeferredWork(this.items, key, this.expandedWorkGroups.indexOf(key) >= 0);
+  }
+
+  private loadDeferredWork(items: RenderItem[], target: string, expanded: boolean): void {
+    for (const item of items) {
+      if (item.type !== 'work_group') continue;
+      const group = item as RenderWorkGroupItem;
+      if (group.key === target) this.loadDeferredWorkChildren(group.children, expanded);
+      else this.loadDeferredWork(group.children, target, expanded);
+    }
+  }
+
+  private loadDeferredWorkChildren(items: RenderItem[], expanded: boolean): void {
+    for (const item of items) {
+      if (item.type === 'work_group') this.loadDeferredWorkChildren((item as RenderWorkGroupItem).children, expanded);
+      else if (item.key.startsWith('history-work:')) {
+        if (expanded) void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, item.key);
+        else AppServices.instance.messages.hideHistoryDetails(this.deviceId, this.sessionId, item.key);
+      }
+    }
   }
 
   private currentSubagentDetail(): RenderSubagentGroupItem | null {
@@ -4469,6 +4535,10 @@ export struct TaskPageContent {
 
   /** 释放 TextArea 焦点并回到单行工具栏；离页前同步执行，避免返回栈复用旧输入首帧。 */
   private collapseComposerSurface(): void {
+    if (this.editingQueueClientId.length === 0) {
+      AppServices.instance.composerDrafts.save(this.sessionId, this.composerDocument, this.deviceId);
+      void AppServices.instance.composerDrafts.flush(this.sessionId, this.deviceId);
+    }
     this.getUIContext().getFocusController().clearFocus();
     this.composerBlurGeneration += 1;
     this.composerFocused = false;
@@ -5049,6 +5119,101 @@ export struct TaskPageContent {
     return '';
   }
 
+  private currentUsageRoute(): string {
+    const session = this.session();
+    return session === undefined ? '' : JSON.stringify([this.deviceId, session.id,
+      this.effectiveModelId(session), this.effectiveProviderId(session)]);
+  }
+
+  private async loadAccountUsage(): Promise<void> {
+    if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+    this.accountUsageRefreshTimer = -1;
+    const generation = ++this.accountUsageGeneration;
+    this.accountUsageRoute = this.currentUsageRoute();
+    const lifecycle = this.pageLifecycleGeneration;
+    const session = this.session();
+    this.accountUsage = new AccountUsageSummary();
+    this.accountUsageLoading = false;
+    if (session === undefined || session.remoteHostId.length > 0) return;
+    const provider = this.effectiveProviderId(session);
+    const model = this.effectiveModelId(session);
+    const current = (): boolean => {
+      const active = this.session();
+      return generation === this.accountUsageGeneration && this.isCurrentPageLifecycle(lifecycle)
+        && active !== undefined && active.id === session.id
+        && this.effectiveProviderId(active) === provider && this.effectiveModelId(active) === model;
+    };
+    this.accountUsageLoading = true;
+    try {
+      await this.loadProviderModelOptions(this.currentAgentTab());
+      if (!current()) return;
+      const option = this.providerModelOptions.find((row: ComposerModelOption) =>
+        row.id === model && (provider ? row.providerId === provider : row.selectedRoute));
+      const actualProvider = provider || option?.providerId || '';
+      const openAi = actualProvider === 'openai' || option?.openAiSubscription === true;
+      const gateway = actualProvider === 'xd' || (!actualProvider && session.agentKind === 'codex' && model.startsWith('codex/'));
+      const nativeCodex = session.agentKind === 'codex' && (!actualProvider || openAi)
+        && !model.startsWith('codex/') && !model.startsWith('chatgpt/') && !model.startsWith('xai/');
+      let raw: Object | undefined;
+      if (gateway) {
+        raw = await this.invokeContextRpc('maker:usage:account', ['claude-code']);
+      } else if (nativeCodex) {
+        try {
+          raw = await this.invokeContextRpc('maker:usage:codex-rate-limits', actualProvider ? [actualProvider] : []);
+        } catch (e) {
+          if ((actualProvider && actualProvider !== 'openai') || (e instanceof Error && /PRECONDITION_FAILED/.test(e.message))) throw new Error('Account scope unavailable');
+          raw = await this.invokeContextRpc('maker:usage:account', ['codex']);
+        }
+      } else if (openAi && session.agentKind !== 'codex' && model.startsWith('chatgpt/')) {
+        raw = await this.invokeContextRpc('maker:usage:account', actualProvider && actualProvider !== 'openai' ? ['codex', actualProvider] : ['codex']);
+      } else return;
+      if (!current()) return;
+      const payload = recordOrEmpty(raw);
+      if (!gateway && actualProvider && actualProvider !== 'openai' && readStr(payload, 'providerId') !== actualProvider) return;
+      if (!gateway && !nativeCodex) raw = payload['webSnapshot'] ?? (payload['source'] === 'openai-web' ? raw : undefined);
+      this.accountUsage = projectAccountUsage(raw, gateway ? 'gateway' : 'chatgpt', model, Date.now(),
+        (key: string, args: string[]): string => this.v12String(key, ...args));
+      this.accountUsage.providerLabel = option?.providerName || actualProvider;
+    } catch (e) {
+      if (current()) this.accountUsage = new AccountUsageSummary();
+    } finally {
+      if (generation === this.accountUsageGeneration) this.accountUsageLoading = false;
+      if (current() && this.sessionActionOpen) {
+        this.accountUsageRefreshTimer = setTimeout(() => {
+          this.accountUsageRefreshTimer = -1;
+          if (this.isCurrentPageLifecycle(lifecycle) && this.sessionActionOpen) void this.loadAccountUsage();
+        }, 60000);
+      }
+    }
+  }
+
+  @Builder
+  accountUsageSection() {
+    Column({ space: 6 }) {
+      Text(this.v12String('v131_account_usage')).fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_tertiary'))
+      if (this.accountUsageLoading) {
+        Text(this.v12String('v131_usage_loading')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      } else if (this.accountUsageRoute === this.currentUsageRoute() && this.accountUsage.lines.length > 0) {
+        if (this.accountUsage.providerLabel.length > 0) {
+          Text(this.accountUsage.providerLabel).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+        }
+        ForEach(this.accountUsage.lines, (line: string, index: number) => {
+          Text(line).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+            .width('100%')
+        }, (line: string, index: number) => `${index}:${line}`)
+        if (this.accountUsage.updatedAt > 0) {
+          Text(this.v12String('v131_usage_updated') + ' · ' + new Date(this.accountUsage.updatedAt).toLocaleString())
+            .fontSize(uiFontSize(11)).fontColor($r('app.color.text_tertiary'))
+        }
+      } else {
+        Text(this.v12String('v131_usage_unavailable')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      }
+    }
+    .alignItems(HorizontalAlign.Start).width('100%').padding(10)
+    .backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+  }
+
   @Builder
   sessionActionLayer() {
     Scroll() {
@@ -5089,6 +5254,8 @@ export struct TaskPageContent {
           }
           .width('100%')
           .padding({ bottom: 4 })
+
+          this.accountUsageSection()
 
           if (this.sessionActionInfoMode) {
             if ((this.session()?.workingDir ?? '').length > 0) {
@@ -7595,7 +7762,19 @@ export struct TaskPageContent {
 
   @Builder
   workGroupChild(child: RenderItem) {
-    if (child.type === 'work_group') {
+    if (child.key.startsWith('history-work:')) {
+      if (AppServices.instance.messages.historyDetailState(this.deviceId, this.sessionId, child.key) !== 'complete') {
+        Button(AppServices.instance.messages.historyDetailState(this.deviceId, this.sessionId, child.key) === 'loading'
+          ? this.v12String('v131_work_loading') : this.v12String('v131_work_load'))
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(9999)
+          .onClick(() => {
+            void AppServices.instance.messages.loadHistoryDetails(this.deviceId, this.sessionId, child.key);
+          })
+      }
+    } else if (child.type === 'work_group') {
       ForEach((child as RenderWorkGroupItem).children, (nested: RenderItem) => {
         this.workGroupChild(nested)
       }, (nested: RenderItem) => `${child.key}-${nested.key}`)
@@ -7833,21 +8012,32 @@ export struct TaskPageContent {
     .borderRadius(UI_RADIUS_CONTAINER)
   }
 
+  @Builder
+  resolvedImageThumb(ref: RemoteImageRef, source: string) {
+    Image(source).width(88).height(88).objectFit(ImageFit.Contain)
+      .onComplete(() => {
+        if (source !== this.imageSources.get(ref.url) || source === this.localImagePreviews.get(ref.url)) return;
+        const previews = new Map(this.localImagePreviews); previews.delete(ref.url); this.localImagePreviews = previews;
+        AppServices.instance.localAttachmentPreviews.release(this.deviceId, ref.url);
+      })
+      .onError(() => this.handleNativeImageError(ref.url, ref))
+  }
+
   /** 历史消息图片缩略图（点击全屏预览）。 */
   @Builder
   imageThumb(ref: RemoteImageRef) {
     if ((this.imageSources.get(ref.url) ?? '').length > 0) {
-      Image(this.imageSources.get(ref.url) ?? '')
-        .width(88)
-        .height(88)
-        .borderRadius(UI_RADIUS_CONTROL)
-        .objectFit(ImageFit.Contain)
-        .clickEffect(UI_CLICK_EFFECT)
-        .onClick(() => {
-          if (this.shareSelectionActive) return;
-          this.openImagePreview(ref);
-        })
-        .onError(() => this.handleNativeImageError(ref.url, ref))
+      Stack() {
+        if (this.localImagePreviews.has(ref.url)) {
+          Image(this.localImagePreviews.get(ref.url) ?? '').width(88).height(88).objectFit(ImageFit.Contain)
+        }
+        this.resolvedImageThumb(ref, this.imageSources.get(ref.url) ?? '')
+      }
+      .width(88).height(88).borderRadius(UI_RADIUS_CONTROL).clip(true)
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(() => {
+        if (!this.shareSelectionActive) this.openImagePreview(ref);
+      })
     } else if (this.imageStatus(ref.url) === 'error') {
       this.mediaErrorFrame(88, 88, () => {
         if (!this.shareSelectionActive) this.retryImage(ref.url, ref);
@@ -10099,6 +10289,7 @@ export struct TaskPageContent {
     this.sessionRenameDraft = this.sessionTitle();
     this.sessionActionInfoMode = false;
     this.sessionRenameMode = false;
+    void this.loadAccountUsage();
     uiAnimateState(this.getUIContext(), () => {
       this.sessionActionOpen = true;
     });
@@ -10106,6 +10297,8 @@ export struct TaskPageContent {
 
   private closeSessionActions(): void {
     if (this.sessionActionBusy) return;
+    if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+    this.accountUsageRefreshTimer = -1;
     uiAnimateFastState(this.getUIContext(), () => {
       this.sessionActionOpen = false;
       this.sessionActionInfoMode = false;
@@ -10634,6 +10827,13 @@ export struct TaskPageContent {
 
   private ensureImageSource(key: string, ref: RemoteImageRef): void {
     if (key.length === 0) return;
+    const preview = AppServices.instance.localAttachmentPreviews.read(this.deviceId, ref.url);
+    if (preview && !this.localImagePreviews.has(key)) {
+      const previews = new Map(this.localImagePreviews); previews.set(key, preview); this.localImagePreviews = previews;
+      if (!this.imageSources.has(key)) {
+        const sources = new Map(this.imageSources); sources.set(key, preview); this.imageSources = sources;
+      }
+    }
     const current = this.imageStates.get(key);
     if (current !== undefined && current.sourceKey === ref.url
       && (current.status === 'loading' || current.status === 'ready' || current.status === 'error')) return;
@@ -10687,7 +10887,8 @@ export struct TaskPageContent {
     if (current === undefined) return;
     const recovery = beginNativeMediaRecovery(current);
     const sources = new Map(this.imageSources);
-    sources.delete(key);
+    const preview = this.localImagePreviews.get(key) ?? '';
+    if (preview) sources.set(key, preview); else sources.delete(key);
     this.imageSources = sources;
     if (recovery !== null) {
       this.setImageState(key, recovery.state);

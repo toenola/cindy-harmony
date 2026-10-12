@@ -1,3 +1,6 @@
+import { RemoteReadRetries } from './RemoteReadRetries';
+import { projectedHistoryPrefix } from './HistoryViewAdapter';
+import { SnapshotReadPool } from './SnapshotReadPool';
 /**
  * 消息 Store：历史加载 + 流式增量 + 发送/停止。
  *
@@ -14,6 +17,7 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { HistoryViewAdapter, historyViewUnavailable, HISTORY_PLACEHOLDER_PREFIX } from './HistoryViewAdapter';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels, sessionTopic, Envelope } from '../device-link/DlProtocol';
@@ -85,7 +89,6 @@ const TAG = 'CindyMsg';
 // 与 Mobile/iOS 的会话历史页一致；Device Link 帧过大时 requestMessagesList
 // 会按 80 → 40 → 20 → 10 → 5 → 1 自动降档。
 const HISTORY_PAGE_LIMIT = 80;
-const RECONNECT_MESSAGE_WINDOW_LIMIT = 80;
 /** 对齐 Mobile：连续正文增量按两帧左右合并，避免每个 token 都重建整棵消息树。 */
 export const TEXT_DELTA_BATCH_INTERVAL_MS = 32;
 /** 进程内保留更多已上翻历史；超限时按最近访问淘汰整个非活动会话。 */
@@ -161,6 +164,9 @@ class LivePlanSnapshot {
 
 /** history:messages 一页响应（messages:list 复用）。 */
 class HistoryPage {
+  projected: boolean = false;
+  authorityRevision: number = -1;
+  projectionCursor: string = '';
   items: RemoteMessage[] = [];
   hasMore: boolean = false;
   effectiveLimit: number = 0;
@@ -195,6 +201,101 @@ class CreateOptsArgs {
 }
 
 export class MessageStore {
+  private historyRetries: RemoteReadRetries = new RemoteReadRetries();
+  private snapshotReads: SnapshotReadPool<HistoryPage> = new SnapshotReadPool();
+  private snapshotResetEpoch: number = 0;
+  private messagePushRevisions: Map<string, Map<string, number>> = new Map();
+  private historyDetailBodies: Map<string, RemoteMessage[]> = new Map();
+  private historyViews: HistoryViewAdapter = new HistoryViewAdapter();
+  private historyDetailsLoading: Set<string> = new Set();
+  private historyDetailsComplete: Set<string> = new Set();
+  private historyDetailsFailed: Set<string> = new Set();
+
+  private historyDetailKey(deviceId: string, sessionId: string, id: string): string {
+    const message = (this.messagesBySession.get(sessionId) ?? []).find((row: RemoteMessage) => row.id === id);
+    const revision = message === undefined ? '' : readStr(readObj(message.agentMeta, 'historyWork'), 'revision');
+    return JSON.stringify([deviceId, sessionId, id, revision, this.snapshotResetEpoch,
+      this.sessionLeaseRevisions.get(sessionId) ?? -1, this.historyHealGenerations.get(sessionId) ?? 0,
+      this.client?.connectionIdentity(deviceId) ?? '']);
+  }
+
+  historyDetailState(deviceId: string, sessionId: string, id: string): string {
+    const key = this.historyDetailKey(deviceId, sessionId, id);
+    return this.historyDetailsComplete.has(key) ? 'complete' : this.historyDetailsLoading.has(key)
+      ? 'loading' : this.historyDetailsFailed.has(key) ? 'failed' : 'idle';
+  }
+
+  hideHistoryDetails(deviceId: string, sessionId: string, id: string): void {
+    if (this.client) void this.historyViews.release(this.client, deviceId, sessionId,
+      id.slice(HISTORY_PLACEHOLDER_PREFIX.length)).catch(() => {});
+  }
+
+  async loadHistoryDetails(deviceId: string, sessionId: string, id: string): Promise<void> {
+    const client = this.client;
+    if (!client || !this.sessionReadAllowed(sessionId, deviceId)) return;
+    const state = this.historyDetailState(deviceId, sessionId, id);
+    if (state === 'loading' || state === 'complete') return;
+    const message = (this.messagesBySession.get(sessionId) ?? []).find((row: RemoteMessage) => row.id === id);
+    if (message === undefined) return;
+    const summary = readObj(message.agentMeta, 'historyWork');
+    const generation = this.historyHealGenerations.get(sessionId) ?? 0;
+    const key = this.historyDetailKey(deviceId, sessionId, id);
+    const current = (): boolean => this.subscribed.get(sessionId) === deviceId
+      && (this.historyHealGenerations.get(sessionId) ?? 0) === generation
+      && this.historyDetailKey(deviceId, sessionId, id) === key
+      && (this.messagesBySession.get(sessionId) ?? []).some((row: RemoteMessage) => row.id === id);
+    this.historyDetailsLoading.add(key);
+    this.historyDetailsFailed.delete(key);
+    this.notify();
+    try {
+      await this.historyViews.details(client, deviceId, sessionId, summary, current, (rows: RemoteMessage[]): void => {
+        if (!current()) return;
+        const body = this.mergeWithoutDuplicates(this.historyDetailBodies.get(key) ?? [], rows);
+        this.historyDetailBodies.set(key, body);
+        const merged = this.mergeWithoutDuplicates(rows, this.messagesBySession.get(sessionId) ?? []);
+        merged.sort(sortMessagesAsc);
+        this.setSessionMessages(sessionId, merged);
+        this.notify();
+      });
+      if (current()) this.historyDetailsComplete.add(key);
+    } catch (e) { if (current()) this.historyDetailsFailed.add(key); }
+    finally { this.historyDetailsLoading.delete(key); this.notify(); }
+  }
+
+  private snapshotIdentity(deviceId: string, sessionId: string, includeAuthority: boolean = false): string {
+    return JSON.stringify([deviceId, sessionId, this.snapshotResetEpoch,
+      this.client?.connectionIdentity(deviceId) ?? '', this.recoveryGeneration,
+      this.sessionLeaseRevisions.get(sessionId) ?? -1, this.historyHealGenerations.get(sessionId) ?? 0,
+      includeAuthority ? this.authoritativeMessageRevisions.get(sessionId) ?? 0 : 0]);
+  }
+
+  private async requestVisibleHistory(deviceId: string, sessionId: string, older: boolean,
+    before: string = ''): Promise<HistoryPage> {
+    // LINK_ACCEPT carries the Host capability list; socket-online alone is insufficient.
+    if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+    const client = this.client;
+    if (client && this.historyViews.available(client, deviceId, sessionId)) {
+      try {
+        const fence = this.snapshotIdentity(deviceId, sessionId);
+        const revision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
+        const projection = await this.historyViews.page(client, deviceId, sessionId, older,
+          this.snapshotIdentity(deviceId, sessionId, true),
+          (): boolean => fence === this.snapshotIdentity(deviceId, sessionId));
+        const page = new HistoryPage();
+        page.items = projection.messages;
+        page.hasMore = projection.hasMore;
+        page.projected = true;
+        page.authorityRevision = revision;
+        page.projectionCursor = projection.nextCursor;
+        return page;
+      } catch (e) {
+        if (!(e instanceof Error) || !historyViewUnavailable(e.message)) {
+          throw e instanceof Error ? e : new Error('History read failed');
+        }
+      }
+    }
+    return this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, before);
+  }
   private client: DlClient | undefined = undefined;
   private listeners: Array<() => void> = [];
   /** 仅在运行 boolean 翻转时通知，避免任务列表随每个流式事件整页重绘。 */
@@ -279,6 +380,15 @@ export class MessageStore {
 
   /** 登出/切换账号：本地消息、运行投影和落盘快照必须一起失效。 */
   async clearAllCachedSessions(): Promise<void> {
+    this.historyRetries.clear();
+    this.snapshotResetEpoch += 1;
+    this.snapshotReads.clear();
+    this.messagePushRevisions.clear();
+    this.historyDetailBodies.clear();
+    this.historyViews.clear();
+    this.historyDetailsLoading.clear();
+    this.historyDetailsComplete.clear();
+    this.historyDetailsFailed.clear();
     // 先推进恢复代次，再等待旧订阅的 best-effort 退订；等待期间若仍有旧回包，
     // 不能把已经清空的账号状态重新种回内存。
     this.recoveryGeneration += 1;
@@ -506,7 +616,8 @@ export class MessageStore {
   private persistSessionMessages(sessionId: string): void {
     const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
     if (deviceId.length === 0) return;
-    this.sessionMessageCache.save(deviceId, sessionId, this.messagesBySession.get(sessionId) ?? []);
+    this.sessionMessageCache.save(deviceId, sessionId, (this.messagesBySession.get(sessionId) ?? [])
+      .filter((row: RemoteMessage) => !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)));
   }
 
   private rememberLivePlanSnapshot(sessionId: string, snapshot: LivePlanSnapshot): void {
@@ -573,6 +684,8 @@ export class MessageStore {
 
   private removeSessionMessages(sessionId: string, removePersistent: boolean): void {
     this.messagesBySession.delete(sessionId);
+    this.messagePushRevisions.delete(sessionId);
+    this.clearHistoryDetailStates(this.cachedDeviceBySession.get(sessionId) ?? '', sessionId);
     if (removePersistent) this.persistSessionMessages(sessionId);
   }
 
@@ -954,7 +1067,7 @@ export class MessageStore {
               this.subscriptionAckedSessions.add(sessionId);
             }
           } catch (e) {
-            // 历史仍可独立恢复，下一次重连/重进继续补订阅。
+            this.retrySubscription(deviceId, sessionId, lease);
           }
         });
       }
@@ -987,7 +1100,7 @@ export class MessageStore {
           this.subscriptionAckedSessions.add(sessionId);
         }
       } catch (e) {
-        // 订阅失败不阻塞历史窗口恢复。
+        this.retrySubscription(deviceId, sessionId, lease);
       }
     });
     const loaded = await this.loadInitial(deviceId, sessionId, lease);
@@ -1005,6 +1118,13 @@ export class MessageStore {
     if (deviceId.length > 0 && this.subscribed.get(sessionId) !== deviceId) return;
     this.consumePendingTextDeltaNotification(sessionId);
     const subscribedDeviceId = this.subscribed.get(sessionId);
+    if (subscribedDeviceId && this.client) {
+      void this.historyViews.release(this.client, subscribedDeviceId, sessionId).catch(() => {});
+      this.historyViews.reset(subscribedDeviceId, sessionId);
+      this.clearHistoryDetailStates(subscribedDeviceId, sessionId);
+    }
+    this.historyRetries.cancel(sessionId);
+    this.historyRetries.cancel(sessionId + ':subscription');
     this.nextSessionLease(sessionId);
     this.subscribed.delete(sessionId);
     this.touchSessionCache(sessionId);
@@ -1105,6 +1225,7 @@ export class MessageStore {
     const previousCoverage = this.historyCoverageBySession.get(sessionId);
     if (previousCoverage !== undefined) previousCoverage.liveTailTrusted = false;
     try {
+      if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
       await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
         if (recoveryGeneration !== this.recoveryGeneration
           || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
@@ -1115,14 +1236,13 @@ export class MessageStore {
         this.subscriptionAckedSessions.add(sessionId);
       }
     } catch (e) {
-      // 订阅失败不阻断 healing
+      this.retrySubscription(deviceId, sessionId, lease);
     }
     if (recoveryGeneration !== this.recoveryGeneration
       || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
     const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     try {
-      const page = await this.requestMessagesList(
-        deviceId, sessionId, RECONNECT_MESSAGE_WINDOW_LIMIT, '');
+      const page = await this.requestVisibleHistory(deviceId, sessionId, false);
       if (recoveryGeneration !== this.recoveryGeneration
         || !this.sessionLeaseCurrent(sessionId, deviceId, lease)) return;
       page.items.sort(sortMessagesAsc);
@@ -1141,7 +1261,8 @@ export class MessageStore {
       this.scheduleHistoryHeal(deviceId, sessionId, true);
       void this.refreshSessionRunningState(deviceId, sessionId, lease);
     } catch (e) {
-      // healing 失败：保持现有消息，等下一次重连恢复。
+      // 只重试历史读取，其他恢复资源独立发布。
+      this.retryHistory(deviceId, sessionId, lease);
     }
   }
 
@@ -1150,6 +1271,8 @@ export class MessageStore {
    * 与 Mobile 同源且不新增 Harmony 专用协议。
    */
   private scheduleHistoryHeal(deviceId: string, sessionId: string, resetVisit: boolean): void {
+    // A projection intentionally omits collapsed bodies; those are not raw history gaps.
+    if (this.client && this.historyViews.available(this.client, deviceId, sessionId)) return;
     const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
     this.historyHealGenerations.set(sessionId, generation);
     if (resetVisit || !this.consideredHistoryGaps.has(sessionId)) {
@@ -1268,6 +1391,7 @@ export class MessageStore {
 
   /** socket 断线会同时撤销实时尾部背书与订阅 ACK。 */
   invalidateLiveTailTrust(): void {
+    this.historyRetries.clear();
     this.recoveryGeneration += 1;
     this.resubscribeOperations.clear();
     this.activeHydrationOperations.clear();
@@ -1810,7 +1934,6 @@ export class MessageStore {
     this.finishStreamingProjection(sessionId);
     const protectedProjectionKeys = this.pendingStreamingProjectionKeysBySession.get(sessionId)
       ?? new Set<string>();
-    this.pendingStreamingProjectionKeysBySession.delete(sessionId);
     this.applyDeferredAuthoritativeEmpty(sessionId, protectedProjectionKeys);
   }
 
@@ -1836,6 +1959,7 @@ export class MessageStore {
   }
 
   private discardPendingStreamingProjection(sessionId: string, message: RemoteMessage): void {
+    if (message.isStreaming || readBool(message.agentMeta, 'remoteContentTruncated', false)) return;
     const keys = this.pendingStreamingProjectionKeysBySession.get(sessionId);
     if (keys === undefined) return;
     keys.delete(messageIdentity(message));
@@ -2025,11 +2149,14 @@ export class MessageStore {
   getMessagesWithStreaming(sessionId: string, deviceId: string = ''): RemoteMessage[] {
     if (!this.sessionReadAllowed(sessionId, deviceId)) return [];
     this.touchSessionCache(sessionId);
-    const base = this.messagesBySession.get(sessionId) ?? [];
+    const history = this.messagesBySession.get(sessionId) ?? [];
     const s = this.streamingBySession.get(sessionId);
     if (s === undefined || (s.text.length === 0 && s.tools.length === 0)) {
-      return base;
+      return history;
     }
+    const known = s.persistId.length > 0 ? history.find((row: RemoteMessage) => row.role === 'assistant'
+      && (row.id === s.persistId || row.clientId === s.persistId)) : undefined;
+    const base = known !== undefined && s.text.length > 0 ? history.filter((row: RemoteMessage) => row !== known) : history;
     const isStreaming = !s.finished;
     const tmp: RemoteMessage[] = [];
     const persistedToolUseIds = new Set<string>();
@@ -2089,17 +2216,19 @@ export class MessageStore {
       tm.clientId = tm.id;
       tm.sessionId = sessionId;
       tm.role = 'assistant';
-      tm.createdAt = s.createdAt;
+      tm.createdAt = known?.createdAt ?? s.createdAt;
+      tm.rowid = known?.rowid ?? 0;
       tm.content = sanitizeStreamingOutput(s.text);
       tm.isStreaming = isStreaming;
       tmp.push(tm);
     }
-    return base.concat(tmp);
+    return base.concat(tmp).sort(sortMessagesAsc);
   }
 
   /** assistant 正文落库时只清同 persistId 投影；旧块 push 不能清掉新块。 */
   private clearStreamingIfAssistant(sessionId: string, message: RemoteMessage): boolean {
-    if (message.role !== 'assistant') {
+    if (message.role !== 'assistant' || message.isStreaming
+      || readBool(message.agentMeta, 'remoteContentTruncated', false)) {
       return false;
     }
     const streaming = this.streamingBySession.get(sessionId);
@@ -2108,6 +2237,36 @@ export class MessageStore {
       && message.id !== streaming.persistId
       && message.clientId !== streaming.persistId) return false;
     return this.streamingBySession.delete(sessionId);
+  }
+
+  private retrySubscription(deviceId: string, sessionId: string, lease: number): void {
+    const recovery = this.recoveryGeneration;
+    this.historyRetries.schedule(sessionId + ':subscription',
+      (): boolean => this.client?.getStatus() === 'online' && recovery === this.recoveryGeneration
+        && this.sessionLeaseCurrent(sessionId, deviceId, lease),
+      (): void => { void this.restoreSubscription(deviceId, sessionId, lease, recovery); });
+  }
+
+  private async restoreSubscription(deviceId: string, sessionId: string, lease: number, recovery: number): Promise<void> {
+    const current = (): boolean => recovery === this.recoveryGeneration
+      && this.sessionLeaseCurrent(sessionId, deviceId, lease);
+    try {
+      if (this.linkOpener !== undefined) await this.linkOpener(deviceId);
+      await this.queueSubscriptionOperation(sessionId, async (): Promise<void> => {
+        if (current() && this.client) await this.client.subscribe(deviceId, [sessionTopic(sessionId)]);
+      });
+      if (!current()) return;
+      this.subscriptionAckedSessions.add(sessionId);
+      this.historyRetries.cancel(sessionId + ':subscription');
+    } catch (_e) { if (current()) this.retrySubscription(deviceId, sessionId, lease); }
+  }
+
+  private retryHistory(deviceId: string, sessionId: string, lease: number): void {
+    const fence = this.snapshotIdentity(deviceId, sessionId);
+    this.historyRetries.schedule(sessionId,
+      (): boolean => this.client?.getStatus() === 'online' && this.sessionLeaseCurrent(sessionId, deviceId, lease)
+        && this.snapshotIdentity(deviceId, sessionId) === fence,
+      (): void => { void this.loadInitial(deviceId, sessionId, lease); });
   }
 
   private async loadInitial(
@@ -2120,7 +2279,7 @@ export class MessageStore {
     const messageRevision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
     try {
       // 对齐 iOS：历史走 local-db:messages:list（返回完整行含 clientId，最新在前）。
-      const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
+      const page = await this.requestVisibleHistory(deviceId, sessionId, false);
       if (!this.sessionLeaseCurrent(sessionId, deviceId, expectedLease)) {
         return false;
       }
@@ -2136,6 +2295,7 @@ export class MessageStore {
       const merged = this.applyLatestWindow(sessionId, page);
       this.setOlderAvailability(
         sessionId, this.hasMoreAfterPage(sessionId, page, merged));
+      this.historyRetries.cancel(sessionId);
       this.loadFailedBySession.delete(sessionId);
       this.notify();
       return true;
@@ -2148,6 +2308,7 @@ export class MessageStore {
       hilog.warn(DOMAIN, TAG, 'loadInitial failed session=%{public}s err=%{public}s',
         sessionId.slice(0, 8), msg);
       this.loadFailedBySession.set(sessionId, true);
+      this.retryHistory(deviceId, sessionId, expectedLease);
       this.notify();
       return false;
     }
@@ -2155,6 +2316,8 @@ export class MessageStore {
 
   /** 破坏性消息操作完成后重拉当前整窗，避免旧分页与服务端截断结果混合。 */
   async reloadSession(deviceId: string, sessionId: string): Promise<boolean> {
+    this.historyViews.reset(deviceId, sessionId);
+    this.clearHistoryDetailStates(deviceId, sessionId);
     if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     const lease = this.currentSessionLease(deviceId, sessionId);
     if (lease < 0) return false;
@@ -2170,13 +2333,15 @@ export class MessageStore {
 
   /** Pi 分支切换后的权威替换；旧分支消息不能与新窗口 merge。 */
   async replaceSessionWindow(deviceId: string, sessionId: string): Promise<boolean> {
+    this.historyViews.reset(deviceId, sessionId);
+    this.clearHistoryDetailStates(deviceId, sessionId);
     if (!this.sessionReadAllowed(sessionId, deviceId)) return false;
     const generation = (this.historyHealGenerations.get(sessionId) ?? 0) + 1;
     this.historyHealGenerations.set(sessionId, generation);
     this.consideredHistoryGaps.delete(sessionId);
     this.historyCoverageBySession.delete(sessionId);
     try {
-      const page = await this.requestMessagesList(deviceId, sessionId, HISTORY_PAGE_LIMIT, '');
+      const page = await this.requestVisibleHistory(deviceId, sessionId, false);
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
         || this.subscribed.get(sessionId) !== deviceId) return false;
       page.items.sort(sortMessagesAsc);
@@ -2212,10 +2377,9 @@ export class MessageStore {
     const generation = this.historyHealGenerations.get(sessionId) ?? 0;
     const current = this.messagesBySession.get(sessionId) ?? [];
     const before = oldestMessageCursor(current);
-    if (before.length === 0) return 0;
+    if (before.length === 0 && !this.historyViews.available(client, deviceId, sessionId)) return 0;
     try {
-      const page = await this.requestMessagesList(
-        deviceId, sessionId, HISTORY_PAGE_LIMIT, before);
+      const page = await this.requestVisibleHistory(deviceId, sessionId, true, before);
       if ((this.historyHealGenerations.get(sessionId) ?? 0) !== generation
         || this.subscribed.get(sessionId) !== deviceId) return 0;
       page.items.sort(sortMessagesAsc);
@@ -2262,6 +2426,7 @@ export class MessageStore {
     merged: RemoteMessage[],
     allowMessageCountInference: boolean = true,
   ): boolean {
+    if (page.projected) return page.hasMore;
     if (shouldKeepOlderMessagesAffordance(page.items.length, page.hasMore)) return true;
     if (!allowMessageCountInference || page.items.length === 0) return false;
     const total = this.messageCountBySession.get(sessionId) ?? 0;
@@ -2279,6 +2444,19 @@ export class MessageStore {
     limit: number,
     beforeId: string,
   ): Promise<HistoryPage> {
+    const fence = this.snapshotIdentity(deviceId, sessionId);
+    const revision = this.authoritativeMessageRevisions.get(sessionId) ?? 0;
+    const key = JSON.stringify([this.snapshotIdentity(deviceId, sessionId, true), limit, beforeId]);
+    return this.snapshotReads.read(key, (): boolean => fence === this.snapshotIdentity(deviceId, sessionId),
+      async (): Promise<HistoryPage> => {
+        const page = await this.readMessagesList(deviceId, sessionId, limit, beforeId);
+        page.authorityRevision = revision;
+        return page;
+      });
+  }
+
+  private async readMessagesList(deviceId: string, sessionId: string, limit: number,
+    beforeId: string): Promise<HistoryPage> {
     const limits = historyRetryLimits(limit);
     let lastError: Error = new Error('messages:list failed');
     for (let i = 0; i < limits.length; i++) {
@@ -2414,6 +2592,9 @@ export class MessageStore {
     this.consumePendingTextDeltaNotification(sessionId);
     this.authoritativeMessageRevisions.set(sessionId,
       (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
+    const rowRevisions = this.messagePushRevisions.get(sessionId) ?? new Map<string, number>();
+    rowRevisions.set(message.id, this.authoritativeMessageRevisions.get(sessionId) ?? 0);
+    this.messagePushRevisions.set(sessionId, rowRevisions);
     this.deferredAuthoritativeEmptySessions.cancel(sessionId);
     this.discardPendingStreamingProjection(sessionId, message);
     let list = this.messagesBySession.get(sessionId);
@@ -2489,12 +2670,20 @@ export class MessageStore {
       (this.authoritativeMessageRevisions.get(sessionId) ?? 0) + 1);
     this.deferredAuthoritativeEmptySessions.cancel(sessionId);
     this.historyCoverageBySession.delete(sessionId);
+    const deviceId = this.subscribed.get(sessionId) ?? '';
+    this.historyViews.reset(deviceId, sessionId);
+    this.clearHistoryDetailStates(deviceId, sessionId);
+    this.historyHealGenerations.set(sessionId, (this.historyHealGenerations.get(sessionId) ?? 0) + 1);
     const list = this.messagesBySession.get(sessionId);
     if (!list) return;
-    const filtered = list.filter((m: RemoteMessage) => !clientIds.includes(m.clientId));
+    const filtered = list.filter((m: RemoteMessage) => !clientIds.includes(m.clientId)
+      && !m.id.startsWith(HISTORY_PLACEHOLDER_PREFIX));
     if (filtered.length !== list.length) {
       this.setSessionMessages(sessionId, filtered);
       this.notify();
+    }
+    if (deviceId && this.client?.supportsHistoryView(deviceId)) {
+      void this.loadInitial(deviceId, sessionId, this.currentSessionLease(deviceId, sessionId));
     }
   }
 
@@ -2801,8 +2990,51 @@ export class MessageStore {
         return this.messagesBySession.get(sessionId) ?? [];
       }
     }
-    const current = this.messagesBySession.get(sessionId) ?? [];
-    const localOnly = current.filter((message: RemoteMessage) => message.localOnly);
+    const cached = this.messagesBySession.get(sessionId) ?? [];
+    const current = page.projected ? cached : cached.filter((row: RemoteMessage) => !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX));
+    for (const message of page.items) {
+      if (!message.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)) {
+        this.discardPendingStreamingProjection(sessionId, message);
+        this.clearStreamingIfAssistant(sessionId, message);
+      }
+    }
+    const protectedKeys = this.pendingStreamingProjectionKeysBySession.get(sessionId) ?? new Set<string>();
+    const localOnly = current.filter((message: RemoteMessage) => message.localOnly || protectedKeys.has(messageIdentity(message)));
+    if (page.authorityRevision >= 0
+      && page.authorityRevision !== (this.authoritativeMessageRevisions.get(sessionId) ?? 0)) {
+      page.items = this.mergeWithoutDuplicates(page.items, current.filter((row: RemoteMessage) =>
+        (this.messagePushRevisions.get(sessionId)?.get(row.id) ?? 0) > page.authorityRevision));
+      page.items.sort(sortMessagesAsc);
+    }
+    if (page.projected) {
+      // Preserve a placeholder object only for the same revision, so in-flight detail reads stay valid.
+      page.items = page.items.map((row: RemoteMessage): RemoteMessage => {
+        if (!row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)) return row;
+        const old = current.find((candidate: RemoteMessage) => candidate.id === row.id);
+        return old !== undefined && readStr(readObj(old.agentMeta, 'historyWork'), 'revision')
+          === readStr(readObj(row.agentMeta, 'historyWork'), 'revision') ? old : row;
+      });
+    }
+    if (page.projected) {
+      const deviceId = this.subscribed.get(sessionId) ?? '';
+      const prefix = projectedHistoryPrefix(current, page.items, page.hasMore);
+      if (prefix.length === 0) {
+        this.historyViews.replaceCursor(deviceId, sessionId, page.projectionCursor);
+      } else {
+        page.hasMore = this.hasMoreBySession.get(sessionId) ?? page.hasMore;
+      }
+      let projected = this.mergeWithoutDuplicates(prefix, page.items);
+      for (const row of projected.slice()) {
+        if (!row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX) || current.indexOf(row) < 0) continue;
+        const body = this.historyDetailBodies.get(this.historyDetailKey(deviceId, sessionId, row.id));
+        if (body !== undefined) projected = this.mergeWithoutDuplicates(body, projected);
+      }
+      projected = this.mergeWithoutDuplicates(localOnly, projected);
+      projected.sort(sortMessagesAsc);
+      this.setSessionMessages(sessionId, projected);
+      this.historyCoverageBySession.delete(sessionId);
+      return projected;
+    }
     const reconciled = reconcileLatestMessageWindow(
       current,
       page.items,
@@ -2819,6 +3051,13 @@ export class MessageStore {
       this.historyCoverageBySession.delete(sessionId);
     }
     return reconciled.items;
+  }
+
+  private clearHistoryDetailStates(deviceId: string, sessionId: string): void {
+    const prefix = JSON.stringify([deviceId, sessionId]).slice(0, -1) + ',';
+    for (const key of this.historyDetailBodies.keys()) if (key.startsWith(prefix)) this.historyDetailBodies.delete(key);
+    for (const key of this.historyDetailsComplete) if (key.startsWith(prefix)) this.historyDetailsComplete.delete(key);
+    for (const key of this.historyDetailsFailed) if (key.startsWith(prefix)) this.historyDetailsFailed.delete(key);
   }
 }
 
@@ -2897,7 +3136,8 @@ export function oldestMessageCursor(messages: RemoteMessage[]): string {
 function isSyntheticMessageId(id: string): boolean {
   return id.startsWith('mobile-system-')
     || id.startsWith('harmony-system-')
-    || id.startsWith('streaming-');
+    || id.startsWith('streaming-')
+    || id.startsWith(HISTORY_PLACEHOLDER_PREFIX);
 }
 
 /** created push 是权威行；唯一例外是不能让新截断占位覆盖已有完整行。 */

@@ -403,6 +403,94 @@
     {
       "name": "v12_pending_interaction_button",
       "value": "%d · %s"
+    },
+    {
+      "name": "v131_window_blocked_title",
+      "value": "无法切换到较小上下文模型"
+    },
+    {
+      "name": "v131_window_confirm_title",
+      "value": "切换模型前确认"
+    },
+    {
+      "name": "v131_window_blocked_message",
+      "value": "当前远程任务的上下文已接近目标模型窗口，请先整理上下文后再切换。"
+    },
+    {
+      "name": "v131_window_confirm_message",
+      "value": "当前上下文已达到目标模型窗口，切换后可能需要整理历史。是否继续？"
+    },
+    {
+      "name": "v131_account_usage",
+      "value": "账户配额与用量"
+    },
+    {
+      "name": "v131_usage_loading",
+      "value": "正在读取…"
+    },
+    {
+      "name": "v131_usage_unavailable",
+      "value": "暂不可用"
+    },
+    {
+      "name": "v131_usage_updated",
+      "value": "更新时间"
+    },
+    {
+      "name": "v131_work_loading",
+      "value": "正在加载工作详情…"
+    },
+    {
+      "name": "v131_work_load",
+      "value": "加载工作详情"
+    },
+    {
+      "name": "v131_cancel",
+      "value": "取消"
+    },
+    {
+      "name": "v131_close",
+      "value": "关闭"
+    },
+    {
+      "name": "v131_continue",
+      "value": "继续"
+    },
+    {
+      "name": "v131_offline",
+      "value": "离线"
+    },
+    {
+      "name": "v131_usage_period",
+      "value": "周期用量：%s / %s %s"
+    },
+    {
+      "name": "v131_usage_today",
+      "value": "今日用量：%s %s"
+    },
+    {
+      "name": "v131_usage_minutes",
+      "value": "%s 分钟"
+    },
+    {
+      "name": "v131_usage_primary",
+      "value": "主要额度"
+    },
+    {
+      "name": "v131_usage_secondary",
+      "value": "次要额度"
+    },
+    {
+      "name": "v131_usage_remaining",
+      "value": "%s剩余 %s"
+    },
+    {
+      "name": "v131_usage_reset",
+      "value": "%s重置"
+    },
+    {
+      "name": "v131_catalog_retry",
+      "value": "模型目录尚未就绪，正在重新读取，请稍后发送。"
     }
   ]
 }
