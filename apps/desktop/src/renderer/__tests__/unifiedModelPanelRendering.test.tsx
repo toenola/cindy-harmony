@@ -16,6 +16,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { FastMode } from '@cindy/maker-shared';
 
 /** 统一面板发起的深度写入带上「面板已串行」标记(见 ModelSelector 的 onEffortChangeLive)。 */
 const FROM_PANEL = { serializedByPanel: true };
@@ -55,8 +56,12 @@ vi.mock('react-i18next', async (importOriginal) => ({
 }));
 
 vi.mock('@/lib/scrollbarAutoHide', () => ({ flashScrollbar: vi.fn() }));
+vi.mock('@/hooks/useModelRouteDevices', () => ({
+  useModelRouteDevices: () => ({ devices: [], leadAgentDeviceId: null }),
+}));
 
 vi.mock('@/hooks/useAgentCapabilities', () => ({
+  getCachedCapabilities: vi.fn(() => null),
   evictDeviceCapabilities: vi.fn(),
   prefetchDeviceCapabilities: vi.fn(async () => {}),
   useAgentCapabilities: () => ({
@@ -182,6 +187,8 @@ vi.mock('@/hooks/useProviders', () => ({
 }));
 const remoteProvidersRef = vi.hoisted(() => ({ providers: [] as unknown[] }));
 vi.mock('@/hooks/useDeviceProviders', () => ({
+  getCachedDeviceProviders: () => ({ providers: remoteProvidersRef.providers }),
+  subscribeDeviceProviders: () => () => {},
   evictDeviceProviders: vi.fn(),
   prefetchDeviceProviders: vi.fn(async () => {}),
   useDeviceProviders: () => ({
@@ -217,7 +224,11 @@ import {
   addModelFavorite,
   listModelFavorites,
   updateModelFavorite,
+  setModelFavoritesOwner,
 } from '@/state/modelFavorites';
+import { setDataOwnerGeneration } from '@/contexts/dataOwnerGeneration';
+import { providerShareFavoriteSource, reconcileProviderShareFavorites } from '@/state/providerShareFavorites';
+import { toast } from '@/lib/toast';
 import { setModelEngineOverride } from '@/state/modelEnginePrefs';
 
 const onProviderChange = vi.fn();
@@ -263,6 +274,63 @@ beforeEach(() => {
   onProviderChange.mockClear();
   resetEnginePrefs();
   resetFavorites();
+});
+
+describe('分享模型收藏', () => {
+  const received = {
+    shareId: 's1', memberId: 'm1', providerId: 'anthropic', providerLabel: 'Anthropic',
+    hostDeviceId: 'host', deviceName: 'Host', status: 'active' as const, hostOnline: true, hostCapable: true,
+    owner: { displayName: 'Owner', avatarUrl: null, region: 'global' as const },
+  };
+  beforeEach(() => {
+    setDataOwnerGeneration('recipient', 1);
+    setModelFavoritesOwner('recipient');
+    reconcileProviderShareFavorites({ ownerStamp: { dataOwnerId: 'recipient', ownerGeneration: 1 }, confirmedRegions: ['global'], received: [received] });
+    remoteProvidersRef.providers = providersRef.providers.map((provider) => ({ ...provider as object, remoteInvocationEnabled: true }));
+  });
+  afterEach(() => {
+    remoteProvidersRef.providers = [];
+    setDataOwnerGeneration(null, 0);
+    vi.restoreAllMocks();
+  });
+
+  it('点击收藏后可见、可重新选择，完整配置保存在受邀者账号', async () => {
+    const onUnifiedSelect = vi.fn();
+    renderPanel({ deviceId: 'share:s1', onUnifiedSelect });
+    await act(async () => fireEvent.click(within(rowFor('Opus 5')).getByRole('button', { name: '存为收藏' })));
+    expect(listModelFavorites()).toEqual([expect.objectContaining({
+      providerId: providerShareFavoriteSource(received), modelId: 'claude-opus-5', agent: 'cc', effort: 'medium',
+    })]);
+    fireEvent.click(document.querySelector('[data-rail-item="favorites"]')!);
+    expect(within(screen.getByRole('listbox')).getAllByText('Opus 5')).toHaveLength(1);
+    await act(async () => fireEvent.click(rowFor('Opus 5')));
+    expect(onUnifiedSelect).toHaveBeenCalledWith(expect.objectContaining({ providerId: 'anthropic', modelId: 'claude-opus-5', engine: 'cc', effort: 'medium', fast: false }));
+  });
+
+  it('存储写失败显示提示，收藏区不会出现未保存的条目', async () => {
+    const failed = vi.spyOn(toast, 'error').mockImplementation(() => 'test');
+    renderPanel({ deviceId: 'share:s1' });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    await act(async () => fireEvent.click(within(rowFor('Opus 5')).getByRole('button', { name: '存为收藏' })));
+    expect(failed).toHaveBeenCalledWith('newChat.modelSelector.unified.favoritesSaveFailed');
+    expect(listModelFavorites()).toEqual([]);
+  });
+
+  it('从分享供应商切到收藏侧栏仍保留分享来源，选择回传完整路由', async () => {
+    const onUnifiedSelect = vi.fn();
+    renderPanel({
+      remoteAgent: { devices: [{ deviceId: 'share:s1', name: '来自 Owner 的分享' }], selectedDeviceId: 'share:s1' },
+      onUnifiedSelect,
+    });
+    await act(async () => fireEvent.click(within(rowFor('Opus 5')).getByRole('button', { name: '存为收藏' })));
+    fireEvent.click(document.querySelector('[data-rail-item="favorites"]')!);
+    expect(within(screen.getByRole('listbox')).getAllByText('Opus 5')).toHaveLength(1);
+    await act(async () => fireEvent.click(rowFor('Opus 5')));
+    expect(onUnifiedSelect).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'anthropic', modelId: 'claude-opus-5', engine: 'cc', effort: 'medium', fast: false,
+      agentDevice: expect.objectContaining({ deviceId: 'share:s1' }),
+    }));
+  });
 });
 
 describe('统一面板 · 打折 GPT-5.6 与 GPT-6 包月互切', () => {
@@ -2593,11 +2661,11 @@ describe('统一面板 · 编辑选中的收藏同步到 live', () => {
  */
 describe('统一面板 · 恢复推荐删记忆键', () => {
   /** 带删除入口的最小记忆实现(本地 providerModelMemory 的形状)。 */
-  function makeMemory(seed?: { effort?: Record<string, string>; fast?: Record<string, boolean> }) {
+  function makeMemory(seed?: { effort?: Record<string, string>; fast?: Record<string, FastMode> }) {
     const keyOf = (agent: string, providerId: string, modelId: string) =>
       `${agent}|${providerId}|${modelId}`;
     const effort = new Map<string, string>(Object.entries(seed?.effort ?? {}));
-    const fast = new Map<string, boolean>(Object.entries(seed?.fast ?? {}));
+    const fast = new Map<string, FastMode>(Object.entries(seed?.fast ?? {}));
     return {
       effort,
       fast,
@@ -2608,7 +2676,7 @@ describe('统一面板 · 恢复推荐删记忆键', () => {
           effort.set(keyOf(a, p, m), e);
         },
         getFast: (a: string, p: string, m: string) => fast.get(keyOf(a, p, m)),
-        setFast: (a: string, p: string, m: string, v: boolean) => {
+        setFast: (a: string, p: string, m: string, v: FastMode) => {
           fast.set(keyOf(a, p, m), v);
         },
         clearEffort: (a: string, p: string, m: string) => {

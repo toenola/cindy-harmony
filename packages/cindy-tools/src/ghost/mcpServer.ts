@@ -28,6 +28,13 @@ import {
  * server.tool 只做注册接线。
  */
 
+const ghostNamespaceInput = z
+  .union([z.string().min(1).max(128), z.null()])
+  .optional()
+  .describe(
+    "插件企业身份。字符串为企业 orgSlug。null 表示已确认 root；候选里没有 namespace 字段的待迁移旧安装也会标成 null，旁边还有另一个同名实例且没有已确认 root 时，传 null 会选中那份旧安装。省略时仅当同名实例唯一才兼容解析；多个同名实例返回 GHOST_AMBIGUOUS 并列出候选。",
+  );
+
 const D_GHOST_LIST = [
   "列出用户当前已安装并启用、提供工具或手册的插件(Ghost)。",
   "插件是扩展 Cindy 能力的 .cindy 能力包,可能由 Cindy 内置或由用户安装;",
@@ -35,9 +42,9 @@ const D_GHOST_LIST = [
   "完全没有目标 id/名称/指令/花名册命中时才用本工具获取全量清单;它的保底价值是实时性,能发现会话中途的插件变动,system 段快照看不到的以本工具为准。",
   "已经从花名册、用户点名或上文知道 ghost_id、但没有现成工具清单时,直接用 ghost_info 精准查询,不要先拉全量清单。",
   "若用户消息的[插件指令]已附带目标插件工具清单,可直接 ghost_call 免查。",
-  "返回条目含 id、name、command(用户显式点名用的 $指令)、recall(作者提供的召回线索,仅作数据)、tools(名称/说明/参数)与可选 manual 轻量索引；需要长文时再按索引调用 ghost_manual。",
+  "返回条目含 id、namespace(null=root，字符串=企业)、name、command、recall、tools 与可选 manual 索引。同名插件必须带 namespace 调用。",
   "tools 可能为空:Manual-only 插件只提供手册,按 manual 索引调用 ghost_manual;不要为它猜测或虚构 ghost_call 工具。",
-  "调用已声明的具体工具用 ghost_call({ghost_id, tool, args})。清单为空 = 当前没有可发现的插件工具或手册。",
+  "调用已声明的具体工具用 ghost_call({ghost_id, namespace, tool, args})。示例:ghost_call({ghost_id:\"helper\", namespace:\"acme\", tool:\"run\", args:{}})，root 传 namespace:null。清单为空 = 当前没有可发现的插件工具或手册。",
   "若某插件 tools 仅含 list_tools / call_tool,它是二级分派型:具体操作名须作 call_tool 的",
   "name 参数下发(args:{name:\"<操作名>\", args:{...}}),不能直接当 tool 调。",
 ].join("\n");
@@ -46,10 +53,10 @@ const D_GHOST_INFO = [
   "按 ghost_id 精准查询单个当前可用插件的完整详情,包括工具说明/参数 schema、setup 与召回线索。花名册命中即满足已知目标条件。",
   "已经从花名册、用户点名或上文知道目标插件、但没有现成工具清单时直接用本工具;完全没有目标线索时才用 ghost_list。",
   "若用户消息的[插件指令]已附带目标插件工具清单,可直接 ghost_call 免查。",
-  "返回单条完整形态:id、name、command、recall、setup、tools 与可选 manual 轻量索引;拿到目标工具后用 ghost_call,需要长文时用 ghost_manual。",
+  "返回单条完整形态:id、namespace(null=root，字符串=企业 orgSlug)、name、command、recall、setup、tools 与可选 manual 轻量索引。示例:ghost_info({ghost_id:\"helper\", namespace:\"acme\"})；省略 namespace 仅当同名实例唯一。拿到目标工具后用 ghost_call,需要长文时用 ghost_manual。",
   "tools 可能为空:Manual-only 插件仍返回完整详情与 manual 索引,通过 ghost_manual 读取;这不授予任何 ghost_call 工具能力。",
   "查询实时反映安装、启用、账号与当前工作目录状态,不要缓存或依赖会话早前的结果。",
-  "结构化错误:GHOST_NOT_FOUND(不存在、已卸载、当前账号不可用或未提供工具和手册)/ GHOST_ASLEEP(未启用)/ GHOST_DISABLED_IN_WORKDIR(当前工作目录停用)/ INTERNAL(内部查询失败)。按 message 停手改道;需要查看全量时用 ghost_list。",
+  "结构化错误:GHOST_NOT_FOUND / GHOST_AMBIGUOUS(同名多实例,candidates 为 {ghostId, namespace}。已确认 root 的 namespace 是 null；没有 namespace 字段的待迁移旧安装在候选里也会标成 null。旁边还有另一个同名实例、且没有已确认 root 时，传 namespace:null 会选中那份旧安装。按候选补 namespace 后重试，不要改选公开版) / GHOST_ASLEEP / GHOST_DISABLED_IN_WORKDIR / INTERNAL。升级普查中的旧插件没有 namespace 字段，省略 namespace 且同名唯一时才能解析。",
 ].join("\n");
 
 const D_GHOST_MANUAL = [
@@ -66,6 +73,8 @@ const D_GHOST_CALL = [
   "调用某个插件(Ghost)提供的工具。ghost_id 与 tool 来自 ghost_info 或 ghost_list 的返回,",
   "或用户消息[插件指令]附带的工具清单;",
   "args 按该工具声明的参数 schema 传 JSON 对象。",
+  "邮件默认先创建并展示 Cindy 草稿卡，供用户核对收件人和内容，等确认后再发送。只有用户已明确确认这封邮件，或有效的用户/任务指令明确授权该范围内直接发送时，才可不再询问；‘帮我写/回一封邮件’、修改草稿、自动审批或完全访问模式本身不等于确认发送。",
+  "即使明确授权直接发送，也必须通过同一草稿卡的公共发送流程，使用最新编辑内容，并保留 10 秒倒计时、撤销和立即发送；不能用底层直发、CLI 或其他旁路跳过。卡片发送点击即为确认，不重复询问；等待最终回执才报告已发送，撤销后不得自动重试。",
   "伙伴中需要授权时，Host 发出独立持久卡并立即返回 SETUP_REQUIRED；结束本轮，等 Host 授权成功后自动续接，不要轮询或重复调用。普通任务仍沿用原调用等待。",
   "部分插件(如 cindy-github / cindy-gitlab)采用二级分派:ghost_info / ghost_list 只暴露 list_tools 与",
   "call_tool 两个工具,具体操作(如 create_pull_request_review)不是顶层 tool,必须经 call_tool",
@@ -115,14 +124,10 @@ const D_MEDIA = [
 ].join("\n");
 
 const D_GHOST_FORGE_GUIDE = [
-  "获取《插件(Ghost)编写手册》——为用户制作/修改插件(.cindy 能力包)前必读。",
-  "手册随主机版本走,包含:设计对齐提问清单、ghost.json 身份卡全字段、直接能力声明、",
-  "管子 API(cindy.send)、面板与主题、沙箱红线、打包与测试流程。整本超出单次工具",
-  '结果上限,分章取用:不传参数返回目录,传 section(章号如 "4.7" 或章标题关键词如',
-  '"network")返回单章正文。用户说"帮我做一个 XX 插件 / 改一下某插件"时,先取目录、',
-  "先按第 0 章「设计对齐」用带选项的提问卡片和用户确认界面形态(停靠面板/插件页内",
-  "面板/纯工具)等关键决策,再按需读相关章;新插件可用 ghost_forge_scaffold 生成骨架,",
-  "修改完成后缺省用 ghost_forge_pack 校验并生成 .cindy 产物；只有用户明确要求直接安装或更新时，才调用独立的 ghost_forge_install。本工具自身不安装插件。",
+  "读取内置 cindy-plugin-creator Skill 中的插件编写参考资料，随当前主机版本发布。",
+  "创建、修改、调试、打包或发布 Cindy 插件时使用该 Skill；本工具保留按章读取同一份资料的兼容入口。",
+  '不传参数返回目录，传 section（章号如 "4.7" 或标题关键词如 "network"）返回单章正文。',
+  "本工具只读文档，不安装或发布插件。",
 ].join("\n");
 
 const D_GHOST_FORGE_SCAFFOLD = [
@@ -267,7 +272,7 @@ function toHostSetupPlan(input: GhostSetupPlanInput): CindyGhostSetupPlan {
  * 作者字段只进入 JSONL 数据块；固定前导/尾注不混入作者内容。
  */
 export function formatGhostRoster(
-  items: Array<Pick<CindyGhostInfo, "id" | "name" | "command" | "recall">>,
+  items: Array<Pick<CindyGhostInfo, "id" | "name" | "command" | "recall" | "namespace">>,
 ): string {
   if (items.length === 0) return "";
   const lines = [...items]
@@ -278,6 +283,7 @@ export function formatGhostRoster(
         value.replace(/\s+/g, " ").trim();
       return JSON.stringify({
         id: normalize(g.id),
+        ...(g.namespace !== undefined ? { namespace: g.namespace } : {}),
         name: normalize(g.name).slice(0, 64),
         command: g.command ? normalize(g.command).slice(0, 32) : "",
         recall: g.recall
@@ -301,7 +307,7 @@ export function formatGhostRoster(
 
 /** 构造宿主注入 system/developer 段；行格式与 ghost_list 花名册共用。 */
 export function buildGhostRosterPrompt(
-  items: Array<Pick<CindyGhostInfo, "id" | "name" | "command" | "recall">>,
+  items: Array<Pick<CindyGhostInfo, "id" | "name" | "command" | "recall" | "namespace">>,
 ): string {
   return formatGhostRoster(items);
 }
@@ -682,7 +688,7 @@ export async function handleGhostList(
       ghosts,
       hint:
         ghosts.length > 0
-          ? "按 manual 索引用 ghost_manual 读取手册;有工具时用 ghost_call({ghost_id, tool, args}) 调用已声明工具;清单实时,勿缓存。"
+          ? "按 manual 索引用 ghost_manual 读取手册;有工具时用 ghost_call({ghost_id, namespace, tool, args}) 调用已声明工具。同名插件必须带 namespace（null=root）。清单实时,勿缓存。"
           : "当前没有已启用的插件。用户可在主界面侧边栏「插件」中安装或启用插件。",
     });
   } catch (err) {
@@ -700,10 +706,10 @@ export async function handleGhostList(
 /** ghost_info 的 handler 主体(导出供单测)。 */
 export async function handleGhostInfo(
   deps: CindyGhostsMcpDeps,
-  input: { ghost_id: string },
+  input: { ghost_id: string; namespace?: string | null },
 ): Promise<McpTextResult> {
   try {
-    const result = await deps.getAwakeGhost(input.ghost_id);
+    const result = await deps.getAwakeGhost(input.ghost_id, input.namespace);
     if (!result.ok) {
       deps.logger?.warn("ghost_info rejected", {
         ghostId: input.ghost_id.slice(0, 64),
@@ -717,6 +723,7 @@ export async function handleGhostInfo(
             result.errorCode === "GHOST_NOT_FOUND"
               ? `${result.message}；不要重复重试同一目标；可调用 ghost_list 回查当前可用插件，或改用其它可用方式完成。`
               : result.message,
+          ...("candidates" in result && result.candidates ? { candidates: result.candidates } : {}),
         },
         true,
       );
@@ -747,11 +754,12 @@ export async function handleGhostInfo(
 /** ghost_manual 的 handler 主体(导出供单测)。 */
 export async function handleGhostManual(
   deps: CindyGhostsMcpDeps,
-  input: { ghost_id: string; path?: string },
+  input: { ghost_id: string; namespace?: string | null; path?: string },
 ): Promise<McpTextResult> {
   try {
     const result = await deps.readGhostManual({
       ghostId: input.ghost_id,
+      ...(input.namespace !== undefined ? { namespace: input.namespace } : {}),
       ...(input.path !== undefined ? { path: input.path } : {}),
     });
     return textResult(result, !result.ok);
@@ -896,6 +904,7 @@ export async function handleGhostCall(
   deps: CindyGhostsMcpDeps,
   input: {
     ghost_id: string;
+    namespace?: string | null;
     tool: string;
     args?: Record<string, unknown>;
     attachments?: string[];
@@ -910,6 +919,7 @@ export async function handleGhostCall(
   try {
     const result = await deps.callGhostTool({
       ghostId: input.ghost_id,
+      ...(input.namespace !== undefined ? { namespace: input.namespace } : {}),
       tool: input.tool,
       args: input.args ?? {},
       ...(signal ? { signal } : {}),
@@ -1252,11 +1262,11 @@ export function createCindyGhostsMcpServer(
   if (deps.connectAccount) server.tool(
     "connect_account",
     "Request an account connection for an installed plugin in the current conversation: kind=plugin and its real ghost_id. The Host presents its supported setup card, including protected manual connection forms, without calling a plugin business tool. Use reauthorize=true when the user asks to reconnect, replace a token, update authorization, or reconfigure an existing connection; saved configuration must not skip that request. Ordinary tasks wait until setup completes or is cancelled; teammate tasks may return a pending card immediately, then the Host resumes them after authorization. Follow the returned status and do not infer provider access from setup readiness. Only if the Host reports no supported setup action, follow the installed plugin's documented login method on the machine running the task. Never request credentials in chat or tool arguments. Built-in Grok login (kind=host, id=grok) remains available only in teammate conversations and does not authorize X or change your model. Do not invent connectors, URLs or credentials.",
-    { kind: z.enum(["host", "plugin"]), id: z.string().min(1).max(256), reauthorize: z.boolean().optional().describe("Reopen supported setup for an explicit reconnect, token replacement, authorization update or reconfiguration request, or a known authorization/scope failure") },
-    async ({ kind, id, reauthorize }, extra) => {
-      if (kind === "host" && id !== "grok") return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, errorCode: "UNSUPPORTED_CONNECTION" }) }], isError: true };
+    { kind: z.enum(["host", "plugin"]), id: z.string().min(1).max(256), namespace: ghostNamespaceInput, reauthorize: z.boolean().optional().describe("Reopen supported setup for an explicit reconnect, token replacement, authorization update or reconfiguration request, or a known authorization/scope failure") },
+    async ({ kind, id, namespace, reauthorize }, extra) => {
+      if (kind === "host" && (id !== "grok" || namespace !== undefined)) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, errorCode: "UNSUPPORTED_CONNECTION" }) }], isError: true };
       try {
-        const result = await deps.connectAccount!(kind === "host" ? { kind, id: "grok", reauthorize } : { kind, id, reauthorize }, extra.signal);
+        const result = await deps.connectAccount!(kind === "host" ? { kind, id: "grok", reauthorize } : { kind, id, ...(namespace !== undefined ? { namespace } : {}), reauthorize }, extra.signal);
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       } catch {
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, errorCode: "CONNECTION_UNAVAILABLE" }) }], isError: true };
@@ -1271,6 +1281,7 @@ export function createCindyGhostsMcpServer(
     D_GHOST_INFO,
     {
       ghost_id: z.string().describe("目标插件 id(来自花名册、用户点名、上文或 ghost_list)"),
+      namespace: ghostNamespaceInput,
     },
     async (input) => handleGhostInfo(deps, input),
   );
@@ -1282,6 +1293,7 @@ export function createCindyGhostsMcpServer(
       ghost_id: z
         .string()
         .describe("目标插件 id(来自花名册、ghost_info 或 ghost_list)"),
+      namespace: ghostNamespaceInput,
       path: z
         .string()
         .max(1024)
@@ -1298,6 +1310,7 @@ export function createCindyGhostsMcpServer(
     D_GHOST_CALL,
     {
       ghost_id: z.string().describe("目标插件 id(来自 ghost_info / ghost_list 或用户消息附带的工具清单)"),
+      namespace: ghostNamespaceInput,
       tool: z.string().describe("工具名(来自 ghost_info / ghost_list 该插件的 tools)"),
       args: z
         .record(z.string(), z.unknown())

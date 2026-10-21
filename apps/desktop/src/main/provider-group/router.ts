@@ -13,16 +13,19 @@
  */
 import { findCatalogModel, isModelSelectableForNewRoute } from '@cindy/model-providers';
 import type { AgentKind } from '@cindy/maker-core';
+import type { RemoteAgentCaps } from '@cindy/device-link';
 
-import type { ProviderGroupConfig, ProviderGroupMember, ProviderGroupView } from '../../shared/providerGroup.js';
+import type { ProviderGroupConfig, ProviderGroupMember, ProviderGroupView, ProviderGroupUsageLimit } from '../../shared/providerGroup.js';
 import type { ProviderGroupBinding } from './bindings.js';
 import type { ProviderGroupDirectory, ResolvedProviderGroupMember } from './directory.js';
 import { pickProviderGroupMember, type SchedulableMember } from './scheduler.js';
+import { createGuestSupportReader } from './sharedStatus.js';
+import { providerGroupMemberUsageState } from './usage.js';
+import { coolingScope, currentCooling, PROVIDER_GROUP_COOLING_SCOPE_CAP, type ProviderGroupPersistedCooling } from './cooling.js';
+export { PROVIDER_GROUP_FAILURE_COOLDOWN_MS, type ProviderGroupPersistedCooling } from './cooling.js';
 
 /** 撞到用量上限但拿不到重置时刻时，默认冷却多久。 */
 export const PROVIDER_GROUP_DEFAULT_COOLDOWN_MS = 30 * 60_000;
-/** 连不上 / 登录失效等失败后，短时间内不再给它分新任务。 */
-export const PROVIDER_GROUP_FAILURE_COOLDOWN_MS = 2 * 60_000;
 /**
  * 「这一轮已试过」多久后作废：一轮里每台最多试一次；换过去之后正常跑了一阵再出错，算新的一轮。
  */
@@ -34,11 +37,10 @@ export const PROVIDER_GROUP_TURN_WINDOW_MS = 30 * 60_000;
  */
 export const PROVIDER_GROUP_PICK_QUICK_MS = 3_000;
 
-/** 落盘的冷却：供应商 → 组内电脑 → 冷却到何时(unix ms)。 */
-export type ProviderGroupPersistedCooling = Record<string, Record<string, number>>;
-
 export interface ProviderGroupRouterDeps {
   directory: ProviderGroupDirectory;
+  /** 仅详情页按需读取；分配与普通状态查询不探测远端能力。 */
+  readCaps?(member: ProviderGroupMember): Promise<RemoteAgentCaps>;
   readGroup(providerId: string): ProviderGroupConfig | null;
   listBindings(): Record<string, ProviderGroupBinding>;
   /** 这个任务现在是否正在运行一轮。 */
@@ -61,6 +63,11 @@ export interface ProviderGroupPickInput {
   providerId: string;
   agentKind: AgentKind;
   model: string;
+  /**
+   * 仅本机任务入口设置：本机任务与其他使用方走同一组策略(2026-10-15 用户裁决)，只是本机的「暂停对外分配」
+   * 不拦本机自己的任务。远程请求与分享中转不传，也不从请求载荷读取，不能借它绕过暂停。
+   */
+  localTask?: true;
   exclude?: ReadonlySet<string>;
   /** 现读组内电脑的最新状态，不用短时缓存(试过不行、带着这一轮试过的来选时)。 */
   fresh?: boolean;
@@ -82,15 +89,15 @@ export const PROVIDER_GROUP_LOCAL_PROVISIONAL_MS = 30_000;
 export type ProviderGroupPickResult =
   | { kind: 'none' }
   | { kind: 'member'; member: ProviderGroupMember; label: string; resolved: ResolvedProviderGroupMember[] }
-  | { kind: 'unavailable'; resolved: ResolvedProviderGroupMember[] };
+  | { kind: 'unavailable'; resolved: ResolvedProviderGroupMember[]; usageLimit?: ProviderGroupUsageLimit };
 
 export interface ProviderGroupRouter {
   pick(input: ProviderGroupPickInput): Promise<ProviderGroupPickResult>;
-  view(providerId: string): Promise<ProviderGroupView>;
+  view(providerId: string, options?: string | { model?: string; agentKind?: AgentKind; includeGuestSupport?: boolean }): Promise<ProviderGroupView>;
   /** 经本组分到这台、正在运行的任务数。 */
   running(providerId: string, memberKey: string): number;
-  markCooling(providerId: string, memberKey: string, until: number): void;
-  coolingUntil(providerId: string, memberKey: string): number | null;
+  markCooling(providerId: string, memberKey: string, until: number, model?: string): void;
+  coolingUntil(providerId: string, memberKey: string, model?: string): number | null;
   /** 记一次「这一轮试过这台」，返回这一轮已试过的全部。 */
   markTried(sessionId: string, memberKey: string): ReadonlySet<string>;
   triedThisTurn(sessionId: string): ReadonlySet<string>;
@@ -103,11 +110,14 @@ function coolKey(providerId: string, memberKey: string): string {
 }
 
 export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): ProviderGroupRouter {
-  const cooling = new Map<string, number>();
+  const guestSupportReader = deps.readCaps ? createGuestSupportReader(deps.readCaps) : null;
+  const cooling = new Map<string, Record<string, number>>();
+  let hasLegacyCooling = false;
   try {
     for (const [providerId, members] of Object.entries(deps.coolingStore?.read() ?? {})) {
-      for (const [memberKey, until] of Object.entries(members)) {
-        if (until > deps.now()) cooling.set(coolKey(providerId, memberKey), until);
+      for (const [memberKey, value] of Object.entries(members)) {
+        if (typeof value === 'number') hasLegacyCooling = true;
+        cooling.set(coolKey(providerId, memberKey), currentCooling(value, deps.now()));
       }
     }
   } catch {
@@ -118,10 +128,11 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
     if (!deps.coolingStore) return;
     const now = deps.now();
     const value: ProviderGroupPersistedCooling = {};
-    for (const [key, until] of cooling) {
-      if (until <= now) continue;
+    for (const [key, remembered] of cooling) {
+      const scopes = currentCooling(remembered, now);
+      if (Object.keys(scopes).length === 0) continue;
       const split = key.indexOf('\u0000');
-      (value[key.slice(0, split)] ??= {})[key.slice(split + 1)] = until;
+      (value[key.slice(0, split)] ??= {})[key.slice(split + 1)] = scopes;
     }
     try {
       deps.coolingStore.write(value);
@@ -129,6 +140,9 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
       // 落盘失败只影响重启后的记忆，本次运行照常避开。
     }
   }
+
+  // 固定首次加载时截短的截止时间，重启或切回账号不能重新起算两分钟。
+  if (hasLegacyCooling) persistCooling();
 
   const lastPicked = new Map<string, string>();
   const tried = new Map<string, { at: number; keys: Set<string> }>();
@@ -145,15 +159,15 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
     return entry.keys;
   }
 
-  function coolingUntil(providerId: string, memberKey: string): number | null {
+  function coolingUntil(providerId: string, memberKey: string, model?: string): number | null {
     const key = coolKey(providerId, memberKey);
-    const until = cooling.get(key);
-    if (until === undefined) return null;
-    if (until <= deps.now()) {
+    const scopes = currentCooling(cooling.get(key), deps.now());
+    if (Object.keys(scopes).length === 0) {
       cooling.delete(key);
       return null;
     }
-    return until;
+    const until = Math.max(scopes[''] ?? 0, scopes[coolingScope(model)] ?? 0);
+    return until || null;
   }
 
   function running(providerId: string, memberKey: string): number {
@@ -197,29 +211,59 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
       const config = deps.readGroup(input.providerId);
       if (!config) return { kind: 'none' };
       const usable = (r: ResolvedProviderGroupMember) =>
-        offersModel(r, input.agentKind, input.model) && coolingUntil(input.providerId, r.member.key) === null;
+        offersModel(r, input.agentKind, input.model) && coolingUntil(input.providerId, r.member.key, input.model) === null
+        && !providerGroupMemberUsageState(r, input.model, deps.now(), input.agentKind).limited;
+      // 「暂停对外分配」只拦本机以外的新任务；除此之外本机任务与其他使用方同一套组策略，不另设本机优先。
+      const paused = (r: ResolvedProviderGroupMember) =>
+        r.member.paused && !(input.localTask === true && r.member.kind === 'local');
       const resolved = await deps.directory.resolveMembers(input.providerId, config, {
         quickMs: PROVIDER_GROUP_PICK_QUICK_MS,
         // 已经有一台能用、可以分的电脑(满载仍可接)：不再等慢的那几台。未满优先由调度器决定。
         enough: (r) => usable(r)
-          && !r.member.paused
+          && !paused(r)
           && !input.exclude?.has(r.member.key),
         ...(input.fresh ? { fresh: true } : {}),
       });
-      const schedulable: SchedulableMember[] = resolved.map((r) => ({
-        key: r.member.key,
-        usable: usable(r),
-        paused: r.member.paused,
-        running: memberRunning(input.providerId, r),
-        limit: r.member.limit,
-        weight: r.member.weight,
-      }));
+      const now = deps.now();
+      const schedulable: SchedulableMember[] = resolved.map((r) => {
+        const quota = providerGroupMemberUsageState(r, input.model, now, input.agentKind);
+        return {
+          key: r.member.key,
+          usable: usable(r),
+          paused: paused(r),
+          running: memberRunning(input.providerId, r),
+          limit: r.member.limit,
+          weight: r.member.weight,
+          usagePercent: quota.usagePercent,
+          weeklyResetAtMs: quota.weeklyResetAtMs,
+          fiveHourResetAtMs: quota.fiveHourResetAtMs,
+        };
+      });
       const key = pickProviderGroupMember(schedulable, config.strategy, {
         exclude: input.exclude,
         lastPicked: lastPicked.get(input.providerId) ?? null,
         random: deps.random,
+        now,
       });
-      if (!key) return { kind: 'unavailable', resolved };
+      if (!key) {
+        // Only members that could take this model after a quota reset count. A paused,
+        // offline or model-mismatched member must not supply a misleading reset time.
+        const limited = resolved.filter((r) => !paused(r) && !input.exclude?.has(r.member.key)
+          && offersModel(r, input.agentKind, input.model))
+          .map((r) => {
+            const quota = providerGroupMemberUsageState(r, input.model, now, input.agentKind);
+            // A reset is useful only once this member's existing cooldown also ends.
+            // A cooldown alone is not evidence of when an unknown quota resets.
+            return { ...quota, resetAtMs: quota.resetAtMs === null ? null
+              : Math.max(quota.resetAtMs, coolingUntil(input.providerId, r.member.key, input.model) ?? 0) };
+          })
+          .filter((quota) => quota.limited);
+        const resets = limited.flatMap((quota) => quota.resetAtMs === null ? [] : [quota.resetAtMs]);
+        return {
+          kind: 'unavailable', resolved,
+          ...(limited.length > 0 ? { usageLimit: { resetAtMs: resets.length > 0 ? Math.min(...resets) : null } } : {}),
+        };
+      }
       lastPicked.set(input.providerId, key);
       if (input.reserveFor) {
         provisional.set(input.reserveFor, {
@@ -233,21 +277,33 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
       return { kind: 'member', member: chosen.member, label: chosen.label, resolved };
     },
 
-    async view(providerId) {
+    async view(providerId, options) {
       const config = deps.readGroup(providerId);
       if (!config) return { providerId, config: null, members: [] };
       const resolved = await deps.directory.resolveMembers(providerId, config);
+      const viewOptions = typeof options === 'string' ? { model: options } : options;
+      const model = viewOptions?.model;
+      const readSupport = viewOptions?.includeGuestSupport ? guestSupportReader : null;
       return {
         providerId,
         config,
-        members: resolved.map((r) => {
-          const until = coolingUntil(providerId, r.member.key);
+        members: await Promise.all(resolved.map(async (r) => {
+          const guestSupport = readSupport
+            ? (r.member.kind === 'local' || r.state === 'ok' ? await readSupport(r.member) : 'unknown' as const)
+            : undefined;
+          const quota = providerGroupMemberUsageState(r, model, deps.now(), viewOptions?.agentKind);
+          const remembered = coolingUntil(providerId, r.member.key, model);
+          const until = quota.limited && quota.resetAtMs === null ? null
+            : remembered === null ? quota.resetAtMs
+            : quota.resetAtMs === null ? remembered : Math.max(remembered, quota.resetAtMs);
           const count = memberRunning(providerId, r);
+          // 那台电脑上这个供应商现在的显示名，读不到时用加入时的快照：同一台电脑有几个账号时界面按它区分。
+          const providerName = r.view?.name || r.member.providerName;
           const state = r.member.paused
             ? 'paused' as const
             : r.state !== 'ok'
               ? r.state
-              : until !== null
+              : until !== null || quota.limited
                 ? 'cooling' as const
                 : count >= r.member.limit
                   ? 'full' as const
@@ -256,7 +312,10 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
             key: r.member.key,
             kind: r.member.kind,
             label: r.label,
+            ...(providerName ? { providerName } : {}),
             ...(r.ownerName ? { ownerName: r.ownerName } : {}),
+            ...(r.appVersion ? { appVersion: r.appVersion } : {}),
+            ...(guestSupport ? { guestSupport } : {}),
             state,
             ...(r.reason ? { reason: r.reason } : {}),
             running: count,
@@ -265,15 +324,21 @@ export function createProviderGroupRouter(deps: ProviderGroupRouterDeps): Provid
             paused: r.member.paused,
             ...(until !== null ? { coolingUntil: until } : {}),
           };
-        }),
+        })),
+        ...(model ? { model } : {}),
       };
     },
 
     running,
 
-    markCooling(providerId, memberKey, until) {
+    markCooling(providerId, memberKey, until, model) {
       const key = coolKey(providerId, memberKey);
-      cooling.set(key, Math.max(cooling.get(key) ?? 0, until));
+      const scopes = currentCooling(cooling.get(key), deps.now());
+      const scope = coolingScope(model);
+      // Always leave room for account-wide authentication/overload failures.
+      if (scope && !(scope in scopes) && Object.keys(scopes).length >= PROVIDER_GROUP_COOLING_SCOPE_CAP - 1) return;
+      scopes[scope] = Math.max(scopes[scope] ?? 0, until);
+      cooling.set(key, scopes);
       persistCooling();
     },
 
