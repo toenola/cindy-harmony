@@ -1,9 +1,11 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
   RichAnswerStream, RichPart, RichValue, hasRichAnswer, richAnswerText, richLinePlot, richResolvedValues,
-  richMediaMarkdown, richVisualStyle, richYoutubeWatchUrl, splitRichAnswer, RichChartPoint, RichNode, RichPlotTick,
+  richMediaMarkdown, richSendText, richVisualStyle, richYoutubeWatchUrl, splitRichAnswer, RichChartPoint, RichNode, RichPlotTick,
 } from '../main/ets/core/messages/RichAnswer';
-import { RichInteractionMemory, RichStateStorage, parseStoredEntries } from '../main/ets/core/messages/RichInteractionMemory';
+import {
+  RichInteractionMemory, RichStateStorage, RichSubmissionController, parseStoredEntries,
+} from '../main/ets/core/messages/RichInteractionMemory';
 import { buildRenderItems, RenderItem, RenderMessageItem, RenderRichPart } from '../main/ets/core/messages/MessageRender';
 import { freezeShareProjection } from '../main/ets/core/sharing/ConversationShareProjection';
 import { parseMessage, RemoteMessage } from '../main/ets/core/tasks/TaskModels';
@@ -101,15 +103,65 @@ export default function v133RichAnswerTest(): void {
 
     it('applies_ops_counts_invalid_lines_and_exports_readable_text', 0, () => {
       const doc = new RichAnswerStream().update(splitRichAnswer(ANSWER)[1].source, true);
-      expect(JSON.stringify(doc.roots)).assertEqual('["months","cost","g","c"]');
-      // 叶子节点挂子节点、seq 跳号各计一次问题；后者之后不再推进。
+      expect(JSON.stringify(doc.roots)).assertEqual('["months","cost","g","c","gap"]');
       expect(doc.issues).assertEqual(2);
-      expect(doc.revision).assertEqual(8);
+      expect(doc.revision).assertEqual(9);
       expect(JSON.stringify((doc.nodes.get('g') as RichNode).children)).assertEqual('["h","ok"]');
       expect((doc.nodes.get('h') as RichNode).props['text'] as string).assertEqual('Plan A');
       expect(richAnswerText(ANSWER))
-        .assertEqual('Intro\n\n\nMonths: 6\n\nTotal: ¥108\n\n### Plan A\n\n☑ Ready\n\nSales\nQ1: 3\nQ2: 6\n\nOutro');
+        .assertEqual('Intro\n\n\nMonths: 6\n\nTotal: ¥108\n\n### Plan A\n\n☑ Ready\n\nSales\nQ1: 3\nQ2: 6\n\nx\n\nOutro');
       expect(richAnswerText('plain answer')).assertEqual('plain answer');
+    });
+
+    it('continues_after_malformed_lines_and_ignores_replayed_sequences', 0, () => {
+      const doc = new RichAnswerStream().update([
+        '{"seq":1,"op":"create","id":"a","kind":"text","props":{"text":"before"}}',
+        '{"seq":2,broken',
+        '{"seq":3,"op":"create","id":"b","kind":"text","props":{"text":"after"}}',
+        '{"seq":4,"op":"patch","id":"b","props":{"text":"updated"}}',
+        '{"seq":3,"op":"remove","id":"a"}',
+      ].join('\n'), true);
+      expect(doc.issues).assertEqual(2);
+      expect(doc.revision).assertEqual(3);
+      expect(JSON.stringify(doc.roots)).assertEqual('["a","b"]');
+      expect((doc.nodes.get('b') as RichNode).props['text'] as string).assertEqual('updated');
+    });
+
+    it('resolves_send_text_and_keeps_failures_retryable_without_losing_values', 0, async () => {
+      const document = new RichAnswerStream().update([
+        '{"seq":1,"op":"create","id":"name","kind":"input","props":{"default":"Ada"}}',
+        '{"seq":2,"op":"create","id":"send","kind":"button","props":{"send":{"op":"concat","args":["Hello ",{"ref":"name"}]}}}',
+      ].join('\n'), true);
+      const node = document.nodes.get('send') as RichNode;
+      const memory = new RichInteractionMemory();
+      const edits: Map<string, RichValue> = new Map();
+      edits.set('name', 'Grace');
+      memory.set('answer', edits);
+      const text = richSendText(node, richResolvedValues(document, memory.get('answer')));
+      expect(text).assertEqual('Hello Grace');
+      const controller = new RichSubmissionController(memory);
+      let attempts = 0;
+      let firstClientId = '';
+      await controller.submit('answer:sent:send', text ?? '', async (_text: string, clientId: string): Promise<boolean> => {
+        attempts++;
+        firstClientId = clientId;
+        return false;
+      });
+      expect(controller.status('answer:sent:send', text)).assertEqual('failed');
+      expect(memory.get('answer').get('name') as string).assertEqual('Grace');
+      await controller.submit('answer:sent:send', text ?? '', async (_text: string, clientId: string): Promise<boolean> => {
+        attempts++;
+        expect(clientId).assertEqual(firstClientId);
+        return true;
+      });
+      expect(controller.status('answer:sent:send', text)).assertEqual('sent');
+      await controller.submit('answer:sent:send', text ?? '', async (): Promise<boolean> => {
+        attempts++;
+        return true;
+      });
+      expect(attempts).assertEqual(2);
+      node.props['send'] = ' '.repeat(16001);
+      expect(richSendText(node, new Map()) === undefined).assertTrue();
     });
 
     it('moves_rejects_cycles_removes_subtrees_and_normalizes_side_style', 0, () => {

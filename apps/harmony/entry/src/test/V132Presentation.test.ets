@@ -194,13 +194,13 @@ export default function v132PresentationTests() {
       expect(badges[0].name).assertEqual('"Snapshot" Phone');
     });
 
-    it('source_duplicate_device_names_append_short_id_like_mobile', 0, () => {
+    it('source_duplicate_device_names_use_stable_numbering', 0, () => {
       const meta = presentationDeviceMeta('sender123', 'mobile', 'Old');
       const names = new Map<string, string>();
       names.set('sender123', 'iPhone');
       names.set('other123', ' IPHONE ');
       const badges = messageSourceBadges(meta, 'viewer', names);
-      expect(badges[0].name).assertEqual('iPhone (sender)');
+      expect(badges[0].name).assertEqual('iPhone (2)');
       expect(badges[0].id).assertEqual('sender123');
     });
 
@@ -210,7 +210,7 @@ export default function v132PresentationTests() {
       expect(input).assertEqual('[Client](ID) User text');
       const unknownViewer = messageSourceBadges(presentationDeviceMeta('sender', 'desktop'), '', new Map<string, string>());
       expect(unknownViewer.length).assertEqual(1);
-      expect(unknownViewer[0].name).assertEqual('');
+      expect(unknownViewer[0].name).assertEqual('未命名电脑');
     });
 
     it('quote_chip_summarizes_visible_markdown_only_and_keeps_input_unchanged', 0, () => {

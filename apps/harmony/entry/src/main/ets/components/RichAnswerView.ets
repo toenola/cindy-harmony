@@ -2,7 +2,7 @@
  * `cindy-ui` 富组件回答的 ArkUI 原生渲染。
  *
  * 行为事实源：`apps/mobile/src/session/RichAnswer.tsx`。只呈现声明式节点：
- * 颜色只映射语义角色、背景归 Cindy；按钮 / 表单只改本机视图值，不执行代码、不发消息。
+ * 颜色只映射语义角色、背景归 Cindy；发送操作由宿主控制，不能指定收件人或执行代码。
  * 宽度 ≤ 600vp 时 row / grid 退为单列（`mobileColumns` 可覆盖，`layout: aside` 保持并排）。
  */
 import { LengthMetrics } from '@kit.ArkUI';
@@ -34,11 +34,14 @@ import {
   richOptions,
   richRange,
   richResolvedValues,
+  richSendText,
   richString,
   richVector,
   richVisualStyle,
 } from '../core/messages/RichAnswer';
-import { RichInteractionMemory } from '../core/messages/RichInteractionMemory';
+import {
+  RichInteractionMemory, RichMessageSender, RichSubmissionController, RichSubmissionStatus,
+} from '../core/messages/RichInteractionMemory';
 import { UI_CLICK_EFFECT, UI_RADIUS_PILL, uiFontSize, uiLineHeight } from './UiKit';
 
 const PHONE_LAYOUT_MAX_WIDTH = 600;
@@ -56,12 +59,19 @@ export class RichViewState {
   complete: boolean = false;
   calcUnavailable: string = '';
   incomplete: string = '';
+  canSend: boolean = false;
+  sendLabel: string = '';
+  sendingLabel: string = '';
+  sentLabel: string = '';
+  failedLabel: string = '';
+  statuses: Map<string, RichSubmissionStatus> = new Map();
 }
 
 /** 节点交互回调；普通类实例，随组件树向下传递。 */
 export class RichAnswerHost {
   change: (key: string, value: RichValue) => void = (_key: string, _value: RichValue): void => {};
   apply: (node: RichNode) => void = (_node: RichNode): void => {};
+  submit: (node: RichNode) => void = (_node: RichNode): void => {};
 }
 
 class RichTextRole {
@@ -197,15 +207,22 @@ export struct RichAnswerView {
   @Prop @Watch('onSourceChange') source: string = '';
   @Prop @Watch('onSourceChange') complete: boolean = false;
   @Prop @Watch('onStateKeyChange') stateKey: string = '';
+  @Prop @Watch('onStateKeyChange') sendEnabled: boolean = false;
+  @Prop sendRevision: number = 0;
   memory: RichInteractionMemory = new RichInteractionMemory();
+  submissions: RichSubmissionController | undefined = undefined;
+  onSend: RichMessageSender = async (_text: string, _clientId: string): Promise<boolean> => false;
   @BuilderParam renderMarkdown: (text: string, key: string) => void = richPlainMarkdown;
   @Provide('cindyRichDoc') richDoc: RichDocument = new RichDocument();
   @Provide('cindyRichState') richState: RichViewState = new RichViewState();
   private parser: RichAnswerStream = new RichAnswerStream();
   private host: RichAnswerHost = new RichAnswerHost();
   private unsubscribe: () => void = (): void => {};
+  private unsubscribeSubmissions: () => void = (): void => {};
+  private viewMounted: boolean = false;
 
   aboutToAppear(): void {
+    this.viewMounted = true;
     this.host.change = (key: string, value: RichValue): void => {
       const patch: Map<string, RichValue> = new Map();
       patch.set(key, value);
@@ -215,14 +232,32 @@ export struct RichAnswerView {
       const changes = richAction(node, this.richState.values);
       if (changes.size > 0) this.memory.set(this.stateKey, changes);
     };
+    this.host.submit = (node: RichNode): void => {
+      const text = richSendText(node, this.richState.values);
+      if (!this.richState.canSend || text === undefined || this.submissions === undefined) return;
+      const stateKey = this.stateKey;
+      const revision = this.sendRevision;
+      const sender = this.onSend;
+      void this.submissions.submit(stateKey + ':sent:' + node.id, text,
+        async (message: string, clientId: string): Promise<boolean> => {
+          if (!this.viewMounted || !this.sendEnabled || this.stateKey !== stateKey
+            || this.sendRevision !== revision) return false;
+          return sender(message, clientId);
+        });
+    };
     this.unsubscribe = this.memory.subscribe(() => this.refreshValues());
+    if (this.submissions !== undefined) {
+      this.unsubscribeSubmissions = this.submissions.subscribe(() => this.refreshValues());
+    }
     this.richDoc = this.parser.update(this.source, this.complete);
     this.refreshValues();
     void this.memory.load();
   }
 
   aboutToDisappear(): void {
+    this.viewMounted = false;
     this.unsubscribe();
+    this.unsubscribeSubmissions();
     void this.memory.flush();
   }
 
@@ -242,6 +277,20 @@ export struct RichAnswerView {
     next.complete = this.complete;
     next.calcUnavailable = this.resourceText('v133_rich_calc_unavailable');
     next.incomplete = this.resourceText('v133_rich_incomplete');
+    next.canSend = this.sendEnabled && this.complete && this.richDoc.issues === 0;
+    next.sendLabel = this.resourceText('v134_rich_send');
+    next.sendingLabel = this.resourceText('v134_rich_sending');
+    next.sentLabel = this.resourceText('v134_rich_sent');
+    next.failedLabel = this.resourceText('v134_rich_send_failed');
+    const submissions = this.submissions;
+    if (submissions !== undefined) {
+      this.richDoc.nodes.forEach((node: RichNode): void => {
+        if (node.kind === 'button' || node.kind === 'form') {
+          next.statuses.set(node.id, submissions.status(this.stateKey + ':sent:' + node.id,
+            richSendText(node, next.values)));
+        }
+      });
+    }
     this.richState = next;
   }
 
@@ -603,6 +652,47 @@ struct RichNodeView {
       .fontColor($r('app.color.text_secondary'))
   }
 
+  private sendStatus(): RichSubmissionStatus {
+    return this.richState.statuses.get(this.nodeId) ?? 'idle';
+  }
+
+  private sendActionEnabled(): boolean {
+    return this.richState.canSend && richSendText(this.node(), this.richState.values) !== undefined
+      && this.sendStatus() !== 'sending' && this.sendStatus() !== 'sent';
+  }
+
+  private sendActionLabel(): string {
+    if (this.sendStatus() === 'sending') return this.richState.sendingLabel;
+    if (this.sendStatus() === 'sent') return this.richState.sentLabel;
+    return this.label() || richString(this.node(), 'text') || this.richState.sendLabel;
+  }
+
+  @Builder
+  sendAction() {
+    Column({ space: 8 }) {
+      if (richSendText(this.node(), this.richState.values) !== undefined) {
+        this.caption(() => richSendText(this.node(), this.richState.values) ?? '')
+      }
+      Text(this.sendActionLabel())
+        .fontSize(uiFontSize(ROLE_BUTTON.size))
+        .lineHeight(uiLineHeight(ROLE_BUTTON.lineHeight))
+        .fontWeight(ROLE_BUTTON.weight)
+        .fontColor($r('app.color.text_primary'))
+        .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+        .constraintSize({ minHeight: 44 })
+        .backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_PILL)
+        .enabled(this.sendActionEnabled())
+        .opacity(this.sendActionEnabled() ? 1 : 0.5)
+        .accessibilityText(this.sendActionLabel())
+        .clickEffect(UI_CLICK_EFFECT)
+        .onClick(() => this.host.submit(this.node()))
+      if (this.sendStatus() === 'failed') this.caption(() => this.richState.failedLabel)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   children(direction: () => FlexDirection) {
     Flex({
@@ -762,12 +852,20 @@ struct RichNodeView {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
     } else if (this.node().kind === 'button') {
-      this.chip(() => this.label().length > 0 ? this.label() : richString(this.node(), 'text'), '', '',
-        () => this.host.apply(this.node()))
+      if (Object.keys(this.node().props).includes('send')) {
+        this.sendAction()
+      } else {
+        this.chip(() => this.label().length > 0 ? this.label() : richString(this.node(), 'text'), '', '',
+          () => this.host.apply(this.node()))
+      }
     } else if (this.node().kind === 'form') {
       Column({ space: STACK_GAP }) {
         this.children(() => FlexDirection.Column)
-        if (this.label().length > 0) this.chip(() => this.label(), '', '', () => this.host.apply(this.node()))
+        if (Object.keys(this.node().props).includes('send')) {
+          this.sendAction()
+        } else if (this.label().length > 0) {
+          this.chip(() => this.label(), '', '', () => this.host.apply(this.node()))
+        }
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start)

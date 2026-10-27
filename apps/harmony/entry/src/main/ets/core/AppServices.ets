@@ -25,6 +25,8 @@ import {
 import { TaskStore, unwrapInvokeResult } from './tasks/TaskStore';
 import { TaskSearchStore } from './tasks/TaskSearchStore';
 import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
+import { TaskAccountTransition } from './tasks/ResidentTaskPanes';
+import { PROJECT_ALIASES_CHANGED, TaskProjectAliasStore } from './tasks/TaskProjectAliasStore';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
 import { DeviceView, parseDeviceView, readStr, recordOrEmpty, safeErrorMessage } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
@@ -32,7 +34,7 @@ import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
 import { SecurityObservabilityAdapter } from './observability/SecurityObservabilityAdapter';
 import { InputQueueStore, isTerminalMakerInputEvent } from './messages/InputQueueStore';
-import { RichInteractionMemory, SecureStoreRichStateStorage } from './messages/RichInteractionMemory';
+import { RichInteractionMemory, RichSubmissionController, SecureStoreRichStateStorage } from './messages/RichInteractionMemory';
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
 import { NewSessionPreferenceStore } from './tasks/NewSessionPreferenceStore';
@@ -60,14 +62,17 @@ export class AppServices {
 
   readonly auth: AuthStore = new AuthStore();
   readonly tasks: TaskStore = new TaskStore();
+  readonly taskAccountTransition: TaskAccountTransition = new TaskAccountTransition();
   readonly taskSearch: TaskSearchStore = new TaskSearchStore();
   readonly taskProjectOrder: TaskProjectOrderStore = new TaskProjectOrderStore();
+  readonly taskProjectAliases: TaskProjectAliasStore = new TaskProjectAliasStore();
   readonly messages: MessageStore = new MessageStore();
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
   private readonly richAnswerStorage: SecureStoreRichStateStorage = new SecureStoreRichStateStorage();
   /** 富组件回答的本机视图值；键已包含账号，退出登录无需清理。 */
   readonly richAnswerMemory: RichInteractionMemory = new RichInteractionMemory(this.richAnswerStorage);
+  readonly richAnswerSubmissions: RichSubmissionController = new RichSubmissionController(this.richAnswerMemory);
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly newSessionPreferences: NewSessionPreferenceStore = new NewSessionPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
@@ -129,6 +134,8 @@ export class AppServices {
       (deviceId: string) => this.openLink(deviceId),
       (): string => this.auth.cacheAccountId,
     );
+    this.taskProjectAliases.attach(this.client, (deviceId: string) => this.openLink(deviceId),
+      (): string => JSON.stringify([this.auth.sessionEpoch, this.auth.cacheAccountId]));
     this.tasks.onChanged(() => {
       this.syncSessionSubscriptions();
       this.taskListSnapshot.save(() => snapshotDevices(
@@ -137,6 +144,10 @@ export class AppServices {
       ));
     });
     this.auth.setLogoutCleanup(async (): Promise<void> => {
+      const accountEpoch = this.auth.sessionEpoch;
+      this.taskAccountTransition.begin(accountEpoch);
+      this.resetSessionSubscriptions();
+      this.tasks.clearAll();
       // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
       this.securityObservability.clearUser();
       await this.newSessionPreferences.setAccountScope('');
@@ -152,10 +163,11 @@ export class AppServices {
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
       this.taskProjectOrder.clearAll();
-      this.tasks.clearAll();
+      this.taskProjectAliases.clearAll();
       this.goals.clearAll();
       this.selfDeviceName = '';
       await this.voiceDictionary.clear();
+      if (this.taskAccountTransition.complete(accountEpoch)) this.tasks.clearAll();
     });
     this.messages.attach(this.client);
     this.inputQueue.attach(this.client);
@@ -374,6 +386,7 @@ export class AppServices {
   onAppForeground(): void {
     if (this.auth.isLoggedIn) {
       this.client.connectNow('foreground', true, true);
+      this.sessionSubscribedDevices.forEach((deviceId: string): void => this.taskProjectAliases.refresh(deviceId));
     }
   }
 
@@ -405,7 +418,7 @@ export class AppServices {
    * 或者桌面端在列表页之外创建任务，都不会丢掉 sessions:created push。
    */
   syncSessionSubscriptions(): void {
-    if (this.client.getStatus() !== 'online') return;
+    if (this.taskAccountTransition.active || this.client.getStatus() !== 'online') return;
 
     const desiredDeviceIds: Set<string> = new Set();
     const devices = this.tasks.deviceList;
@@ -470,6 +483,7 @@ export class AppServices {
         this.linkGeneration += 1;
         this.linkedDevices.clear();
         this.taskProjectOrder.resetConnectionFence();
+        this.taskProjectAliases.resetConnection();
         this.resetSessionSubscriptions();
         this.messages.invalidateLiveTailTrust();
         if (status === 'stopped') {
@@ -495,7 +509,6 @@ export class AppServices {
     events.onHelloAck = (ack: HelloAckPayload) => {
       // setStatus('online') 已在同一 hello-ack 处理链中触发 loadDevices；这里只记录
       // 本机身份，避免冷启动对设备 REST 发出两份完全相同的并发请求。
-      this.tasks.setSelfDeviceId(ack.deviceId);
       const previousAccountId = this.auth.cacheAccountId;
       if (previousAccountId.length > 0 && previousAccountId !== ack.userId) {
         // 本机名称由服务端按账号保存；换号后不能把上个账号的名称带进新账号。
@@ -505,6 +518,7 @@ export class AppServices {
       if (this.auth.rememberRelayUserId(ack.userId)) {
         void this.switchTaskListAccountScope(previousAccountId, ack.userId);
       }
+      this.tasks.setSelfDeviceId(ack.deviceId);
     };
     events.onAuthFailed = () => {
       // 握手被 401 拒：强制刷新 token 后立即重连。
@@ -541,6 +555,7 @@ export class AppServices {
 
   /** 拉取全量设备快照（REST 管理面），presence 补丁保留在线状态不回退。 */
   async loadDevices(): Promise<boolean> {
+    if (this.taskAccountTransition.active) return false;
     const epoch = this.auth.sessionEpoch;
     const existing = this.deviceLoadInFlight;
     if (existing !== undefined && this.deviceLoadInFlightEpoch === epoch) {
@@ -653,13 +668,19 @@ export class AppServices {
   }
 
   private async switchTaskListAccountScope(previousAccountId: string, accountId: string): Promise<void> {
-    const preferencesReady = this.newSessionPreferences.setAccountScope(accountId);
-    if (previousAccountId.length > 0 && previousAccountId !== accountId) {
+    const accountEpoch = this.auth.sessionEpoch;
+    const switchingAccount = previousAccountId.length > 0 && previousAccountId !== accountId;
+    if (switchingAccount) {
+      this.taskAccountTransition.begin(accountEpoch);
       // hello-ack 发现账号变化时未必经过 SettingsPage.logout；清理所有带
       // 账号语义的运行投影和应用级 sessions 订阅，不能只清任务/消息列表。
       this.linkGeneration += 1;
       this.linkedDevices.clear();
       this.resetSessionSubscriptions();
+      this.tasks.clearAll();
+    }
+    const preferencesReady = this.newSessionPreferences.setAccountScope(accountId);
+    if (switchingAccount) {
       // hello-ack 发现账号变化时同样丢弃旧账号 topic lease；当前连接可能已
       // 属于新账号，不能把旧账号的 pending unsubscribe 发到新账号。
       this.newSessionCreations.clearAll(false);
@@ -669,8 +690,12 @@ export class AppServices {
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
       this.taskProjectOrder.clearAll();
-      this.tasks.clearAll();
+      this.taskProjectAliases.clearAll();
       this.goals.clearAll();
+    }
+    if (accountEpoch !== this.auth.sessionEpoch) {
+      if (switchingAccount) this.taskAccountTransition.complete(accountEpoch);
+      return;
     }
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
@@ -678,6 +703,11 @@ export class AppServices {
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);
     await preferencesReady;
+    if (accountEpoch !== this.auth.sessionEpoch) {
+      if (switchingAccount) this.taskAccountTransition.complete(accountEpoch);
+      return;
+    }
+    if (switchingAccount && this.taskAccountTransition.complete(accountEpoch)) this.tasks.clearAll();
     void this.loadDevices();
   }
 
@@ -688,6 +718,9 @@ export class AppServices {
     ownerStamp: Object | undefined = undefined,
   ): void {
     switch (channel) {
+      case PROJECT_ALIASES_CHANGED:
+        this.taskProjectAliases.refresh(deviceId);
+        break;
       case 'sidebar-settings:project-order-changed':
         this.taskProjectOrder.handlePush(deviceId, payload, ownerStamp);
         break;
@@ -777,12 +810,14 @@ export class AppServices {
     try {
       await this.openLink(deviceId);
       if (!this.sessionSubscriptionStillNeeded(deviceId, generation)) return;
+      this.taskProjectAliases.refresh(deviceId);
       await this.client.subscribe(deviceId, [SESSIONS_TOPIC]);
       if (!this.sessionSubscriptionStillNeeded(deviceId, generation)) {
         await this.unsubscribeSessions(deviceId);
         return;
       }
       this.sessionSubscribedDevices.add(deviceId);
+      this.taskProjectAliases.refresh(deviceId);
       this.clearSessionSubscriptionRetry(deviceId);
       const loaded = await this.tasks.loadSessions(deviceId);
       if (loaded) {

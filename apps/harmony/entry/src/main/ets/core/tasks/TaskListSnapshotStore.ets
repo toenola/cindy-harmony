@@ -10,7 +10,7 @@ import { PresenceSnapshot } from '../device-link/DlProtocol';
 import { SecureStore } from '../storage/SecureStore';
 import {
   RemoteSession, RemoteSessionRuntimePending, RemoteSessionRuntimeProfile,
-  parseSession, sortSessionsByUpdatedAt,
+  parseSession, sessionListActivityAt,
 } from './TaskModels';
 
 const KEY = 'task.list.snapshot.v2';
@@ -31,12 +31,6 @@ function truncated(value: string): string {
   return value.slice(0, MAX_TEXT_CHARS);
 }
 
-function lastActivityAt(session: RemoteSession): string {
-  return session.userSendAt.length > 0
-    ? session.userSendAt
-    : (session.updatedAt.length > 0 ? session.updatedAt : session.createdAt);
-}
-
 function sessionRecord(session: RemoteSession): Record<string, Object | null> {
   const out: Record<string, Object | null> = {};
   out['id'] = session.id;
@@ -51,6 +45,7 @@ function sessionRecord(session: RemoteSession): Record<string, Object | null> {
   if (session.orcaRole.length > 0) out['orcaRole'] = truncated(session.orcaRole);
   if (session.pinnedAt.length > 0) out['pinnedAt'] = session.pinnedAt;
   if (session.userSendAt.length > 0) out['userSendAt'] = session.userSendAt;
+  if (session.lastActivityAt.length > 0) out['lastActivityAt'] = session.lastActivityAt;
   out['createdAt'] = session.createdAt;
   if (session.updatedAt.length > 0) out['updatedAt'] = session.updatedAt;
   if (session.preview.length > 0) out['preview'] = truncated(session.preview);
@@ -94,7 +89,8 @@ function normalizedSessions(input: RemoteSession[], limit: number): RemoteSessio
   }
   const sessions: RemoteSession[] = [];
   byId.forEach((session: RemoteSession) => sessions.push(session));
-  sessions.sort(sortSessionsByUpdatedAt);
+  sessions.sort((left: RemoteSession, right: RemoteSession) =>
+    sessionListActivityAt(right).localeCompare(sessionListActivityAt(left)));
   return sessions.slice(0, limit);
 }
 
@@ -114,7 +110,7 @@ function normalizedDevices(input: CachedTaskListDevice[], perDeviceLimit: number
     devices.push(device);
   }
   devices.sort((a: CachedTaskListDevice, b: CachedTaskListDevice) =>
-    lastActivityAt(b.sessions[0]).localeCompare(lastActivityAt(a.sessions[0])));
+    sessionListActivityAt(b.sessions[0]).localeCompare(sessionListActivityAt(a.sessions[0])));
   return devices;
 }
 

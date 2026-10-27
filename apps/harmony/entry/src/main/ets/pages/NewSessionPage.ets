@@ -61,6 +61,7 @@ import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readObj, readStr } from '../core/tasks/TaskModels';
+import { normalizeTaskProjectPath } from '../core/tasks/TaskProjectOrderStore';
 import {
   NewSessionDirectoryDrive,
   NewSessionDraftPrefWriter,
@@ -178,6 +179,7 @@ export struct NewSessionPageContent {
       });
     };
   @State devices: PresenceSnapshot[] = [];
+  @State projectAliasRevision: number = 0;
   @State selectedDeviceId: string = '';
   @State selectedAgentKind: NewAgentKind = 'claude-code';
   @State workspaceKind: WorkspaceKind = 'dialogue';
@@ -322,6 +324,9 @@ export struct NewSessionPageContent {
     }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
+    }));
+    this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => {
+      this.projectAliasRevision += 1;
     }));
     this.unsubs.push(AppServices.instance.auth.onChanged(() => {
       if (this.runtimeCatalogScope !== this.currentRuntimeScope()) {
@@ -559,7 +564,7 @@ export struct NewSessionPageContent {
       if (!found) {
         const project = new RecentProject();
         project.path = path;
-        project.title = directoryTitle(path);
+        project.title = this.projectDisplayTitle(path, this.projectAliasRevision);
         project.lastActivityAt = session.updatedAt;
         out.push(project);
       }
@@ -569,6 +574,14 @@ export struct NewSessionPageContent {
       return a.lastActivityAt > b.lastActivityAt ? -1 : 1;
     });
     return out.slice(0, 8);
+  }
+
+  private projectDisplayTitle(path: string, _revision: number): string {
+    const normalized = normalizeTaskProjectPath(path);
+    const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId)
+      .filter((session: RemoteSession): boolean => session.status !== 'deleted'
+        && session.workspaceKind !== 'dialogue' && normalizeTaskProjectPath(session.workingDir) === normalized);
+    return AppServices.instance.taskProjectAliases.resolve(this.selectedDeviceId, sessions) || directoryTitle(path);
   }
 
   private selectAgent(kind: NewAgentKind): void {
@@ -2020,7 +2033,7 @@ export struct NewSessionPageContent {
   workspaceSelector() {
     Button() {
       Row({ space: 4 }) {
-        Text(this.workspaceKind === 'dialogue' ? '对话' : directoryTitle(this.workingDir))
+        Text(this.workspaceKind === 'dialogue' ? '对话' : this.projectDisplayTitle(this.workingDir, this.projectAliasRevision))
           .fontSize(uiFontSize(13))
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
@@ -2158,7 +2171,7 @@ export struct NewSessionPageContent {
         Column() {
           ForEach(this.recentProjects(), (project: RecentProject) => {
             this.recentProjectOption(project)
-          }, (project: RecentProject) => `recent-project:${project.path}`)
+          }, (project: RecentProject) => JSON.stringify(['recent-project', project.path, project.title]))
           if (this.recentProjects().length === 0) {
             Text('还没有最近项目')
               .fontSize(12)

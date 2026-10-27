@@ -5,11 +5,19 @@ import { parseNewSessionPreferences, NewSessionPreferenceStore, WorkspacePrefere
 import { parseHistoryProjection, historyViewUnavailable, HistoryViewAdapter, projectedHistoryPrefix } from '../main/ets/core/messages/HistoryViewAdapter';
 import { SnapshotReadPool } from '../main/ets/core/messages/SnapshotReadPool';
 import { ProjectMachine, projectMachineLabel } from '../main/ets/core/tasks/ProjectMachineIdentity';
+import { deviceDisplayName } from '../main/ets/core/tasks/DeviceDisplayName';
+import {
+  initialTaskPaneMessage, rememberResidentTaskPane, residentPaneAllowsPositioning, residentPaneSurvives,
+  ResidentTaskPane, TaskAccountTransition, taskComposerInputId,
+} from '../main/ets/core/tasks/ResidentTaskPanes';
+import { parseHostProjectAliases, resolveProjectAliasForSessions, TaskProjectAliasStore } from '../main/ets/core/tasks/TaskProjectAliasStore';
+import { InputQueueStore } from '../main/ets/core/messages/InputQueueStore';
+import { SerializedComposerDocument } from '../main/ets/core/messages/ComposerDocument';
 import { MessageStore } from '../main/ets/core/messages/MessageStore';
 import { parseThinkingPresentation } from '../main/ets/core/messages/MessageRender';
 import { DlClient, DlClientOptions, DlInvokeOptions } from '../main/ets/core/device-link/DlClient';
 import { Envelope } from '../main/ets/core/device-link/DlProtocol';
-import { RemoteMessage } from '../main/ets/core/tasks/TaskModels';
+import { RemoteMessage, RemoteSession } from '../main/ets/core/tasks/TaskModels';
 import { projectAccountUsage } from '../main/ets/core/messages/AccountUsage';
 
 class DeferredValue<T> {
@@ -53,6 +61,24 @@ class ProjectionClient extends DlClient {
     if (options.channel === 'local-db:messages:work-details') return Promise.resolve(success(JSON.parse(
       '{"version":1,"messages":[{"id":"a","clientId":"a","role":"thinking","content":{"text":"detail"},"createdAt":"1970-01-01T00:00:01Z"}],"hasMore":false}') as Object));
     return Promise.resolve(success(options.channel === 'local-db:messages:list' ? [] : false));
+  }
+}
+
+class AliasClient extends DlClient {
+  response: Envelope = success([]);
+  constructor() { super(new DlClientOptions()); }
+  getStatus(): string { return 'online'; }
+  invoke(_device: string, _options: DlInvokeOptions): Promise<Envelope> { return Promise.resolve(this.response); }
+}
+
+class DelayedCloseClient extends ProjectionClient {
+  delayClose: boolean = false;
+  closeStarted: DeferredValue<void> = new DeferredValue<void>();
+  closeResult: DeferredValue<Envelope> = new DeferredValue<Envelope>();
+  async unsubscribe(_device: string, _topics: string[], _timeout: number = 0): Promise<Envelope> {
+    if (!this.delayClose) return success(true);
+    this.closeStarted.resolve();
+    return this.closeResult.promise;
   }
 }
 
@@ -214,10 +240,165 @@ export default function v131Tests(): void {
     it('disambiguates_only_visible_distinct_computers', 0, () => {
       const a = new ProjectMachine(); a.deviceId = 'a'; a.name = 'Mac'; a.online = true;
       const b = new ProjectMachine(); b.deviceId = 'b'; b.name = 'mac';
-      expect(projectMachineLabel('a', '', [a, b], 'Offline')).assertEqual('Mac · a');
-      expect(projectMachineLabel('b', '', [a, b], 'Offline')).assertEqual('mac · b · Offline');
+      expect(projectMachineLabel('a', '', [a, b], 'Offline')).assertEqual('Mac (1)');
+      expect(projectMachineLabel('b', '', [a, b], 'Offline')).assertEqual('mac (2) · Offline');
       expect(projectMachineLabel('a', '', [a, a], 'Offline')).assertEqual('Mac');
       expect(projectMachineLabel('a', 'a', [a, b], 'Offline')).assertEqual('');
+    });
+    it('keeps_three_recent_panes_and_suspends_positioning_while_hidden_or_healing', 0, () => {
+      let panes: ResidentTaskPane[] = [];
+      panes = rememberResidentTaskPane(panes, 1, 'd', 'a', '');
+      panes = rememberResidentTaskPane(panes, 1, 'd', 'b', '');
+      panes = rememberResidentTaskPane(panes, 1, 'd', 'c', '');
+      panes = rememberResidentTaskPane(panes, 1, 'd', 'a', '');
+      panes = rememberResidentTaskPane(panes, 1, 'd', 'd', '');
+      expect(panes.map((pane: ResidentTaskPane): string => pane.sessionId).join(',')).assertEqual('c,a,d');
+      const next = rememberResidentTaskPane([], 2, 'd', 'a', '');
+      expect(next[0].key === panes[1].key).assertFalse();
+      expect(residentPaneAllowsPositioning(false, false)).assertFalse();
+      expect(residentPaneAllowsPositioning(true, true)).assertFalse();
+      expect(residentPaneAllowsPositioning(true, false)).assertTrue();
+    });
+    // 回归：TaskStore 直接移除已删除任务，原判定把「找不到」一律保留，已删除任务会一直常驻。
+    it('releases_removed_hidden_panes_but_keeps_unloaded_or_selected_ones', 0, () => {
+      expect(residentPaneSurvives('running', undefined, 5, false)).assertFalse();
+      expect(residentPaneSurvives('running', undefined, 5, true)).assertTrue();
+      expect(residentPaneSurvives('running', undefined, 0, false)).assertTrue();
+      expect(residentPaneSurvives(undefined, undefined, 5, false)).assertTrue();
+      expect(residentPaneSurvives('idle', 'archived', 5, false)).assertFalse();
+      expect(residentPaneSurvives('archived', 'archived', 5, false)).assertTrue();
+      expect(residentPaneSurvives(undefined, 'archived', 5, false)).assertTrue();
+      expect(residentPaneSurvives('idle', 'idle', 5, false)).assertTrue();
+    });
+    // 回归：常驻任务共用固定输入框 ID，焦点请求可能命中隐藏任务的输入框。
+    it('gives_each_resident_task_its_own_composer_input_id', 0, () => {
+      const a = taskComposerInputId(1, 'd', 'a');
+      expect(a === taskComposerInputId(1, 'd', 'a')).assertTrue();
+      expect(a === taskComposerInputId(1, 'd', 'b')).assertFalse();
+      expect(a === taskComposerInputId(1, 'e', 'a')).assertFalse();
+      expect(a === taskComposerInputId(2, 'd', 'a')).assertFalse();
+      // 拼接不能产生歧义：'d:a' + 'b' 与 'd' + 'a:b' 必须不同。
+      expect(taskComposerInputId(1, 'd:a', 'b') === taskComposerInputId(1, 'd', 'a:b')).assertFalse();
+    });
+    it('isolates_embedded_message_targets_from_the_outer_route', 0, () => {
+      expect(initialTaskPaneMessage(true, '', 'outer-message')).assertEqual('');
+      expect(initialTaskPaneMessage(true, 'pane-message', 'outer-message')).assertEqual('pane-message');
+      expect(initialTaskPaneMessage(false, '', 'outer-message')).assertEqual('outer-message');
+    });
+    it('keeps_account_transition_blocked_until_the_current_cleanup_finishes', 0, () => {
+      const transition = new TaskAccountTransition();
+      expect(transition.active).assertFalse();
+      transition.begin(2);
+      transition.begin(3);
+      expect(transition.complete(2)).assertFalse();
+      expect(transition.active).assertTrue();
+      expect(transition.complete(3)).assertTrue();
+      expect(transition.active).assertFalse();
+    });
+    it('preserves_resident_message_window_when_subscription_pauses', 0, async () => {
+      const client = new ProjectionClient();
+      const rows: Object[] = [];
+      for (let index = 0; index < 85; index++) {
+        const row: Record<string, Object> = {};
+        row['id'] = 'row-' + index.toString(); row['clientId'] = 'row-' + index.toString();
+        row['role'] = 'user'; row['content'] = 'message'; row['createdAt'] = new Date(index * 1000).toISOString();
+        rows.push(row);
+      }
+      const block: Record<string, Object> = {}; block['type'] = 'messages'; block['messages'] = rows;
+      const page: Record<string, Object> = {}; page['version'] = 1; page['items'] = [block]; page['hasMore'] = false;
+      client.page = page;
+      const store = new MessageStore(); store.attach(client);
+      const lease = store.retainResidentSession('device', 'session');
+      expect(await store.openSession('device', 'session')).assertTrue();
+      expect(store.getMessages('session', 'device').length).assertEqual(85);
+      await store.closeSession('session', 'device');
+      expect(store.getMessages('session', 'device').length).assertEqual(85);
+      expect(await store.openSession('device', 'session')).assertTrue();
+      expect(store.getMessages('session', 'device').length).assertEqual(85);
+      store.releaseResidentSession(lease);
+      await store.closeSession('session', 'device');
+      expect(store.getMessages('session', 'device').length <= 80).assertTrue();
+    });
+    it('cancels_an_open_waiting_for_link_when_the_pane_is_hidden', 0, async () => {
+      const client = new ProjectionClient(); const store = new MessageStore(); store.attach(client);
+      const gate = new DeferredValue<void>();
+      store.setLinkOpener((_device: string): Promise<void> => gate.promise);
+      const opening = store.openSession('device', 'session');
+      await store.closeSession('session', 'device');
+      gate.resolve();
+      expect(await opening).assertFalse();
+      expect(store.isSessionOpen('session', 'device')).assertFalse();
+    });
+    it('does_not_compact_a_window_while_its_new_open_waits_for_link', 0, async () => {
+      const client = new DelayedCloseClient();
+      const rows: Object[] = [];
+      for (let index = 0; index < 85; index++) {
+        const row: Record<string, Object> = {};
+        row['id'] = 'row-' + index.toString(); row['clientId'] = 'row-' + index.toString();
+        row['role'] = 'user'; row['content'] = 'message'; row['createdAt'] = new Date(index * 1000).toISOString();
+        rows.push(row);
+      }
+      const block: Record<string, Object> = {}; block['type'] = 'messages'; block['messages'] = rows;
+      const page: Record<string, Object> = {}; page['version'] = 1; page['items'] = [block]; page['hasMore'] = false;
+      client.page = page;
+      const store = new MessageStore(); store.attach(client);
+      expect(await store.openSession('device', 'session')).assertTrue();
+      client.delayClose = true;
+      const closing = store.closeSession('session', 'device');
+      await client.closeStarted.promise;
+      const gate = new DeferredValue<void>();
+      store.setLinkOpener((_device: string): Promise<void> => gate.promise);
+      const opening = store.openSession('device', 'session');
+      client.closeResult.resolve(success(true));
+      await closing;
+      expect(store.getMessages('session', 'device').length).assertEqual(85);
+      gate.resolve();
+      expect(await opening).assertTrue();
+      client.delayClose = false;
+      await store.closeSession('session', 'device');
+    });
+    it('keeps_aliases_local_to_the_host_and_rejects_mixed_remote_groups', 0, () => {
+      const raw = JSON.parse('[{"projectKey":"local:/repo","alias":"Named"},{"projectKey":"local:/repo","alias":"Old"},{"projectKey":"remote:ssh:/repo","alias":"Wrong"}]') as Object;
+      const aliases = parseHostProjectAliases('device', raw);
+      const session = new RemoteSession(); session.workingDir = '/repo/.worktrees/branch';
+      expect(resolveProjectAliasForSessions('device', [session], aliases)).assertEqual('Named');
+      const remote = new RemoteSession(); remote.workingDir = '/repo'; remote.remoteHostId = 'ssh';
+      expect(resolveProjectAliasForSessions('device', [session, remote], aliases)).assertEqual('');
+      expect(resolveProjectAliasForSessions('other', [session], aliases)).assertEqual('');
+    });
+    it('clears_a_stale_alias_when_an_old_host_rejects_the_channel', 0, async () => {
+      const client = new AliasClient();
+      client.response = success(JSON.parse('[{"projectKey":"local:/repo","alias":"Named"}]') as Object);
+      const store = new TaskProjectAliasStore();
+      store.attach(client, async (_device: string): Promise<void> => {}, (): string => 'account');
+      let changed = new DeferredValue<void>();
+      store.onChanged((): void => changed.resolve());
+      const session = new RemoteSession(); session.workingDir = '/repo';
+      store.refresh('device');
+      await changed.promise;
+      expect(store.resolve('device', [session])).assertEqual('Named');
+      changed = new DeferredValue<void>();
+      const error: Record<string, Object> = {}; error['code'] = 'CHANNEL_NOT_ALLOWED'; error['message'] = 'old host';
+      const payload: Record<string, Object> = {}; payload['ok'] = false; payload['error'] = error;
+      client.response = new Envelope(); client.response.payload = payload;
+      store.refresh('device');
+      await changed.promise;
+      expect(store.resolve('device', [session])).assertEqual('');
+      store.clearAll();
+    });
+    it('keeps_computer_numbers_stable_and_never_displays_an_id_as_its_name', 0, () => {
+      const names = new Map<string, string>(); names.set('b', 'Mac'); names.set('a', 'mac');
+      expect(deviceDisplayName('b', 'Mac', 'Unnamed', names)).assertEqual('Mac (2)');
+      expect(deviceDisplayName('a', 'mac', 'Unnamed', names)).assertEqual('mac (1)');
+      names.set('c', 'c');
+      expect(deviceDisplayName('c', 'c', 'Unnamed', names)).assertEqual('Unnamed');
+    });
+    it('does_not_duplicate_an_independent_message_in_the_deferred_outbox', 0, () => {
+      const store = new InputQueueStore(); const session = new RemoteSession(); session.id = 'session';
+      const document = new SerializedComposerDocument(); document.text = 'independent message';
+      expect(store.deferDocument('device', session, document, [], [], 'stable')).assertEqual('stable');
+      expect(store.deferDocument('device', session, document, [], [], 'stable')).assertEqual('stable');
+      expect(store.getBubbles('session', 'device').length).assertEqual(1);
     });
     it('resolves_implicit_native_sources_and_preserves_legacy_visibility', 0, () => {
       const raw = JSON.parse('{"providers":[{"id":"other","connected":true,"agents":["codex"],"models":{"codex":[{"id":"m"}]}},{"id":"openai","connected":true,"suspended":true,"agents":["codex"],"models":{"codex":[{"id":"m","defaultEnabled":false}]}}]}') as Object;

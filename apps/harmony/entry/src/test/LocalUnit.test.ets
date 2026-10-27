@@ -12,6 +12,7 @@ import {
   DeviceView,
   RemoteMessage,
   RemoteSession,
+  sessionListActivityAt,
   sortMessagesAsc,
 } from '../main/ets/core/tasks/TaskModels';
 import {
@@ -130,16 +131,13 @@ import {
 } from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
   consumeTaskSplitRouteSelection,
+  effectiveTaskSafeWindow,
   handoffTaskSplitRouteSelection,
   isWideTaskLayout,
-  TASK_FOLD_STATUS_EXPANDED,
-  TASK_FOLD_STATUS_FOLDED,
-  TASK_FOLD_STATUS_HALF_FOLDED,
   taskDetailKeyboardInset,
   taskDetailPaneWidth,
   taskListPaneWidth,
-  taskSplitRatioForDrag,
-  TASK_SPLIT_DEFAULT_RATIO,
+  taskSplitWidthForDrag,
 } from '../main/ets/pages/TaskSplitLayout';
 
 import {
@@ -1670,6 +1668,49 @@ export default function localUnitTest() {
       const queue = store.getProjection(session.id).pendingQueue;
       expect(queue.length).assertEqual(1);
       expect(queue[0].clientId).assertEqual('stable-client');
+    });
+
+    it('shows_forwarded_queue_and_settling_text_without_changing_the_wire_body', 0, () => {
+      const store = new InputQueueStore();
+      const session = new RemoteSession();
+      session.id = 'forwarded-queue';
+      session.model = 'model';
+      const raw = '[来源] 任务 A\n用户原话："第一行\\n第二行"\nAgent补充："请处理"';
+      store.seedOptimisticText('device-1', session, 'agent-only text', [], 'forwarded');
+      store.seedOptimisticText('device-1', session, raw, [], 'ordinary');
+      const items = store.getProjection(session.id, 'device-1').pendingQueue;
+      const origin: Record<string, Object> = {};
+      origin['kind'] = 'session';
+      items[0].raw['origin'] = origin;
+      items[0].raw['persistedContent'] = raw;
+      const projection: Record<string, Object> = {};
+      projection['sessionId'] = session.id;
+      projection['pendingQueue'] = items.map((item) => item.raw as Object);
+      store.handleProjectionPush(projection, 'device-1');
+      const expected = '[来源] 任务 A\n\n用户原话：\n\n第一行\n第二行\n\nAgent补充：\n\n请处理';
+      expect(store.getBubbles(session.id, 'device-1')[0].text).assertEqual(expected);
+      expect(store.getBubbles(session.id, 'device-1')[1].text).assertEqual(raw);
+      expect(store.getProjection(session.id, 'device-1').pendingQueue[0].text).assertEqual('agent-only text');
+      expect(store.getProjection(session.id, 'device-1').pendingQueue[0].persistedContent).assertEqual(raw);
+      projection['pendingQueue'] = [items[1].raw as Object];
+      store.handleProjectionPush(projection, 'device-1');
+      expect(store.getBubbles(session.id, 'device-1')[0].text).assertEqual(expected);
+
+      const attachmentStore = new InputQueueStore();
+      attachmentStore.seedOptimisticText('device-1', session, 'agent-only text', [], 'with-file');
+      const attachmentItem = attachmentStore.getProjection(session.id, 'device-1').pendingQueue[0].raw;
+      attachmentItem['origin'] = origin;
+      const file: Record<string, Object> = {};
+      file['path'] = 'attachment';
+      attachmentItem['files'] = [file];
+      const envelope: Record<string, Object> = {};
+      envelope['text'] = raw;
+      attachmentItem['persistedContent'] = JSON.stringify(envelope);
+      const attachmentProjection: Record<string, Object> = {};
+      attachmentProjection['sessionId'] = session.id;
+      attachmentProjection['pendingQueue'] = [attachmentItem];
+      attachmentStore.handleProjectionPush(attachmentProjection, 'device-1');
+      expect(attachmentStore.getBubbles(session.id, 'device-1')[0].text).assertEqual(expected);
     });
 
     it('rebuildsQueueBubblePresentationAfterAckAndRenumbersAfterDrain', 0, () => {
@@ -3883,6 +3924,54 @@ export default function localUnitTest() {
       expect(updated.pendingLocalCreation).assertEqual(true);
     });
 
+    // 回归：合并只复制部分字段，改名 patch 会清空 lastActivityAt、Agent 所在电脑和运行时档位，
+    // 最近活动退回旧时间、B2 的换模型防护失效。
+    it('keepsUncarriedSessionFieldsAcrossPartialPatch', 0, () => {
+      const store = new TaskStore();
+      const effective: Record<string, Object> = {};
+      effective['agentKind'] = 'codex';
+      effective['model'] = 'gpt-5.5';
+      effective['fastMode'] = true;
+      effective['fastModeTier'] = 'ultrafast';
+      const pendingProfile: Record<string, Object> = {};
+      pendingProfile['agentKind'] = 'codex';
+      pendingProfile['model'] = 'gpt-5.6';
+      const pending: Record<string, Object> = {};
+      pending['generation'] = 4;
+      pending['source'] = 'remote';
+      pending['profile'] = pendingProfile;
+      const raw: Record<string, Object> = {};
+      raw['id'] = 'activity-session';
+      raw['title'] = '旧标题';
+      raw['agentDeviceId'] = 'agent-pc';
+      raw['userSendAt'] = '2026-10-26T08:00:00.000Z';
+      raw['lastActivityAt'] = '2026-10-27T09:00:00.000Z';
+      raw['updatedAt'] = '2026-10-26T08:00:00.000Z';
+      raw['clearedAt'] = '2026-10-20T00:00:00.000Z';
+      raw['activeTurnStartedAt'] = 1761555600000;
+      raw['runtimeGeneration'] = 3;
+      raw['runtimeEffective'] = effective;
+      raw['runtimePending'] = pending;
+      store.upsertSession('device-1', parseSession(raw));
+      const patch: Record<string, Object> = {};
+      patch['title'] = '新标题';
+      const payload: Record<string, Object> = {};
+      payload['sessionId'] = 'activity-session';
+      payload['patch'] = patch;
+      store.handleSessionsPush('device-1', DlChannels.SESSIONS_PATCHED, payload);
+      const updated = store.getSessions('device-1')[0];
+      expect(updated.title).assertEqual('新标题');
+      expect(sessionListActivityAt(updated)).assertEqual('2026-10-27T09:00:00.000Z');
+      expect(updated.agentDeviceId).assertEqual('agent-pc');
+      expect(updated.clearedAt).assertEqual('2026-10-20T00:00:00.000Z');
+      expect(updated.activeTurnStartedAt).assertEqual(1761555600000);
+      expect(updated.runtimeGeneration).assertEqual(3);
+      expect(updated.runtimeEffective?.model).assertEqual('gpt-5.5');
+      expect(updated.runtimeEffective?.fastModeTier).assertEqual('ultrafast');
+      expect(updated.runtimePending?.generation).assertEqual(4);
+      expect(updated.runtimePending?.profile.model).assertEqual('gpt-5.6');
+    });
+
     it('removesDeletedSessionFromTaskProjectionOnPatchPush', 0, () => {
       const store = new TaskStore();
       const session = new RemoteSession();
@@ -3928,6 +4017,7 @@ export default function localUnitTest() {
       session.agentKind = 'codex';
       session.createdAt = '2026-08-10T01:00:00.000Z';
       session.updatedAt = '2026-08-10T02:00:00.000Z';
+      session.lastActivityAt = '2026-08-10T03:00:00.000Z';
       session.preview = 'cached preview';
       device.sessions = [session];
 
@@ -3940,6 +4030,7 @@ export default function localUnitTest() {
       expect(restored[0].sessions[0].title.length).assertEqual(240);
       expect(restored[0].sessions[0].workingDir).assertEqual('/workspace/cindy');
       expect(restored[0].sessions[0].preview).assertEqual('cached preview');
+      expect(restored[0].sessions[0].lastActivityAt).assertEqual('2026-08-10T03:00:00.000Z');
       expect(parseTaskListSnapshot(serialized ?? '', 'account-2').length).assertEqual(0);
     });
 
@@ -4635,28 +4726,37 @@ export default function localUnitTest() {
     });
 
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {
-      expect(isWideTaskLayout(639, 400)).assertEqual(false);
-      expect(isWideTaskLayout(640, 400)).assertEqual(true);
-      expect(isWideTaskLayout(900, 1200, TASK_FOLD_STATUS_EXPANDED)).assertEqual(false);
-      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_EXPANDED)).assertEqual(true);
-      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_FOLDED)).assertEqual(false);
-      expect(isWideTaskLayout(1200, 900, TASK_FOLD_STATUS_HALF_FOLDED)).assertEqual(false);
-      expect(isWideTaskLayout(1200, 900, 0)).assertEqual(false);
-      expect(taskListPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
-      expect(taskListPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(300);
-      expect(taskDetailPaneWidth(900, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(600);
-      expect(taskDetailPaneWidth(640, TASK_SPLIT_DEFAULT_RATIO)).assertEqual(340);
-      expect(taskListPaneWidth(1200, 0.4)
-        + taskDetailPaneWidth(1200, 0.4)).assertEqual(1200);
-      expect(taskDetailKeyboardInset(639, 400, -1, 320)).assertEqual(0);
-      expect(taskDetailKeyboardInset(900, 600, -1, 320)).assertEqual(320);
-      expect(taskDetailKeyboardInset(640, 900, -1, 320)).assertEqual(0);
-      expect(taskDetailKeyboardInset(900, 600, TASK_FOLD_STATUS_FOLDED, 320)).assertEqual(0);
-      expect(taskDetailKeyboardInset(900, 600, -1, -1)).assertEqual(0);
+      expect(isWideTaskLayout(459, 459, 672)).assertFalse();
+      expect(isWideTaskLayout(672, 672, 459)).assertFalse();
+      expect(isWideTaskLayout(664, 664, 939)).assertFalse();
+      expect(isWideTaskLayout(664, 664, 445)).assertFalse();
+      expect(isWideTaskLayout(939, 939, 664)).assertTrue();
+      expect(isWideTaskLayout(900, 900, 1200)).assertTrue();
+      expect(isWideTaskLayout(900, 759, 600)).assertFalse();
+      expect(isWideTaskLayout(900, 900, 479)).assertFalse();
+      expect(taskListPaneWidth(939)).assertEqual(319);
+      expect(taskDetailPaneWidth(939)).assertEqual(620);
+      expect(taskListPaneWidth(760, 420)).assertEqual(360);
+      expect(taskListPaneWidth(1200, 400) + taskDetailPaneWidth(1200, 400)).assertEqual(1200);
+      expect(taskDetailKeyboardInset(900, 900, 600, 320)).assertEqual(320);
+      expect(taskDetailKeyboardInset(900, 900, 479, 320)).assertEqual(0);
+      expect(taskDetailKeyboardInset(900, 900, 600, -1)).assertEqual(0);
+      expect(taskSplitWidthForDrag(939, 319, 200)).assertEqual(420);
+      expect(taskSplitWidthForDrag(939, 319, -500)).assertEqual(300);
+    });
 
-      const dragged = taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, 200);
-      expect(dragged > 0.55 && dragged <= 0.6).assertEqual(true);
-      expect(taskSplitRatioForDrag(900, TASK_SPLIT_DEFAULT_RATIO, -500)).assertEqual(0.25);
+    // 回归：安全区读取失败时 safeWidth 恒为 0，任何窗口都进不了双栏；读取中仍须保持 0，
+    // 否则冷启动先进双栏、拿到真实挖孔避让后退出，会误触发单栏详情跳转。
+    it('fallsBackToViewportOnlyWhenWindowMetricsAreUnavailable', 0, () => {
+      const pending = effectiveTaskSafeWindow(939, 664, 0, 0, false);
+      expect(isWideTaskLayout(939, pending.width, pending.height)).assertFalse();
+      const unavailable = effectiveTaskSafeWindow(939, 664, 0, 0, true);
+      expect(isWideTaskLayout(939, unavailable.width, unavailable.height)).assertTrue();
+      const cutout = effectiveTaskSafeWindow(780, 664, 740, 600, false);
+      expect(isWideTaskLayout(780, cutout.width, cutout.height)).assertFalse();
+      // 输入法压缩页面高度时仍以窗口安全区高度为准，不在输入中收起双栏。
+      const typing = effectiveTaskSafeWindow(939, 300, 939, 600, false);
+      expect(isWideTaskLayout(939, typing.width, typing.height)).assertTrue();
     });
 
     it('handsCurrentTaskBackToSplitLayoutOnlyOnce', 0, () => {
@@ -4682,6 +4782,11 @@ export default function localUnitTest() {
       session.userSendAt = '2026-08-01T10:00:00.000Z';
       session.updatedAt = '2026-08-01T11:00:00.000Z';
       expect(taskActivityAt(session)).assertEqual('2026-08-01T10:00:00.000Z');
+      session.lastActivityAt = '2026-08-01T09:00:00.000Z';
+      expect(taskActivityAt(session)).assertEqual('2026-08-01T09:00:00.000Z');
+      session.lastActivityAt = '';
+      session.userSendAt = '';
+      expect(taskActivityAt(session)).assertEqual('2026-08-01T11:00:00.000Z');
 
       const now = Date.parse('2026-08-01T12:00:00.000Z');
       expect(taskRelativeTime('2026-08-01T11:59:45.000Z', now)).assertEqual('刚刚');

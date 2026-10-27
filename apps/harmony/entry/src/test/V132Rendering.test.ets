@@ -72,6 +72,22 @@ function renderingTypes(items: RenderItem[]): string {
 
 export default function v132RenderingTests() {
   describe('V132Rendering', () => {
+    it('renders_complete_forwarded_envelopes_without_changing_the_original', 0, () => {
+      const raw = '[来源] 任务 A\n用户原话："第一行\\n第二行"\nAgent补充："请处理\\t附件"';
+      const forwarded = renderingMessage('forwarded', 'user', raw);
+      forwarded.agentMeta = renderingRecord('{"origin":{"kind":"session"}}');
+      const item = rootRenderingMessage(buildRenderItems([forwarded]), 'forwarded') as RenderMessageItem;
+      expect(item.body).assertEqual('[来源] 任务 A\n\n用户原话：\n\n第一行\n第二行\n\nAgent补充：\n\n请处理\t附件');
+      expect(item.originalBody).assertEqual(raw);
+      expect(forwarded.content as string).assertEqual(raw);
+      const ordinary = renderingMessage('ordinary', 'user', raw);
+      expect((rootRenderingMessage(buildRenderItems([ordinary]), 'ordinary') as RenderMessageItem).body).assertEqual(raw);
+      const incomplete = renderingMessage('incomplete', 'user', raw.slice(0, -1));
+      incomplete.agentMeta = forwarded.agentMeta;
+      expect((rootRenderingMessage(buildRenderItems([incomplete]), 'incomplete') as RenderMessageItem).body)
+        .assertEqual(raw.slice(0, -1));
+    });
+
     it('excludes_orca_cards_and_source_labels_from_share_images', 0, () => {
       const visible = renderingMessage('visible', 'user', 'Visible body');
       visible.agentMeta = renderingRecord('{"sourceDevice":{"deviceId":"private-device","platform":"mobile","name":"private-phone"},"sourcePlugin":{"pluginId":"private-plugin","name":"private-name"}}');
@@ -285,6 +301,20 @@ export default function v132RenderingTests() {
       expect(rootRenderingMessage(items, 'waiting') === undefined).assertTrue();
       expect((nestedRenderingMessage(items, 'waiting') as RenderMessageItem).body).assertEqual('Still waiting');
       expect((rootRenderingMessage(items, 'final') as RenderMessageItem).isTurnFinalAssistant).assertTrue();
+    });
+
+    it('archives_commentary_before_the_final_answer_with_and_without_a_seal', 0, () => {
+      for (const sealed of [false, true]) {
+        const progress = renderingMessage('progress', 'assistant', 'Checking', 1);
+        progress.agentMeta = renderingRecord('{"assistantPhase":"commentary"}');
+        const items = buildRenderItems([
+          renderingMessage('user', 'user', 'Work'), progress,
+          renderingMessage('final', 'assistant', 'Done', 2, sealed),
+        ]);
+        expect(rootRenderingMessage(items, 'progress') === undefined).assertTrue();
+        expect((nestedRenderingMessage(items, 'progress') as RenderMessageItem).body).assertEqual('Checking');
+        expect((rootRenderingMessage(items, 'final') as RenderMessageItem).body).assertEqual('Done');
+      }
     });
 
     it('keeps_the_whole_sealed_delivery_run_and_all_answer_source_identities', 0, () => {

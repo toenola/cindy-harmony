@@ -13,7 +13,7 @@ import { writeFastMode } from './ModelSpeed';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { PresenceSnapshot, DlChannels, Envelope } from '../device-link/DlProtocol';
 import {
-  RemoteSession, DeviceView, parseDeviceView, parseSession, sortSessionsByUpdatedAt,
+  RemoteSession, RemoteSessionRuntimeProfile, DeviceView, parseDeviceView, parseSession, sortSessionsByUpdatedAt,
   readStr, readObj,
 } from './TaskModels';
 import { CachedTaskListDevice } from './TaskListSnapshotStore';
@@ -728,40 +728,9 @@ export class TaskStore {
   }
 
   private mergeSession(base: RemoteSession, patch: Record<string, Object>): RemoteSession {
-    // 以 base 为底，patch 覆盖已知字段（未知字段忽略，等待下次整表重拉）。
-    const merged = new RemoteSession();
-    merged.id = base.id;
-    merged.userId = base.userId;
-    merged.title = base.title;
-    merged.workingDir = base.workingDir;
-    merged.worktreePath = base.worktreePath;
-    merged.extraDirs = base.extraDirs.slice();
-    merged.remoteHostId = base.remoteHostId;
-    merged.workspaceKind = base.workspaceKind;
-    merged.model = base.model;
-    merged.providerId = base.providerId;
-    merged.effort = base.effort;
-    merged.permissionMode = base.permissionMode;
-    merged.planModeEnabled = base.planModeEnabled;
-    merged.fastMode = base.fastMode;
-    merged.fastModeTier = base.fastModeTier;
-    merged.sdkSessionId = base.sdkSessionId;
-    merged.totalTokenUsage = base.totalTokenUsage;
-    merged.contextTokens = base.contextTokens;
-    merged.contextWindow = base.contextWindow;
-    merged.status = base.status;
-    merged.agentKind = base.agentKind;
-    merged.source = base.source;
-    merged.orcaRole = base.orcaRole;
-    merged.parentSessionId = base.parentSessionId;
-    merged.pinnedAt = base.pinnedAt;
-    merged.userSendAt = base.userSendAt;
-    merged.createdAt = base.createdAt;
-    merged.updatedAt = base.updatedAt;
-    merged.preview = base.preview;
-    merged.messageCount = base.messageCount;
-    merged.pendingLocalCreation = base.pendingLocalCreation;
-    const record = this.sessionToRecord(merged);
+    // 以 base 的完整记录为底，patch 只覆盖它携带的键；sessionToRecord 必须覆盖 parseSession
+    // 读取的全部字段，否则一次改名 / 状态 patch 就会把未携带的字段清空。
+    const record = this.sessionToRecord(base);
     if (Object.keys(patch).includes('fastMode')) record['fastModeTier'] = '';
     return parseSession(mergeFields(record, patch));
   }
@@ -777,6 +746,7 @@ export class TaskStore {
     out['worktreePath'] = s.worktreePath;
     out['extraDirs'] = s.extraDirs;
     out['remoteHostId'] = s.remoteHostId;
+    out['agentDeviceId'] = s.agentDeviceId;
     out['workspaceKind'] = s.workspaceKind;
     out['model'] = s.model;
     out['providerId'] = s.providerId;
@@ -784,6 +754,17 @@ export class TaskStore {
     out['permissionMode'] = s.permissionMode;
     out['planModeEnabled'] = s.planModeEnabled;
     writeFastMode(out, s.fastMode, s.fastModeTier);
+    if (s.runtimeGeneration !== undefined) out['runtimeGeneration'] = s.runtimeGeneration;
+    if (s.runtimeBaseline !== undefined) out['runtimeBaseline'] = runtimeProfileToRecord(s.runtimeBaseline);
+    if (s.runtimeEffective !== undefined) out['runtimeEffective'] = runtimeProfileToRecord(s.runtimeEffective);
+    // 消费方对 null 与 undefined 一视同仁，只回写确有内容的待生效档位。
+    if (s.runtimePending !== undefined && s.runtimePending !== null) {
+      const pending: Record<string, Object> = {};
+      pending['generation'] = s.runtimePending.generation;
+      pending['source'] = s.runtimePending.source;
+      pending['profile'] = runtimeProfileToRecord(s.runtimePending.profile);
+      out['runtimePending'] = pending;
+    }
     out['sdkSessionId'] = s.sdkSessionId;
     out['totalTokenUsage'] = s.totalTokenUsage;
     out['contextTokens'] = s.contextTokens;
@@ -795,8 +776,12 @@ export class TaskStore {
     out['parentSessionId'] = s.parentSessionId;
     out['pinnedAt'] = s.pinnedAt;
     out['userSendAt'] = s.userSendAt;
+    out['lastActivityAt'] = s.lastActivityAt;
     out['createdAt'] = s.createdAt;
     out['updatedAt'] = s.updatedAt;
+    out['clearedAt'] = s.clearedAt;
+    out['activeTurnStartedAt'] = s.activeTurnStartedAt;
+    out['lastTurnEndedAt'] = s.lastTurnEndedAt;
     out['preview'] = s.preview;
     out['pendingLocalCreation'] = s.pendingLocalCreation;
     out['_count'] = count;
@@ -819,6 +804,16 @@ export class TaskStore {
     out.sort(sortSessionsByUpdatedAt);
     return out;
   }
+}
+
+function runtimeProfileToRecord(profile: RemoteSessionRuntimeProfile): Record<string, Object> {
+  const out: Record<string, Object> = {};
+  out['agentKind'] = profile.agentKind;
+  out['model'] = profile.model;
+  out['providerId'] = profile.providerId;
+  out['effort'] = profile.effort;
+  writeFastMode(out, profile.fastMode, profile.fastModeTier);
+  return out;
 }
 
 function liveActivityKeyPrefix(deviceId: string): string {

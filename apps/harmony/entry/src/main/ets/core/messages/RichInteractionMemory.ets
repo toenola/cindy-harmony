@@ -3,7 +3,7 @@
  *
  * 对齐 `packages/maker-shared/src/richAnswer.ts` 的 RichInteractionMemory：键由宿主按
  * 「账号 / 设备 / 任务 / 消息 / 片段」组成，只做本机视图缓存，绝不发送给模型或同步到其它设备。
- * 上限：256 条、序列化 512 KB、单条 2048 个键或 64 KB。
+ * 上限：256 条、序列化 512 KB、单条 2048 个键或 100 KB。
  */
 import { common } from '@kit.AbilityKit';
 import { SecureStore } from '../storage/SecureStore';
@@ -13,7 +13,7 @@ const ID = /^[a-zA-Z0-9_-]{1,80}$/;
 const MAX_ENTRIES = 256;
 const MAX_SERIALIZED = 524288;
 const MAX_ENTRY_KEYS = 2048;
-const MAX_ENTRY_SIZE = 65536;
+const MAX_ENTRY_SIZE = 100000;
 const WRITE_DEBOUNCE_MS = 200;
 export const RICH_MEMORY_STORAGE_KEY = 'cindy.richAnswer.viewState.v1';
 
@@ -140,6 +140,81 @@ export class RichInteractionMemory {
   clear(): void {
     this.entries.clear();
     this.notify();
+  }
+}
+
+export type RichSubmissionStatus = 'idle' | 'sending' | 'sent' | 'failed';
+export type RichMessageSender = (text: string, clientId: string) => Promise<boolean>;
+
+class RichSubmissionAttempt {
+  text: string = '';
+  clientId: string = '';
+}
+
+export class RichSubmissionController {
+  private memory: RichInteractionMemory;
+  private pending: Set<string> = new Set();
+  private failed: Set<string> = new Set();
+  private attempts: Map<string, RichSubmissionAttempt> = new Map();
+  private listeners: Set<() => void> = new Set();
+  private sequence: number = 0;
+
+  constructor(memory: RichInteractionMemory) {
+    this.memory = memory;
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return (): void => { this.listeners.delete(listener); };
+  }
+
+  private notify(): void {
+    this.listeners.forEach((listener: () => void) => listener());
+  }
+
+  status(key: string, text: string | undefined): RichSubmissionStatus {
+    if (this.pending.has(key)) return 'sending';
+    if (text !== undefined && this.memory.get(key).get('text') === text) return 'sent';
+    return this.failed.has(key) ? 'failed' : 'idle';
+  }
+
+  async submit(key: string, text: string, send: RichMessageSender): Promise<void> {
+    const status = this.status(key, text);
+    if (status === 'sending' || status === 'sent') return;
+    this.pending.add(key);
+    this.failed.delete(key);
+    let attempt = this.attempts.get(key);
+    if (attempt === undefined || attempt.text !== text) {
+      attempt = new RichSubmissionAttempt();
+      attempt.text = text;
+      this.sequence += 1;
+      attempt.clientId = 'rich-' + Date.now().toString(36) + '-' +
+        Math.random().toString(36).slice(2, 10) + '-' + this.sequence.toString(36);
+      this.attempts.delete(key);
+      this.attempts.set(key, attempt);
+    }
+    this.notify();
+    try {
+      await this.memory.load();
+      if (this.memory.get(key).get('text') === text) return;
+      if (!await send(text, attempt.clientId)) throw new Error('message-not-accepted');
+      const patch: Map<string, RichValue> = new Map();
+      patch.set('text', text);
+      this.memory.set(key, patch);
+      await this.memory.flush();
+      this.attempts.delete(key);
+    } catch (_error) {
+      this.failed.add(key);
+      while (this.failed.size > 256) {
+        const oldest = this.failed.values().next();
+        if (oldest.done) break;
+        this.failed.delete(oldest.value);
+        this.attempts.delete(oldest.value);
+      }
+    } finally {
+      this.pending.delete(key);
+      this.notify();
+    }
   }
 }
 

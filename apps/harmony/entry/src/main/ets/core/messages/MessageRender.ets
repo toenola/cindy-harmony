@@ -37,7 +37,7 @@ import {
   isAgentTaskToolName,
 } from './AgentTaskStore';
 import { isAutoResumeRowInFlight } from './AutoResumePresentation';
-import { sanitizeSourceName } from './MessageSourcePresentation';
+import { forwardedRequestDisplayText, sanitizeSourceName } from './MessageSourcePresentation';
 import {
   CONTINUE_AFTER_APP_EXIT_PROMPT,
   CONTINUE_AFTER_ERROR_PROMPT,
@@ -173,6 +173,7 @@ export class RenderMessageItem extends RenderItem {
   kind: string = '';
   label: string = '';
   body: string = '';
+  originalBody: string | undefined = undefined;
   /** 预解析的 Markdown 块（渲染直接消费，避免 @Builder 内做逻辑）。 */
   mdBlocks: MdBlock[] = [];
   /** user 消息按内容特征切出的渲染段（长文本折叠 / 正常）。 */
@@ -1960,8 +1961,11 @@ function buildLinearRenderItems(
       const parsed = parseUserContent(m.content);
       const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
       const identity = rawIdentity.length > 0 ? `${m.sessionId}:${rawIdentity}` : '';
-      item.body = parsed.text;
-      item.segments = buildSegments(parsed.text, parsed.ranges, m.automationOrigin, identity);
+      item.body = readStr(readObj(m.agentMeta, 'origin'), 'kind') === 'session'
+        ? forwardedRequestDisplayText(parsed.text) : parsed.text;
+      if (item.body !== parsed.text) item.originalBody = parsed.text;
+      item.segments = buildSegments(item.body, item.originalBody === undefined ? parsed.ranges : [],
+        m.automationOrigin, identity);
       item.mdBlocks = item.segments.length > 0
         ? item.segments[0].mdBlocks : parseMessageMarkdown(identity, item.body);
       item.images = parsed.images;
@@ -2403,7 +2407,8 @@ function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0,
       let answerStart = sealedIndex;
       while (answerStart > lastWork + 1
         && answerStart > segmentStart
-        && isAssistantAnswerCandidate(items[answerStart - 1])) {
+        && isAssistantAnswerCandidate(items[answerStart - 1])
+        && canPrependToAnswer(items[answerStart - 1])) {
         answerStart -= 1;
       }
       let keep = !resumed && sealIndex === sealed.length - 1;
@@ -2436,7 +2441,8 @@ function groupAnsweredTurnItems(items: RenderItem[], turnStartMs: number = 0,
       }
     }
     let answerStart = lastAnswerIndex;
-    while (answerStart > lastWork + 1 && isAssistantAnswerCandidate(items[answerStart - 1])) {
+    while (answerStart > lastWork + 1 && isAssistantAnswerCandidate(items[answerStart - 1])
+      && canPrependToAnswer(items[answerStart - 1])) {
       answerStart -= 1;
     }
     for (let i = answerStart; i <= lastAnswerIndex; i++) {
@@ -2536,6 +2542,10 @@ function isAssistantAnswerCandidate(item: RenderItem): boolean {
     && message !== undefined
     && !message.failedSamplingAttempt
     && (item as RenderMessageItem).body.trim().length > 0;
+}
+
+function canPrependToAnswer(item: RenderItem): boolean {
+  return item.type !== 'message' || readStr((item as RenderMessageItem).message?.agentMeta, 'assistantPhase') !== 'commentary';
 }
 
 /** 已证实失败的采样输出：沿用工作过程折叠，绝不当最终回答（对齐共享 isWorkActivityItem）。 */

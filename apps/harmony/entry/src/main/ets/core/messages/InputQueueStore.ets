@@ -13,6 +13,7 @@ import { RemoteSession, readBool, readObj, readStr, safeErrorMessage } from '../
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { buildPersistedUserContent } from './MessageStore';
 import { SerializedComposerDocument } from './ComposerDocument';
+import { forwardedRequestDisplayText } from './MessageSourcePresentation';
 import {
   UsageLimitWait, UsageLimitWaitState, readUsageLimitWait,
   shouldShowUsageLimitWait, usageLimitWaitCancelUnsupported,
@@ -33,6 +34,23 @@ export class QueuedInputItem {
   raw: Record<string, Object> = {};
   images: RemoteImageRef[] = [];
   files: RemoteSerializedAttachment[] = [];
+}
+
+function queuedInputDisplayText(item: QueuedInputItem): string {
+  if (readStr(readObj(item.raw, 'origin'), 'kind') !== 'session') return item.text;
+  let visible = item.persistedContent.length > 0 ? item.persistedContent : item.text;
+  const files = item.raw['files'];
+  if (Array.isArray(files) && files.length > 0) {
+    try {
+      const content = JSON.parse(visible) as Object;
+      if (content !== null && typeof content === 'object' && !Array.isArray(content)) {
+        const text = (content as Record<string, Object>)['text'];
+        if (typeof text === 'string') visible = text;
+      }
+    } catch (_error) {
+    }
+  }
+  return forwardedRequestDisplayText(visible);
 }
 
 export class InputProjectionState {
@@ -659,12 +677,15 @@ export class InputQueueStore {
     serialized: SerializedComposerDocument,
     images: RemoteImageRef[],
     files: RemoteSerializedAttachment[],
+    stableClientId: string = '',
   ): string {
     this.rememberSessionDevice(deviceId, session.id);
     if (!this.sessionDeviceMatches(session.id, deviceId)) return '';
-    const item = this.buildQueuedMessage(session, serialized, images, files);
-    this.ownInputDelivery(deviceId, session.id, item.clientId);
     const current = this.deferredBySession.get(session.id) ?? [];
+    if (stableClientId.length > 0 && current.some((item: QueuedInputItem): boolean =>
+      item.clientId === stableClientId)) return stableClientId;
+    const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
+    this.ownInputDelivery(deviceId, session.id, item.clientId);
     this.deferredBySession.set(session.id, current.concat([item]));
     this.notify();
     return item.clientId;
@@ -707,7 +728,7 @@ export class InputQueueStore {
       const item = settling[i];
       const bubble = new PendingQueueBubble();
       bubble.clientId = item.clientId;
-      bubble.text = item.text;
+      bubble.text = queuedInputDisplayText(item);
       bubble.phase = 'settling';
       bubble.images = item.images;
       bubble.files = item.files;
@@ -717,7 +738,7 @@ export class InputQueueStore {
       const item = projection.pendingQueue[i];
       const bubble = new PendingQueueBubble();
       bubble.clientId = item.clientId;
-      bubble.text = item.text;
+      bubble.text = queuedInputDisplayText(item);
       bubble.queueIndex = i + 1;
       bubble.images = item.images;
       bubble.files = item.files;
@@ -734,7 +755,7 @@ export class InputQueueStore {
       const item = deferred[i];
       const bubble = new PendingQueueBubble();
       bubble.clientId = item.clientId;
-      bubble.text = item.text;
+      bubble.text = queuedInputDisplayText(item);
       bubble.queueIndex = projection.pendingQueue.length + i + 1;
       bubble.images = item.images;
       bubble.files = item.files;
@@ -746,7 +767,7 @@ export class InputQueueStore {
       const item = connectionWaiting[i];
       const bubble = new PendingQueueBubble();
       bubble.clientId = item.clientId;
-      bubble.text = item.text;
+      bubble.text = queuedInputDisplayText(item);
       bubble.queueIndex = projection.pendingQueue.length + deferred.length + i + 1;
       bubble.images = item.images;
       bubble.files = item.files;

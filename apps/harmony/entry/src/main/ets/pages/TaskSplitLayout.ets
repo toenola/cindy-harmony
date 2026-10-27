@@ -1,22 +1,18 @@
 /**
  * 任务页宽屏双栏布局的纯计算。
  *
- * 640vp 是展开横屏双栏的产品断点；左右内容栏下限分别为 300vp / 320vp。
- * 只有展开态横屏才使用主从双栏，竖屏、盒盖态和半折叠态都回到单页导航。
- * 比例只约束列表宽度；分隔条是跨在真实交界线两侧的透明命中区，不占布局宽度。
+ * 窗口与安全区共同决定是否分栏，不依赖设备折叠状态或横竖屏。
+ * 列表标题的四个操作需要保留 300vp；分隔条不占布局宽度。
  */
 
-export const WIDE_TASK_LAYOUT_MIN_WIDTH = 640;
+export const WIDE_TASK_LAYOUT_MIN_WIDTH = 600;
+export const WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH = 760;
+export const WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT = 480;
 export const TASK_SPLIT_DIVIDER_WIDTH = 20;
 /** 容纳设备下拉、四个头部操作按钮和底部导航，不允许控件彼此覆盖。 */
 export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
-export const TASK_SPLIT_MIN_DETAIL_WIDTH = 320;
-export const TASK_SPLIT_DEFAULT_RATIO = 1 / 3;
-export const TASK_SPLIT_MIN_RATIO = 0.25;
-export const TASK_SPLIT_MAX_RATIO = 0.6;
-export const TASK_FOLD_STATUS_EXPANDED = 1;
-export const TASK_FOLD_STATUS_FOLDED = 2;
-export const TASK_FOLD_STATUS_HALF_FOLDED = 3;
+export const TASK_SPLIT_MIN_DETAIL_WIDTH = 400;
+export const TASK_SPLIT_MAX_LIST_WIDTH = 420;
 
 /**
  * 独立详情页转入宽屏双栏时，先把当前任务交还给仍在路由栈中的列表页。
@@ -50,32 +46,48 @@ export function consumeTaskSplitRouteSelection(): TaskSplitRouteSelection | null
 
 export function isWideTaskLayout(
   viewportWidth: number,
-  viewportHeight: number,
-  foldStatus: number = -1,
+  safeWidth: number,
+  safeHeight: number,
 ): boolean {
-  const postureSupportsSplit = foldStatus === -1 || foldStatus === TASK_FOLD_STATUS_EXPANDED;
-  if (!postureSupportsSplit) {
-    return false;
-  }
   return Number.isFinite(viewportWidth)
-    && Number.isFinite(viewportHeight)
-    && viewportHeight > 0
-    && viewportWidth > viewportHeight
-    && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH;
+    && Number.isFinite(safeWidth)
+    && Number.isFinite(safeHeight)
+    && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH
+    && safeWidth >= WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH
+    && safeHeight >= WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT;
 }
 
-export function clampTaskSplitRatio(ratio: number): number {
-  if (!Number.isFinite(ratio)) return TASK_SPLIT_DEFAULT_RATIO;
-  return Math.min(TASK_SPLIT_MAX_RATIO, Math.max(TASK_SPLIT_MIN_RATIO, ratio));
+export class TaskSafeWindowSize {
+  width: number = 0;
+  height: number = 0;
 }
 
-export function taskListPaneWidth(viewportWidth: number, ratio: number): number {
+/**
+ * 分栏判断使用的安全区尺寸。窗口避让区明确读不到时退回页面尺寸，不能让双栏永久不可用；
+ * 仍在读取时保持 0，避免冷启动先进入双栏、拿到真实安全区后又退出并触发单栏跳转。
+ * 高度不与页面高度取较小值：输入法会压缩页面高度，不能因此在输入时收起双栏。
+ */
+export function effectiveTaskSafeWindow(
+  viewportWidth: number,
+  viewportHeight: number,
+  safeWidth: number,
+  safeHeight: number,
+  metricsUnavailable: boolean,
+): TaskSafeWindowSize {
+  const size = new TaskSafeWindowSize();
+  size.width = metricsUnavailable ? viewportWidth : Math.min(viewportWidth, safeWidth);
+  size.height = metricsUnavailable ? viewportHeight : safeHeight;
+  return size;
+}
+
+export function taskListPaneWidth(viewportWidth: number, requestedWidth: number = 0): number {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 0;
-  const availableWidth = viewportWidth;
-  const minListWidth = Math.min(TASK_SPLIT_MIN_LIST_WIDTH, availableWidth);
-  const maxListWidth = Math.max(minListWidth, availableWidth - TASK_SPLIT_MIN_DETAIL_WIDTH);
-  const requestedWidth = Math.round(availableWidth * clampTaskSplitRatio(ratio));
-  return Math.min(maxListWidth, Math.max(minListWidth, requestedWidth));
+  const minListWidth = Math.min(TASK_SPLIT_MIN_LIST_WIDTH, viewportWidth);
+  const maxListWidth = Math.max(minListWidth, Math.min(TASK_SPLIT_MAX_LIST_WIDTH,
+    viewportWidth - TASK_SPLIT_MIN_DETAIL_WIDTH));
+  const preferred = Number.isFinite(requestedWidth) && requestedWidth > 0
+    ? requestedWidth : Math.min(320, Math.round(viewportWidth * 0.34));
+  return Math.round(Math.min(maxListWidth, Math.max(minListWidth, preferred)));
 }
 
 /**
@@ -83,25 +95,20 @@ export function taskListPaneWidth(viewportWidth: number, ratio: number): number 
  * HdsNavigation 嵌套在 Row 的 layoutWeight 子节点时可能回退到内容固有宽度，
  * 因此不能只依赖权重分配，否则大屏右侧会残留一块空白窗口背景。
  */
-export function taskDetailPaneWidth(viewportWidth: number, ratio: number): number {
+export function taskDetailPaneWidth(viewportWidth: number, requestedWidth: number = 0): number {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 0;
   return Math.max(
     0,
-    viewportWidth - taskListPaneWidth(viewportWidth, ratio),
+    viewportWidth - taskListPaneWidth(viewportWidth, requestedWidth),
   );
 }
 
-export function taskSplitRatioForDrag(
+export function taskSplitWidthForDrag(
   viewportWidth: number,
-  startRatio: number,
+  startWidth: number,
   deltaX: number,
 ): number {
-  if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
-    return clampTaskSplitRatio(startRatio);
-  }
-  const availableWidth = viewportWidth;
-  const nextWidth = taskListPaneWidth(viewportWidth, startRatio) + deltaX;
-  return clampTaskSplitRatio(nextWidth / availableWidth);
+  return taskListPaneWidth(viewportWidth, Math.max(1, taskListPaneWidth(viewportWidth, startWidth) + deltaX));
 }
 
 /**
@@ -110,11 +117,11 @@ export function taskSplitRatioForDrag(
  */
 export function taskDetailKeyboardInset(
   viewportWidth: number,
-  viewportHeight: number,
-  foldStatus: number,
+  safeWidth: number,
+  safeHeight: number,
   keyboardHeight: number,
 ): number {
-  if (!isWideTaskLayout(viewportWidth, viewportHeight, foldStatus)) return 0;
+  if (!isWideTaskLayout(viewportWidth, safeWidth, safeHeight)) return 0;
   if (!Number.isFinite(keyboardHeight) || keyboardHeight <= 0) return 0;
   return keyboardHeight;
 }

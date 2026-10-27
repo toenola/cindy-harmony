@@ -185,6 +185,7 @@ export class RemoteSession {
   parentSessionId: string = '';
   pinnedAt: string = '';
   userSendAt: string = '';
+  lastActivityAt: string = '';
   createdAt: string = '';
   updatedAt: string = '';
   clearedAt: string = '';
@@ -257,6 +258,7 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.parentSessionId = readStr(raw, 'parentSessionId');
   s.pinnedAt = readStr(raw, 'pinnedAt');
   s.userSendAt = readStr(raw, 'userSendAt');
+  s.lastActivityAt = readStr(raw, 'lastActivityAt');
   s.createdAt = readStr(raw, 'createdAt');
   s.updatedAt = readStr(raw, 'updatedAt');
   s.clearedAt = readStr(raw, 'clearedAt');
@@ -498,6 +500,10 @@ export function sortMessagesAsc(a: RemoteMessage, b: RemoteMessage): number {
     return a.rowid - b.rowid;
   }
   return 0;
+}
+
+export function sessionListActivityAt(session: RemoteSession): string {
+  return session.lastActivityAt || session.userSendAt || session.updatedAt || session.createdAt;
 }
 
 export function sortSessionsByUpdatedAt(a: RemoteSession, b: RemoteSession): number {

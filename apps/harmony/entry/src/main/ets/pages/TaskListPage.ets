@@ -1,4 +1,5 @@
 import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachineIdentity';
+import { deviceDisplayName } from '../core/tasks/DeviceDisplayName';
 /**
  * 任务聚合首页。
  *
@@ -10,7 +11,6 @@ import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachin
  */
 
 import {
-  display,
   KeyboardAvoidMode,
   LengthMetrics,
   promptAction,
@@ -65,17 +65,22 @@ import {
   TaskListReconcileBackoff,
 } from '../core/tasks/TaskListReconcilePolicy';
 import { TaskPageContent } from './TaskPage';
+import {
+  ResidentTaskPane, rememberResidentTaskPane, residentPaneSurvives, residentTaskPaneKey,
+} from '../core/tasks/ResidentTaskPanes';
 import { NewSessionPageContent } from './NewSessionPage';
 import {
   consumeTaskSplitRouteSelection,
+  effectiveTaskSafeWindow,
   isWideTaskLayout,
-  TASK_SPLIT_DEFAULT_RATIO,
+  TaskSafeWindowSize,
   TASK_SPLIT_DIVIDER_WIDTH,
   taskDetailKeyboardInset,
   taskDetailPaneWidth,
   taskListPaneWidth,
-  taskSplitRatioForDrag,
+  taskSplitWidthForDrag,
 } from './TaskSplitLayout';
+import { readTaskWindowMetrics } from './TaskWindowMetrics';
 import {
   compareTaskListLabels,
   compareTaskSessionsForList,
@@ -153,6 +158,12 @@ struct TaskListPage {
   @State selectedSessionDeviceId: string = '';
   @State selectedSessionId: string = '';
   @State selectedMessageClientId: string = '';
+  @State residentPanes: ResidentTaskPane[] = [];
+  /**
+   * 每次选择任务都递增，让同一常驻实例对「同一条消息再点一次」也重新定位。
+   * 常驻实例由 ForEach 按任务 key 复用，不能靠替换 pane 对象传入新的定位目标。
+   */
+  @State selectedMessageRevision: number = 0;
   /** 新任务只在当前页面保留本地草稿；宽屏放在右栏，窄屏覆盖整页。 */
   @State newSessionDraftOpen: boolean = false;
   @State newSessionDraftDeviceId: string = '';
@@ -196,8 +207,11 @@ struct TaskListPage {
   @State now: number = Date.now();
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
-  @State foldStatus: number = -1;
-  @State listPaneRatio: number = TASK_SPLIT_DEFAULT_RATIO;
+  @State safeWindowWidth: number = 0;
+  @State safeWindowHeight: number = 0;
+  /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
+  @State safeWindowMetricsUnavailable: boolean = false;
+  @State requestedListPaneWidth: number = 0;
   @State keyboardHeight: number = 0;
 
   private routeParamsInitialized: boolean = false;
@@ -216,14 +230,21 @@ struct TaskListPage {
   private projectDragStartOrder: string[] = [];
   private projectDragMoved: boolean = false;
   private dividerTouchStartX: number = 0;
-  private dividerTouchStartRatio: number = TASK_SPLIT_DEFAULT_RATIO;
-  private foldStatusListening: boolean = false;
+  private dividerTouchStartWidth: number = 0;
   private singlePaneNavigationPending: boolean = false;
   private pageActive: boolean = false;
   /** 页面重进后，旧的刷新/任务操作 Promise 不能再改写新页面状态。 */
   private pageLifecycleGeneration: number = 0;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
+  private avoidAreaListening: boolean = false;
+  private avoidAreaListener: (options: window.AvoidAreaOptions) => void =
+    (options: window.AvoidAreaOptions): void => {
+      if (options.type === window.AvoidAreaType.TYPE_KEYBOARD) return;
+      const wasSplit = this.splitLayoutEnabled();
+      this.refreshSafeWindowMetrics();
+      this.handleSplitLayoutChange(wasSplit);
+    };
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
     // 输入法出现时 ArkUI 可能按当前焦点重新应用页面级避让。展开分栏与窄屏新建草稿
     // 都由业务内容消费一次键盘高度，避免系统 OFFSET 只托起光标却遮住 Composer 工具栏。
@@ -241,17 +262,14 @@ struct TaskListPage {
   /** 正数表示向列表末尾浏览，负数表示回看上方；方向改变时重新累计。 */
   private floatingBarScrollIntent: number = 0;
   private initialListTabIndex: number = 0;
-  private foldStatusListener: (status: number) => void = (status: number): void => {
-    const wasSplit = this.splitLayoutEnabled();
-    this.foldStatus = status;
-    this.handleSplitLayoutChange(wasSplit);
-  };
-
+  private residentAccountEpoch: number = -1;
+  private residentSessionStatuses: Map<string, string> = new Map();
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
     this.pageActive = true;
     this.singlePaneNavigationPending = false;
     this.taskListReconcileGeneration += 1;
+    this.residentAccountEpoch = AppServices.instance.auth.sessionEpoch;
     if (!this.routeParamsInitialized) {
       const params = (router.getParams() ?? {}) as Record<string, Object>;
       this.selectedDeviceId = readStr(params, 'deviceId');
@@ -265,11 +283,11 @@ struct TaskListPage {
       this.selectedSessionDeviceId = splitRouteSelection.deviceId;
       this.selectedSessionId = splitRouteSelection.sessionId;
       this.selectedMessageClientId = splitRouteSelection.messageClientId;
+      this.selectedMessageRevision += 1;
     }
     this.hydratePreferences();
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
-    this.observeFoldStatus();
     // KeyboardAvoidMode 是 UIContext 级状态；从新建页等单栏页面返回时，
     // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
     this.updateKeyboardAvoidance();
@@ -277,6 +295,10 @@ struct TaskListPage {
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
+    }));
+    this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => this.refreshProjection()));
+    this.unsubs.push(AppServices.instance.auth.onChanged(() => {
+      this.syncResidentAccount();
     }));
     this.unsubs.push(AppServices.instance.interactions.onChanged(() => {
       this.refreshProjection();
@@ -328,6 +350,7 @@ struct TaskListPage {
   aboutToDisappear(): void {
     this.pageLifecycleGeneration += 1;
     this.pageActive = false;
+    this.residentPanes = [];
     this.taskListReconcileGeneration += 1;
     this.cancelTaskSearch();
     for (const unsubscribe of this.unsubs) {
@@ -346,7 +369,6 @@ struct TaskListPage {
     this.taskListReconcileBackoff.clear();
     this.refreshing = false;
     this.sessionActionBusy = false;
-    this.stopFoldStatusObservation();
     this.stopKeyboardHeightObservation();
     this.keyboardHeight = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
@@ -419,31 +441,13 @@ struct TaskListPage {
     AppServices.instance.taskListPreferences.save(prefs);
   }
 
-  private observeFoldStatus(): void {
-    if (this.foldStatusListening) return;
-    try {
-      if (!display.isFoldable()) return;
-      this.foldStatus = Number(display.getFoldStatus());
-      display.on('foldStatusChange', this.foldStatusListener);
-      this.foldStatusListening = true;
-    } catch (e) {
-      // 非折叠设备或旧系统没有可用状态时，宽度判断仍可独立工作。
-      this.foldStatus = -1;
-      this.foldStatusListening = false;
-    }
-  }
-
-  private stopFoldStatusObservation(): void {
-    if (!this.foldStatusListening) return;
-    try {
-      display.off('foldStatusChange', this.foldStatusListener);
-    } catch (e) {
-      // 页面销毁时取消监听失败不应影响任务订阅清理。
-    }
-    this.foldStatusListening = false;
-  }
-
   private refreshProjection(): void {
+    this.syncResidentAccount();
+    if (AppServices.instance.taskAccountTransition.active) {
+      this.devices = [];
+      this.entries = [];
+      return;
+    }
     const devices = AppServices.instance.tasks.deviceList;
     const next: TaskListEntry[] = [];
     for (let deviceIndex = 0; deviceIndex < devices.length; deviceIndex++) {
@@ -456,7 +460,7 @@ struct TaskListPage {
         const entry = new TaskListEntry();
         entry.key = `${device.deviceId}:${session.id}`;
         entry.deviceId = device.deviceId;
-        entry.deviceName = device.deviceName;
+        entry.deviceName = this.displayDeviceName(device.deviceId, device.deviceName, devices);
         entry.session = session;
         next.push(entry);
       }
@@ -470,9 +474,12 @@ struct TaskListPage {
     }
     this.devices = devices;
     this.entries = next;
+    this.pruneResidentPanes();
     this.reconcileTaskSearchProjectKeys();
     this.collapseProjectGroupsOnce();
     this.ensureWideSelection();
+    // 选中的已删除任务要等 ensureWideSelection 换走选择后才能释放。
+    this.pruneResidentPanes();
     this.tryOpenPendingDeepLink();
     if (this.taskSearchActive()) this.scheduleTaskSearch();
   }
@@ -489,7 +496,22 @@ struct TaskListPage {
     this.collapsedProjectKeys = keys.filter((key: string) => this.savedOpenProjectKeys.indexOf(key) < 0);
   }
 
+  /** 释放已删除或刚被归档的常驻任务，判定规则见 residentPaneSurvives。 */
+  private pruneResidentPanes(): void {
+    this.residentPanes = this.residentPanes.filter((pane: ResidentTaskPane): boolean => {
+      const sessions = AppServices.instance.tasks.getSessions(pane.deviceId);
+      const session = sessions.find((item: RemoteSession): boolean => item.id === pane.sessionId);
+      const previous = this.residentSessionStatuses.get(pane.key);
+      const selected = pane.deviceId === this.selectedSessionDeviceId && pane.sessionId === this.selectedSessionId;
+      const survives = residentPaneSurvives(previous, session?.status, sessions.length, selected);
+      if (session !== undefined) this.residentSessionStatuses.set(pane.key, session.status);
+      else if (!survives) this.residentSessionStatuses.delete(pane.key);
+      return survives;
+    });
+  }
+
   private ensureWideSelection(): void {
+    if (AppServices.instance.taskAccountTransition.active) return;
     if (!this.splitLayoutEnabled()) return;
     if (this.newSessionDraftOpen) return;
     if (this.taskSearchActive()) {
@@ -499,7 +521,10 @@ struct TaskListPage {
       const results = this.taskSearchResultsForCategory(this.activeListTab);
       for (let i = 0; i < results.length; i++) {
         if (results[i].deviceId === this.selectedSessionDeviceId
-          && results[i].session.id === this.selectedSessionId) return;
+          && results[i].session.id === this.selectedSessionId) {
+          this.rememberSelectedTask();
+          return;
+        }
       }
       if (results.length === 0) {
         this.selectedSessionDeviceId = '';
@@ -507,15 +532,14 @@ struct TaskListPage {
         this.selectedMessageClientId = '';
         return;
       }
-      this.selectedSessionDeviceId = results[0].deviceId;
-      this.selectedSessionId = results[0].session.id;
-      this.selectedMessageClientId = results[0].contentMessageClientId;
+      this.setSelectedTask(results[0].deviceId, results[0].session.id, results[0].contentMessageClientId);
       return;
     }
     const scoped = this.activeListEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].deviceId === this.selectedSessionDeviceId
         && scoped[i].session.id === this.selectedSessionId) {
+        this.rememberSelectedTask();
         return;
       }
     }
@@ -525,9 +549,7 @@ struct TaskListPage {
       this.selectedMessageClientId = '';
       return;
     }
-    this.selectedSessionDeviceId = scoped[0].deviceId;
-    this.selectedSessionId = scoped[0].session.id;
-    this.selectedMessageClientId = '';
+    this.setSelectedTask(scoped[0].deviceId, scoped[0].session.id, '');
   }
 
   private handleAreaChange(_oldArea: Area, newArea: Area): void {
@@ -540,12 +562,14 @@ struct TaskListPage {
     const wasSplit = this.splitLayoutEnabled();
     this.viewportWidth = width;
     this.viewportHeight = height;
+    this.refreshSafeWindowMetrics();
     this.handleSplitLayoutChange(wasSplit);
   }
 
   private handleSplitLayoutChange(wasSplit: boolean): void {
     const splitEnabled = this.splitLayoutEnabled();
     if (splitEnabled) this.ensureWideSelection();
+    if (wasSplit && !splitEnabled) this.residentPanes = [];
     if (wasSplit && !splitEnabled && !this.newSessionDraftOpen) {
       void this.openSelectedTaskAfterSplitExit();
     }
@@ -589,7 +613,34 @@ struct TaskListPage {
   }
 
   private splitLayoutEnabled(): boolean {
-    return isWideTaskLayout(this.viewportWidth, this.viewportHeight, this.foldStatus);
+    const safe = this.safeWindowSize();
+    return isWideTaskLayout(this.viewportWidth, safe.width, safe.height);
+  }
+
+  private refreshSafeWindowMetrics(): void {
+    if (this.keyboardWindow === null) return;
+    try {
+      const metrics = readTaskWindowMetrics(this.keyboardWindow, (value: number): number =>
+        this.getUIContext().px2vp(value));
+      this.safeWindowWidth = metrics.safeWidth;
+      this.safeWindowHeight = metrics.safeHeight;
+      this.safeWindowMetricsUnavailable = false;
+    } catch (_error) {
+      this.safeWindowMetricsUnavailable = true;
+    }
+  }
+
+  /** 读取窗口失败时退回页面尺寸判断分栏；状态翻转需按普通布局变化处理。 */
+  private markSafeWindowMetricsUnavailable(): void {
+    if (this.safeWindowMetricsUnavailable) return;
+    const wasSplit = this.splitLayoutEnabled();
+    this.safeWindowMetricsUnavailable = true;
+    this.handleSplitLayoutChange(wasSplit);
+  }
+
+  private safeWindowSize(): TaskSafeWindowSize {
+    return effectiveTaskSafeWindow(this.viewportWidth, this.viewportHeight,
+      this.safeWindowWidth, this.safeWindowHeight, this.safeWindowMetricsUnavailable);
   }
 
   private updateKeyboardAvoidance(): void {
@@ -605,14 +656,27 @@ struct TaskListPage {
   private async observeKeyboardHeight(): Promise<void> {
     if (this.keyboardHeightListening) return;
     const hostContext = this.getUIContext().getHostContext();
-    if (hostContext === undefined) return;
+    if (hostContext === undefined) {
+      this.markSafeWindowMetricsUnavailable();
+      return;
+    }
     try {
       const hostWindow = await window.getLastWindow(hostContext);
       if (!this.pageActive || this.keyboardHeightListening) return;
       this.keyboardWindow = hostWindow;
       hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
       this.keyboardHeightListening = true;
+      try {
+        hostWindow.on('avoidAreaChange', this.avoidAreaListener);
+        this.avoidAreaListening = true;
+      } catch (_error) {
+        this.avoidAreaListening = false;
+      }
+      const wasSplit = this.splitLayoutEnabled();
+      this.refreshSafeWindowMetrics();
+      this.handleSplitLayoutChange(wasSplit);
     } catch (_err) {
+      this.markSafeWindowMetricsUnavailable();
       // 监听不可用时宁可回退为全页避让，也不能让输入框被键盘遮住。
       if (this.pageActive && (this.splitLayoutEnabled() || this.newSessionDraftOpen)) {
         this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
@@ -621,14 +685,16 @@ struct TaskListPage {
   }
 
   private stopKeyboardHeightObservation(): void {
-    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    if (this.keyboardWindow === null) return;
     try {
-      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+      if (this.keyboardHeightListening) this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+      if (this.avoidAreaListening) this.keyboardWindow.off('avoidAreaChange', this.avoidAreaListener);
     } catch (_err) {
       // 页面退出时监听已被系统清理，不影响后续路由恢复默认避让。
     }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
+    this.avoidAreaListening = false;
   }
 
   private floatingBarBottomMargin(): number {
@@ -645,12 +711,8 @@ struct TaskListPage {
   }
 
   private detailKeyboardInset(): number {
-    return taskDetailKeyboardInset(
-      this.viewportWidth,
-      this.viewportHeight,
-      this.foldStatus,
-      this.keyboardHeight,
-    );
+    const safe = this.safeWindowSize();
+    return taskDetailKeyboardInset(this.viewportWidth, safe.width, safe.height, this.keyboardHeight);
   }
 
   private newSessionKeyboardInset(): number {
@@ -660,11 +722,11 @@ struct TaskListPage {
   }
 
   private listPaneWidth(): number {
-    return taskListPaneWidth(this.viewportWidth, this.listPaneRatio);
+    return taskListPaneWidth(this.viewportWidth, this.requestedListPaneWidth);
   }
 
   private detailPaneWidth(): number {
-    return taskDetailPaneWidth(this.viewportWidth, this.listPaneRatio);
+    return taskDetailPaneWidth(this.viewportWidth, this.requestedListPaneWidth);
   }
 
   private selectedTaskKey(): string {
@@ -672,8 +734,54 @@ struct TaskListPage {
     return `${this.selectedSessionDeviceId}:${this.selectedSessionId}`;
   }
 
-  private selectedTaskInstanceKey(): string {
-    return `${this.selectedTaskKey()}:${this.selectedMessageClientId}`;
+  private rememberSelectedTask(): void {
+    if (AppServices.instance.taskAccountTransition.active || !this.splitLayoutEnabled()) return;
+    const key = residentTaskPaneKey(this.residentAccountEpoch, this.selectedSessionDeviceId, this.selectedSessionId);
+    const last = this.residentPanes[this.residentPanes.length - 1];
+    if (last !== undefined && last.key === key && last.messageClientId === this.selectedMessageClientId) return;
+    this.residentPanes = rememberResidentTaskPane(this.residentPanes, this.residentAccountEpoch,
+      this.selectedSessionDeviceId, this.selectedSessionId, this.selectedMessageClientId);
+    const sessions = AppServices.instance.tasks.getSessions(this.selectedSessionDeviceId);
+    const session = sessions.find((item: RemoteSession): boolean => item.id === this.selectedSessionId);
+    if (session !== undefined) this.residentSessionStatuses.set(key, session.status);
+    const kept = new Set<string>(this.residentPanes.map((pane: ResidentTaskPane): string => pane.key));
+    this.residentSessionStatuses.forEach((_status: string, identity: string): void => {
+      if (!kept.has(identity)) this.residentSessionStatuses.delete(identity);
+    });
+  }
+
+  private syncResidentAccount(): void {
+    const epoch = AppServices.instance.auth.sessionEpoch;
+    if (epoch === this.residentAccountEpoch) return;
+    this.residentAccountEpoch = epoch;
+    this.residentPanes = [];
+    this.residentSessionStatuses.clear();
+    this.selectedSessionDeviceId = '';
+    this.selectedSessionId = '';
+    this.selectedMessageClientId = '';
+    this.cancelTaskSearch();
+    if (AppServices.instance.taskAccountTransition.active) {
+      this.selectedDeviceId = '';
+      this.taskSearchProjectKeys = [];
+      this.taskListReconcileGeneration += 1;
+      this.taskListLoadInFlight.clear();
+      this.taskListReconcileBackoff.clear();
+      this.projectOrderScopeGeneration += 1;
+    }
+  }
+
+  private setSelectedTask(deviceId: string, sessionId: string, messageClientId: string): void {
+    if (AppServices.instance.taskAccountTransition.active) return;
+    this.selectedSessionDeviceId = deviceId;
+    this.selectedSessionId = sessionId;
+    this.selectedMessageClientId = messageClientId;
+    this.selectedMessageRevision += 1;
+    this.rememberSelectedTask();
+  }
+
+  private paneSelected(pane: ResidentTaskPane): boolean {
+    return !this.newSessionDraftOpen && pane.deviceId === this.selectedSessionDeviceId
+      && pane.sessionId === this.selectedSessionId;
   }
 
   private entrySelected(entry: TaskListEntry): boolean {
@@ -685,12 +793,11 @@ struct TaskListPage {
   private selectSession(entry: TaskListEntry): void {
     this.newSessionDraftOpen = false;
     this.updateKeyboardAvoidance();
-    this.selectedSessionDeviceId = entry.deviceId;
-    this.selectedSessionId = entry.session.id;
-    this.selectedMessageClientId = '';
+    this.setSelectedTask(entry.deviceId, entry.session.id, '');
   }
 
   private tryOpenPendingDeepLink(): void {
+    if (AppServices.instance.taskAccountTransition.active) return;
     const intent = AppServices.instance.peekPendingDeepLink();
     if (intent === null) return;
     const devices = AppServices.instance.tasks.deviceList;
@@ -710,9 +817,7 @@ struct TaskListPage {
     if (this.splitLayoutEnabled()) {
       this.setActiveListTab(taskListCategory(targetSession));
       if (this.selectedDeviceId.length > 0) this.selectedDeviceId = deviceId;
-      this.selectedSessionDeviceId = deviceId;
-      this.selectedSessionId = intent.sessionId;
-      this.selectedMessageClientId = intent.messageClientId;
+      this.setSelectedTask(deviceId, intent.sessionId, intent.messageClientId);
       this.persistPreferences();
       return;
     }
@@ -850,14 +955,14 @@ struct TaskListPage {
     const point = event.changedTouches[0];
     if (event.type === TouchType.Down) {
       this.dividerTouchStartX = point.displayX;
-      this.dividerTouchStartRatio = this.listPaneRatio;
+      this.dividerTouchStartWidth = this.listPaneWidth();
       return;
     }
     if (event.type === TouchType.Move) {
       // 直接拖拽跟手，不加缓动（跟随手指本身就是反馈）。
-      this.listPaneRatio = taskSplitRatioForDrag(
+      this.requestedListPaneWidth = taskSplitWidthForDrag(
         this.viewportWidth,
-        this.dividerTouchStartRatio,
+        this.dividerTouchStartWidth,
         point.displayX - this.dividerTouchStartX,
       );
       return;
@@ -902,9 +1007,7 @@ struct TaskListPage {
     }
 
     const session = cached ?? result.session;
-    this.selectedSessionDeviceId = result.deviceId;
-    this.selectedSessionId = session.id;
-    this.selectedMessageClientId = result.contentMessageClientId;
+    this.setSelectedTask(result.deviceId, session.id, result.contentMessageClientId);
     this.setActiveListTab(taskListCategory(session));
     this.persistPreferences();
     if (this.splitLayoutEnabled()) return;
@@ -1214,11 +1317,17 @@ struct TaskListPage {
     if (this.selectedDeviceId.length === 0) return '所有任务';
     for (let i = 0; i < this.devices.length; i++) {
       if (this.devices[i].deviceId === this.selectedDeviceId) {
-        return this.devices[i].deviceName;
+        return this.displayDeviceName(this.devices[i].deviceId, this.devices[i].deviceName);
       }
     }
     const resolved = AppServices.instance.tasks.getDeviceName(this.selectedDeviceId);
-    return resolved.length > 0 ? resolved : this.selectedDeviceNameHint;
+    return this.displayDeviceName(this.selectedDeviceId, resolved || this.selectedDeviceNameHint);
+  }
+
+  private displayDeviceName(deviceId: string, name: string, devices: PresenceSnapshot[] = this.devices): string {
+    const names = new Map<string, string>();
+    for (const device of devices) names.set(device.deviceId, device.deviceName);
+    return deviceDisplayName(deviceId, name, this.v12String('v134_unnamed_computer'), names);
   }
 
   private deviceScopedEntries(): TaskListEntry[] {
@@ -1286,10 +1395,12 @@ struct TaskListPage {
       if (this.selectedDeviceId.length > 0 && device.deviceId !== this.selectedDeviceId) continue;
       const projects = listTaskSearchProjects(
         device.deviceId,
-        device.deviceName,
+        this.displayDeviceName(device.deviceId, device.deviceName),
         AppServices.instance.tasks.getSessions(device.deviceId),
       );
       for (let projectIndex = 0; projectIndex < projects.length; projectIndex++) {
+        const alias = this.projectAlias(device.deviceId, projects[projectIndex].workingDir);
+        if (alias.length > 0) projects[projectIndex].title = alias;
         out.push(projects[projectIndex]);
       }
     }
@@ -1328,7 +1439,7 @@ struct TaskListPage {
       if (this.taskSearchProjectKeys.length > 0 && !dirsByDevice.has(device.deviceId)) continue;
       const origin = new TaskSearchOrigin();
       origin.deviceId = device.deviceId;
-      origin.deviceName = device.deviceName;
+      origin.deviceName = this.displayDeviceName(device.deviceId, device.deviceName);
       origin.reachable = this.deviceCanOpen(device);
       const dirs = dirsByDevice.get(device.deviceId);
       origin.workingDirs = dirs === undefined ? null : dirs.slice();
@@ -1751,6 +1862,14 @@ struct TaskListPage {
     return this.projectGroupsFrom(this.regularEntries());
   }
 
+  private projectAlias(deviceId: string, workingDir: string): string {
+    const key = taskProjectOrderKey(deviceId, workingDir);
+    const members = AppServices.instance.tasks.getSessions(deviceId).filter((session: RemoteSession): boolean =>
+      session.status !== 'deleted' && session.orcaRole !== 'worker' && taskListCategory(session) === 'projects'
+        && taskProjectOrderKey(deviceId, session.workingDir) === key);
+    return AppServices.instance.taskProjectAliases.resolve(deviceId, members);
+  }
+
   private projectGroupsFrom(entries: TaskListEntry[]): TaskProjectGroup[] {
     const groups: Map<string, TaskProjectGroup> = new Map();
     for (let i = 0; i < entries.length; i++) {
@@ -1800,6 +1919,10 @@ struct TaskListPage {
         return a.key.localeCompare(b.key);
       });
     }
+    for (const group of out) {
+      const alias = this.projectAlias(group.deviceId, group.workingDir);
+      if (alias.length > 0) group.title = alias;
+    }
     return out;
   }
 
@@ -1829,13 +1952,20 @@ struct TaskListPage {
 
   private sessionEntryRenderKey(prefix: string, entry: TaskListEntry): string {
     const state = taskListEntryPresentationState(entry.session, this.taskRightStatusKind(entry));
-    return `${prefix}:${entry.key}:state:${state.length}:${state}`;
+    return JSON.stringify([prefix, entry.key, state, this.agentDeviceLabel(entry)]);
+  }
+
+  private agentDeviceLabel(entry: TaskListEntry): string {
+    const deviceId = entry.session.agentDeviceId;
+    if (deviceId.length === 0) return '';
+    const device = this.devices.find((item: PresenceSnapshot): boolean => item.deviceId === deviceId);
+    return this.displayDeviceName(deviceId, device?.deviceName ?? '');
   }
 
   private projectGroupRenderKey(group: TaskProjectGroup): string {
     // 外层项目节点也会捕获旧 entries；成员不仅新增/移除，任一行的可见状态变化
     // 都必须进入外层 key，否则内部 ForEach 连重新计算 key 的机会都没有。
-    let key = `project:${group.key}:${this.projectMachineLabel(group)}`;
+    let key = JSON.stringify(['project', group.key, group.title, this.projectMachineLabel(group)]);
     for (let i = 0; i < group.entries.length; i++) {
       key += `:${this.sessionEntryRenderKey('member', group.entries[i])}`;
     }
@@ -2004,9 +2134,7 @@ struct TaskListPage {
           onSessionStarted: (deviceId: string, sessionId: string): void => {
             this.newSessionDraftOpen = false;
             this.updateKeyboardAvoidance();
-            this.selectedSessionDeviceId = deviceId;
-            this.selectedSessionId = sessionId;
-            this.selectedMessageClientId = '';
+            this.setSelectedTask(deviceId, sessionId, '');
             if (!this.splitLayoutEnabled()) {
               void router.pushUrl({
                 url: 'pages/TaskPage',
@@ -2286,20 +2414,30 @@ struct TaskListPage {
 
   @Builder
   detailPane() {
-    if (this.selectedTaskKey().length === 0) {
-      this.emptyDetailPane()
-    } else {
-      ForEach([this.selectedTaskInstanceKey()], (key: string) => {
+    Stack() {
+      if (this.selectedTaskKey().length === 0) {
+        this.emptyDetailPane()
+      }
+      ForEach(this.residentPanes, (pane: ResidentTaskPane) => {
+        // 定位目标与版本号从父级 @State 读取：同 key 复用实例时，替换 pane 对象不会重新执行这里。
         TaskPageContent({
-          paneDeviceId: this.selectedSessionDeviceId,
-          paneSessionId: this.selectedSessionId,
-          paneMessageClientId: this.selectedMessageClientId,
+          paneDeviceId: pane.deviceId,
+          paneSessionId: pane.sessionId,
+          paneMessageClientId: this.paneSelected(pane) ? this.selectedMessageClientId : '',
+          paneMessageRevision: this.paneSelected(pane) ? this.selectedMessageRevision : 0,
+          paneActive: this.paneSelected(pane),
           paneComposerBottomInset: this.detailComposerBottomInset(),
           paneKeyboardInset: this.detailKeyboardInset(),
         })
-          .transition(uiRevealTransition())
-      }, (key: string) => key)
+          .width('100%')
+          .height('100%')
+          .visibility(this.paneSelected(pane) ? Visibility.Visible : Visibility.Hidden)
+          .hitTestBehavior(this.paneSelected(pane) ? HitTestMode.Default : HitTestMode.None)
+          .accessibilityLevel(this.paneSelected(pane) ? 'auto' : 'no-hide-descendants')
+      }, (pane: ResidentTaskPane) => pane.key)
     }
+    .width('100%')
+    .height('100%')
   }
 
   @Builder
@@ -2781,17 +2919,18 @@ struct TaskListPage {
   }
 
   private taskSearchResultSubtitle(result: TaskSearchResult): string {
-    const device = result.deviceName.length > 0
-      ? result.deviceName : this.v12String('v12_device');
+    const current = this.devices.find((item: PresenceSnapshot): boolean => item.deviceId === result.deviceId);
+    const device = this.displayDeviceName(result.deviceId, current?.deviceName ?? result.deviceName);
     const project = result.session.workingDir.length > 0
-      ? taskProjectName(result.session.workingDir)
+      ? (this.projectAlias(result.deviceId, result.session.workingDir) || taskProjectName(result.session.workingDir))
       : taskListCategory(result.session) === 'automations'
         ? this.v12String('v12_automation') : this.v12String('v12_dialogue');
     return `${device} · ${project}`;
   }
 
   private taskSearchResultRenderKey(result: TaskSearchResult): string {
-    return `${result.deviceId}:${result.session.id}:${result.matchKind}:${result.contentMessageClientId}`;
+    return JSON.stringify([result.deviceId, result.session.id, result.matchKind,
+      result.contentMessageClientId, this.taskSearchResultSubtitle(result)]);
   }
 
   @Builder
@@ -2881,9 +3020,7 @@ struct TaskListPage {
         .width('100%')
 
         if (entry.session.agentDeviceId.length > 0) {
-          Text(harmonyV12String(this.getUIContext().getHostContext(), 'v132_agent_location',
-            this.devices.find((device: PresenceSnapshot) => device.deviceId === entry.session.agentDeviceId)?.deviceName
-              || entry.session.agentDeviceId))
+          Text(harmonyV12String(this.getUIContext().getHostContext(), 'v132_agent_location', this.agentDeviceLabel(entry)))
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
@@ -3030,15 +3167,15 @@ struct TaskListPage {
 
   private projectMachineLabel(group: TaskProjectGroup): string {
     const visible: ProjectMachine[] = [];
-    for (const project of this.projectGroups()) {
-      if (visible.some((row: ProjectMachine) => row.deviceId === project.deviceId)) continue;
+    for (const device of this.devices) {
       const machine = new ProjectMachine();
-      machine.deviceId = project.deviceId;
-      machine.name = AppServices.instance.tasks.getDeviceName(project.deviceId) || project.deviceId;
-      machine.online = this.devices.find((row: PresenceSnapshot) => row.deviceId === project.deviceId)?.online ?? false;
+      machine.deviceId = device.deviceId;
+      machine.name = device.deviceName;
+      machine.online = device.online;
       visible.push(machine);
     }
-    return projectMachineLabel(group.deviceId, this.selectedDeviceId, visible, harmonyV12String(this.getUIContext().getHostContext(), 'v131_offline'));
+    return projectMachineLabel(group.deviceId, this.selectedDeviceId, visible,
+      harmonyV12String(this.getUIContext().getHostContext(), 'v131_offline'), this.v12String('v134_unnamed_computer'));
   }
 
   @Builder
@@ -3446,7 +3583,8 @@ struct TaskListPage {
                 () => this.toggleTaskSearchProject(project.key),
                 `${project.count}`,
               )
-            }, (project: TaskSearchProjectOption) => `search-project:${project.key}`)
+            }, (project: TaskSearchProjectOption) => JSON.stringify(['search-project', project.key,
+              project.title, project.deviceName, project.count]))
             if (this.taskSearchProjects().length === 0) {
               Text($r('app.string.v12_no_synced_projects'))
                 .fontSize(13)
@@ -3533,7 +3671,8 @@ struct TaskListPage {
             this.scopeMenuAllRow()
             ForEach(this.devices, (device: PresenceSnapshot) => {
               this.scopeMenuDeviceRow(device)
-            }, (device: PresenceSnapshot) => `scope:${device.deviceId}`)
+            }, (device: PresenceSnapshot) => JSON.stringify(['scope', device.deviceId,
+              this.displayDeviceName(device.deviceId, device.deviceName), device.online, device.remoteControlEnabled]))
           }
           .width('100%')
         }
@@ -3599,7 +3738,7 @@ struct TaskListPage {
       }
       .width(22)
       .height(22)
-      Text(device.deviceName)
+      Text(this.displayDeviceName(device.deviceId, device.deviceName))
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))

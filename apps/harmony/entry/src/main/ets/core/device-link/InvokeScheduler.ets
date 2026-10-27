@@ -6,6 +6,7 @@ const MAX_QUEUED = 128;
 const MAX_BACKGROUND_QUEUED = 96;
 
 const BACKGROUND_INVOKE_CHANNELS: string[] = [
+  'local-db:project-aliases:list',
   'git-context:pr-refs:list',
   'git-context:pr-status',
   'maker:schedule:list-sidebar-index-runs',

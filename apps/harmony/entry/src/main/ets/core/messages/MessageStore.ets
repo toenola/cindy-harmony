@@ -537,6 +537,8 @@ export class MessageStore {
   /** 非活动会话进程内缓存的 LRU 顺序。 */
   private cacheAccessBySession: Map<string, number> = new Map();
   private cacheAccessSequence: number = 0;
+  private residentCacheLeaseSequence: number = 0;
+  private residentCacheLeases: Map<number, string> = new Map();
   /**
    * 任务快照查询（AppServices 注入 TaskStore）。驻留分类只认权威 `source`，
    * 未注入时全部按普通任务处理，宁可多驻留也不误回收。
@@ -589,8 +591,29 @@ export class MessageStore {
     this.sessionMessageCache.setAccountScope(accountId);
   }
 
+  retainResidentSession(deviceId: string, sessionId: string): number {
+    const lease = ++this.residentCacheLeaseSequence;
+    this.residentCacheLeases.set(lease, JSON.stringify([deviceId, sessionId]));
+    return lease;
+  }
+
+  releaseResidentSession(lease: number): void {
+    if (!this.residentCacheLeases.delete(lease)) return;
+    this.evictInactiveSessionCaches();
+  }
+
+  private residentSessionRetained(sessionId: string): boolean {
+    const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
+    const key = JSON.stringify([deviceId, sessionId]);
+    for (const identity of this.residentCacheLeases.values()) {
+      if (identity === key) return true;
+    }
+    return false;
+  }
+
   /** 登出/切换账号：本地消息、运行投影和落盘快照必须一起失效。 */
   async clearAllCachedSessions(): Promise<void> {
+    this.residentCacheLeases.clear();
     this.historyRetries.clear();
     this.snapshotResetEpoch += 1;
     this.snapshotReads.clear();
@@ -1008,7 +1031,7 @@ export class MessageStore {
       let oldest = Number.MAX_SAFE_INTEGER;
       for (let i = 0; i < ids.length; i++) {
         const sessionId = ids[i];
-        if (this.subscribed.has(sessionId)) continue;
+        if (this.subscribed.has(sessionId) || this.residentSessionRetained(sessionId)) continue;
         const access = this.cacheAccessBySession.get(sessionId) ?? 0;
         if (access < oldest) {
           oldest = access;
@@ -1037,7 +1060,7 @@ export class MessageStore {
       candidate.rowCount = messages.length;
       candidate.bytes = estimateMessageRowsBytes(messages);
       candidate.accessOrder = this.cacheAccessBySession.get(sessionId) ?? 0;
-      candidate.leased = this.subscribed.has(sessionId);
+      candidate.leased = this.subscribed.has(sessionId) || this.residentSessionRetained(sessionId);
       candidate.hasProtectedRows = hasProtectedMessageRow(messages);
       candidates.push(candidate);
     });
@@ -1335,7 +1358,12 @@ export class MessageStore {
    * 真正内存回收由 LRU 负责；落盘只保留稳定消息的最近一页。
    */
   async closeSession(sessionId: string, deviceId: string = ''): Promise<void> {
-    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== deviceId) return;
+    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== deviceId) {
+      if (!this.subscribed.has(sessionId) && this.cachedDeviceBySession.get(sessionId) === deviceId) {
+        this.nextSessionLease(sessionId);
+      }
+      return;
+    }
     this.consumePendingTextDeltaNotification(sessionId);
     const subscribedDeviceId = this.subscribed.get(sessionId);
     if (subscribedDeviceId && this.client) {
@@ -1345,7 +1373,7 @@ export class MessageStore {
     }
     this.historyRetries.cancel(sessionId);
     this.historyRetries.cancel(sessionId + ':subscription');
-    this.nextSessionLease(sessionId);
+    const closeLease = this.nextSessionLease(sessionId);
     this.subscribed.delete(sessionId);
     this.touchSessionCache(sessionId);
     this.persistSessionMessages(sessionId);
@@ -1372,9 +1400,11 @@ export class MessageStore {
       }
     }
     // 退订等待期间可能已在同一页面重新打开 B；旧的 close 不能再压缩或淘汰 B 的投影。
-    if (deviceId.length > 0 && this.subscribed.get(sessionId) !== undefined) return;
+    if (this.sessionLeaseRevisions.get(sessionId) !== closeLease
+      || (deviceId.length > 0 && this.subscribed.get(sessionId) !== undefined)) return;
     await this.sessionMessageCache.flush();
-    this.compactSessionWindowOnLeave(sessionId);
+    if (this.sessionLeaseRevisions.get(sessionId) !== closeLease) return;
+    if (!this.residentSessionRetained(sessionId)) this.compactSessionWindowOnLeave(sessionId);
     this.evictInactiveSessionCaches();
     this.notify();
   }

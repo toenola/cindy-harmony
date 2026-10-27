@@ -224,7 +224,7 @@ export class RichAnswerStream {
     }
     const seq = seqValue as number;
     if (seq <= this.seq) return false;
-    if (seq !== this.seq + 1) throw new Error('gap');
+    this.issues += Math.min(seq - this.seq - 1, MAX_NODES);
     this.seq = seq;
     if (hasKey(op, 'version') && op['version'] !== 1) throw new Error('version');
     const idValue = op['id'];
@@ -520,6 +520,13 @@ export function richEvaluate(expr: Object | undefined | null, values: RichValues
   else if (op === 'gt') return nums[0] > nums[1];
   else return undefined;
   return Number.isFinite(result) ? result : undefined;
+}
+
+export function richSendText(node: RichNode, values: RichValues): string | undefined {
+  if (node.kind !== 'button' && node.kind !== 'form') return undefined;
+  const text = richEvaluate(node.props['send'], values);
+  if (typeof text !== 'string' || text.length > 16000 || text.trim().length === 0) return undefined;
+  return text.trim();
 }
 
 function nodeExpression(node: RichNode): Object {

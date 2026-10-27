@@ -8,7 +8,7 @@
 
 import { DlClient, DlError, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels } from '../device-link/DlProtocol';
-import { RemoteSession, parseSession, readNum, readObj, readStr, safeErrorMessage } from './TaskModels';
+import { RemoteSession, parseSession, readNum, readObj, readStr, safeErrorMessage, sessionListActivityAt } from './TaskModels';
 import { TaskStore, unwrapInvokeResult } from './TaskStore';
 
 export const TASK_SEARCH_LIMIT = 24;
@@ -519,7 +519,7 @@ function taskSearchActivityCutoff(filter: TaskSearchLastActivityFilter): number 
 }
 
 function taskSearchActivityMs(session: RemoteSession): number {
-  return Math.max(parseTaskSearchTime(session.userSendAt), parseTaskSearchTime(session.updatedAt));
+  return parseTaskSearchTime(sessionListActivityAt(session));
 }
 
 function parseTaskSearchTime(value: string): number {

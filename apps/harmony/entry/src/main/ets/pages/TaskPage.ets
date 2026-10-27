@@ -12,7 +12,7 @@ import { providerCatalogUnavailable } from '../core/ComposerCatalog';
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { display, KeyboardAvoidMode, LengthMetrics, router, promptAction, window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, LengthMetrics, router, promptAction, window } from '@kit.ArkUI';
 import { LevelMode } from '@kit.ArkUI';
 import {
   BlurStrategy,
@@ -27,6 +27,9 @@ import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import {
+  initialTaskPaneMessage, residentPaneAllowsPositioning, taskComposerInputId,
+} from '../core/tasks/ResidentTaskPanes';
 import { AccountUsageSummary, projectAccountUsage } from '../core/messages/AccountUsage';
 import { HistoryWorkPresentation } from '../core/messages/HistoryWorkPresentation';
 import { formatHistoryWorkLine } from '../core/messages/HistoryLinePresentation';
@@ -119,8 +122,11 @@ import {
 } from '../core/tasks/NewSessionCreationStore';
 import {
   handoffTaskSplitRouteSelection,
+  effectiveTaskSafeWindow,
   isWideTaskLayout,
+  TaskSafeWindowSize,
 } from './TaskSplitLayout';
+import { readTaskWindowMetrics } from './TaskWindowMetrics';
 import {
   PiSessionTreeNode,
   PiSessionTreeSnapshot,
@@ -502,7 +508,11 @@ export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
-  @Prop paneMessageClientId: string = '';
+  @Prop @Watch('onPaneMessageChanged') paneMessageClientId: string = '';
+  /** 父页面每次选择任务递增；同一条消息再次选择时也要重新定位。 */
+  @Prop @Watch('onPaneMessageChanged') paneMessageRevision: number = 0;
+  @Prop @Watch('onPaneActiveChanged') paneActive: boolean = true;
+  @State paneActivationRevision: number = 0;
   /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
   /**
@@ -518,6 +528,12 @@ export struct TaskPageContent {
   private composerDraftGeneration: number = 0;
   /** 返回动作跨一帧提交 Composer 收起态时，防止连续点击重复 pop 路由。 */
   private leavingDetailPage: boolean = false;
+  private detailMounted: boolean = false;
+  private paneAccountEpoch: number = -1;
+  private residentCacheLease: number = 0;
+  private paneResumePending: boolean = false;
+  /** 本实例 Composer 输入框的唯一组件 ID，在 aboutToAppear 确定任务后生成。 */
+  private composerInputId: string = 'task-composer-input';
   @State sending: boolean = false;
   /** Desktop 输入投影产生的排队/派发/失败气泡。 */
   @State queueBubbles: PendingQueueBubble[] = [];
@@ -821,7 +837,92 @@ export struct TaskPageContent {
   @State generationReliable: boolean = true;
 
   private isCurrentPageLifecycle(generation: number): boolean {
-    return generation === this.pageLifecycleGeneration && !this.leavingDetailPage;
+    return generation === this.pageLifecycleGeneration && !this.leavingDetailPage && this.paneActive;
+  }
+
+  private onPaneMessageChanged(): void {
+    if (!this.detailMounted || this.paneMessageClientId.length === 0) return;
+    this.routeMessageClientId = this.paneMessageClientId;
+    this.messageFocusGeneration += 1;
+    this.messageFocusLoadStarted = false;
+    if (this.paneActive && this.sessionOpenResolved) this.focusMessageTarget();
+  }
+
+  private onPaneActiveChanged(): void {
+    if (!this.detailMounted || this.leavingDetailPage) return;
+    this.paneActivationRevision += 1;
+    if (this.paneActive) {
+      this.paneResumePending = this.initialLoadResolved;
+      this.refreshNewSessionCreation();
+      this.refreshGitBranch(true);
+      this.startGitBranchRefresh();
+      return;
+    }
+    this.pageLifecycleGeneration += 1;
+    this.itemsRefreshGeneration += 1;
+    this.itemsRefreshScheduled = false;
+    this.initialScrollGeneration += 1;
+    this.followScrollGeneration += 1;
+    this.followScrollScheduled = false;
+    this.followScrollTrailingRequested = false;
+    this.initialLoadGeneration += 1;
+    this.messageFocusGeneration += 1;
+    this.messageFocusLoadStarted = false;
+    this.routeMessageClientId = '';
+    this.historyAnchorRestoreGeneration += 1;
+    this.pendingHistoryAnchorRestore = undefined;
+    this.initialScrollSettling = false;
+    this.loadingOlder = false;
+    this.listTouchActive = false;
+    this.taskPlanBackfillPending = false;
+    this.sending = false;
+    this.queueBusy = false;
+    this.contextRpcBusy = false;
+    this.sessionActionBusy = false;
+    this.goalActionBusy = false;
+    this.messageActionBusyId = '';
+    this.fileShareBusy = false;
+    this.closeContextSheet();
+    this.composerPopupRestoreFocus = false;
+    this.restoreComposerFocusOnSheetDisappear = false;
+    this.composerPaletteGeneration += 1;
+    this.composerPaletteMode = '';
+    this.sessionActionOpen = false;
+    this.sessionTreeOpen = false;
+    this.sessionTreeGeneration += 1;
+    // 下面这些标记由请求的 finally 按页面 / 面板代次清理；隐藏已递增代次，旧请求不会再清，
+    // 必须在这里复位，否则切回后分支面板、指令候选与队列横幅会一直处于忙碌态。
+    this.sessionTreeSwitchingId = '';
+    this.sessionTreeLoading = false;
+    this.composerPaletteLoading = false;
+    this.tailBannerBusy = false;
+    if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+    this.accountUsageRefreshTimer = -1;
+    this.messageActionItemKey = '';
+    this.subagentDetailKey = '';
+    this.previewImageUrl = '';
+    this.closeFilePreview();
+    this.cancelConversationShare();
+    this.imageQueue.cancelPicking();
+    this.fileQueue.cancelPicking();
+    // 隐藏不等于离开：编辑锁会阻止 Host 派发这条排队消息，必须像离页一样释放；
+    // 同时恢复编辑前的草稿，让下面的收起逻辑照常保存它。
+    this.cancelQueueEdit();
+    this.collapseComposerSurface();
+    this.stopGitBranchRefresh();
+    // 恢复时 refreshItems 会按流式状态重新启动计时。
+    this.stopWorkClock();
+    if (this.inputQueueActivated) {
+      AppServices.instance.inputQueue.deactivateSession(this.deviceId, this.sessionId);
+      this.inputQueueActivated = false;
+    }
+    if (this.interactionSessionActivated) {
+      AppServices.instance.interactions.deactivateSession(this.deviceId, this.sessionId);
+      this.interactionSessionActivated = false;
+    }
+    this.sessionSyncStarted = false;
+    this.sessionOpenResolved = false;
+    void AppServices.instance.messages.closeSession(this.sessionId, this.deviceId);
   }
 
   private presentationScope(): TaskPresentationScope {
@@ -922,8 +1023,14 @@ export struct TaskPageContent {
     this.sessionId = this.paneSessionId.length > 0
       ? this.paneSessionId
       : readStr(params, 'sessionId');
-    this.routeMessageClientId = this.paneMessageClientId.length > 0
-      ? this.paneMessageClientId : readStr(params, 'message');
+    this.paneAccountEpoch = AppServices.instance.auth.sessionEpoch;
+    this.composerInputId = taskComposerInputId(this.paneAccountEpoch, this.deviceId, this.sessionId);
+    this.detailMounted = true;
+    if (this.isEmbeddedDetailPane()) {
+      this.residentCacheLease = AppServices.instance.messages.retainResidentSession(this.deviceId, this.sessionId);
+    }
+    this.routeMessageClientId = initialTaskPaneMessage(
+      this.isEmbeddedDetailPane(), this.paneMessageClientId, readStr(params, 'message'));
     this.subagentDetailKey = '';
     this.focusedMessageClientId = '';
     this.tailHiddenErrorClientIds = [];
@@ -1036,6 +1143,7 @@ export struct TaskPageContent {
   }
 
   aboutToDisappear(): void {
+    this.detailMounted = false;
     if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
     this.accountUsageRefreshTimer = -1;
     this.pageLifecycleGeneration += 1;
@@ -1104,17 +1212,19 @@ export struct TaskPageContent {
     this.composerPaletteGeneration += 1;
     this.composerPaletteMode = '';
     this.composerDraftGeneration += 1;
-    void AppServices.instance.composerDrafts.flush(this.sessionId, this.deviceId);
-    if (this.editingQueueClientId.length > 0) {
+    if (this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
+      void AppServices.instance.composerDrafts.flush(this.sessionId, this.deviceId);
+    }
+    if (this.editingQueueClientId.length > 0 && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
       void AppServices.instance.inputQueue.setEditLock(
         this.deviceId, this.sessionId, this.editingQueueClientId, false).catch(() => {
       });
     }
-    if (this.inputQueueActivated) {
+    if (this.inputQueueActivated && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
       AppServices.instance.inputQueue.deactivateSession(this.deviceId, this.sessionId);
       this.inputQueueActivated = false;
     }
-    if (this.interactionSessionActivated) {
+    if (this.interactionSessionActivated && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
       AppServices.instance.interactions.deactivateSession(this.deviceId, this.sessionId);
       this.interactionSessionActivated = false;
     }
@@ -1123,7 +1233,13 @@ export struct TaskPageContent {
       u();
     }
     this.unsubs = [];
-    void AppServices.instance.messages.closeSession(this.sessionId, this.deviceId);
+    if (this.residentCacheLease > 0) {
+      AppServices.instance.messages.releaseResidentSession(this.residentCacheLease);
+      this.residentCacheLease = 0;
+    }
+    if (this.sessionSyncStarted && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
+      void AppServices.instance.messages.closeSession(this.sessionId, this.deviceId);
+    }
   }
 
   private refreshNewSessionCreation(): void {
@@ -1203,7 +1319,8 @@ export struct TaskPageContent {
 
   /** 创建完成后只启动一次详情页的完整远端同步。 */
   private startSessionSyncOnce(): void {
-    if (this.sessionSyncStarted || this.deviceId.length === 0 || this.sessionId.length === 0) return;
+    if (!this.paneActive || this.sessionSyncStarted || this.deviceId.length === 0 || this.sessionId.length === 0
+      || this.paneAccountEpoch !== AppServices.instance.auth.sessionEpoch) return;
     this.sessionSyncStarted = true;
     AppServices.instance.inputQueue.activateSession(this.deviceId, this.sessionId);
     this.inputQueueActivated = true;
@@ -1216,7 +1333,21 @@ export struct TaskPageContent {
     void this.invokeContextRpc('notification:clear-session-attention', [this.sessionId, 'explicit']).catch(() => {
       // 已读清除是幂等增强；旧被控端不支持时不阻塞详情页。
     });
-    this.beginInitialLoad();
+    if (this.paneResumePending) this.resumeResidentSession();
+    else this.beginInitialLoad();
+  }
+
+  private resumeResidentSession(): void {
+    const generation = this.initialLoadGeneration;
+    this.refreshItems();
+    AppServices.instance.messages.openSession(this.deviceId, this.sessionId).then((loaded: boolean) => {
+      if (generation !== this.initialLoadGeneration || !this.paneActive) return;
+      this.sessionOpenResolved = true;
+      this.loadFailed = !loaded || AppServices.instance.messages.loadFailed(this.sessionId, this.deviceId);
+      this.refreshItems();
+      this.paneResumePending = false;
+      if (this.routeMessageClientId.length > 0) this.focusMessageTarget();
+    });
   }
 
   private refreshQueueState(): void {
@@ -2008,16 +2139,17 @@ export struct TaskPageContent {
   }
 
   private restoreComposerFocusAfterPopupDismiss(): void {
-    if (!this.composerPopupRestoreFocus || this.leavingDetailPage) return;
+    if (!this.composerPopupRestoreFocus || this.leavingDetailPage || !this.paneActive) return;
     this.composerPopupRestoreFocus = false;
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.composerFocused = true;
+    const generation = this.pageLifecycleGeneration;
     setTimeout(() => {
-      if (this.leavingDetailPage || this.composerPermissionPopupOpen
+      if (!this.isCurrentPageLifecycle(generation) || this.composerPermissionPopupOpen
         || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
       try {
-        this.getUIContext().getFocusController().requestFocus('task-composer-input');
+        this.getUIContext().getFocusController().requestFocus(this.composerInputId);
       } catch (_err) {
         // 页面或分栏在 Popup 退场期间切换时，只保留展开态，不向已销毁节点请求焦点。
       }
@@ -2050,7 +2182,7 @@ export struct TaskPageContent {
   }
 
   private restoreComposerFocusAfterSheetDisappear(): void {
-    if (!this.restoreComposerFocusOnSheetDisappear || this.leavingDetailPage) return;
+    if (!this.restoreComposerFocusOnSheetDisappear || this.leavingDetailPage || !this.paneActive) return;
     this.restoreComposerFocusOnSheetDisappear = false;
     this.expandComposerForEditing(true);
   }
@@ -2543,6 +2675,46 @@ export struct TaskPageContent {
     });
   }
 
+  private canSendRichMessage(): boolean {
+    return this.paneActive && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch
+      && !this.sending && !this.deviceDisabled && !this.leavingDetailPage
+      && !this.isCreationBlockingRemoteOps() && this.session() !== undefined
+      && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions);
+  }
+
+  private async sendRichMessage(text: string, clientId: string): Promise<boolean> {
+    if (!this.canSendRichMessage() || AppServices.instance.client.getStatus() !== 'online') return false;
+    const session = this.session();
+    if (session === undefined) return false;
+    if (!this.composerModelReselectionExempt(text, false)
+      && sessionSendNeedsModelReselection(this.modelVisibilityOverrides, session, this.pendingAgentSwitchIntent)) {
+      this.error = this.v12String('v132_model_reselection_required');
+      this.openComposerControlPopup('model');
+      return false;
+    }
+    const scope = this.presentationScope();
+    const queue = AppServices.instance.inputQueue;
+    const delivery = queue.getInputDeliveryState(scope.sessionId, clientId, scope.deviceId);
+    if (delivery === 'accepted' || delivery === 'pending') return true;
+    if (delivery === 'removed') return false;
+    const tracked = queue.getInputDeliveryClientIds(scope.sessionId, scope.deviceId).includes(clientId)
+      || queue.isLocallyFailed(clientId);
+    if (tracked && !queue.canRetryInputDelivery(scope.sessionId, clientId, scope.deviceId)) return false;
+    this.sending = true;
+    try {
+      if (queue.shouldDeferNewInput(scope.sessionId)) {
+        const document = new SerializedComposerDocument();
+        document.text = text;
+        return queue.deferDocument(scope.deviceId, session, document, [], [], clientId).length > 0;
+      }
+      return (await queue.enqueueText(scope.deviceId, session, text, [], clientId)).length > 0;
+    } catch (_error) {
+      return false;
+    } finally {
+      if (this.isCurrentPresentationScope(scope)) this.sending = false;
+    }
+  }
+
   private sendLearnCommand(command: LearnCommandMatch): void {
     if (this.sending || this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
     if (this.composerImages.length > 0 || this.composerFiles.length > 0) {
@@ -2950,6 +3122,7 @@ export struct TaskPageContent {
   }
 
   private scheduleItemsRefresh(): void {
+    if (!this.paneActive) return;
     if (this.itemsRefreshScheduled) return;
     this.itemsRefreshScheduled = true;
     const generation = this.itemsRefreshGeneration;
@@ -2962,6 +3135,7 @@ export struct TaskPageContent {
 
   /** 历史 + 流式统一进入同一个渲染模型，并把会话是否正在流式传入聚合层。 */
   private refreshItems(): void {
+    if (!this.paneActive) return;
     this.syncMessageCount();
     const previousItems = this.items;
     const previousTailToken = this.renderTailToken(this.items);
@@ -3015,6 +3189,10 @@ export struct TaskPageContent {
     this.reconcileSearchSelection();
     this.loadFailed = AppServices.instance.messages.loadFailed(this.sessionId, this.deviceId);
     this.ensureImageUrls();
+    if (this.paneResumePending) {
+      if (tailChanged) this.hasNewMessages = true;
+      return;
+    }
     if (this.sessionOpenResolved && this.items.length > 0 && !this.initialScrolled) {
       if (this.routeMessageClientId.length > 0) this.focusMessageTarget();
       else this.scrollToBottomOnce();
@@ -3125,6 +3303,7 @@ export struct TaskPageContent {
   }
 
   private focusMessageTarget(): void {
+    if (!this.paneActive) return;
     const target = this.routeMessageClientId;
     if (target.length === 0) return;
     const index = this.messageRenderIndex(target);
@@ -3189,6 +3368,7 @@ export struct TaskPageContent {
 
   /** 贴底态的流式补滚；不在用户回看历史或 prepend 期间抢阅读位置。 */
   private followLatestSoon(): void {
+    if (!residentPaneAllowsPositioning(this.paneActive, this.paneResumePending)) return;
     // 手势期间不排队自动滚动；尾部仍会更新，松手后由用户位置决定是否继续跟随。
     if (this.listTouchActive) return;
     if (this.followScrollScheduled) {
@@ -3943,6 +4123,7 @@ export struct TaskPageContent {
   }
 
   private jumpToLatest(): void {
+    if (!this.paneActive) return;
     this.showComposerAfterScroll();
     this.followingLatest = true;
     this.hasNewMessages = false;
@@ -4099,6 +4280,7 @@ export struct TaskPageContent {
 
   /** 进入会话/重试后定位到最新消息；等待列表完成布局，并阻止首屏翻页抢占锚点。 */
   private scrollToBottomOnce(): void {
+    if (!residentPaneAllowsPositioning(this.paneActive, this.paneResumePending)) return;
     if (this.initialScrolled) {
       return;
     }
@@ -4198,6 +4380,7 @@ export struct TaskPageContent {
     continueSearch: boolean = false,
     initialAutofill: boolean = false,
   ): void {
+    if (!residentPaneAllowsPositioning(this.paneActive, this.paneResumePending)) return;
     if (this.loadingOlder) {
       return;
     }
@@ -4333,6 +4516,7 @@ export struct TaskPageContent {
   }
 
   private attemptAutoLoadEarlier(): void {
+    if (!residentPaneAllowsPositioning(this.paneActive, this.paneResumePending)) return;
     // 历史浏览采用电平触发：滚动回调、惯性滚动结束后的回调和 prepend 布局回调
     // 都可以重新评估。loadingOlder 与真实游标去重负责防止重复请求，不再要求请求
     // 必须发生在手指仍按住屏幕的那一帧。
@@ -4807,13 +4991,16 @@ export struct TaskPageContent {
     this.composerFocused = requestFocus;
     if (requestFocus) {
       // Composer 在同一帧才会挂载；下一轮向真实 TextArea 请求焦点，避免丢失首次点击。
-      setTimeout(() => focusControl.requestFocus('task-composer-input'), 0);
+      const generation = this.pageLifecycleGeneration;
+      setTimeout(() => {
+        if (this.isCurrentPageLifecycle(generation)) focusControl.requestFocus(this.composerInputId);
+      }, 0);
     }
   }
 
   /** 释放 TextArea 焦点并回到单行工具栏；离页前同步执行，避免返回栈复用旧输入首帧。 */
   private collapseComposerSurface(): void {
-    if (this.editingQueueClientId.length === 0) {
+    if (this.editingQueueClientId.length === 0 && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
       AppServices.instance.composerDrafts.save(this.sessionId, this.composerDocument, this.deviceId);
       void AppServices.instance.composerDrafts.flush(this.sessionId, this.deviceId);
     }
@@ -5109,7 +5296,10 @@ export struct TaskPageContent {
     this.composerPaletteGeneration += 1;
     this.composerPaletteMode = '';
     this.composerPaletteItems = [];
-    setTimeout(() => focusControl.requestFocus('task-composer-input'), 0);
+    const generation = this.pageLifecycleGeneration;
+    setTimeout(() => {
+      if (this.isCurrentPageLifecycle(generation)) focusControl.requestFocus(this.composerInputId);
+    }, 0);
   }
 
   @Builder
@@ -6503,6 +6693,7 @@ export struct TaskPageContent {
         .cachedCount(3, true)
         .maintainVisibleContentPosition(true)
         .onScrollIndex((start: number, end: number, _center: number) => {
+          if (!this.paneActive) return;
           this.visibleStartIndex = start;
           this.visibleEndIndex = end;
           if (this.listTouchPushedUp && end >= this.bottomSentinelListIndex()) {
@@ -6512,6 +6703,7 @@ export struct TaskPageContent {
           this.attemptAutoLoadEarlier();
         })
         .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
+          if (!this.paneActive) return;
           this.handleComposerListScroll(scrollOffset, scrollState);
           this.attemptAutoLoadEarlier();
         })
@@ -6519,6 +6711,7 @@ export struct TaskPageContent {
           this.handleListTouch(event);
         })
         .onReachStart(() => {
+          if (!this.paneActive) return;
           this.showComposerAfterScroll();
           this.attemptAutoLoadEarlier();
         })
@@ -6682,7 +6875,7 @@ export struct TaskPageContent {
         floatingGlass: true,
         compactToolbar: true,
         floatingBottomInset: this.paneComposerBottomInset,
-        inputId: 'task-composer-input',
+        inputId: this.composerInputId,
         onInputChange: (value: string): void => {
           if (this.leavingForCreationEdit) return;
           this.applyComposerTextChange(value);
@@ -9506,7 +9699,8 @@ export struct TaskPageContent {
 
   private presentationSourceBadges(item: RenderMessageItem): MessageSourceBadge[] {
     return item.message?.role === 'user' && !item.message.isSyntheticTrigger
-      ? messageSourceBadges(item.message.agentMeta, this.sourceViewerDeviceId, this.sourceDeviceNames) : [];
+      ? messageSourceBadges(item.message.agentMeta, this.sourceViewerDeviceId, this.sourceDeviceNames,
+        this.v12String('v134_unnamed_computer')) : [];
   }
 
   private sourceBadgeLabel(badge: MessageSourceBadge): string {
@@ -10490,7 +10684,11 @@ export struct TaskPageContent {
             source: part.source,
             complete: part.complete,
             stateKey: this.richAnswerStateKey(item, part.key),
+            sendEnabled: this.canSendRichMessage() && item.message?.isStreaming !== true,
             memory: AppServices.instance.richAnswerMemory,
+            submissions: AppServices.instance.richAnswerSubmissions,
+            onSend: (text: string, clientId: string): Promise<boolean> => this.sendRichMessage(text, clientId),
+            sendRevision: this.paneActivationRevision,
             renderMarkdown: (text: string, key: string): void => {
               this.richAnswerMarkdown(text, `${item.key}:${part.key}:${key}`)
             },
@@ -11394,7 +11592,7 @@ export struct TaskPageContent {
   }
 
   private addMessageToComposer(item: RenderMessageItem): void {
-    const body = item.body.trim();
+    const body = (item.originalBody ?? item.body).trim();
     if (body.length === 0) return;
     const next = this.input.trim().length === 0 ? body : `${this.input}\n\n${body}`;
     this.setComposerDocument(reconcileComposerProjectedText(this.composerDocument, next));
@@ -11599,7 +11797,7 @@ export struct TaskPageContent {
 
   private copyMessage(item: RenderMessageItem): void {
     // 对齐 Mobile：assistant 整条复制走 richAnswerText，复制可读文本而不是组件源码。
-    this.copyPlainText(item.kind === 'assistant' ? richAnswerText(item.body) : item.body, '已复制');
+    this.copyPlainText(item.kind === 'assistant' ? richAnswerText(item.body) : (item.originalBody ?? item.body), '已复制');
   }
 
   private confirmFork(item: RenderMessageItem): void {
@@ -11632,7 +11830,7 @@ export struct TaskPageContent {
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const deviceId = this.deviceId;
     const sessionId = this.sessionId;
-    const draftText = item.body;
+    const draftText = item.originalBody ?? item.body;
     this.resolveClientId(item).then((clientId: string) => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (clientId.length === 0) {
@@ -12506,19 +12704,23 @@ export struct TaskPageContent {
 struct TaskPage {
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
-  @State foldStatus: number = -1;
+  @State safeWindowWidth: number = 0;
+  @State safeWindowHeight: number = 0;
+  /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
+  @State safeWindowMetricsUnavailable: boolean = false;
   /** 独立详情页的键盘高度；展开横屏转入 TaskListPage 后由右侧详情栏继续接管。 */
   @State keyboardHeight: number = 0;
-  private foldStatusListening: boolean = false;
   private splitNavigationPending: boolean = false;
   private pageActive: boolean = false;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
+  private avoidAreaListening: boolean = false;
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
-  private foldStatusListener: (status: number) => void = (status: number): void => {
-    this.foldStatus = status;
+  private avoidAreaListener: (options: window.AvoidAreaOptions) => void = (options: window.AvoidAreaOptions): void => {
+    if (options.type === window.AvoidAreaType.TYPE_KEYBOARD) return;
+    this.refreshSafeWindowMetrics();
     this.openSplitLayoutIfNeeded();
   };
 
@@ -12528,13 +12730,11 @@ struct TaskPage {
     this.keyboardHeight = 0;
     // 单页详情显式缩小内容可用高度；不能依赖 HdsNavigation 内层对全局 OFFSET 的响应。
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
-    this.observeFoldStatus();
     void this.observeKeyboardHeight();
   }
 
   aboutToDisappear(): void {
     this.pageActive = false;
-    this.stopFoldStatusObservation();
     this.stopKeyboardHeightObservation();
     this.keyboardHeight = 0;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
@@ -12543,51 +12743,67 @@ struct TaskPage {
   private async observeKeyboardHeight(): Promise<void> {
     if (this.keyboardHeightListening) return;
     const hostContext = this.getUIContext().getHostContext();
-    if (hostContext === undefined) return;
+    if (hostContext === undefined) {
+      this.markSafeWindowMetricsUnavailable();
+      return;
+    }
     try {
       const hostWindow = await window.getLastWindow(hostContext);
       if (!this.pageActive || this.keyboardHeightListening) return;
       this.keyboardWindow = hostWindow;
       hostWindow.on('keyboardHeightChange', this.keyboardHeightListener);
       this.keyboardHeightListening = true;
+      try {
+        hostWindow.on('avoidAreaChange', this.avoidAreaListener);
+        this.avoidAreaListening = true;
+      } catch (_error) {
+        this.avoidAreaListening = false;
+      }
+      this.refreshSafeWindowMetrics();
+      this.openSplitLayoutIfNeeded();
     } catch (_err) {
+      this.markSafeWindowMetricsUnavailable();
       // 极少数设备不提供高度通知时，退回系统避让，仍优先保证输入区可见。
       if (this.pageActive) this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
     }
   }
 
   private stopKeyboardHeightObservation(): void {
-    if (!this.keyboardHeightListening || this.keyboardWindow === null) return;
+    if (this.keyboardWindow === null) return;
     try {
-      this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+      if (this.keyboardHeightListening) this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
+      if (this.avoidAreaListening) this.keyboardWindow.off('avoidAreaChange', this.avoidAreaListener);
     } catch (_err) {
       // 页面退出时窗口可能已先被系统回收。
     }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
+    this.avoidAreaListening = false;
   }
 
-  private observeFoldStatus(): void {
-    if (this.foldStatusListening) return;
+  private refreshSafeWindowMetrics(): void {
+    if (this.keyboardWindow === null) return;
     try {
-      if (!display.isFoldable()) return;
-      this.foldStatus = Number(display.getFoldStatus());
-      display.on('foldStatusChange', this.foldStatusListener);
-      this.foldStatusListening = true;
-    } catch (_err) {
-      this.foldStatus = -1;
-      this.foldStatusListening = false;
+      const metrics = readTaskWindowMetrics(this.keyboardWindow, (value: number): number =>
+        this.getUIContext().px2vp(value));
+      this.safeWindowWidth = metrics.safeWidth;
+      this.safeWindowHeight = metrics.safeHeight;
+      this.safeWindowMetricsUnavailable = false;
+    } catch (_error) {
+      this.safeWindowMetricsUnavailable = true;
     }
   }
 
-  private stopFoldStatusObservation(): void {
-    if (!this.foldStatusListening) return;
-    try {
-      display.off('foldStatusChange', this.foldStatusListener);
-    } catch (_err) {
-      // 页面退出时系统可能已经清理监听。
-    }
-    this.foldStatusListening = false;
+  /** 读取窗口失败时退回页面尺寸判断分栏，不能让独立详情永远无法回到双栏。 */
+  private markSafeWindowMetricsUnavailable(): void {
+    if (this.safeWindowMetricsUnavailable) return;
+    this.safeWindowMetricsUnavailable = true;
+    this.openSplitLayoutIfNeeded();
+  }
+
+  private safeWindowSize(): TaskSafeWindowSize {
+    return effectiveTaskSafeWindow(this.viewportWidth, this.viewportHeight,
+      this.safeWindowWidth, this.safeWindowHeight, this.safeWindowMetricsUnavailable);
   }
 
   private handleAreaChange(_oldArea: Area, newArea: Area): void {
@@ -12596,13 +12812,15 @@ struct TaskPage {
     if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
     this.viewportWidth = width;
     this.viewportHeight = height;
+    this.refreshSafeWindowMetrics();
     this.openSplitLayoutIfNeeded();
   }
 
-  /** 竖屏独立详情进入展开横屏时，回到承载主从双栏的任务列表页。 */
+  /** 独立详情满足双栏尺寸时，回到承载主从双栏的任务列表页。 */
   private openSplitLayoutIfNeeded(): void {
+    const safe = this.safeWindowSize();
     if (this.splitNavigationPending
-      || !isWideTaskLayout(this.viewportWidth, this.viewportHeight, this.foldStatus)) {
+      || !isWideTaskLayout(this.viewportWidth, safe.width, safe.height)) {
       return;
     }
     const params = recordOrEmpty(router.getParams());

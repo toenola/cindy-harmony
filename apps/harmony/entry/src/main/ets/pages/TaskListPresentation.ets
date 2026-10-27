@@ -5,7 +5,7 @@
  * 项目名称和相对时间投影，避免 ArkUI 页面把展示规则散落在 builder 中。
  */
 
-import { RemoteSession } from '../core/tasks/TaskModels';
+import { RemoteSession, sessionListActivityAt } from '../core/tasks/TaskModels';
 
 const DEFAULT_DRAFT_TITLE = 'New Maker';
 const MINUTE_MS = 60 * 1000;
@@ -196,9 +196,7 @@ export function taskProjectKey(deviceId: string, workingDir: string): string {
 }
 
 export function taskActivityAt(session: RemoteSession): string {
-  if (session.userSendAt.length > 0) return session.userSendAt;
-  if (session.updatedAt.length > 0) return session.updatedAt;
-  return session.createdAt;
+  return sessionListActivityAt(session);
 }
 
 /** 字母排序忽略大小写；原文和 id 只承担稳定兜底，不改变主要语义。 */
@@ -212,7 +210,7 @@ export function compareTaskListLabels(left: string, right: string): number {
 
 /**
  * 会话排序口径：
- * - 最近优先沿用 Mobile / Desktop 的 userSendAt → updatedAt → createdAt；
+ * - 最近优先沿用 Mobile / Desktop 的 lastActivityAt → userSendAt → updatedAt → createdAt；
  * - 字母排序按用户可见标题；
  * - 默认排序保留被控端提供的稳定顺序，因此比较器返回相等。
  */

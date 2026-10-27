@@ -1,6 +1,39 @@
 import { readObj, readStr } from '../tasks/TaskModels';
+import { deviceDisplayName } from '../tasks/DeviceDisplayName';
 
 const MCP_APP_PLUGIN_PREFIX = 'mcp-app:';
+
+const FORWARDED_DIALECTS: string[][] = [
+  ['[Source] ', 'User’s original words:', 'Agent supplement:', '[Task source] ', 'Task ID:'],
+  ['[来源] ', '用户原话：', 'Agent补充：', '[任务来源] ', '任务 ID：'],
+  ['[来源] ', '用户原话：', 'agent补充：', '[任务来源] ', '任务 ID：'],
+  ['[來源] ', '使用者原話：', 'Agent補充：', '[任務來源] ', '任務 ID：'],
+  ['[出典] ', 'ユーザーの原文：', 'Agent の補足：', '[タスクの出典] ', 'タスク ID：'],
+  ['[출처] ', '사용자 원문:', 'Agent 보충:', '[작업 출처] ', '작업 ID:'],
+];
+
+export function forwardedRequestDisplayText(body: string): string {
+  if (!body.startsWith('[')) return body;
+  const lines = body.split('\n');
+  for (const dialect of FORWARDED_DIALECTS) {
+    const offset = lines.length === 7 && lines[0].startsWith(dialect[3])
+      && lines[1] === '' && lines[2].startsWith(dialect[4] + ' ') && lines[3] === '' ? 4 : 0;
+    if (lines.length !== offset + 3 || !lines[offset].startsWith(dialect[0])
+      || !lines[offset + 1].startsWith(dialect[1]) || !lines[offset + 2].startsWith(dialect[2])) continue;
+    const quotedUser = lines[offset + 1].slice(dialect[1].length);
+    const quotedAgent = lines[offset + 2].slice(dialect[2].length);
+    try {
+      const user = JSON.parse(quotedUser) as Object;
+      const agent = JSON.parse(quotedAgent) as Object;
+      if (typeof user !== 'string' || typeof agent !== 'string'
+        || JSON.stringify(user) !== quotedUser || JSON.stringify(agent) !== quotedAgent) continue;
+      return lines.slice(0, offset).concat([lines[offset], '', dialect[1], '', user, '', dialect[2], '', agent]).join('\n');
+    } catch (_error) {
+      continue;
+    }
+  }
+  return body;
+}
 
 export class MessageSourceBadge {
   kind: string = '';
@@ -15,7 +48,7 @@ export function sanitizeSourceName(value: string): string {
 }
 
 export function messageSourceBadges(meta: Record<string, Object>, viewerDeviceId: string,
-  deviceNames: Map<string, string>): MessageSourceBadge[] {
+  deviceNames: Map<string, string>, unnamedComputer: string = '未命名电脑'): MessageSourceBadge[] {
   const result: MessageSourceBadge[] = [];
   const plugin = readObj(meta, 'sourcePlugin');
   const origin = readObj(meta, 'origin');
@@ -47,15 +80,13 @@ export function messageSourceBadges(meta: Record<string, Object>, viewerDeviceId
     const badge = new MessageSourceBadge();
     badge.kind = platform;
     badge.id = deviceId;
-    badge.name = sanitizeSourceName(deviceNames.get(deviceId) ?? '') || sanitizeSourceName(readStr(device, 'name'));
-    if (badge.name.length > 0) {
-      const nameKey = badge.name.trim().toLocaleLowerCase();
-      let collides = false;
-      deviceNames.forEach((name: string, id: string): void => {
-        if (id !== deviceId && name.trim().toLocaleLowerCase() === nameKey) collides = true;
-      });
-      if (collides) badge.name += ' (' + deviceId.slice(0, 6) + ')';
-    }
+    const sourceName = sanitizeSourceName(deviceNames.get(deviceId) ?? '')
+      || sanitizeSourceName(readStr(device, 'name'));
+    const safeNames = new Map<string, string>();
+    deviceNames.forEach((name: string, id: string): void => {
+      safeNames.set(id, sanitizeSourceName(name));
+    });
+    badge.name = deviceDisplayName(deviceId, sourceName, platform === 'desktop' ? unnamedComputer : '', safeNames);
     result.push(badge);
   }
   return result;
