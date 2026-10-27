@@ -5,6 +5,10 @@ vi.mock('../../clientEndpointsService.js', () => ({ getClientEndpoint: () => 'ht
 vi.mock('../chatServerMedia.js', () => ({ createChatMedia: () => ({ upload: fixture.upload, download: fixture.download }) }));
 vi.mock('../chatServerWorkspaces.js', () => ({ chatServerWorkspaces: () => ({ read: () => null, save: vi.fn() }) }));
 vi.mock('../chatMigrationReceipts.js', () => ({ chatMigrationReceipts: () => ({ read: () => null, save: vi.fn() }) }));
+// These transport/lifecycle fixtures isolate native disk IO; actual snapshot and
+// journal persistence is exercised through chatPersistence.test.ts and chatServer.test.ts.
+vi.mock('../chatLocalHistory.js', () => ({ chatLocalHistory: () => ({ read: () => null, save: vi.fn(), forget: vi.fn() }) }));
+vi.mock('../chatSendJournal.js', () => ({ chatSendJournal: () => ({ read: () => null, save: vi.fn(), confirm: vi.fn(), forgetRoom: vi.fn() }) }));
 vi.mock('electron', () => ({ app: { get isPackaged() { return fixture.packaged; }, getPath: () => '/isolated' } }));
 vi.mock('node:fs', () => ({ existsSync: fixture.exists, readFileSync: () => fixture.config || '{"baseUrl":"https://example.com","token":"test"}' }));
 vi.mock('../botGroupChatService.js', () => ({ readPersistedReplyText: vi.fn() }));
@@ -103,6 +107,30 @@ describe('server group feature parity', () => {
     });
   }
   async function flush() { await vi.advanceTimersByTimeAsync(0); }
+  // Mention-only must suppress the auxiliary planning request as well as model replies.
+  it.each([undefined, 'proposed', 'waiting'] as const)('keeps unaddressed mention-only messages idle with plan=%s', async status => {
+    arrange(status ? { ...proposed, status } : undefined);
+    const base = fixture.handle.getMockImplementation()!;
+    fixture.handle.mockImplementation((route, method, data) => route.endsWith('/snapshot')
+      ? { body: { room: { ...room(roomId), response_mode: 'mentioned' }, members, messages: [], cursor: '1' } }
+      : base(route, method, data));
+    expect((await send()).ok).toBe(true); await flush();
+    expect(deps.decidePlan).not.toHaveBeenCalled();
+    expect(planPosts()).toHaveLength(0);
+    expect(fixture.handle.mock.calls.some(([route, method]) => route.includes(`/plans/${planId}`) && method === 'POST')).toBe(false);
+    const posted = fixture.handle.mock.calls.find(([route, method]) => route.endsWith('/messages') && method === 'POST')![2];
+    expect(posted).toMatchObject({ deferExecution: false, mentions: [] });
+  });
+  it.each([{ division: true }, { mentions: { all: true, botIds: [] } }])('keeps directed planning available in mention-only rooms: %j', async input => {
+    arrange();
+    const base = fixture.handle.getMockImplementation()!;
+    fixture.handle.mockImplementation((route, method, data) => route.endsWith('/snapshot')
+      ? { body: { room: { ...room(roomId), response_mode: 'mentioned' }, members, messages: [], cursor: '1' } }
+      : base(route, method, data));
+    expect((await send(input)).ok).toBe(true); await flush();
+    expect(deps.decidePlan).toHaveBeenCalledTimes(1);
+    expect(planPosts()).toHaveLength(1);
+  });
   it.each([
     ['proposed', 'dismiss'],
     ['waiting', 'stop'],

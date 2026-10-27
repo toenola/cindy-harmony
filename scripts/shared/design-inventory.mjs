@@ -575,6 +575,7 @@ export function catalogSurfaces() {
         '/bots/groups/:groupId',
         '/bots/remote/:deviceId/:botId',
         '/bots/remote/:deviceId/:botId/history/:sessionId',
+        '/bots/remote/:deviceId/:botId/session/:sessionId',
       ],
       routeEntryComponents: {
         '/bots': 'BotsHomeView',
@@ -588,6 +589,7 @@ export function catalogSurfaces() {
         '/bots/groups/:groupId': 'BotGroupChatView',
         '/bots/remote/:deviceId/:botId': 'RemoteBotSessionView',
         '/bots/remote/:deviceId/:botId/history/:sessionId': 'BotHistorySessionView',
+        '/bots/remote/:deviceId/:botId/session/:sessionId': 'RemoteBotSessionView',
       },
     },
     {
@@ -1439,6 +1441,7 @@ export function mobileRouteCoverage(repoRoot, catalog = mobileCatalogSurfaces())
     ['+native-intent.ts', 'native intent routing; no screen'],
     ['automations/[deviceId].tsx', 'legacy automation link redirect; no screen'],
     ['splash-preview.tsx', 'MOBILE_VISUAL_MOCK_ENABLED preview; not production UI'],
+    ['plugin-management-preview.tsx', 'gated plugin settings visual fixture; not production UI'],
     ['listperf.tsx', '__DEV__ list performance harness; not production UI'],
   ]);
   const owners = new Map(catalog.flatMap(s => (s.mobileRoutes ?? []).map(r => [r, s.id])));
@@ -1449,6 +1452,9 @@ export function mobileRouteCoverage(repoRoot, catalog = mobileCatalogSurfaces())
     if (excluded.has(route)) {
       // Keep dev exclusions honest: removing their gate cannot silently hide a screen.
       if (route === 'splash-preview.tsx' && !source.includes('if (!MOBILE_VISUAL_MOCK_ENABLED)')) missing.push(file);
+      if (route === 'plugin-management-preview.tsx' &&
+        (!source.includes('if (!MOBILE_VISUAL_MOCK_ENABLED && !demosEnabled)') ||
+          !source.includes('__DEV__ && process.env.EXPO_PUBLIC_CINDY_PLUGIN_DEMOS === "1"'))) missing.push(file);
       if (route === 'listperf.tsx' && !source.includes('if (!__DEV__)')) missing.push(file);
       exclusions.push({ path: file, reason: excluded.get(route) });
       continue;
