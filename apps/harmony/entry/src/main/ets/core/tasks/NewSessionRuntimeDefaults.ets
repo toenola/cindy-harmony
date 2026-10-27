@@ -5,12 +5,15 @@ import {
   resolveNewSessionDefaultModel,
 } from '../ComposerCatalog';
 import { readBool, readStr } from './TaskModels';
+import { fastModeWireValue, readFastEnabled, readFastTier, ultrafastRestorable } from './ModelSpeed';
 
 export class NewSessionRuntime {
   model: string = '';
   providerId: string = '';
   effort: string = '';
   fastMode: boolean = false;
+  /** `'ultrafast'` 表示超快（仅 Codex 且模型声明支持时保留）。 */
+  fastModeTier: string = '';
 }
 
 export function runtimeDefaultsScope(accountId: string, deviceId: string, agent: string): string {
@@ -27,7 +30,8 @@ export function hostDraftRuntimeFromDefaults(value: Object | undefined): NewSess
   runtime.model = model;
   runtime.providerId = providerId;
   runtime.effort = readStr(record, 'effort').trim();
-  runtime.fastMode = readBool(record, 'fastMode', false);
+  runtime.fastMode = readFastEnabled(record);
+  runtime.fastModeTier = readFastTier(record);
   return runtime;
 }
 
@@ -77,7 +81,9 @@ export function pickNewSessionRuntime(
       runtime.model = preferred.model;
       runtime.providerId = preferred.providerId;
       runtime.effort = selected === undefined ? preferred.effort : reconcileModelEffort(selected, preferred.effort);
-      runtime.fastMode = preferred.fastMode && selected?.supportsFastMode === true;
+      runtime.fastMode = preferred.fastMode && selected?.supportsFastMode === true
+        && ultrafastRestorable(preferred.fastModeTier, agent, selected?.supportsUltrafastMode === true);
+      runtime.fastModeTier = runtime.fastMode ? preferred.fastModeTier : '';
       return runtime;
     }
     selected = preferred.providerId.length > 0
@@ -98,7 +104,9 @@ export function pickNewSessionRuntime(
   runtime.effort = reconcileModelEffort(selected, preferred?.effort ?? '');
   runtime.fastMode = preferred !== null && preferred.fastMode && preferred.model === selected.id
     && (preferred.providerId.length === 0 || preferred.providerId === selected.providerId)
-    && selected.supportsFastMode;
+    && selected.supportsFastMode
+    && ultrafastRestorable(preferred.fastModeTier, agent, selected.supportsUltrafastMode);
+  runtime.fastModeTier = runtime.fastMode && preferred !== null ? preferred.fastModeTier : '';
   return runtime;
 }
 
@@ -125,7 +133,7 @@ export function newSessionDraftPref(
   pref['active'] = active;
   if (active) pref['markModelChoice'] = markModelChoice;
   if (runtime.effort.length > 0) pref['effort'] = runtime.effort;
-  pref['fast'] = runtime.fastMode;
+  pref['fast'] = fastModeWireValue(runtime.fastMode, runtime.fastModeTier);
   return pref;
 }
 

@@ -5,7 +5,8 @@
  * sessions:patched 回流前伪造 RemoteSession.agentKind / model。
  */
 
-import { RemoteSession, readBool, readStr } from './TaskModels';
+import { isFastModeWireValue, readFastEnabled, readFastTier, sameFastSpeed } from './ModelSpeed';
+import { RemoteSession, readStr } from './TaskModels';
 import { modelNeedsReselection } from '../ComposerCatalog';
 
 export const SESSION_AGENT_KINDS: string[] = ['claude-code', 'codex', 'pi'];
@@ -22,6 +23,7 @@ export class SessionAgentSwitchIntent {
   hasProviderId: boolean = false;
   effort: string = '';
   fastMode: boolean = false;
+  fastModeTier: string = '';
   hasFastMode: boolean = false;
   agentDeviceId: string | null | undefined = undefined;
 }
@@ -53,7 +55,8 @@ export function sessionAgentSwitchIntentApplied(session: RemoteSession,
     && (intent.agentDeviceId === undefined || intent.agentDeviceId === currentLocation)
     && (!intent.hasProviderId || intent.providerId === profile.providerId)
     && (intent.effort.length === 0 || intent.effort === profile.effort)
-    && (!intent.hasFastMode || intent.fastMode === profile.fastMode);
+    && (!intent.hasFastMode
+      || sameFastSpeed(intent.fastMode, intent.fastModeTier, profile.fastMode, profile.fastModeTier));
 }
 
 export function sessionSendNeedsModelReselection(visibility: Map<string, boolean>,
@@ -106,7 +109,7 @@ export function parseSessionAgentSwitchIntent(value: Object | undefined): Sessio
   if (locationValue !== undefined && locationValue !== null
     && (typeof locationValue !== 'string' || locationValue.length === 0)) return null;
   const fastModeValue = raw['fastMode'];
-  if (fastModeValue !== undefined && typeof fastModeValue !== 'boolean') return null;
+  if (fastModeValue !== undefined && !isFastModeWireValue(fastModeValue)) return null;
 
   const intent = new SessionAgentSwitchIntent();
   intent.targetAgentKind = targetAgentKind;
@@ -114,8 +117,9 @@ export function parseSessionAgentSwitchIntent(value: Object | undefined): Sessio
   intent.providerId = typeof providerValue === 'string' ? providerValue : '';
   intent.hasProviderId = providerValue === null || typeof providerValue === 'string';
   intent.effort = typeof effortValue === 'string' ? effortValue : '';
-  intent.fastMode = readBool(raw, 'fastMode', false);
-  intent.hasFastMode = typeof fastModeValue === 'boolean';
+  intent.fastMode = readFastEnabled(raw);
+  intent.fastModeTier = readFastTier(raw);
+  intent.hasFastMode = isFastModeWireValue(fastModeValue);
   intent.agentDeviceId = locationValue === null ? null
     : typeof locationValue === 'string' ? locationValue : undefined;
   return intent;

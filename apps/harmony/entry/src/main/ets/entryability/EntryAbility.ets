@@ -1,4 +1,4 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { router, window } from '@kit.ArkUI';
 import { AppServices } from '../core/AppServices';
@@ -7,7 +7,7 @@ import {
   taskSessionDeepLink,
 } from '../core/notifications/TaskCompletionPushModels';
 import { safeErrorMessage } from '../core/tasks/TaskModels';
-import { setSystemFontSizeScale } from '../components/UiKit';
+import { UI_COLOR_MODE_STORAGE_KEY, setSystemFontSizeScale } from '../components/UiKit';
 
 const DOMAIN = 0x0000;
 
@@ -42,6 +42,7 @@ export default class EntryAbility extends UIAbility {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onWindowStageCreate');
     this.mainWindowStage = windowStage;
+    this.publishColorMode();
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
@@ -67,20 +68,29 @@ export default class EntryAbility extends UIAbility {
     }
     // 回前台：立即重连（后台期间 WS 可能已断），并触发重连后的订阅恢复。
     AppServices.instance.onAppForeground();
+    this.publishColorMode();
   }
 
-  onConfigurationUpdate(): void {
+  onConfigurationUpdate(configuration: Configuration): void {
     // 运行时切换深浅色：同步刷新系统状态栏/导航栏配色，避免图标与背景同色不可见。
     if (this.mainWindowStage !== null) {
       void this.applySystemBarAppearance(this.mainWindowStage);
     }
     // 系统字体缩放变化后，随字号增长的容器上限要跟着更新，避免元信息被截断。
     setSystemFontSizeScale(this.context.config.fontSizeScale);
+    // Canvas 绘制的富组件图形不会自动跟随资源色，靠这个代次触发重绘。
+    this.publishColorMode(configuration.colorMode);
+  }
+
+  private publishColorMode(mode: number | undefined = this.context.config.colorMode): void {
+    AppStorage.setOrCreate<number>(UI_COLOR_MODE_STORAGE_KEY, mode !== undefined ? mode : -1);
   }
 
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onBackground');
+    // 富组件视图值与 Mobile 一致：离开前台时落盘。
+    void AppServices.instance.richAnswerMemory.flush();
     // 退后台释放分享位图与临时文件，避免长会话分享图在后台继续占用内存。
     AppServices.instance.onAppBackground();
   }

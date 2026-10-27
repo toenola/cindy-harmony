@@ -20,11 +20,23 @@ export struct ComposerModelOptionRow {
   @Prop effortPickerOpen: boolean = false;
   @Prop fastModeVisible: boolean = false;
   @Prop fastModeOn: boolean = false;
+  /** Codex 模型声明 supportsUltrafastMode 时，开关改为 标准 / 快速 / 超快 三档（对齐 Mobile）。 */
+  @Prop ultrafastAvailable: boolean = false;
+  /** standard | fast | ultrafast */
+  @Prop fastSpeed: string = 'standard';
+  @State private speedPickerOpen: boolean = false;
   effortLabel: (effort: string) => string = (effort: string): string => effort;
   onSelect: () => void = () => {};
   onToggleEffortPicker: () => void = () => {};
   onSelectEffort: (effort: string) => void = (_effort: string): void => {};
   onFastModeChange: (enabled: boolean) => void = (_enabled: boolean): void => {};
+  onSpeedChange: (speed: string) => void = (_speed: string): void => {};
+
+  private speedLabel(speed: string): Resource {
+    if (speed === 'ultrafast') return $r('app.string.v133_speed_ultrafast');
+    if (speed === 'fast') return $r('app.string.v133_speed_fast');
+    return $r('app.string.v133_speed_standard');
+  }
 
   @Builder
   private providerMark() {
@@ -99,7 +111,24 @@ export struct ComposerModelOptionRow {
           .onClick(() => this.onToggleEffortPicker())
         }
 
-        if (this.fastModeVisible) {
+        if (this.fastModeVisible && this.ultrafastAvailable) {
+          Button() {
+            Row({ space: 3 }) {
+              Text(this.speedLabel(this.fastSpeed))
+                .fontSize(uiFontSize(12))
+                .fontColor($r('app.color.text_secondary'))
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(uiFontSize(9))
+                .fontColor([$r('app.color.text_tertiary')])
+            }
+          }
+          .height(28)
+          .padding({ left: 5, right: 5 })
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.disabled && (!this.paymentRequired || this.selected))
+          .accessibilityText($r('app.string.v133_speed_label'))
+          .onClick(() => { this.speedPickerOpen = !this.speedPickerOpen; })
+        } else if (this.fastModeVisible) {
           Toggle({ type: ToggleType.Switch, isOn: this.fastModeOn })
             .selectedColor($r('app.color.accent'))
             .enabled(!this.disabled && (!this.paymentRequired || this.selected))
@@ -150,6 +179,29 @@ export struct ComposerModelOptionRow {
               .borderRadius(UI_RADIUS_PILL)
               .onClick(() => this.onSelectEffort(effort))
           }, (effort: string) => effort)
+        }
+        .width('100%')
+        .padding({ left: 26, right: 4, bottom: 4 })
+      }
+
+      if (this.speedPickerOpen && this.fastModeVisible && this.ultrafastAvailable) {
+        Row({ space: 4 }) {
+          ForEach(['standard', 'fast', 'ultrafast'], (speed: string) => {
+            Button(this.speedLabel(speed))
+              .height(26)
+              .fontSize(uiFontSize(11))
+              .fontColor(speed === this.fastSpeed
+                ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+              .padding({ left: 9, right: 9 })
+              .backgroundColor(speed === this.fastSpeed
+                ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+              .borderRadius(UI_RADIUS_PILL)
+              .accessibilitySelected(speed === this.fastSpeed)
+              .onClick(() => {
+                this.speedPickerOpen = false;
+                this.onSpeedChange(speed);
+              })
+          }, (speed: string) => speed)
         }
         .width('100%')
         .padding({ left: 26, right: 4, bottom: 4 })

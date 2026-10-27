@@ -9,6 +9,8 @@
  * 中保留，后续切片按需补解析。
  */
 
+import { readFastEnabled, readFastTier } from './ModelSpeed';
+
 // ─── 通用读取 helpers ────────────────────────────────────────────────────────
 
 export function recordOrEmpty(value: Object | null | undefined): Record<string, Object> {
@@ -118,6 +120,8 @@ export class RemoteSessionRuntimeProfile {
   /** Empty string represents the wire-level null effort. */
   effort: string = '';
   fastMode: boolean = false;
+  /** `'ultrafast'` 表示超快；空串时由 fastMode 区分标准 / 快速。 */
+  fastModeTier: string = '';
 }
 
 export class RemoteSessionRuntimePending {
@@ -136,7 +140,8 @@ function parseRuntimeProfile(value: Object | undefined): RemoteSessionRuntimePro
   profile.model = readStr(raw, 'model');
   profile.providerId = readStr(raw, 'providerId');
   profile.effort = readStr(raw, 'effort');
-  profile.fastMode = readBool(raw, 'fastMode', false);
+  profile.fastMode = readFastEnabled(raw);
+  profile.fastModeTier = readFastTier(raw);
   if (profile.agentKind.length === 0 || profile.model.length === 0) return undefined;
   return profile;
 }
@@ -159,6 +164,8 @@ export class RemoteSession {
   permissionMode: string = '';
   planModeEnabled: boolean = false;
   fastMode: boolean = false;
+  /** 超快档（Codex Ultrafast）；见 ModelSpeed.ets。 */
+  fastModeTier: string = '';
   /** Monotonic host runtime-control generation; undefined means old host. */
   runtimeGeneration: number | undefined = undefined;
   runtimeBaseline: RemoteSessionRuntimeProfile | undefined = undefined;
@@ -212,7 +219,8 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.effort = readStr(raw, 'effort');
   s.permissionMode = readStr(raw, 'permissionMode');
   s.planModeEnabled = readBool(raw, 'planModeEnabled', false);
-  s.fastMode = readBool(raw, 'fastMode', false);
+  s.fastMode = readFastEnabled(raw);
+  s.fastModeTier = readFastTier(raw);
   const rawGeneration = raw['runtimeGeneration'];
   if (typeof rawGeneration === 'number' && Number.isFinite(rawGeneration)) {
     s.runtimeGeneration = rawGeneration as number;
@@ -279,6 +287,8 @@ export class RemoteMessage {
   turnCompleted: boolean = false;
   /** 区分协议缺失与显式 false；Codex 失败印记依赖该三态。 */
   hasTurnCompleted: boolean = false;
+  /** Codex 流重试时失败那次的部分输出（agentMeta.failedSamplingAttempt）；只进工作过程，不是回答。 */
+  failedSamplingAttempt: boolean = false;
   terminalPlanSnapshot: boolean = false;
   terminalPlanAtMs: number = 0;
   /** 流式投影标记；历史正文不应被当作最终答复展示。 */
@@ -396,6 +406,11 @@ export function parseMessage(raw: Record<string, Object>): RemoteMessage {
       || Object.keys(turnCost).length > 0
       || readNum(agentMeta, 'turnCostUsd', 0) > 0;
   }
+  // 对齐 Mobile remoteMessageCompletesTurn：失败采样永远不封 turn。
+  const failedAttempt = agentMeta['failedSamplingAttempt'];
+  m.failedSamplingAttempt = m.role === 'assistant' && failedAttempt !== undefined && failedAttempt !== null
+    && failedAttempt !== false;
+  if (m.failedSamplingAttempt) m.turnCompleted = false;
   m.terminalPlanSnapshot = readBool(raw, 'terminalPlanSnapshot', false)
     || readBool(agentMeta, 'terminalPlanSnapshot', false)
     || readBool(contentRecord, 'terminalPlanSnapshot', false);

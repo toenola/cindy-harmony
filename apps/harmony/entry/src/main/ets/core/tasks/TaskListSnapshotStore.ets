@@ -4,6 +4,7 @@
  * 只保存列表首屏需要的瘦身字段；它是可丢弃的 last-known 投影，远端设备与会话
  * 快照返回后必须由 TaskStore 对账覆盖，不能成为业务真相。
  */
+import { MODEL_SPEED_ULTRAFAST } from './ModelSpeed';
 import { common } from '@kit.AbilityKit';
 import { PresenceSnapshot } from '../device-link/DlProtocol';
 import { SecureStore } from '../storage/SecureStore';
@@ -70,6 +71,7 @@ function runtimeProfileRecord(profile: RemoteSessionRuntimeProfile): Record<stri
   out['providerId'] = profile.providerId.length > 0 ? profile.providerId : null;
   out['effort'] = profile.effort.length > 0 ? profile.effort : null;
   out['fastMode'] = profile.fastMode;
+  if (profile.fastMode && profile.fastModeTier === MODEL_SPEED_ULTRAFAST) out['fastModeTier'] = MODEL_SPEED_ULTRAFAST;
   return out;
 }
 

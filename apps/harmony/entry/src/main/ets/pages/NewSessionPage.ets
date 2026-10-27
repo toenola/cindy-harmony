@@ -1,4 +1,5 @@
 import { harmonyV12String } from '../core/HarmonyStrings';
+import { MODEL_SPEED_ULTRAFAST, fastModeWireValue, ultrafastRestorable } from '../core/tasks/ModelSpeed';
 import { providerCatalogUnavailable } from '../core/ComposerCatalog';
 /**
  * 新建任务页：选择 Agent、对话类型和项目目录，然后用同款 Composer 发送首条消息。
@@ -208,6 +209,7 @@ export struct NewSessionPageContent {
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并应用。 */
   @State modelEffortMemory: Map<string, string> = new Map();
   @State modelFastMemory: Map<string, boolean> = new Map();
+  @State modelFastTierMemory: Map<string, string> = new Map();
   @State modelEffortPickerKey: string = '';
   @State contextSelectedUris: string[] = [];
   @State browseOpen: boolean = false;
@@ -227,6 +229,8 @@ export struct NewSessionPageContent {
   @State planModeNative: boolean = false;
   @State planModeEnabled: boolean = false;
   @State fastMode: boolean = false;
+  /** '' 或 'ultrafast'；仅在 fastMode 为 true 时有意义。 */
+  @State fastModeTier: string = '';
   @State modelOptions: RuntimeModelOption[] = [];
   @State providerModelOptions: RuntimeModelOption[] = [];
   @State providerModelAgent: string = '';
@@ -470,6 +474,7 @@ export struct NewSessionPageContent {
     this.permissionModeBeforePlan = draft.permissionMode;
     this.planModeEnabled = draft.planModeEnabled;
     this.fastMode = draft.fastMode;
+    this.fastModeTier = draft.fastMode ? draft.fastModeTier : '';
     if (consume) this.pendingEditDraft = null;
   }
 
@@ -592,10 +597,12 @@ export struct NewSessionPageContent {
     this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
     const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
     const nextFastMode = this.modelFastForRow(option);
+    const nextFastTier = this.modelFastTierForRow(option);
     this.model = option.id;
     this.providerId = option.providerId;
     this.effort = nextEffort;
     this.fastMode = nextFastMode;
+    this.fastModeTier = nextFastTier;
     this.error = '';
     this.writeRuntimeChoice(true);
   }
@@ -614,6 +621,7 @@ export struct NewSessionPageContent {
     if (!this.fastModeCapability || model === undefined || !model.supportsFastMode || this.creating) return;
     this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
     this.fastMode = !this.fastMode;
+    this.fastModeTier = '';
     this.writeRuntimeChoice(false);
   }
 
@@ -1072,6 +1080,7 @@ export struct NewSessionPageContent {
     this.planModeNative = false;
     this.planModeEnabled = false;
     this.fastMode = false;
+    this.fastModeTier = '';
     this.modelOptions = [];
     this.providerModelOptions = [];
     this.providerModelAgent = '';
@@ -1133,6 +1142,7 @@ export struct NewSessionPageContent {
     runtime.providerId = this.providerId;
     runtime.effort = this.effort;
     runtime.fastMode = this.fastMode;
+    runtime.fastModeTier = this.fastMode ? this.fastModeTier : '';
     return runtime;
   }
 
@@ -1145,6 +1155,7 @@ export struct NewSessionPageContent {
       runtime.providerId = option.providerId;
       runtime.effort = this.modelEffortForRow(option);
       runtime.fastMode = this.modelFastForRow(option);
+      runtime.fastModeTier = this.modelFastTierForRow(option);
     }
     if (runtime.model.length === 0 || (!active && runtime.providerId.length === 0)) return;
     const deviceId = this.selectedDeviceId;
@@ -1278,7 +1289,26 @@ export struct NewSessionPageContent {
   private modelFastForRow(option: RuntimeModelOption): boolean {
     if (!this.fastModeCapability || !option.supportsFastMode) return false;
     if (this.modelOptionIsCurrent(option)) return this.fastMode;
-    return this.modelFastMemory.get(this.modelRuntimeKey(option)) ?? false;
+    const key = this.modelRuntimeKey(option);
+    // 记忆的超快档在目标模型撤回能力时整体关闭（对齐 Mobile isFastRestorable）。
+    return (this.modelFastMemory.get(key) ?? false) && ultrafastRestorable(
+      this.modelFastTierMemory.get(key) ?? '', this.selectedAgentKind, option.supportsUltrafastMode);
+  }
+
+  private modelFastTierForRow(option: RuntimeModelOption): string {
+    if (!this.modelFastForRow(option)) return '';
+    if (this.modelOptionIsCurrent(option)) return this.fastModeTier;
+    return this.modelFastTierMemory.get(this.modelRuntimeKey(option)) ?? '';
+  }
+
+  private modelRowSupportsUltrafast(option: RuntimeModelOption): boolean {
+    return this.fastModeCapability && option.supportsFastMode && option.supportsUltrafastMode
+      && this.selectedAgentKind === 'codex';
+  }
+
+  private modelSpeedForRow(option: RuntimeModelOption): string {
+    if (!this.modelFastForRow(option)) return 'standard';
+    return this.modelFastTierForRow(option) === MODEL_SPEED_ULTRAFAST ? 'ultrafast' : 'fast';
   }
 
   private modelEffortMenuItems(option: RuntimeModelOption): MenuElement[] {
@@ -1307,13 +1337,25 @@ export struct NewSessionPageContent {
   }
 
   private setModelRowFast(option: RuntimeModelOption, enabled: boolean): void {
+    this.setModelRowSpeed(option, enabled ? 'fast' : 'standard');
+  }
+
+  private setModelRowSpeed(option: RuntimeModelOption, speed: string): void {
     if (this.creating || !this.fastModeCapability || !option.supportsFastMode) return;
+    if (speed === 'ultrafast' && !this.modelRowSupportsUltrafast(option)) return;
+    const enabled = speed !== 'standard';
+    const tier = speed === 'ultrafast' ? MODEL_SPEED_ULTRAFAST : '';
+    const key = this.modelRuntimeKey(option);
     const next = new Map(this.modelFastMemory);
-    next.set(this.modelRuntimeKey(option), enabled);
+    next.set(key, enabled);
     this.modelFastMemory = next;
+    const tiers = new Map(this.modelFastTierMemory);
+    tiers.set(key, tier);
+    this.modelFastTierMemory = tiers;
     if (this.modelOptionIsCurrent(option)) {
       this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
       this.fastMode = enabled;
+      this.fastModeTier = tier;
     }
     this.error = '';
     this.writeRuntimeChoice(false, option);
@@ -1406,6 +1448,7 @@ export struct NewSessionPageContent {
       this.providerId = localChoice.providerId;
       this.effort = localChoice.effort;
       this.fastMode = localChoice.fastMode;
+      this.fastModeTier = localChoice.fastMode ? localChoice.fastModeTier : '';
       this.runtimeModelTouchedGeneration = generation;
       this.runtimeEffortTouchedGeneration = generation;
       this.runtimeFastTouchedGeneration = generation;
@@ -1477,7 +1520,10 @@ export struct NewSessionPageContent {
         this.model = runtime.model;
         this.providerId = runtime.providerId;
         if (!effortTouched) this.effort = runtime.effort;
-        if (!fastTouched) this.fastMode = this.fastModeCapability && runtime.fastMode;
+        if (!fastTouched) {
+          this.fastMode = this.fastModeCapability && runtime.fastMode;
+          this.fastModeTier = this.fastMode ? runtime.fastModeTier : '';
+        }
         selectedModel = this.findModelOption(this.model, this.providerId);
       }
       if (!effortTouched) {
@@ -1659,7 +1705,7 @@ export struct NewSessionPageContent {
     options['permissionMode'] = !this.planModeNative && this.planModeEnabled
       ? 'plan' : this.permissionMode;
     options['planMode'] = this.planModeNative && this.planModeEnabled;
-    options['fastMode'] = this.fastMode;
+    options['fastMode'] = fastModeWireValue(this.fastMode, this.fastModeTier);
     if (this.providerId.trim().length > 0) options['providerId'] = this.providerId.trim();
     if (this.effort.trim().length > 0) options['effort'] = this.effort.trim();
     if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir;
@@ -1683,6 +1729,7 @@ export struct NewSessionPageContent {
     session.permissionMode = !this.planModeNative && this.planModeEnabled ? 'plan' : this.permissionMode;
     session.planModeEnabled = this.planModeEnabled;
     session.fastMode = this.fastMode;
+    session.fastModeTier = this.fastMode ? this.fastModeTier : '';
     session.agentKind = this.selectedAgentKind === 'claude-code' ? 'cc' : this.selectedAgentKind;
     session.status = 'active';
     session.pendingLocalCreation = true;
@@ -2555,6 +2602,8 @@ export struct NewSessionPageContent {
       effortPickerOpen: this.modelEffortPickerKey === this.modelOptionKey(option),
       fastModeVisible: this.fastModeCapability && option.supportsFastMode,
       fastModeOn: this.modelFastForRow(option),
+      ultrafastAvailable: this.modelRowSupportsUltrafast(option),
+      fastSpeed: this.modelSpeedForRow(option),
       effortLabel: (effort: string): string => this.modelEffortLabel(option, effort),
       onSelect: (): void => this.selectContextModel(option),
       onToggleEffortPicker: (): void => {
@@ -2566,6 +2615,7 @@ export struct NewSessionPageContent {
         this.modelEffortPickerKey = '';
       },
       onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
+      onSpeedChange: (speed: string): void => this.setModelRowSpeed(option, speed),
     })
   }
 

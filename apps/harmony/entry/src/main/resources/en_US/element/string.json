@@ -159,6 +159,21 @@
     {"name":"v132_delivery_absent","value":"Your computer confirmed it did not receive this message. You can retry sending it."},
     {"name":"v132_delivery_check_done","value":"Delivery status updated."},
     {"name":"v132_delivery_check_failed","value":"Could not check delivery status. Check the connection and try again."},
-    {"name":"v132_delivery_send_failed","value":"Sending did not complete. Check the connection and try again."}
+    {"name":"v132_delivery_send_failed","value":"Sending did not complete. Check the connection and try again."},
+    {"name":"v133_rich_calc_unavailable","value":"Unable to calculate this value."},
+    {"name":"v133_rich_incomplete","value":"Some content could not be displayed."},
+    {"name":"v133_rich_open_video","value":"Open original video"},
+    {"name":"v133_rich_open_media","value":"Open media"},
+    {"name":"v133_speed_label","value":"Speed"},
+    {"name":"v133_speed_standard","value":"Standard"},
+    {"name":"v133_speed_fast","value":"Fast"},
+    {"name":"v133_speed_ultrafast","value":"Ultrafast"},
+    {"name":"v133_failed_sampling_attempt","value":"This reply did not complete. Its content is for reference only."},
+    {"name":"v133_image_delivery_failed","value":"Image delivery failed. Retry transferring the existing image."},
+    {"name":"v133_image_delivery_retry","value":"Retry delivery"},
+    {"name":"v133_image_delivery_retrying","value":"Delivering…"},
+    {"name":"v133_image_delivery_retry_failed","value":"Delivery is still unavailable. Check that the source computer is online."},
+    {"name":"v133_source_mcp_app_named","value":"Sent by MCP App “%s”"},
+    {"name":"v133_source_mcp_server_id","value":"MCP Server ID: %s"}
   ]
 }

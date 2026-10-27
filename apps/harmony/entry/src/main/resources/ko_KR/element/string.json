@@ -159,6 +159,21 @@
     {"name":"v132_delivery_absent","value":"컴퓨터가 이 메시지를 받지 않았음을 확인했습니다. 다시 보낼 수 있습니다."},
     {"name":"v132_delivery_check_done","value":"전송 상태를 업데이트했습니다."},
     {"name":"v132_delivery_check_failed","value":"전송 상태를 확인하지 못했습니다. 연결을 확인한 후 다시 시도하세요."},
-    {"name":"v132_delivery_send_failed","value":"전송이 완료되지 않았습니다. 연결을 확인한 후 다시 시도하세요."}
+    {"name":"v132_delivery_send_failed","value":"전송이 완료되지 않았습니다. 연결을 확인한 후 다시 시도하세요."},
+    {"name":"v133_rich_calc_unavailable","value":"이 값을 계산할 수 없습니다."},
+    {"name":"v133_rich_incomplete","value":"일부 내용을 표시하지 못했습니다."},
+    {"name":"v133_rich_open_video","value":"원본 동영상 열기"},
+    {"name":"v133_rich_open_media","value":"미디어 열기"},
+    {"name":"v133_speed_label","value":"속도"},
+    {"name":"v133_speed_standard","value":"표준"},
+    {"name":"v133_speed_fast","value":"빠름"},
+    {"name":"v133_speed_ultrafast","value":"초고속"},
+    {"name":"v133_failed_sampling_attempt","value":"완료되지 않은 답변입니다. 내용은 참고용으로만 확인해 주세요."},
+    {"name":"v133_image_delivery_failed","value":"이미지 전달에 실패했습니다. 기존 이미지 전송을 다시 시도할 수 있습니다."},
+    {"name":"v133_image_delivery_retry","value":"전달 다시 시도"},
+    {"name":"v133_image_delivery_retrying","value":"전달 중…"},
+    {"name":"v133_image_delivery_retry_failed","value":"전달할 수 없습니다. 이미지를 생성한 컴퓨터가 온라인인지 확인해 주세요."},
+    {"name":"v133_source_mcp_app_named","value":"MCP App “%s”에서 전송"},
+    {"name":"v133_source_mcp_server_id","value":"MCP 서버 ID: %s"}
   ]
 }

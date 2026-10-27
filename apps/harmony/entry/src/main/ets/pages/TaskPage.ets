@@ -140,7 +140,7 @@ import {
 import {
   RenderItem, RenderMessageItem, RenderThinkingItem,
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
-  RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem,
+  RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem, RenderRichPart,
   buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
   orcaCollabCanExpand, orcaCollabExpansionKey,
   latestTaskPlanWindowResolved,
@@ -159,8 +159,14 @@ import {
 import {
   MdBlock, InlineToken, InlineTokenGroup, MdSelectableBlockGroup, MdSelectableTextBlock,
   groupInlineTokens, groupMarkdownSelectableBlocks,
-  tokenizeInline,
+  parseMarkdown, tokenizeInline,
 } from '../core/messages/MarkdownParser';
+import { RichValue, richAnswerText } from '../core/messages/RichAnswer';
+import { ProcessMediaRef } from '../core/messages/ToolProcessMedia';
+import {
+  MODEL_SPEED_ULTRAFAST, fastModeWireValue, sameFastSpeed, ultrafastRestorable,
+} from '../core/tasks/ModelSpeed';
+import { RichAnswerView } from '../components/RichAnswerView';
 import { ThinkingTextToken, tokenizeThinkingText } from '../core/messages/ThinkingTextParser';
 import { buildMarkdownTableColumnWidths } from '../core/messages/MarkdownTableLayout';
 import {
@@ -338,6 +344,11 @@ struct TodoRunningStatusIcon {
       if (!this.reduceMotion) this.breathOpacity = 0.38;
     })
   }
+}
+
+class RichMarkdownCacheEntry {
+  text: string = '';
+  blocks: MdBlock[] = [];
 }
 
 class ComposerPaletteItem {
@@ -543,6 +554,10 @@ export struct TaskPageContent {
   private tableColumnWidthCache: Map<MdBlock, number[]> = new Map();
   /** 完成态 Markdown 数组身份稳定；缓存连续文本组，避免页面状态刷新时重复线性分组。 */
   private markdownSelectableGroupCache: Map<MdBlock[], MdSelectableBlockGroup[]> = new Map();
+  private richMarkdownCache: Map<string, RichMarkdownCacheEntry> = new Map();
+  private processImageRefs: Map<string, RemoteImageRef> = new Map();
+  /** 生图交付重试：'' 空闲 / pending / failed。 */
+  @State imageDeliveryRetryState: Map<string, string> = new Map();
   /** 用户是否仍明确跟随消息尾部。 */
   @State followingLatest: boolean = true;
   /** 离底期间收到尾部更新时，在回到底部浮标上显示提示点。 */
@@ -695,6 +710,8 @@ export struct TaskPageContent {
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并写入。 */
   @State modelEffortMemory: Map<string, string> = new Map();
   @State modelFastMemory: Map<string, boolean> = new Map();
+  /** 各模型行记忆的速度档位（'' 或 'ultrafast'），与 modelFastMemory 配对使用。 */
+  @State modelFastTierMemory: Map<string, string> = new Map();
   @State modelEffortPickerKey: string = '';
   /** RPC 进行中先把勾选移动到用户刚点击的模型，失败时再回退。 */
   @State pendingModelSelectionKey: string = '';
@@ -1345,6 +1362,11 @@ export struct TaskPageContent {
       ? session.runtimeEffective.fastMode : session.fastMode;
   }
 
+  private effectiveFastTier(session: RemoteSession): string {
+    return session.runtimeEffective !== undefined
+      ? session.runtimeEffective.fastModeTier : session.fastModeTier;
+  }
+
   private agentKindForCapability(session: RemoteSession): string {
     return session.agentKind === 'cc' ? 'claude-code' : session.agentKind;
   }
@@ -1741,7 +1763,29 @@ export struct TaskPageContent {
       const session = this.session();
       return session === undefined ? false : this.effectiveFastMode(session);
     }
-    return this.modelFastMemory.get(this.modelRuntimeKey(option)) ?? false;
+    const key = this.modelRuntimeKey(option);
+    // 记忆的超快档在目标模型撤回能力时整体关闭（对齐 Mobile isFastRestorable）。
+    return (this.modelFastMemory.get(key) ?? false) && ultrafastRestorable(
+      this.modelFastTierMemory.get(key) ?? '', this.composerAgentKind(), option.supportsUltrafastMode);
+  }
+
+  private modelFastTierForRow(option: ComposerModelOption): string {
+    if (!this.modelFastForRow(option)) return '';
+    if (this.modelOptionIsCurrent(option)) {
+      const session = this.session();
+      return session === undefined ? '' : this.effectiveFastTier(session);
+    }
+    return this.modelFastTierMemory.get(this.modelRuntimeKey(option)) ?? '';
+  }
+
+  private modelRowSupportsUltrafast(option: ComposerModelOption): boolean {
+    return this.visibleFastModeCapability() && option.supportsFastMode && option.supportsUltrafastMode
+      && this.composerAgentKind() === 'codex';
+  }
+
+  private modelSpeedForRow(option: ComposerModelOption): string {
+    if (!this.modelFastForRow(option)) return 'standard';
+    return this.modelFastTierForRow(option) === MODEL_SPEED_ULTRAFAST ? 'ultrafast' : 'fast';
   }
 
   private modelEffortOptions(option: ComposerModelOption): ComposerChoiceOption[] {
@@ -1803,15 +1847,30 @@ export struct TaskPageContent {
   }
 
   private setModelRowFast(option: ComposerModelOption, enabled: boolean): void {
+    this.setModelRowSpeed(option, enabled ? 'fast' : 'standard');
+  }
+
+  private setModelRowSpeed(option: ComposerModelOption, speed: string): void {
     if (this.contextRpcBusy || this.runtimeRouteLocked()
       || !this.visibleFastModeCapability() || !option.supportsFastMode) return;
+    if (speed === 'ultrafast' && !this.modelRowSupportsUltrafast(option)) return;
+    const enabled = speed !== 'standard';
+    const tier = speed === 'ultrafast' ? MODEL_SPEED_ULTRAFAST : '';
     if (this.modelOptionIsCurrent(option)) {
-      void this.setFastMode(enabled);
+      void this.setFastMode(enabled, tier);
       return;
     }
+    this.rememberModelSpeed(option, enabled, tier);
+  }
+
+  private rememberModelSpeed(option: ComposerModelOption, enabled: boolean, tier: string): void {
+    const key = this.modelRuntimeKey(option);
     const next = new Map(this.modelFastMemory);
-    next.set(this.modelRuntimeKey(option), enabled);
+    next.set(key, enabled);
     this.modelFastMemory = next;
+    const tiers = new Map(this.modelFastTierMemory);
+    tiers.set(key, enabled ? tier : '');
+    this.modelFastTierMemory = tiers;
   }
 
   private currentModelOption(): ComposerModelOption | null {
@@ -2151,6 +2210,8 @@ export struct TaskPageContent {
     }
     const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
     const nextFastMode = this.modelFastForRow(option);
+    const nextFastTier = this.modelFastTierForRow(option);
+    const nextFastWire = fastModeWireValue(nextFastMode, nextFastTier);
     const selectionKey = this.modelRuntimeKey(option);
     this.pendingModelSelectionKey = selectionKey;
     this.returnToComposerAfterModelSheet();
@@ -2161,7 +2222,7 @@ export struct TaskPageContent {
         const writeGeneration = ++this.agentSwitchWriteGeneration;
         const effort = nextEffort;
         result = await this.invokeContextRpc('maker:switch-session-agent', [
-          session.id, targetAgent, option.id, option.providerId, effort, nextFastMode,
+          session.id, targetAgent, option.id, option.providerId, effort, nextFastWire,
         ]);
         if (!this.isCurrentPageLifecycle(lifecycleGeneration)
           || writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) {
@@ -2184,9 +2245,9 @@ export struct TaskPageContent {
           }
         }
         // 模型切换必须写穿 false；目标模型不支持 Fast 时，不能把旧 true 留在服务端。
-        if (nextFastMode !== session.fastMode) {
+        if (!sameFastSpeed(nextFastMode, nextFastTier, session.fastMode, session.fastModeTier)) {
           try {
-            await this.invokeContextRpc('maker:set-fast-mode', [session.id, nextFastMode]);
+            await this.invokeContextRpc('maker:set-fast-mode', [session.id, nextFastWire]);
         } catch (e) {
             runtimeSettingsFailed = true;
           }
@@ -2242,24 +2303,21 @@ export struct TaskPageContent {
     }
   }
 
-  private async setFastMode(enabled: boolean): Promise<void> {
+  private async setFastMode(enabled: boolean, tier: string = ''): Promise<void> {
     if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy || !this.currentModelSupportsFastMode()
-      || session.fastMode === enabled) {
+      || sameFastSpeed(session.fastMode, session.fastModeTier, enabled, tier)) {
       return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
     this.contextRpcBusy = true;
     try {
-      await this.invokeContextRpc('maker:set-fast-mode', [session.id, enabled]);
+      // 超快原样发 'ultrafast'（与 Mobile setFastMode 同口径）。
+      await this.invokeContextRpc('maker:set-fast-mode', [session.id, fastModeWireValue(enabled, tier)]);
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       const model = this.currentModelOption();
-      if (model !== null) {
-        const next = new Map(this.modelFastMemory);
-        next.set(this.modelRuntimeKey(model), enabled);
-        this.modelFastMemory = next;
-      }
+      if (model !== null) this.rememberModelSpeed(model, enabled, tier);
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         promptAction.showToast({ message: this.invokeFailureText(e, 'Fast 模式更新失败，请重试') });
@@ -3356,7 +3414,10 @@ export struct TaskPageContent {
     // 在渲染时逐条判定，这里只需要一个保守的可见上限。
     const collapsedLimit = collapsedUserMessageLineLimit(false);
     const projection = freezeShareProjection(
-      sourceItems, expanded, collapsedLimit, this.shareVisibleUserTextOverrides());
+      sourceItems, expanded, collapsedLimit, this.shareVisibleUserTextOverrides(),
+      (message: RenderMessageItem, partKey: number): Map<string, RichValue> => {
+        return AppServices.instance.richAnswerMemory.get(this.richAnswerStateKey(message, partKey));
+      });
     if (projection.items.length === 0) {
       this.shareSelectionBusy = false;
       promptAction.showToast({ message: this.v12String('v12_no_shareable_content') });
@@ -7042,6 +7103,8 @@ export struct TaskPageContent {
       effortPickerOpen: this.modelEffortPickerKey === composerModelKey(option),
       fastModeVisible: this.visibleFastModeCapability() && option.supportsFastMode,
       fastModeOn: this.modelFastForRow(option),
+      ultrafastAvailable: this.modelRowSupportsUltrafast(option),
+      fastSpeed: this.modelSpeedForRow(option),
       effortLabel: (effort: string): string => {
         return option.effortDisplayNames[effort] ?? this.effortOptionLabel(effort, effort);
       },
@@ -7054,6 +7117,7 @@ export struct TaskPageContent {
       },
       onSelectEffort: (effort: string): void => this.setModelRowEffortById(option, effort),
       onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
+      onSpeedChange: (speed: string): void => this.setModelRowSpeed(option, speed),
     })
   }
 
@@ -9127,7 +9191,8 @@ export struct TaskPageContent {
   }
 
   private hasVisibleMessageBody(item: RenderMessageItem): boolean {
-    return item.body.trim().length > 0 || item.mdBlocks.length > 0 || item.segments.length > 0;
+    return item.body.trim().length > 0 || item.mdBlocks.length > 0 || item.segments.length > 0
+      || item.richParts.length > 0;
   }
 
   private attachmentTitle(file: RemoteSerializedAttachment): string {
@@ -9449,12 +9514,14 @@ export struct TaskPageContent {
       const name = badge.kind === 'mobile' ? 'v132_source_device_mobile' : 'v132_source_device_desktop';
       return badge.name.length > 0 ? this.v12String(name + '_named', badge.name) : this.v12String(name);
     }
+    if (badge.kind === 'mcpApp') return this.v12String('v133_source_mcp_app_named', badge.name);
     const name = badge.kind === 'plugin' ? 'v132_source_plugin' : 'v132_session_origin';
     return badge.name.length > 0 ? this.v12String(name + '_named', badge.name) : this.v12String(name);
   }
 
   private sourceBadgeIdLabel(badge: MessageSourceBadge): string {
     const name = badge.kind === 'plugin' ? 'v132_source_plugin_id'
+      : badge.kind === 'mcpApp' ? 'v133_source_mcp_server_id'
       : badge.kind === 'session' ? 'v132_source_session_id' : 'v132_source_device_id';
     return badge.id.length > 0 ? this.v12String(name, badge.id) : '';
   }
@@ -9580,7 +9647,7 @@ export struct TaskPageContent {
         && item.message !== undefined
         && item.message.automationOrigin
         && !this.presentationSourceBadges(item).some((badge: MessageSourceBadge) =>
-          badge.kind === 'plugin' || badge.kind === 'session')) {
+          badge.kind === 'plugin' || badge.kind === 'mcpApp' || badge.kind === 'session')) {
         Row({ space: 4 }) {
           SymbolGlyph($r('sys.symbol.timer'))
             .fontSize(uiFontSize(12))
@@ -9593,6 +9660,13 @@ export struct TaskPageContent {
         .width('86%')
         .justifyContent(FlexAlign.End)
         .alignSelf(ItemAlign.End)
+      }
+
+      if (item.kind === 'assistant' && item.message !== undefined && item.message.failedSamplingAttempt) {
+        Text($r('app.string.v133_failed_sampling_attempt'))
+          .fontSize(uiFontSize(13))
+          .lineHeight(uiLineHeight(18))
+          .fontColor($r('app.color.text_secondary'))
       }
 
       // iOS 把附件放在文字气泡外；纯附件消息不会留下空白气泡。
@@ -9646,6 +9720,8 @@ export struct TaskPageContent {
             }, (seg: RenderTextSegment) => `${item.key}-${seg.seq}`)
           } else if (item.kind === 'user' && item.segments.length > 0 && item.segments[0].isPasted) {
             this.pastedBlock(item, item.segments[0])
+          } else if (item.richParts.length > 0) {
+            this.richAnswerBody(item)
           } else if (item.mdBlocks.length > 0) {
             this.mdBlocks(item.mdBlocks,
               item.message === undefined || item.message.isStreaming !== true,
@@ -9974,6 +10050,107 @@ export struct TaskPageContent {
         this.toolRow(t, action)
       },
       (action: ToolActionPresentation) => this.toolActionKey(t, action))
+    if (t.processMedia.length > 0) {
+      this.toolProcessMedia(t)
+    }
+  }
+
+  /** 对齐 Mobile ToolActionRow：原生过程媒体留在所属工具步骤里（明确交付媒体仍走媒体结果块）。 */
+  @Builder
+  toolProcessMedia(t: RenderToolItem) {
+    Column({ space: 6 }) {
+      if (this.processMediaImages(t).length > 0) {
+        List({ space: 8 }) {
+          ForEach(this.processMediaImages(t), (ref: RemoteImageRef) => {
+            ListItem() {
+              this.toolMediaImage(ref)
+            }
+            .onAppear(() => this.ensureImageSource(ref.url, ref))
+          }, (ref: RemoteImageRef) => `${t.toolUseId}-process-${ref.url}`)
+        }
+        .listDirection(Axis.Horizontal)
+        .height(176)
+        .width('100%')
+      }
+      ForEach(this.processMediaVideos(t), (payload: RenderMediaPayload) => {
+        this.toolMediaFile(payload)
+      }, (payload: RenderMediaPayload) => `${t.toolUseId}-process-${payload.url}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: 30, right: 8, top: 2, bottom: 4 })
+  }
+
+  private processMediaImages(t: RenderToolItem): RemoteImageRef[] {
+    const out: RemoteImageRef[] = [];
+    t.processMedia.forEach((media: ProcessMediaRef) => {
+      if (media.kind !== 'image') return;
+      let ref = this.processImageRefs.get(media.url);
+      if (ref === undefined) {
+        ref = new RemoteImageRef();
+        ref.url = media.url;
+        if (this.processImageRefs.size >= 256) this.processImageRefs.clear();
+        this.processImageRefs.set(media.url, ref);
+      }
+      out.push(ref);
+    });
+    return out;
+  }
+
+  private processMediaVideos(t: RenderToolItem): RenderMediaPayload[] {
+    const out: RenderMediaPayload[] = [];
+    t.processMedia.forEach((media: ProcessMediaRef) => {
+      if (media.kind !== 'video') return;
+      const payload = new RenderMediaPayload();
+      payload.kind = 'video';
+      payload.url = media.url;
+      payload.previewable = false;
+      out.push(payload);
+    });
+    return out;
+  }
+
+  @Builder
+  imageDeliveryRetry(t: RenderToolItem) {
+    Column({ space: 6 }) {
+      Text(this.imageDeliveryRetryState.get(t.failedImageDeliveryId) === 'failed'
+        ? $r('app.string.v133_image_delivery_retry_failed') : $r('app.string.v133_image_delivery_failed'))
+        .fontSize(uiFontSize(12))
+        .lineHeight(uiLineHeight(18))
+        .fontColor($r('app.color.chat_text_secondary'))
+      Button(this.imageDeliveryRetryState.get(t.failedImageDeliveryId) === 'pending'
+        ? $r('app.string.v133_image_delivery_retrying') : $r('app.string.v133_image_delivery_retry'))
+        .height(32)
+        .fontSize(uiFontSize(13))
+        .fontColor($r('app.color.text_primary'))
+        .backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_PILL)
+        .enabled(this.imageDeliveryRetryState.get(t.failedImageDeliveryId) !== 'pending')
+        .onClick(() => void this.retryImageDelivery(t.failedImageDeliveryId))
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 只重传 Host 已存的图片，不重新提问；成功后 Host 原地替换该结果行。 */
+  private async retryImageDelivery(imageId: string): Promise<void> {
+    if (imageId.length === 0 || this.imageDeliveryRetryState.get(imageId) === 'pending') return;
+    const sessionId = this.sessionId;
+    const lifecycleGeneration = this.pageLifecycleGeneration;
+    this.setImageDeliveryRetryState(imageId, 'pending');
+    try {
+      await this.invokeContextRpc('maker:images:retry', [sessionId, imageId]);
+      if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.setImageDeliveryRetryState(imageId, '');
+    } catch (_error) {
+      if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.setImageDeliveryRetryState(imageId, 'failed');
+    }
+  }
+
+  private setImageDeliveryRetryState(imageId: string, state: string): void {
+    const next = new Map(this.imageDeliveryRetryState);
+    if (state.length > 0) next.set(imageId, state);
+    else next.delete(imageId);
+    this.imageDeliveryRetryState = next;
   }
 
   @Builder
@@ -10033,7 +10210,9 @@ export struct TaskPageContent {
               .lineHeight(uiLineHeight(18))
               .width('100%')
           }
-          if (t.hasResult && t.resultText.length > 0) {
+          if (t.failedImageDeliveryId.length > 0) {
+            this.imageDeliveryRetry(t)
+          } else if (t.hasResult && t.resultText.length > 0) {
             Text(t.resultText)
               .fontSize(uiFontSize(12))
               .fontFamily('monospace')
@@ -10300,6 +10479,66 @@ export struct TaskPageContent {
       .backgroundColor($r('app.color.bg_chip'))
       .borderRadius(UI_RADIUS_CONTROL)
     }
+  }
+
+  @Builder
+  richAnswerBody(item: RenderMessageItem) {
+    Column({ space: 16 }) {
+      ForEach(item.richParts, (part: RenderRichPart) => {
+        if (part.kind === 'rich') {
+          RichAnswerView({
+            source: part.source,
+            complete: part.complete,
+            stateKey: this.richAnswerStateKey(item, part.key),
+            memory: AppServices.instance.richAnswerMemory,
+            renderMarkdown: (text: string, key: string): void => {
+              this.richAnswerMarkdown(text, `${item.key}:${part.key}:${key}`)
+            },
+          })
+        } else if (part.mdBlocks.length > 0) {
+          this.mdBlocks(part.mdBlocks, part.complete, true)
+        }
+      }, (part: RenderRichPart) => part.kind === 'rich'
+        ? `${item.key}:rich:${part.key}` : `${item.key}:md:${part.key}:${part.source.length}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 组件内的 Markdown / 代码 / 公式 / 图片节点复用正文 Markdown 渲染与图片链路。 */
+  @Builder
+  richAnswerMarkdown(text: string, key: string) {
+    Column() {
+      this.mdBlocks(this.richAnswerMarkdownBlocks(text, key), true, true)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 对齐 Mobile：视图值按账号 / 设备 / 任务 / 消息 / 片段隔离，仅保存在本机。 */
+  private richAnswerStateKey(item: RenderMessageItem, partKey: number): string {
+    const message = item.message;
+    const messageKey = message !== undefined && message.clientId.length > 0 ? message.clientId : item.key;
+    return `${AppServices.instance.auth.cacheAccountId}:${this.deviceId}:${this.sessionId}:${messageKey}:${partKey}`;
+  }
+
+  private richAnswerMarkdownBlocks(text: string, key: string): MdBlock[] {
+    const cached = this.richMarkdownCache.get(key);
+    if (cached !== undefined && cached.text === text) return cached.blocks;
+    const entry = new RichMarkdownCacheEntry();
+    entry.text = text;
+    entry.blocks = parseMarkdown(text);
+    if (this.richMarkdownCache.size >= 512) this.richMarkdownCache.clear();
+    this.richMarkdownCache.set(key, entry);
+    const blocks = entry.blocks;
+    // 构建期间不改状态：图片预取放到下一轮事件循环。
+    setTimeout(() => {
+      for (let i = 0; i < blocks.length; i++) {
+        this.ensureInlineImageSources(blocks[i].inlineTokens);
+        for (let k = 0; k < blocks[i].itemTokens.length; k++) this.ensureInlineImageSources(blocks[i].itemTokens[k]);
+      }
+    }, 0);
+    return blocks;
   }
 
   @Builder
@@ -11359,7 +11598,8 @@ export struct TaskPageContent {
   }
 
   private copyMessage(item: RenderMessageItem): void {
-    this.copyPlainText(item.body, '已复制');
+    // 对齐 Mobile：assistant 整条复制走 richAnswerText，复制可读文本而不是组件源码。
+    this.copyPlainText(item.kind === 'assistant' ? richAnswerText(item.body) : item.body, '已复制');
   }
 
   private confirmFork(item: RenderMessageItem): void {

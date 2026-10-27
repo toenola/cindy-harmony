@@ -129,6 +129,7 @@ export class NewSessionEditDraft {
   permissionMode: string = '';
   planModeEnabled: boolean = false;
   fastMode: boolean = false;
+  fastModeTier: string = '';
   text: string = '';
   images: RemoteImageRef[] = [];
   files: RemoteSerializedAttachment[] = [];
@@ -292,6 +293,7 @@ export class NewSessionCreationStore {
       ? task.params.legacyPlanRestore : task.session.permissionMode;
     draft.planModeEnabled = task.session.planModeEnabled;
     draft.fastMode = task.session.fastMode;
+    draft.fastModeTier = task.session.fastModeTier;
     draft.text = task.firstMessageText;
     const extra = additionalText.trim();
     if (extra.length > 0) {

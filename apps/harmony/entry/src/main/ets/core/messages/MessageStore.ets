@@ -1,4 +1,5 @@
 import { RemoteReadRetries } from './RemoteReadRetries';
+import { fastModeWireValue } from '../tasks/ModelSpeed';
 import { projectedHistoryPrefix } from './HistoryViewAdapter';
 import { SnapshotReadPool } from './SnapshotReadPool';
 /**
@@ -203,7 +204,8 @@ class CreateOptsArgs {
   effort: string = '';
   permissionMode: string = '';
   planMode: boolean = false;
-  fastMode: boolean = false;
+  /** 布尔或 `'ultrafast'`（超快原样回传，避免 lazy create 时降级）。 */
+  fastMode: boolean | string = false;
 }
 
 class HistoryRefreshOperation {
@@ -3010,7 +3012,7 @@ export class MessageStore {
     createOpts.effort = session.effort;
     createOpts.permissionMode = session.permissionMode;
     createOpts.planMode = session.planModeEnabled;
-    createOpts.fastMode = session.fastMode;
+    createOpts.fastMode = fastModeWireValue(session.fastMode, session.fastModeTier);
 
     const sendOpts: Record<string, Object> = {};
     sendOpts['messageUuid'] = clientId;

@@ -217,6 +217,9 @@ function toolPresentationState(tool: RenderToolItem): string {
   for (let i = 0; i < tool.richMedia.length; i++) {
     mediaState.push(`${tool.richMedia[i].kind}:${textRevision(tool.richMedia[i].url)}`);
   }
+  for (let i = 0; i < tool.processMedia.length; i++) {
+    mediaState.push(`p:${tool.processMedia[i].kind}:${textRevision(tool.processMedia[i].url)}`);
+  }
   return [
     `id:${textRevision(tool.toolUseId)}`,
     `n:${textRevision(tool.toolName)}`,
@@ -227,6 +230,7 @@ function toolPresentationState(tool: RenderToolItem): string {
     `a:${textRevision(tool.agentTaskStatus)}`,
     `d:${tool.diff === null ? '0' : '1'}`,
     `m:${mediaState.join(',')}`,
+    `f:${textRevision(tool.failedImageDeliveryId)}`,
   ].join('|');
 }
 

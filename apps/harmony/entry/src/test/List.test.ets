@@ -10,6 +10,9 @@ import v132RenderingTests from './V132Rendering.test';
 import v132PresentationTests from './V132Presentation.test';
 import v132DeletionTests from './V132Deletion.test';
 import v132DeliveryTests from './V132Delivery.test';
+import v133RichAnswerTests from './V133RichAnswer.test';
+import v133SpeedTests from './V133Speed.test';
+import v133PresentationTests from './V133Presentation.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -24,4 +27,7 @@ export default function testsuite() {
   v132PresentationTests();
   v132DeletionTests();
   v132DeliveryTests();
+  v133RichAnswerTests();
+  v133SpeedTests();
+  v133PresentationTests();
 }

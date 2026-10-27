@@ -1,5 +1,7 @@
 import { readObj, readStr } from '../tasks/TaskModels';
 
+const MCP_APP_PLUGIN_PREFIX = 'mcp-app:';
+
 export class MessageSourceBadge {
   kind: string = '';
   id: string = '';
@@ -19,9 +21,17 @@ export function messageSourceBadges(meta: Record<string, Object>, viewerDeviceId
   const origin = readObj(meta, 'origin');
   if (readStr(plugin, 'pluginId').trim().length > 0) {
     const badge = new MessageSourceBadge();
-    badge.kind = 'plugin';
-    badge.id = readStr(plugin, 'pluginId').trim();
+    const pluginId = readStr(plugin, 'pluginId').trim();
     badge.name = sanitizeSourceName(readStr(plugin, 'name'));
+    // 对齐共享 messageSourceIdEntries：MCP App 用 `mcp-app:<serverId>` 记来源，ID 只露服务器 ID。
+    if (pluginId.startsWith(MCP_APP_PLUGIN_PREFIX) && pluginId.length > MCP_APP_PLUGIN_PREFIX.length) {
+      badge.kind = 'mcpApp';
+      badge.id = pluginId.slice(MCP_APP_PLUGIN_PREFIX.length);
+      if (badge.name.length === 0) badge.name = sanitizeSourceName(badge.id);
+    } else {
+      badge.kind = 'plugin';
+      badge.id = pluginId;
+    }
     result.push(badge);
   } else if (readStr(origin, 'kind') === 'session') {
     const badge = new MessageSourceBadge();

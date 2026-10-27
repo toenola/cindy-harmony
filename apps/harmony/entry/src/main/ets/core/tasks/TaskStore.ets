@@ -9,6 +9,7 @@
  *   鸿蒙端不做本地持久化真相。
  */
 
+import { writeFastMode } from './ModelSpeed';
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { PresenceSnapshot, DlChannels, Envelope } from '../device-link/DlProtocol';
 import {
@@ -743,6 +744,7 @@ export class TaskStore {
     merged.permissionMode = base.permissionMode;
     merged.planModeEnabled = base.planModeEnabled;
     merged.fastMode = base.fastMode;
+    merged.fastModeTier = base.fastModeTier;
     merged.sdkSessionId = base.sdkSessionId;
     merged.totalTokenUsage = base.totalTokenUsage;
     merged.contextTokens = base.contextTokens;
@@ -759,7 +761,9 @@ export class TaskStore {
     merged.preview = base.preview;
     merged.messageCount = base.messageCount;
     merged.pendingLocalCreation = base.pendingLocalCreation;
-    return parseSession(mergeFields(this.sessionToRecord(merged), patch));
+    const record = this.sessionToRecord(merged);
+    if (Object.keys(patch).includes('fastMode')) record['fastModeTier'] = '';
+    return parseSession(mergeFields(record, patch));
   }
 
   private sessionToRecord(s: RemoteSession): Record<string, Object> {
@@ -779,7 +783,7 @@ export class TaskStore {
     out['effort'] = s.effort;
     out['permissionMode'] = s.permissionMode;
     out['planModeEnabled'] = s.planModeEnabled;
-    out['fastMode'] = s.fastMode;
+    writeFastMode(out, s.fastMode, s.fastModeTier);
     out['sdkSessionId'] = s.sdkSessionId;
     out['totalTokenUsage'] = s.totalTokenUsage;
     out['contextTokens'] = s.contextTokens;

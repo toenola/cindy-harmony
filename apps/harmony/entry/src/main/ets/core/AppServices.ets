@@ -32,6 +32,7 @@ import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
 import { SecurityObservabilityAdapter } from './observability/SecurityObservabilityAdapter';
 import { InputQueueStore, isTerminalMakerInputEvent } from './messages/InputQueueStore';
+import { RichInteractionMemory, SecureStoreRichStateStorage } from './messages/RichInteractionMemory';
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
 import { NewSessionPreferenceStore } from './tasks/NewSessionPreferenceStore';
@@ -64,6 +65,9 @@ export class AppServices {
   readonly messages: MessageStore = new MessageStore();
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
+  private readonly richAnswerStorage: SecureStoreRichStateStorage = new SecureStoreRichStateStorage();
+  /** 富组件回答的本机视图值；键已包含账号，退出登录无需清理。 */
+  readonly richAnswerMemory: RichInteractionMemory = new RichInteractionMemory(this.richAnswerStorage);
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly newSessionPreferences: NewSessionPreferenceStore = new NewSessionPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
@@ -254,6 +258,7 @@ export class AppServices {
     await Promise.all([
       this.auth.init(context),
       this.composerDrafts.init(context),
+      this.richAnswerStorage.init(context),
       this.taskListPreferences.init(context),
       this.newSessionPreferences.init(context),
       this.taskListSnapshot.init(context),

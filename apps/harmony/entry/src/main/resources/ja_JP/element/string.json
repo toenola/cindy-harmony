@@ -159,6 +159,21 @@
     {"name":"v132_delivery_absent","value":"コンピュータはこのメッセージを受信していないことを確認しました。再送信できます。"},
     {"name":"v132_delivery_check_done","value":"配信状態を更新しました。"},
     {"name":"v132_delivery_check_failed","value":"配信状態を確認できません。接続を確認して再試行してください。"},
-    {"name":"v132_delivery_send_failed","value":"送信が完了しませんでした。接続を確認して再試行してください。"}
+    {"name":"v132_delivery_send_failed","value":"送信が完了しませんでした。接続を確認して再試行してください。"},
+    {"name":"v133_rich_calc_unavailable","value":"この値を計算できません。"},
+    {"name":"v133_rich_incomplete","value":"一部の内容を表示できませんでした。"},
+    {"name":"v133_rich_open_video","value":"元の動画を開く"},
+    {"name":"v133_rich_open_media","value":"メディアを開く"},
+    {"name":"v133_speed_label","value":"速度"},
+    {"name":"v133_speed_standard","value":"標準"},
+    {"name":"v133_speed_fast","value":"高速"},
+    {"name":"v133_speed_ultrafast","value":"超高速"},
+    {"name":"v133_failed_sampling_attempt","value":"この返信は完了しませんでした。内容は参考情報としてご覧ください。"},
+    {"name":"v133_image_delivery_failed","value":"画像の転送に失敗しました。既存の画像の転送を再試行できます。"},
+    {"name":"v133_image_delivery_retry","value":"転送を再試行"},
+    {"name":"v133_image_delivery_retrying","value":"転送中…"},
+    {"name":"v133_image_delivery_retry_failed","value":"転送できません。画像を生成したパソコンがオンラインか確認してください。"},
+    {"name":"v133_source_mcp_app_named","value":"MCP App「%s」から送信"},
+    {"name":"v133_source_mcp_server_id","value":"MCP サーバー ID：%s"}
   ]
 }

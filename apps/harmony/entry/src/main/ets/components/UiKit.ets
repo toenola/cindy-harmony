@@ -48,6 +48,9 @@ export function uiScaledMaxWidth(base: number, cap: number): number {
 }
 
 /** 三档圆角（DESIGN.md §5）：内部控件 / 容器 / 胶囊。 */
+/** EntryAbility 写入当前深浅色；Canvas 绘制内容据此重绘（资源色不会自动刷新画布）。 */
+export const UI_COLOR_MODE_STORAGE_KEY = 'cindyColorMode';
+
 export const UI_RADIUS_CONTROL = 8;
 export const UI_RADIUS_CONTAINER = 12;
 export const UI_RADIUS_PILL = 999;

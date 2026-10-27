@@ -23,6 +23,9 @@ import {
   RenderWorkGroupItem,
 } from '../messages/MessageRender';
 import { readObj } from '../tasks/TaskModels';
+import { RichValue, richAnswerVisibleText } from '../messages/RichAnswer';
+
+export type ShareRichStateReader = (message: RenderMessageItem, partKey: number) => Map<string, RichValue>;
 
 /** 单张导出图任一边的保守像素上限（设备实际值可用 hidumper vktextureLimit 查询）。 */
 export const SHARE_MAX_IMAGE_EDGE_PX = 8192;
@@ -80,6 +83,7 @@ export function freezeShareProjection(
   expandedKeys: Set<string>,
   collapsedUserTextLimit: number,
   visibleUserTextOverrides: Map<string, string> | undefined = undefined,
+  readRichState?: ShareRichStateReader,
 ): ShareProjection {
   const out = new ShareProjection();
   for (let i = 0; i < items.length; i++) {
@@ -97,7 +101,7 @@ export function freezeShareProjection(
         projected.text = overriddenText;
         if (overriddenText !== message.body) out.omittedCollapsedContent = true;
       } else {
-        const visible = visibleUserText(message, collapsedUserTextLimit);
+        const visible = visibleUserText(message, collapsedUserTextLimit, readRichState);
         projected.text = visible.text;
         if (visible.truncated) out.omittedCollapsedContent = true;
       }
@@ -123,7 +127,7 @@ export function freezeShareProjection(
       projected.kind = 'work';
       const work = workGroupShareText(
         item as RenderWorkGroupItem, expandedKeys, collapsedUserTextLimit,
-        visibleUserTextOverrides,
+        visibleUserTextOverrides, readRichState,
       );
       projected.text = work.text;
       out.omittedCollapsedContent = out.omittedCollapsedContent || work.omitted;
@@ -133,7 +137,7 @@ export function freezeShareProjection(
       projected.kind = 'work';
       const subagent = item as RenderSubagentGroupItem;
       const work = subagentShareText(
-        subagent, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides,
+        subagent, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, readRichState,
       );
       projected.text = work.text;
       out.omittedCollapsedContent = out.omittedCollapsedContent || work.omitted;
@@ -162,10 +166,11 @@ function workGroupShareText(
   expandedKeys: Set<string>,
   collapsedUserTextLimit: number,
   visibleUserTextOverrides: Map<string, string> | undefined,
+  readRichState: ShareRichStateReader | undefined,
 ): WorkShareText {
   const result = new WorkShareText();
   collectWorkShareText(
-    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result,
+    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result, readRichState,
   );
   return result;
 }
@@ -175,10 +180,11 @@ function subagentShareText(
   expandedKeys: Set<string>,
   collapsedUserTextLimit: number,
   visibleUserTextOverrides: Map<string, string> | undefined,
+  readRichState: ShareRichStateReader | undefined,
 ): WorkShareText {
   const result = new WorkShareText();
   collectWorkShareText(
-    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result,
+    group.children, expandedKeys, collapsedUserTextLimit, visibleUserTextOverrides, result, readRichState,
   );
   return result;
 }
@@ -189,6 +195,7 @@ function collectWorkShareText(
   collapsedUserTextLimit: number,
   visibleUserTextOverrides: Map<string, string> | undefined,
   result: WorkShareText,
+  readRichState: ShareRichStateReader | undefined,
 ): void {
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -201,7 +208,7 @@ function collectWorkShareText(
         if (overriddenText !== message.body) result.omitted = true;
         continue;
       }
-      const visible = visibleUserText(message, collapsedUserTextLimit);
+      const visible = visibleUserText(message, collapsedUserTextLimit, readRichState);
       appendWorkSharePart(result, visible.text);
       if (visible.truncated) result.omitted = true;
       continue;
@@ -211,7 +218,7 @@ function collectWorkShareText(
       // 折叠入口，因此父组打开后递归读取其子树即可。
       collectWorkShareText(
         (item as RenderWorkGroupItem).children, expandedKeys, collapsedUserTextLimit,
-        visibleUserTextOverrides, result,
+        visibleUserTextOverrides, result, readRichState,
       );
       continue;
     }
@@ -238,7 +245,7 @@ function collectWorkShareText(
       }
       collectWorkShareText(
         subagent.children, expandedKeys, collapsedUserTextLimit,
-        visibleUserTextOverrides, result,
+        visibleUserTextOverrides, result, readRichState,
       );
     }
   }
@@ -257,9 +264,18 @@ function isShareableMessage(message: RenderMessageItem): boolean {
 }
 
 /** 长用户消息收起后只导出可见行，与屏幕一致。 */
-function visibleUserText(message: RenderMessageItem, collapsedLimit: number): VisibleText {
+function visibleUserText(message: RenderMessageItem, collapsedLimit: number,
+  readRichState: ShareRichStateReader | undefined): VisibleText {
   const result = new VisibleText();
+  // 分享卡是纯文本投影：富组件回答导出为可读文本，而不是 cindy-ui 源码。
   result.text = message.body;
+  if (message.kind === 'assistant') {
+    const readEdited = readRichState === undefined ? undefined
+      : (partKey: number): Map<string, RichValue> => readRichState(message, partKey);
+    const snapshot = richAnswerVisibleText(message.body, readEdited, message.message?.isStreaming !== true);
+    result.text = snapshot.text;
+    result.truncated = snapshot.omittedCollapsedContent;
+  }
   if (message.kind !== 'user' || collapsedLimit <= 0) return result;
   const lines = message.body.split('\n');
   if (lines.length <= collapsedLimit) return result;

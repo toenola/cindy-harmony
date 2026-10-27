@@ -20,6 +20,8 @@ export class ComposerModelOption {
   efforts: string[] = [];
   defaultEffort: string = '';
   supportsFastMode: boolean = false;
+  /** Codex 模型明确声明的超快档能力（#6559）；旧 Host 缺省 false。 */
+  supportsUltrafastMode: boolean = false;
   effortDisplayNames: Record<string, string> = {};
   /** provider-aware 目录行；空值表示旧 capabilities 扁平回退。 */
   providerId: string = '';
@@ -228,6 +230,7 @@ export function parseModelOptions(value: Object | undefined): ComposerModelOptio
       option.description = readStr(record, 'description');
       option.defaultEffort = readStr(record, 'defaultEffort');
       option.supportsFastMode = readBool(record, 'supportsFastMode', false);
+      option.supportsUltrafastMode = readBool(record, 'supportsUltrafastMode', false);
       option.availability = readAvailability(record);
       option.contextWindow = readNum(record, 'contextWindow', 0);
       readNewSessionDefaults(record, option);
@@ -392,6 +395,7 @@ export function parseProviderModelOptions(
       option.description = readStr(model, 'description');
       option.defaultEffort = readStr(model, 'defaultEffort');
       option.supportsFastMode = readBool(model, 'supportsFastMode', false);
+      option.supportsUltrafastMode = readBool(model, 'supportsUltrafastMode', false);
       readNewSessionDefaults(model, option);
       readEffortDisplayNames(model, option);
       option.providerId = providerId;

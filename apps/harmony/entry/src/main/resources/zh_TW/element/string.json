@@ -159,6 +159,21 @@
     {"name":"v132_delivery_absent","value":"電腦確認沒有收到這則訊息，可以重試傳送。"},
     {"name":"v132_delivery_check_done","value":"投遞狀態已更新。"},
     {"name":"v132_delivery_check_failed","value":"暫時無法核對投遞狀態，請檢查連線後重試。"},
-    {"name":"v132_delivery_send_failed","value":"傳送暫未完成，請檢查連線後重試。"}
+    {"name":"v132_delivery_send_failed","value":"傳送暫未完成，請檢查連線後重試。"},
+    {"name":"v133_rich_calc_unavailable","value":"此項暫時無法計算。"},
+    {"name":"v133_rich_incomplete","value":"部分內容未能顯示。"},
+    {"name":"v133_rich_open_video","value":"開啟原影片"},
+    {"name":"v133_rich_open_media","value":"開啟媒體"},
+    {"name":"v133_speed_label","value":"速度"},
+    {"name":"v133_speed_standard","value":"標準"},
+    {"name":"v133_speed_fast","value":"快速"},
+    {"name":"v133_speed_ultrafast","value":"超快"},
+    {"name":"v133_failed_sampling_attempt","value":"此回覆未完成，內容僅供參考。"},
+    {"name":"v133_image_delivery_failed","value":"圖片交付失敗，可重試傳輸已有圖片。"},
+    {"name":"v133_image_delivery_retry","value":"重試交付"},
+    {"name":"v133_image_delivery_retrying","value":"正在交付…"},
+    {"name":"v133_image_delivery_retry_failed","value":"暫時無法交付，請確認產生圖片的電腦在線。"},
+    {"name":"v133_source_mcp_app_named","value":"由 MCP App「%s」傳送"},
+    {"name":"v133_source_mcp_server_id","value":"MCP 伺服器 ID：%s"}
   ]
 }

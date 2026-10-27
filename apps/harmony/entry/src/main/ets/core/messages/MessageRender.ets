@@ -16,6 +16,10 @@ import {
   RemoteMessage, readStr, readObj, readAny,
 } from '../tasks/TaskModels';
 import { parseMarkdown, MdBlock } from './MarkdownParser';
+import { RichPart, hasRichAnswer, splitRichAnswer } from './RichAnswer';
+import {
+  ProcessMediaRef, readFailedImageDelivery, readToolProcessMedia, readToolProcessText,
+} from './ToolProcessMedia';
 import { sanitizeInternalOutput, stripGoalVerdictBlock } from './InternalOutputSanitizer';
 import { parseToolResultCompactionMarker, toolResultCompactionPreview } from './ToolResultCompaction';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
@@ -100,6 +104,31 @@ function parseMessageMarkdown(identity: string, text: string): MdBlock[] {
   return entry.blocks;
 }
 
+/** 对齐 Mobile `MarkdownBody`：只有显式 `cindy-ui` 围栏才切分，其余仍是一段 Markdown。 */
+export function buildRichParts(identity: string, body: string, streaming: boolean): RenderRichPart[] {
+  if (!hasRichAnswer(body)) return [];
+  return splitRichAnswer(body).map((part: RichPart) => {
+    const rendered = new RenderRichPart();
+    rendered.kind = part.kind;
+    rendered.key = part.key;
+    rendered.source = part.source;
+    rendered.complete = part.complete || !streaming;
+    if (part.kind === 'markdown') {
+      rendered.mdBlocks = identity.length > 0
+        ? parseMessageMarkdown(`${identity}:rich-md:${part.key}`, part.source) : parseMarkdown(part.source);
+    }
+    return rendered;
+  });
+}
+
+function richPartMarkdownBlocks(parts: RenderRichPart[]): MdBlock[] {
+  const blocks: MdBlock[] = [];
+  parts.forEach((part: RenderRichPart) => {
+    part.mdBlocks.forEach((block: MdBlock) => blocks.push(block));
+  });
+  return blocks;
+}
+
 // ─── 渲染项类型 ──────────────────────────────────────────────────────────────
 
 export class RenderItem {
@@ -129,6 +158,16 @@ export class RenderTextSegment {
   mdBlocks: MdBlock[] = [];
 }
 
+/** assistant 正文中的一段：普通 Markdown，或一个 `cindy-ui` 富组件文档。 */
+export class RenderRichPart {
+  kind: string = 'markdown'; // markdown | rich
+  key: number = 0;
+  source: string = '';
+  /** 富组件段已闭合，或整条消息已不在流式中。 */
+  complete: boolean = false;
+  mdBlocks: MdBlock[] = [];
+}
+
 /** 普通消息块（user / assistant / system / error / agent_switch …）。 */
 export class RenderMessageItem extends RenderItem {
   kind: string = '';
@@ -138,6 +177,8 @@ export class RenderMessageItem extends RenderItem {
   mdBlocks: MdBlock[] = [];
   /** user 消息按内容特征切出的渲染段（长文本折叠 / 正常）。 */
   segments: RenderTextSegment[] = [];
+  /** assistant 含 `cindy-ui` 围栏时的分段；为空时按 mdBlocks 渲染。 */
+  richParts: RenderRichPart[] = [];
   /** user 消息携带的图片引用（content.images，URL 为 cindy-oss-attach 或 OSS 直链）。 */
   images: RemoteImageRef[] = [];
   /** user 消息携带的普通文件；与 Mobile 一致放在正文气泡外。 */
@@ -452,6 +493,10 @@ export class RenderToolItem {
   media: RemoteImageRef[] = [];
   /** 视频、音频和图片的统一媒体描述；images 字段继续保留兼容旧视图。 */
   richMedia: RenderMediaPayload[] = [];
+  /** 工具原生过程媒体（cindy_process_media 信封）；留在本工具步骤内，不升级为交付媒体。 */
+  processMedia: ProcessMediaRef[] = [];
+  /** Host 签发的生图交付失败记录；非空时可重试交付已有图片。 */
+  failedImageDeliveryId: string = '';
   /** Edit / MultiEdit / Write 的结构化变更预览。 */
   diff: RenderDiffPayload | null = null;
   /** 调用发起时间 ISO（work_group 时长计算用）。 */
@@ -1618,6 +1663,16 @@ function buildLinearRenderItems(
   const adjacentResultByMessageId = new Map<string, string>();
   const adjacentMediaByMessageId = new Map<string, RemoteImageRef[]>();
   const adjacentRichMediaByMessageId = new Map<string, RenderMediaPayload[]>();
+  const processMediaByKey = new Map<string, ProcessMediaRef[]>();
+  const failedImageByKey = new Map<string, string>();
+  // 信封在这里统一剥掉：媒体与交付记录先从原文读出，下游解析与展示只看信封里的文字。
+  const readToolResult = (key: string, raw: string): string => {
+    const media = readToolProcessMedia(raw);
+    if (media.length > 0) processMediaByKey.set(key, media);
+    const failed = readFailedImageDelivery(raw);
+    if (failed.length > 0) failedImageByKey.set(key, failed);
+    return readToolProcessText(raw);
+  };
   const adjacentErrorMessageIds = new Set<string>();
   const adjacentSettledMessageIds = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
@@ -1636,7 +1691,7 @@ function buildLinearRenderItems(
     if (useId.length === 0) continue;
     settledUseIds.add(useId);
     resultAtByUseId.set(useId, m.createdAt);
-    const fullResult = contentPreview(m.content);
+    const fullResult = readToolResult(`use:${useId}`, contentPreview(m.content));
     if (toolResultHasError(m, toolNameByUseId.get(useId) ?? '')) resultErrorByUseId.set(useId, true);
     const media = extractToolResultImages(fullResult);
     const richMedia = extractToolResultMedia(fullResult);
@@ -1655,7 +1710,7 @@ function buildLinearRenderItems(
     const useInfo = parseToolUse(use);
     adjacentSettledMessageIds.add(use.id);
     if (toolResultHasError(result, useInfo.toolName)) adjacentErrorMessageIds.add(use.id);
-    const fullResult = contentPreview(result.content);
+    const fullResult = readToolResult(`adjacent:${use.id}`, contentPreview(result.content));
     const media = extractToolResultImages(fullResult);
     const richMedia = extractToolResultMedia(fullResult);
     if (media.length > 0) adjacentMediaByMessageId.set(use.id, media);
@@ -1793,12 +1848,16 @@ function buildLinearRenderItems(
         item.settledAt = resultAtByUseId.get(item.toolUseId) ?? '';
         item.media = mediaByUseId.get(item.toolUseId) ?? [];
         item.richMedia = richMediaByUseId.get(item.toolUseId) ?? [];
+        item.processMedia = processMediaByKey.get(`use:${item.toolUseId}`) ?? [];
+        item.failedImageDeliveryId = failedImageByKey.get(`use:${item.toolUseId}`) ?? '';
       } else if (adjacentSettledMessageIds.has(m.id)) {
         item.resultText = adjacentResultByMessageId.get(m.id) ?? '';
         item.hasResult = true;
         item.hasError = adjacentErrorMessageIds.has(m.id);
         item.media = adjacentMediaByMessageId.get(m.id) ?? [];
         item.richMedia = adjacentRichMediaByMessageId.get(m.id) ?? [];
+        item.processMedia = processMediaByKey.get(`adjacent:${m.id}`) ?? [];
+        item.failedImageDeliveryId = failedImageByKey.get(`adjacent:${m.id}`) ?? '';
       }
       item.createdAt = m.createdAt;
       if (pendingTools.length > 0 && shouldSplitToolGroup(pendingToolEndAt, item.createdAt)) {
@@ -1922,7 +1981,10 @@ function buildLinearRenderItems(
     if (item.kind === 'assistant' && item.body.trim().length === 0) continue;
     const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
     const identity = rawIdentity.length > 0 ? `${m.sessionId}:${rawIdentity}` : '';
-    item.mdBlocks = parseMessageMarkdown(identity, item.body);
+    item.richParts = item.kind === 'assistant'
+      ? buildRichParts(identity, item.body, m.isStreaming === true) : [];
+    item.mdBlocks = item.richParts.length > 0
+      ? richPartMarkdownBlocks(item.richParts) : parseMessageMarkdown(identity, item.body);
     item.message = m;
     if (item.kind === 'assistant') {
       item.isTurnFinalAssistant = rawIdentity.length > 0 && finalAssistantIds.has(rawIdentity);
@@ -2472,7 +2534,15 @@ function isAssistantAnswerCandidate(item: RenderItem): boolean {
   const message = (item as RenderMessageItem).message;
   return (item as RenderMessageItem).kind === 'assistant'
     && message !== undefined
+    && !message.failedSamplingAttempt
     && (item as RenderMessageItem).body.trim().length > 0;
+}
+
+/** 已证实失败的采样输出：沿用工作过程折叠，绝不当最终回答（对齐共享 isWorkActivityItem）。 */
+function isFailedSamplingItem(item: RenderItem): boolean {
+  if (item.type !== 'message') return false;
+  const message = (item as RenderMessageItem).message;
+  return (item as RenderMessageItem).kind === 'assistant' && message !== undefined && message.failedSamplingAttempt;
 }
 
 function isCompactBoundaryItem(item: RenderItem): boolean {
@@ -2495,7 +2565,7 @@ function isWorkActivityItem(item: RenderItem): boolean {
       tool?.agentTaskStatus ?? '',
     ) !== 'running';
   }
-  return item.type === 'thinking' || item.type === 'tool_group';
+  return item.type === 'thinking' || item.type === 'tool_group' || isFailedSamplingItem(item);
 }
 
 function isWorkChild(item: RenderItem): boolean {
@@ -2505,6 +2575,8 @@ function isWorkChild(item: RenderItem): boolean {
 function isDeliveryProseItem(item: RenderItem): boolean {
   if (!isAssistantAnswerCandidate(item)) return false;
   const body = ((item as RenderMessageItem).body).trim();
+  // 对齐共享 isDeliveryProseText：富组件回答本身就是交付内容。
+  if ((item as RenderMessageItem).richParts.length > 0 || hasRichAnswer(body)) return true;
   if (body.length >= DELIVERY_PROSE_MIN_LENGTH) return true;
   if (MARKDOWN_HEADING_RE.test(body) || MARKDOWN_TABLE_DIVIDER_RE.test(body)) return true;
   if (/!\[[^\]\n]*\]\([^)\s]+(?:\s[^)]*)?\)/.test(body)
@@ -2527,10 +2599,18 @@ function createWorkGroup(
 ): RenderWorkGroupItem {
   const group = new RenderWorkGroupItem();
   group.type = 'work_group';
-  group.key = `work-${workChildKey(children[0])}`;
+  // 失败采样正文也会进组：组身份与时长起点优先锚第一个真实动作（对齐共享 firstActivity）。
+  let firstActivity = children[0];
+  for (let i = 0; i < children.length; i++) {
+    if (!isFailedSamplingItem(children[i])) {
+      firstActivity = children[i];
+      break;
+    }
+  }
+  group.key = `work-${workChildKey(firstActivity)}`;
   group.children = children.slice();
   group.isStreaming = isStreaming;
-  const anchor = itemStartTimestamp(children[0]);
+  const anchor = itemStartTimestamp(firstActivity);
   // 段起点优先锚上一个边界（本轮用户消息 / 上一句正文），与桌面活表口径一致；
   // 边界缺失（窗口截断、历史空洞）或时序异常时退回段内首个动作时间。
   const start = previousBoundaryMs > 0 && (anchor <= 0 || previousBoundaryMs <= anchor)

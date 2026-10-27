@@ -6,6 +6,7 @@ import { RemoteReadRetries } from './RemoteReadRetries';
  * `maker:input:projection` push；页面只消费归一化投影。所有操作复用 Mobile
  * 已使用的 `maker:input:*` 通道，不创建 Harmony 专用协议。
  */
+import { fastModeWireValue } from '../tasks/ModelSpeed';
 import { DlClient, DlError, DlInvokeOptions, isSafeUnsentDlError } from '../device-link/DlClient';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
 import { RemoteSession, readBool, readObj, readStr, safeErrorMessage } from '../tasks/TaskModels';
@@ -2151,7 +2152,7 @@ export class InputQueueStore {
     createOpts['model'] = session.model;
     createOpts['effort'] = session.effort;
     createOpts['permissionMode'] = session.permissionMode.length > 0 ? session.permissionMode : 'ask';
-    createOpts['fastMode'] = session.fastMode;
+    createOpts['fastMode'] = fastModeWireValue(session.fastMode, session.fastModeTier);
     if (session.providerId.length > 0) createOpts['providerId'] = session.providerId;
     if (session.remoteHostId.length > 0) createOpts['remoteHostId'] = session.remoteHostId;
     if (session.sdkSessionId.length > 0) createOpts['resumeSessionId'] = session.sdkSessionId;
@@ -2345,7 +2346,7 @@ export class InputQueueStore {
     createOpts['permissionMode'] = session.permissionMode.length > 0 ? session.permissionMode : 'ask';
     createOpts['planMode'] = planModeOverride === null
       ? session.planModeEnabled : planModeOverride;
-    createOpts['fastMode'] = session.fastMode;
+    createOpts['fastMode'] = fastModeWireValue(session.fastMode, session.fastModeTier);
     createOpts['displayReasoning'] = 'summarized';
     if (session.providerId.length > 0) createOpts['providerId'] = session.providerId;
     if (session.remoteHostId.length > 0) createOpts['remoteHostId'] = session.remoteHostId;
