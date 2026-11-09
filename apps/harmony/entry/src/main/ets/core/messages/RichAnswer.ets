@@ -13,6 +13,7 @@ export const RICH_ANSWER_KINDS: string[] = [
   'range', 'input', 'check', 'select', 'button', 'form', 'details', 'tabs',
 ];
 export const RICH_CONTAINER_KINDS: string[] = ['stack', 'row', 'grid', 'group', 'form', 'details', 'tabs'];
+/** 渲染 `props.text` 的种类：只有它们能被 append，也只有它们接受裸字符串 props。 */
 const APPENDABLE_KINDS: string[] = ['text', 'markdown', 'heading', 'code', 'math', 'diagram'];
 const CONTROL_KINDS: string[] = ['input', 'range', 'select', 'check', 'tabs', 'details'];
 export const RICH_COLOR_ROLES: string[] = ['primary', 'secondary', 'tertiary', 'success', 'warning', 'danger'];
@@ -148,6 +149,27 @@ function cloneNode(node: RichNode): RichNode {
   return copy;
 }
 
+function textProps(text: string): Record<string, Object> {
+  const props: Record<string, Object> = {};
+  props['text'] = text;
+  return props;
+}
+
+function withoutKey(base: Record<string, Object>, omitted: string): Record<string, Object> {
+  const out: Record<string, Object> = {};
+  Object.keys(base).forEach((key: string) => {
+    if (key !== omitted) out[key] = base[key];
+  });
+  return out;
+}
+
+/** 结束行解析失败时的检查点；源文本变长后只从这一行重试。 */
+class RichLineCheckpoint {
+  offset: number = 0;
+  seq: number = 0;
+  issues: number = 0;
+}
+
 function mergeProps(base: Record<string, Object>, patch: Record<string, Object>): Record<string, Object> {
   const merged: Record<string, Object> = {};
   Object.keys(base).forEach((key: string) => { merged[key] = base[key]; });
@@ -162,8 +184,12 @@ export class RichAnswerStream {
   private seq: number = 0;
   private nodes: Map<string, RichNode> = new Map();
   private roots: string[] = [];
+  /** 容器 id → 承接直接 append 到该容器的正文的隐式 markdown 子节点。 */
+  private implicitText: Map<string, string> = new Map();
   private revision: number = 0;
   private issues: number = 0;
+  private failedFinalLine: RichLineCheckpoint | null = null;
+  private sourceTooLong: boolean = false;
 
   update(source: string, complete: boolean = false): RichDocument {
     if (!source.startsWith(this.source)) {
@@ -172,22 +198,40 @@ export class RichAnswerStream {
       this.seq = 0;
       this.nodes = new Map();
       this.roots = [];
+      this.implicitText.clear();
       this.issues = 0;
+      this.failedFinalLine = null;
       this.revision++;
+    } else if (this.failedFinalLine !== null && source.length > this.source.length && source.length <= MAX_SOURCE) {
+      // 只重试失败的那一行：已提交内容不能重放，坏后缀被消费过后重解析会得到不同结果。
+      const checkpoint = this.failedFinalLine as RichLineCheckpoint;
+      this.offset = checkpoint.offset;
+      this.seq = checkpoint.seq;
+      this.issues = checkpoint.issues;
+      this.failedFinalLine = null;
     }
     if (source.length > MAX_SOURCE) {
-      this.issues = Math.max(1, this.issues);
+      this.sourceTooLong = true;
       return this.snapshot();
     }
+    this.sourceTooLong = false;
     this.source = source;
     let end = source.indexOf('\n', this.offset);
     while (end !== -1) {
       this.line(source.slice(this.offset, end));
+      this.failedFinalLine = null;
       this.offset = end + 1;
       end = source.indexOf('\n', this.offset);
     }
     if (complete && this.offset < source.length) {
-      this.line(source.slice(this.offset));
+      const checkpoint = new RichLineCheckpoint();
+      checkpoint.offset = this.offset;
+      checkpoint.seq = this.seq;
+      checkpoint.issues = this.issues;
+      const failed = !this.line(source.slice(this.offset));
+      // 已提交尾部之后的后缀不是完整一行，后续快照延长它时不能当整行重试。
+      this.failedFinalLine = failed && (this.offset === 0 || source.charAt(this.offset - 1) === '\n')
+        ? checkpoint : null;
       this.offset = source.length;
     }
     return this.snapshot();
@@ -201,16 +245,19 @@ export class RichAnswerStream {
       node.children.forEach((child: string) => { doc.parents.set(child, node.id); });
     });
     doc.revision = this.revision;
-    doc.issues = this.issues;
+    doc.issues = this.sourceTooLong ? Math.max(1, this.issues) : this.issues;
     return doc;
   }
 
-  private line(line: string): void {
-    if (line.trim().length === 0) return;
+  /** 返回 false 表示这一行被拒绝（已计入 issues）。 */
+  private line(line: string): boolean {
+    if (line.trim().length === 0) return true;
     try {
       if (this.apply(JSON.parse(line) as Object)) this.revision++;
+      return true;
     } catch (_error) {
       this.issues++;
+      return false;
     }
   }
 
@@ -231,7 +278,8 @@ export class RichAnswerStream {
     if (typeof idValue !== 'string' || !ID.test(idValue)) throw new Error('id');
     const id = idValue as string;
     const current = this.nodes.get(id);
-    const props = this.props(op['props']);
+    const kindValue = op['kind'];
+    const props = this.props(op['props'], typeof kindValue === 'string' ? kindValue as string : undefined);
     // 部分真实输出把 style 放在 props 旁边，这里统一归一一次。
     if (richIsRecord(op['style']) && !hasKey(props, 'style')) props['style'] = this.props(op['style']);
     const kind = op['op'];
@@ -264,7 +312,10 @@ export class RichAnswerStream {
     const node = new RichNode();
     node.id = id;
     node.kind = kindValue as string;
-    node.props = props;
+    // #7627：容器把子节点内联写在 props.children 里时，还原成真正的子节点。
+    const inline = props['children'];
+    const inlineChildren = Array.isArray(inline) && RICH_CONTAINER_KINDS.includes(node.kind);
+    node.props = inlineChildren ? withoutKey(props, 'children') : props;
     this.nodes.set(id, node);
     const index = this.insertIndex(op['index']);
     if (parent !== undefined) {
@@ -276,16 +327,108 @@ export class RichAnswerStream {
       this.roots = this.roots.slice();
       this.roots.splice(index, 0, id);
     }
+    if (inlineChildren) this.attachInlineChildren(id, inline as Object[], this.depth(id) + 1);
+  }
+
+  /** #7627：内联写在 props 里的子节点按原意成为子节点；单个坏草稿只计 issue，不连累兄弟节点。 */
+  private attachInlineChildren(parentId: string, drafts: Object[], childDepth: number): void {
+    const parent = this.nodes.get(parentId);
+    if (parent === undefined) return;
+    const children = parent.children.slice();
+    for (let offset = 0; offset < drafts.length; offset++) {
+      const draft = drafts[offset];
+      if (!richIsRecord(draft)) {
+        this.issues++;
+        continue;
+      }
+      const record = draft as Record<string, Object>;
+      const kindValue = record['kind'];
+      if (typeof kindValue !== 'string' || !RICH_ANSWER_KINDS.includes(kindValue as string)
+        || childDepth > RICH_MAX_DEPTH || this.nodes.size >= MAX_NODES) {
+        this.issues++;
+        continue;
+      }
+      const kind = kindValue as string;
+      const rawProps = record['props'];
+      const rawText = record['text'];
+      let props: Record<string, Object> | null = null;
+      try {
+        props = this.props(rawProps !== undefined && rawProps !== null ? rawProps
+          : typeof rawText === 'string' ? textProps(rawText as string) : undefined, kind);
+      } catch (_error) {
+        props = null;
+      }
+      if (props === null) {
+        this.issues++;
+        continue;
+      }
+      // 草稿可以自带 id（tabs.props.default 会指向它），仍空闲时优先使用。
+      const declaredId = record['id'];
+      const declared = typeof declaredId === 'string' && ID.test(declaredId as string)
+        && !this.nodes.has(declaredId as string);
+      const id = declared ? declaredId as string : this.inlineChildId(parentId, offset + 1);
+      // children 可以写在草稿本身或它的 props 里，两者同义，嵌套同样受深度上限约束。
+      const ownChildren = record['children'];
+      const nested = Array.isArray(ownChildren) ? ownChildren : props['children'];
+      const nestedChildren = Array.isArray(nested) && RICH_CONTAINER_KINDS.includes(kind);
+      const node = new RichNode();
+      node.id = id;
+      node.kind = kind;
+      node.props = nestedChildren ? withoutKey(props, 'children') : props;
+      this.nodes.set(id, node);
+      children.push(id);
+      if (nestedChildren) this.attachInlineChildren(id, nested as Object[], childDepth + 1);
+    }
+    const next = cloneNode(parent);
+    next.children = children;
+    this.nodes.set(parentId, next);
+  }
+
+  private inlineChildId(parentId: string, ordinal: number): string {
+    // id 语法上限 80 字符，先给后缀留位置。
+    let attempt = 1;
+    while (true) {
+      const suffix = attempt === 1 ? `-${ordinal}` : `-${ordinal}-${attempt}`;
+      const id = `${parentId.slice(0, 80 - suffix.length)}${suffix}`;
+      if (!this.nodes.has(id)) return id;
+      attempt++;
+    }
   }
 
   private append(op: Record<string, Object>, current: RichNode | undefined): void {
     const text = op['text'];
-    if (current === undefined || !APPENDABLE_KINDS.includes(current.kind) || typeof text !== 'string') {
-      throw new Error('text');
+    if (current === undefined || typeof text !== 'string') throw new Error('text');
+    if (APPENDABLE_KINDS.includes(current.kind)) {
+      this.appendText(current, text as string);
+      return;
     }
+    if (!RICH_CONTAINER_KINDS.includes(current.kind)) throw new Error('text');
+    // 模型会把正文直接 append 到容器上；容器不渲染文字，正文落进该容器的隐式 markdown 子节点，
+    // 不能整段丢弃。只在它仍是容器最后一个子节点时续写，否则会打乱模型书写的顺序。
+    const existing = this.implicitText.get(current.id);
+    const child = existing !== undefined ? this.nodes.get(existing) : undefined;
+    if (child !== undefined && child.kind === 'markdown' && current.children.length > 0
+      && current.children[current.children.length - 1] === existing) {
+      this.appendText(child, text as string);
+      return;
+    }
+    // 只有新建节点受数量与深度上限约束；续写已有子节点不受影响。
+    if (this.nodes.size >= MAX_NODES || this.depth(current.id) >= RICH_MAX_DEPTH) throw new Error('depth');
+    const node = new RichNode();
+    node.id = this.inlineChildId(current.id, 1);
+    node.kind = 'markdown';
+    node.props = this.props(textProps(text as string), 'markdown');
+    this.nodes.set(node.id, node);
+    const next = cloneNode(current);
+    next.children = current.children.concat([node.id]);
+    this.nodes.set(current.id, next);
+    this.implicitText.set(current.id, node.id);
+  }
+
+  private appendText(current: RichNode, text: string): void {
     const next = cloneNode(current);
     const patch: Record<string, Object> = {};
-    patch['text'] = richString(current, 'text') + (text as string);
+    patch['text'] = richString(current, 'text') + text;
     next.props = mergeProps(current.props, patch);
     this.nodes.set(current.id, next);
   }
@@ -296,8 +439,15 @@ export class RichAnswerStream {
       const node = this.nodes.get(nodeId);
       if (node !== undefined) node.children.forEach((child: string) => removeTree(child));
       this.nodes.delete(nodeId);
+      // 子树已删除，它的隐式正文映射不能再复用。
+      this.implicitText.delete(nodeId);
     };
     removeTree(current.id);
+    const stale: string[] = [];
+    this.implicitText.forEach((child: string, container: string) => {
+      if (!this.nodes.has(child)) stale.push(container);
+    });
+    stale.forEach((container: string) => { this.implicitText.delete(container); });
     this.detach(current.id);
   }
 
@@ -345,8 +495,15 @@ export class RichAnswerStream {
       ? Math.max(0, value as number) : Number.MAX_SAFE_INTEGER;
   }
 
-  private props(value: Object | undefined): Record<string, Object> {
+  private props(value: Object | undefined, kind: string | undefined = undefined): Record<string, Object> {
     if (value === undefined) return {};
+    // 模型会把正文直接写成 `"props": "hello"`；只有渲染 text 的种类接受，其他种类存了也显示不出来。
+    if (typeof value === 'string') {
+      if (kind !== undefined && !APPENDABLE_KINDS.includes(kind)) throw new Error('props');
+      const text = textProps(value as string);
+      if (JSON.stringify(text).length > MAX_PROPS) throw new Error('props');
+      return text;
+    }
     if (!richIsRecord(value) || JSON.stringify(value).length > MAX_PROPS) throw new Error('props');
     const source = value as Record<string, Object>;
     const out: Record<string, Object> = {};
@@ -603,11 +760,26 @@ export function richMarkdown(node: RichNode): string | null {
 export function richMediaSource(node: RichNode): string | null {
   const src = richString(node, 'src').trim();
   if (src.length === 0 || /[\r\n]/.test(src)) return null;
-  if (/^[a-zA-Z][\w+.-]*:/.test(src) && !/^[a-zA-Z]:[\\/]/.test(src)
-    && !/^(https?:\/\/|file:\/\/|xdt-(?:file|image|video|audio):\/\/|cindy-(?:remote-)?media:\/\/)/.test(src)) {
-    return null;
+  const allowed = /^(https?|file|xdt-(?:file|image|video|audio)|cindy-(?:remote-)?media):\/\//i.exec(src);
+  if (/^[a-zA-Z][\w+.-]*:/.test(src) && !/^[a-zA-Z]:[\\/]/.test(src) && allowed === null) return null;
+  return allowed !== null ? allowed[1].toLowerCase() + src.slice(allowed[1].length) : src;
+}
+
+/** 富组件实际渲染的媒体地址（不含代码示例与已删除节点）；用于去掉工具结果里的重复预览。 */
+export function richAnswerMediaSources(source: string): Set<string> {
+  const urls = new Set<string>();
+  if (source.indexOf(RICH_ANSWER_LANGUAGE) === -1) return urls;
+  const parts = splitRichAnswer(source);
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].kind !== 'rich') continue;
+    const doc = new RichAnswerStream().update(parts[i].source, true);
+    doc.nodes.forEach((node: RichNode) => {
+      if (node.kind !== 'image' && node.kind !== 'video' && node.kind !== 'audio') return;
+      const url = richMediaSource(node);
+      if (url !== null) urls.add(url);
+    });
   }
-  return src;
+  return urls;
 }
 
 export class RichChartPoint {

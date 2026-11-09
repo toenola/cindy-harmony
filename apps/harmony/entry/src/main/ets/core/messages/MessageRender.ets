@@ -16,7 +16,7 @@ import {
   RemoteMessage, readStr, readObj, readAny,
 } from '../tasks/TaskModels';
 import { parseMarkdown, MdBlock } from './MarkdownParser';
-import { RichPart, hasRichAnswer, splitRichAnswer } from './RichAnswer';
+import { RichPart, hasRichAnswer, richAnswerMediaSources, splitRichAnswer } from './RichAnswer';
 import {
   ProcessMediaRef, readFailedImageDelivery, readToolProcessMedia, readToolProcessText,
 } from './ToolProcessMedia';
@@ -470,7 +470,8 @@ function hasSubagentPlanOwner(message: RemoteMessage): boolean {
     return !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(explicit.trim());
   }
   const parent = readStr(message.agentMeta, 'parentUuid').trim();
-  return /^(?:toolu|call)[_-]/iu.test(parent)
+  // SDK tool-use id，含 HY4 的 chatcmpl-tool-*。
+  return /^(?:(?:toolu|call)[_-]|chatcmpl-tool-)/iu.test(parent)
     || /^[A-Za-z][A-Za-z0-9_-]*_x*\d+(?:_dup\d+)?$/u.test(parent);
 }
 
@@ -1651,6 +1652,19 @@ function buildLinearRenderItems(
   const finalAssistantIds = turnFinalAssistantIds(messages, isSessionStreaming);
   const todoInsertAt = visibleTodoPlanInsertions(messages, taskHistoryMayBeIncomplete);
   const renderedTaskKeys = new Set<string>();
+  // 同一轮的富组件已显示的媒体，不再从工具结果里重复出一次；先整轮收集再投影，
+  // 工具步骤本身保持原样，展开工作过程仍能看到结果（对齐共享 buildLinearItems）。
+  const inlineMediaByMessageId = new Map<string, Set<string>>();
+  let inlineMedia = new Set<string>();
+  for (const message of messages) {
+    if (isPlanUserBoundary(message)) inlineMedia = new Set<string>();
+    inlineMediaByMessageId.set(message.id, inlineMedia);
+    if (message.role === 'assistant' && message.isStreaming !== true && !message.failedSamplingAttempt) {
+      const turnMedia = inlineMedia;
+      richAnswerMediaSources(assistantDisplayBody(message)).forEach((url: string) => turnMedia.add(url));
+    }
+  }
+  const inlineMediaByTool = new Map<RenderToolItem, Set<string>>();
 
   // 结果必须只作为 tool_use 的 secondary body 消费。之前把 tool_result 再建成一个
   // tool_group，导致同一条 Bash 在鸿蒙端出现两次，正是截图里“重复调用 bash”的来源。
@@ -1734,29 +1748,34 @@ function buildLinearRenderItems(
     group.tools = pendingTools;
     items.push(group);
     const mediaTools: RenderToolItem[] = [];
+    const media = new RenderToolMediaItem();
+    media.type = 'tool_media';
+    media.key = `media-${group.key}`;
+    const seenMedia = new Set<string>();
     for (let i = 0; i < pendingTools.length; i++) {
-      if (pendingTools[i].richMedia.length > 0 || pendingTools[i].media.length > 0) mediaTools.push(pendingTools[i]);
+      const tool = pendingTools[i];
+      const inline = inlineMediaByTool.get(tool);
+      let shown = false;
+      for (let j = 0; j < tool.media.length; j++) {
+        const ref = tool.media[j];
+        if (inline?.has(ref.url)) continue;
+        shown = true;
+        if (seenMedia.has(ref.url)) continue;
+        seenMedia.add(ref.url);
+        media.images.push(ref);
+      }
+      for (let j = 0; j < tool.richMedia.length; j++) {
+        const payload = tool.richMedia[j];
+        if (inline?.has(payload.url)) continue;
+        shown = true;
+        if (seenMedia.has(payload.url)) continue;
+        seenMedia.add(payload.url);
+        media.media.push(payload);
+      }
+      if (shown) mediaTools.push(tool);
     }
     if (mediaTools.length > 0) {
-      const media = new RenderToolMediaItem();
-      media.type = 'tool_media';
-      media.key = `media-${group.key}`;
       media.tools = mediaTools;
-      const seenMedia = new Set<string>();
-      for (let i = 0; i < mediaTools.length; i++) {
-        for (let j = 0; j < mediaTools[i].media.length; j++) {
-          const ref = mediaTools[i].media[j];
-          if (seenMedia.has(ref.url)) continue;
-          seenMedia.add(ref.url);
-          media.images.push(ref);
-        }
-        for (let j = 0; j < mediaTools[i].richMedia.length; j++) {
-          const payload = mediaTools[i].richMedia[j];
-          if (seenMedia.has(payload.url)) continue;
-          seenMedia.add(payload.url);
-          media.media.push(payload);
-        }
-      }
       items.push(media);
     }
     pendingTools = [];
@@ -1865,6 +1884,8 @@ function buildLinearRenderItems(
         flushTools();
       }
       if (pendingTools.length === 0) pendingFirstKey = m.id;
+      const turnMedia = inlineMediaByMessageId.get(m.id);
+      if (turnMedia !== undefined && turnMedia.size > 0) inlineMediaByTool.set(item, turnMedia);
       pendingTools.push(item);
       const itemEndAt = item.settledAt.length > 0 ? item.settledAt : item.createdAt;
       if (pendingToolEndAt.length === 0

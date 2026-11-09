@@ -1,12 +1,15 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
-  RichAnswerStream, RichPart, RichValue, hasRichAnswer, richAnswerText, richLinePlot, richResolvedValues,
-  richMediaMarkdown, richSendText, richVisualStyle, richYoutubeWatchUrl, splitRichAnswer, RichChartPoint, RichNode, RichPlotTick,
+  RichAnswerStream, RichDocument, RichPart, RichValue, hasRichAnswer, richAnswerText, richLinePlot, richMediaSource,
+  richResolvedValues, richMediaMarkdown, richSendText, richVisualStyle, richYoutubeWatchUrl, splitRichAnswer, RichChartPoint, RichNode, RichPlotTick,
 } from '../main/ets/core/messages/RichAnswer';
 import {
   RichInteractionMemory, RichStateStorage, RichSubmissionController, parseStoredEntries,
 } from '../main/ets/core/messages/RichInteractionMemory';
-import { buildRenderItems, RenderItem, RenderMessageItem, RenderRichPart } from '../main/ets/core/messages/MessageRender';
+import {
+  buildRenderItems, RenderItem, RenderMessageItem, RenderRichPart, RenderToolGroupItem, RenderToolMediaItem,
+  RenderWorkGroupItem,
+} from '../main/ets/core/messages/MessageRender';
 import { freezeShareProjection } from '../main/ets/core/sharing/ConversationShareProjection';
 import { parseMessage, RemoteMessage } from '../main/ets/core/tasks/TaskModels';
 
@@ -85,6 +88,22 @@ function values(entries: string): Map<string, RichValue> {
   const record = JSON.parse(entries) as Record<string, Object>;
   Object.keys(record).forEach((key: string) => out.set(key, record[key] as RichValue));
   return out;
+}
+
+/** 与共享实现输出同形：根、问题数、修订号与按插入顺序的 [id, kind, props, children]。 */
+function docShape(doc: RichDocument): string {
+  const nodes: Object[] = [];
+  doc.nodes.forEach((node: RichNode) => { nodes.push([node.id, node.kind, node.props, node.children]); });
+  return JSON.stringify([doc.roots, doc.issues, doc.revision, nodes]);
+}
+
+function mediaTurn(id: string, role: string, content: string): RemoteMessage {
+  const message = new RemoteMessage();
+  message.id = id;
+  message.clientId = id;
+  message.role = role;
+  message.content = content;
+  return message;
 }
 
 export default function v133RichAnswerTest(): void {
@@ -296,6 +315,91 @@ export default function v133RichAnswerTest(): void {
       edited.set('details', false);
       edited.set('tabs', 'b');
       expect(current.items[0].text.includes('HIDDEN DETAILS')).assertTrue();
+    });
+
+    // v1.3.5 C1：以下期望值均由 upstream/main（ae7bd0721）的 packages/maker-shared/src/richAnswer.ts
+    // 对同一输入运行得到。旧实现会把这些模型输出整段丢弃。
+    it('appends_container_prose_to_implicit_markdown_children_in_written_order', 0, () => {
+      const doc = new RichAnswerStream().update([
+        '{"seq":1,"op":"create","id":"s","kind":"stack"}',
+        '{"seq":2,"op":"append","id":"s","text":"Hello "}',
+        '{"seq":3,"op":"append","id":"s","text":"world"}',
+        '{"seq":4,"op":"create","id":"t","kind":"text","parent":"s","props":{"text":"mid"}}',
+        '{"seq":5,"op":"append","id":"s","text":"tail"}',
+        '{"seq":6,"op":"append","id":"t","text":"!"}',
+        '{"seq":7,"op":"append","id":"divider-x","text":"no"}',
+        '{"seq":8,"op":"create","id":"d","kind":"divider"}',
+        '{"seq":9,"op":"append","id":"d","text":"no"}',
+      ].join('\n'), true);
+      expect(docShape(doc)).assertEqual('[["s","d"],2,7,[["s","stack",{},["s-1","t","s-1-2"]],'
+        + '["s-1","markdown",{"text":"Hello world"},[]],["t","text",{"text":"mid!"},[]],'
+        + '["s-1-2","markdown",{"text":"tail"},[]],["d","divider",{},[]]]]');
+    });
+
+    it('restores_string_props_and_inline_children_without_dropping_siblings', 0, () => {
+      const doc = new RichAnswerStream().update([
+        '{"seq":1,"op":"create","id":"p","kind":"text","props":"plain"}',
+        '{"seq":2,"op":"create","id":"bad","kind":"stat","props":"x"}',
+        '{"seq":3,"op":"create","id":"tabs","kind":"tabs","props":{"default":"second","children":['
+          + '{"kind":"stack","props":{"label":"One"},"children":[{"kind":"markdown","props":"a"}]},'
+          + '{"id":"second","kind":"stack","props":{"label":"Two","children":[{"kind":"text","text":"b"}]}},'
+          + '{"kind":"bogus"},{"kind":"stat","props":"y"}]}}',
+      ].join('\n'), true);
+      expect(docShape(doc)).assertEqual('[["p","tabs"],3,2,[["p","text",{"text":"plain"},[]],'
+        + '["tabs","tabs",{"default":"second"},["tabs-1","second"]],["tabs-1","stack",{"label":"One"},["tabs-1-1"]],'
+        + '["tabs-1-1","markdown",{"text":"a"},[]],["second","stack",{"label":"Two"},["second-1"]],'
+        + '["second-1","text",{"text":"b"},[]]]]');
+    });
+
+    it('retries_only_the_failed_final_line_when_the_source_grows', 0, () => {
+      const stream = new RichAnswerStream();
+      const head = '{"seq":1,"op":"create","id":"a","kind":"text","props":{"text":"x"}}\n';
+      const cut = stream.update(head + '{"seq":2,"op":"create","id":"b","kind":"text","props":{"text":"y', true);
+      expect(docShape(cut)).assertEqual('[["a"],1,1,[["a","text",{"text":"x"},[]]]]');
+      const full = stream.update(head + '{"seq":2,"op":"create","id":"b","kind":"text","props":{"text":"yz"}}', true);
+      expect(docShape(full)).assertEqual('[["a","b"],0,2,[["a","text",{"text":"x"},[]],["b","text",{"text":"yz"},[]]]]');
+    });
+
+    it('normalizes_media_scheme_case_and_hides_tool_media_already_shown_in_the_same_turn', 0, () => {
+      const image = (id: string, src: string): RichNode => {
+        const node = new RichNode();
+        node.id = id;
+        node.kind = 'image';
+        node.props['src'] = src;
+        return node;
+      };
+      expect(richMediaSource(image('i', 'HTTPS://example.com/A.png'))).assertEqual('https://example.com/A.png');
+      expect(richMediaSource(image('j', 'Cindy-Media://blobs/b.png'))).assertEqual('cindy-media://blobs/b.png');
+
+      const richImage = (src: string): string => `${FENCE}cindy-ui\n`
+        + `{"version":1,"seq":1,"op":"create","id":"img","kind":"image","props":{"src":"${src}","alt":"x"}}\n${FENCE}`;
+      const tool = mediaTurn('tool-media', 'tool_use', '');
+      tool.toolUseId = 'use-media';
+      const toolContent: Record<string, Object> = {};
+      toolContent['toolUseId'] = 'use-media';
+      toolContent['toolName'] = 'image_generate';
+      toolContent['input'] = '{}';
+      tool.content = toolContent;
+      const result = mediaTurn('result-media', 'tool_result',
+        JSON.stringify({ xdt_image_urls: ['xdt-image://art/a.png', 'xdt-image://art/b.png'] }));
+      result.toolUseId = 'use-media';
+      const items = buildRenderItems([
+        mediaTurn('u1', 'user', 'draw'), tool, result,
+        mediaTurn('a1', 'assistant', richImage('xdt-image://art/a.png')),
+        // 下一轮显示 b 不影响上一轮：去重只在同一轮内生效。
+        mediaTurn('u2', 'user', 'again'), mediaTurn('a2', 'assistant', richImage('xdt-image://art/b.png')),
+      ]);
+      const media = items.filter((item: RenderItem) => item.type === 'tool_media') as RenderToolMediaItem[];
+      expect(media.length).assertEqual(1);
+      expect(JSON.stringify(media[0].images.map((ref) => ref.url))).assertEqual('["xdt-image://art/b.png"]');
+      // 工具步骤本身保持完整，展开工作过程仍能看到两张图。
+      let toolImages = -1;
+      const visit = (list: RenderItem[]): void => list.forEach((item: RenderItem) => {
+        if (item.type === 'tool_group') toolImages = (item as RenderToolGroupItem).tools[0].media.length;
+        if (item.type === 'work_group') visit((item as RenderWorkGroupItem).children);
+      });
+      visit(items);
+      expect(toolImages).assertEqual(2);
     });
 
     it('persists_prototype_named_bindings_without_losing_their_values', 0, async () => {
