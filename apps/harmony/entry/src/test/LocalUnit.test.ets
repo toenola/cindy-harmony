@@ -84,6 +84,7 @@ import {
   buildAgentUserContent,
   buildPersistedUserContent,
   MessageStore,
+  RewindPreview,
   oldestMessageCursor,
   TEXT_DELTA_BATCH_INTERVAL_MS,
   preferIncomingCreatedMessage,
@@ -237,6 +238,10 @@ import {
   slashCommandDisplayLabel,
   textComposerDocument,
 } from '../main/ets/core/messages/ComposerDocument';
+import {
+  MessageEditRewindOptions, commitMessageEditRewind, lastUserMessageClientId, mergeMessageEditDraft, messageEditErrorKey,
+  messageEditRollbackHint,
+} from '../main/ets/core/messages/MessageEdit';
 import {
   extendCoverageEarlier,
   MessageWindowCoverage,
@@ -2381,6 +2386,67 @@ export default function localUnitTest() {
       retryEvent['data'] = retryData;
       store.handleMakerEvent('err-session', retryEvent, 'retry-1');
       expect(store.activeErrorClientId('err-session', '', 'No capacity')).assertEqual('');
+    });
+
+    // v1.3.5 C3：对齐 Mobile messageEdit.ts（#8287）。编辑 = 回退（requireLatestUser）+ 重发；
+    // 运行中首次被拒只停一次并有限重试，编辑失效即放弃；只截断对话时不得意外恢复文件。
+    it('editsTheLastUserMessageByRewindingWithBoundedStopRetry', 0, async () => {
+      const options: string[] = [];
+      let stops = 0;
+      let calls = 0;
+      const result = await commitMessageEditRewind<string>(
+        (opts: MessageEditRewindOptions): Promise<string> => {
+          calls += 1;
+          options.push(JSON.stringify(opts));
+          return calls < 3 ? Promise.reject(new Error('SESSION_RUNNING')) : Promise.resolve('rewound');
+        }, true, (): void => { stops += 1; }, (): boolean => true, (): Promise<void> => Promise.resolve());
+      expect(result).assertEqual('rewound');
+      expect(stops).assertEqual(1);
+      expect(options[0]).assertEqual('{"requireLatestUser":true,"allowFileRestore":false}');
+
+      let current = true;
+      let abandoned = '';
+      await commitMessageEditRewind<string>((): Promise<string> => Promise.reject(new Error('SESSION_RUNNING')),
+        false, (): void => { current = false; }, (): boolean => current, (): Promise<void> => Promise.resolve())
+        .catch((e: Error): void => { abandoned = e.message; });
+      expect(abandoned).assertEqual('SESSION_RUNNING');
+      let notLast = '';
+      await commitMessageEditRewind<string>((opts: MessageEditRewindOptions): Promise<string> => {
+        expect(JSON.stringify(opts)).assertEqual('{"requireLatestUser":true}');
+        return Promise.reject(new Error('REWIND_TARGET_NOT_LATEST'));
+      }, false, (): void => {}, (): boolean => true).catch((e: Error): void => { notLast = messageEditErrorKey(e); });
+      expect(notLast).assertEqual('v135_edit_not_last');
+
+      const preview = new RewindPreview();
+      preview.conversationOnly = true;
+      expect(messageEditRollbackHint(preview).kind).assertEqual('conversation-only');
+      preview.filesChanged = ['a.ts', 'b.ts'];
+      expect(`${messageEditRollbackHint(preview).kind}:${messageEditRollbackHint(preview).count}`).assertEqual('files:2');
+      preview.canRewind = false;
+      expect(messageEditRollbackHint(preview).kind).assertEqual('');
+    });
+
+    it('editsOnlyTheLatestVisibleUserMessageAndMergesDraftsOnce', 0, () => {
+      const row = (id: string, role: string): RemoteMessage => {
+        const message = new RemoteMessage();
+        message.id = id;
+        message.clientId = id;
+        message.role = role;
+        message.content = id;
+        return message;
+      };
+      expect(lastUserMessageClientId(buildRenderItems([row('u1', 'user'), row('a1', 'assistant'),
+        row('u2', 'user'), row('a2', 'assistant')]))).assertEqual('u2');
+
+      const stash = textComposerDocument('my draft');
+      // 离场后库里仍是暂存草稿：替代内容在前、暂存草稿只出现一次。
+      expect(composerDocumentProjectedText(mergeMessageEditDraft(stash, stash, textComposerDocument('edited'))))
+        .assertEqual('edited\n\nmy draft');
+      // 重发已受理、库被清空：只恢复暂存草稿。
+      expect(composerDocumentProjectedText(mergeMessageEditDraft(null, stash, null))).assertEqual('my draft');
+      // 等待期间新输入的内容保留在前。
+      expect(composerDocumentProjectedText(mergeMessageEditDraft(textComposerDocument('typed'), stash, null)))
+        .assertEqual('typed\n\nmy draft');
     });
 
     it('batchesRapidTextNotificationsAndFlushesBeforeToolBoundaries', 0, () => {

@@ -596,6 +596,18 @@
     {"name":"v135_ask_required","value":"请填写此必填项。"},
     {"name":"v135_ask_choice","value":"请选择列出的选项。"},
     {"name":"v135_ask_too_short","value":"请至少输入 %d 个字符。"},
-    {"name":"v135_ask_too_long","value":"请最多输入 %d 个字符。"}
+    {"name":"v135_ask_too_long","value":"请最多输入 %d 个字符。"},
+    {"name":"v135_edit_action","value":"编辑"},
+    {"name":"v135_edit_editing","value":"正在编辑消息"},
+    {"name":"v135_edit_discard","value":"放弃编辑消息"},
+    {"name":"v135_edit_stop_timeout","value":"等待任务停止超时，请稍后重试"},
+    {"name":"v135_edit_queue_not_empty","value":"任务有排队中的消息，先发送或移除队列内容后再编辑"},
+    {"name":"v135_edit_not_last","value":"任务里已有更新的消息，这条不再是最后一条，无法编辑重发"},
+    {"name":"v135_edit_failed","value":"编辑重发失败，请重试"},
+    {"name":"v135_edit_no_prior_assistant","value":"这条消息前面还没有 AI 回复，电脑端当前版本暂不支持编辑；更新电脑端 Cindy 后再试。"},
+    {"name":"v135_edit_uploads_pending","value":"还有附件正在上传，等上传完成后再编辑消息。"},
+    {"name":"v135_edit_tray_not_empty","value":"输入框里还有附件，先发送或移除后再编辑消息。"},
+    {"name":"v135_edit_rollback_hint","value":"发送将撤销上一轮对 %d 个文件的改动"},
+    {"name":"v135_edit_conversation_only","value":"发送不会恢复项目文件，上一轮的文件改动会保留"}
   ]
 }

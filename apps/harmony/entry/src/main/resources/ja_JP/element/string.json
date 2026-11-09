@@ -192,6 +192,18 @@
     {"name":"v135_ask_required","value":"この必須項目を入力してください。"},
     {"name":"v135_ask_choice","value":"一覧の選択肢から選んでください。"},
     {"name":"v135_ask_too_short","value":"%d文字以上で入力してください。"},
-    {"name":"v135_ask_too_long","value":"%d文字以内で入力してください。"}
+    {"name":"v135_ask_too_long","value":"%d文字以内で入力してください。"},
+    {"name":"v135_edit_action","value":"編集"},
+    {"name":"v135_edit_editing","value":"メッセージを編集中"},
+    {"name":"v135_edit_discard","value":"メッセージの編集を破棄"},
+    {"name":"v135_edit_stop_timeout","value":"タスクの停止待ちがタイムアウトしました。もう一度お試しください"},
+    {"name":"v135_edit_queue_not_empty","value":"このセッションには送信待ちのメッセージがあります。先に送信または削除してから編集してください"},
+    {"name":"v135_edit_not_last","value":"セッションに新しいメッセージがあるため、これは最新ではなくなり編集して再送信できません"},
+    {"name":"v135_edit_failed","value":"編集の再送信に失敗しました。もう一度お試しください"},
+    {"name":"v135_edit_no_prior_assistant","value":"このメッセージの前に AI の返信がなく、パソコンの Cindy のバージョンではまだ編集できません。パソコンの Cindy を更新してからもう一度お試しください。"},
+    {"name":"v135_edit_uploads_pending","value":"添付ファイルをアップロード中です。完了してからメッセージを編集してください。"},
+    {"name":"v135_edit_tray_not_empty","value":"入力欄に添付ファイルが残っています。送信または削除してからメッセージを編集してください。"},
+    {"name":"v135_edit_rollback_hint","value":"送信すると前のターンで変更された %d 個のファイルが元に戻ります"},
+    {"name":"v135_edit_conversation_only","value":"送信してもプロジェクトファイルは復元されず、前回のファイル変更は残ります"}
   ]
 }

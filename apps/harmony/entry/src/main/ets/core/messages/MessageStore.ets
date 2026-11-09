@@ -187,6 +187,8 @@ export class RewindPreview {
   filesChanged: string[] = [];
   insertions: number = 0;
   deletions: number = 0;
+  /** 被控端判定只能截断对话、不会恢复项目文件。 */
+  conversationOnly: boolean = false;
 }
 
 /** maker:send 的 user 消息形态（对齐 mobile chatMessage）。 */
@@ -3176,6 +3178,7 @@ export class MessageStore {
     preview.error = readStr(result, 'error');
     preview.insertions = readNum(result, 'insertions', 0);
     preview.deletions = readNum(result, 'deletions', 0);
+    preview.conversationOnly = readBool(result, 'conversationOnly', false);
     const rawFiles = result['filesChanged'];
     if (Array.isArray(rawFiles)) {
       const files = rawFiles as Object[];
@@ -3187,10 +3190,12 @@ export class MessageStore {
   }
 
   /** Rewind 提交：返回更新后的同一任务，绝不是新任务 id。 */
-  async rewindCommit(deviceId: string, sessionId: string, clientId: string): Promise<RemoteSession | null> {
+  async rewindCommit(deviceId: string, sessionId: string, clientId: string,
+    options: Object | undefined = undefined): Promise<RemoteSession | null> {
     const client = this.client;
     if (!client) return null;
-    const args: Object[] = [sessionId, clientId];
+    // 编辑最后一条消息时带 requireLatestUser / allowFileRestore（对齐 Mobile rewindCommit opts）。
+    const args: Object[] = options === undefined ? [sessionId, clientId] : [sessionId, clientId, options];
     const opts = new DlInvokeOptions();
     opts.channel = 'maker:rewind:commit';
     opts.args = args;

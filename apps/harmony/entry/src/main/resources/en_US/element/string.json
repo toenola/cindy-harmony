@@ -192,6 +192,18 @@
     {"name":"v135_ask_required","value":"Complete this required field."},
     {"name":"v135_ask_choice","value":"Choose one of the listed options."},
     {"name":"v135_ask_too_short","value":"Enter at least %d characters."},
-    {"name":"v135_ask_too_long","value":"Enter no more than %d characters."}
+    {"name":"v135_ask_too_long","value":"Enter no more than %d characters."},
+    {"name":"v135_edit_action","value":"Edit"},
+    {"name":"v135_edit_editing","value":"Editing message"},
+    {"name":"v135_edit_discard","value":"Discard message edit"},
+    {"name":"v135_edit_stop_timeout","value":"Timed out waiting for the task to stop — please try again"},
+    {"name":"v135_edit_queue_not_empty","value":"This session has queued messages — send or remove them before editing"},
+    {"name":"v135_edit_not_last","value":"A newer message exists in this session — this one is no longer the latest and cannot be edited"},
+    {"name":"v135_edit_failed","value":"Failed to edit and resend, please try again"},
+    {"name":"v135_edit_no_prior_assistant","value":"There is no AI reply before this message, and the Cindy version on the computer can't edit it yet. Update Cindy on the computer and try again."},
+    {"name":"v135_edit_uploads_pending","value":"Attachments are still uploading. Wait for them to finish before editing the message."},
+    {"name":"v135_edit_tray_not_empty","value":"The input box still has attachments. Send or remove them before editing the message."},
+    {"name":"v135_edit_rollback_hint","value":"Sending will undo changes to %d file(s) from the last turn"},
+    {"name":"v135_edit_conversation_only","value":"Sending will not restore project files; previous file changes will remain"}
   ]
 }

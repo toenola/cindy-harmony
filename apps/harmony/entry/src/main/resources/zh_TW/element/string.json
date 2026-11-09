@@ -192,6 +192,18 @@
     {"name":"v135_ask_required","value":"請填寫此必填項目。"},
     {"name":"v135_ask_choice","value":"請選擇列出的選項。"},
     {"name":"v135_ask_too_short","value":"請至少輸入 %d 個字元。"},
-    {"name":"v135_ask_too_long","value":"請最多輸入 %d 個字元。"}
+    {"name":"v135_ask_too_long","value":"請最多輸入 %d 個字元。"},
+    {"name":"v135_edit_action","value":"編輯"},
+    {"name":"v135_edit_editing","value":"正在編輯訊息"},
+    {"name":"v135_edit_discard","value":"放棄編輯訊息"},
+    {"name":"v135_edit_stop_timeout","value":"等待任務停止超時，請稍後重試"},
+    {"name":"v135_edit_queue_not_empty","value":"任務有排隊中的訊息，先傳送或移除佇列內容後再編輯"},
+    {"name":"v135_edit_not_last","value":"任務裡已有更新的訊息，這條不再是最後一條，無法編輯重發"},
+    {"name":"v135_edit_failed","value":"編輯重發失敗，請重試"},
+    {"name":"v135_edit_no_prior_assistant","value":"這條訊息前面還沒有 AI 回覆，電腦端目前版本暫不支援編輯；更新電腦端 Cindy 後再試。"},
+    {"name":"v135_edit_uploads_pending","value":"還有附件正在上傳，等上傳完成後再編輯訊息。"},
+    {"name":"v135_edit_tray_not_empty","value":"輸入框裡還有附件，先傳送或移除後再編輯訊息。"},
+    {"name":"v135_edit_rollback_hint","value":"傳送將撤銷上一輪對 %d 個檔案的改動"},
+    {"name":"v135_edit_conversation_only","value":"傳送不會恢復專案檔案，上一輪的檔案改動會保留"}
   ]
 }

@@ -152,6 +152,15 @@ import {
   supportsSessionAgentSwitch,
 } from '../core/tasks/SessionAgentSwitch';
 import {
+  MessageEditRewindOptions,
+  MessageEditRollbackHint,
+  commitMessageEditRewind,
+  lastUserMessageClientId,
+  mergeMessageEditDraft,
+  messageEditErrorKey,
+  messageEditRollbackHint,
+} from '../core/messages/MessageEdit';
+import {
   AgentLocationArgument,
   RemoteAgentCatalog,
   RemoteAgentDevice,
@@ -583,6 +592,16 @@ export struct TaskPageContent {
   @State newSessionCreationClientId: string = '';
   @State selectedQueueClientId: string = '';
   @State editingQueueClientId: string = '';
+  /** 正在编辑的最后一条用户消息（v1.3.5 C3，对齐 Mobile 消息编辑）；与排队编辑共用输入框，互斥。 */
+  @State editingMessageClientId: string = '';
+  @State messageEditHint: MessageEditRollbackHint = new MessageEditRollbackHint();
+  @State messageEditSubmitting: boolean = false;
+  /** 进入编辑前用户自己的草稿；编辑期间不写草稿库，结束后合并回来。 */
+  private messageEditStash: ComposerDocument = new ComposerDocument();
+  /** 原消息附件按被控端引用原样重发，不当作手机中转上传。 */
+  private messageEditImages: RemoteImageRef[] = [];
+  private messageEditFiles: RemoteSerializedAttachment[] = [];
+  private messageEditSeq: number = 0;
   private stashedComposerInput: string = '';
   private stashedComposerDocument: ComposerDocument = new ComposerDocument();
   private editingQueueOriginalText: string = '';
@@ -1395,6 +1414,7 @@ export struct TaskPageContent {
   private refreshQueueState(): void {
     const projection = AppServices.instance.inputQueue.getProjection(this.sessionId, this.deviceId);
     this.queueBubbles = AppServices.instance.inputQueue.getBubbles(this.sessionId, this.deviceId);
+    this.reconcileMessageEdit();
     this.queuePaused = projection.queuePaused;
     this.queueProjectionError = isRemoteBusyMessage(projection.error)
       ? this.v12String('v132_remote_busy') : projection.error;
@@ -2754,6 +2774,10 @@ export struct TaskPageContent {
       this.saveQueueEdit(text);
       return;
     }
+    if (this.editingMessageClientId.length > 0) {
+      void this.submitMessageEdit();
+      return;
+    }
     const learn = parseLearnCommand(text, this.selectedLearnRoute === 'agent-skill');
     if (learn.matched) {
       this.sendLearnCommand(learn);
@@ -2915,6 +2939,198 @@ export struct TaskPageContent {
     });
   }
 
+  /** 最后一条用户消息可以编辑重发（首条同样可编辑；被控端会权威核对是否仍是最新）。 */
+  private canEditMessage(item: RenderMessageItem): boolean {
+    if (item.kind !== 'user' || item.message === undefined || this.deviceDisabled
+      || this.isCreationBlockingRemoteOps() || this.session() === undefined) return false;
+    const clientId = item.message.clientId.length > 0 ? item.message.clientId : item.message.id;
+    return clientId.length > 0 && clientId === lastUserMessageClientId(this.items);
+  }
+
+  /**
+   * 进入消息编辑：原文载入底部输入框，暂存用户原本的草稿。不在这里中断运行中的任务——
+   * 放弃编辑时任务应照常继续，发送时才中断（对齐 Mobile beginMessageEdit）。
+   */
+  private beginMessageEdit(item: RenderMessageItem): void {
+    const message = item.message;
+    if (message === undefined || this.messageEditSubmitting || this.sending) return;
+    const clientId = message.clientId.length > 0 ? message.clientId : message.id;
+    if (clientId.length === 0 || this.editingMessageClientId === clientId) return;
+    // 排队消息是针对回退前的旧上下文写的，重发会排到它们后面，先让用户处理队列。
+    if (this.editingQueueClientId.length > 0 || AppServices.instance.inputQueue.getProjection(
+      this.sessionId, this.deviceId).pendingQueue.length > 0) {
+      promptAction.showToast({ message: this.v12String('v135_edit_queue_not_empty') });
+      return;
+    }
+    if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
+      promptAction.showToast({ message: this.v12String('v135_edit_uploads_pending') });
+      return;
+    }
+    // 输入框里的附件属于用户自己的草稿，不能混进这条消息重发。
+    if (this.imageQueue.images.length > 0 || this.fileQueue.files.length > 0) {
+      promptAction.showToast({ message: this.v12String('v135_edit_tray_not_empty') });
+      return;
+    }
+    if (this.editingMessageClientId.length === 0) this.messageEditStash = this.composerDocument;
+    this.messageEditSeq += 1;
+    this.editingMessageClientId = clientId;
+    this.messageEditHint = new MessageEditRollbackHint();
+    this.messageEditImages = item.images.slice();
+    this.messageEditFiles = item.files.slice();
+    this.error = '';
+    this.setComposerDocument(textComposerDocument(item.originalBody ?? item.body), false);
+    this.expandComposerForEditing(true);
+    this.loadMessageEditHint(clientId, this.messageEditSeq);
+  }
+
+  /** 静默预览文件回滚影响（运行中会被拒绝，只是不提示）；失败不阻塞发送。 */
+  private loadMessageEditHint(clientId: string, seq: number): void {
+    const lifecycle = this.pageLifecycleGeneration;
+    void AppServices.instance.messages.rewindPreview(this.deviceId, this.sessionId, clientId)
+      .then((preview: RewindPreview) => {
+        if (!this.isCurrentPageLifecycle(lifecycle) || seq !== this.messageEditSeq) return;
+        this.messageEditHint = messageEditRollbackHint(preview);
+      }).catch(() => {});
+  }
+
+  private messageEditHintText(): string {
+    if (this.messageEditHint.kind === 'files') {
+      return this.v12String('v135_edit_rollback_hint', this.messageEditHint.count);
+    }
+    return this.messageEditHint.kind === 'conversation-only' ? this.v12String('v135_edit_conversation_only') : '';
+  }
+
+  private finishMessageEdit(): void {
+    this.messageEditSeq += 1;
+    this.editingMessageClientId = '';
+    this.messageEditHint = new MessageEditRollbackHint();
+    this.messageEditImages = [];
+    this.messageEditFiles = [];
+  }
+
+  /** 放弃编辑：原样恢复进入编辑前的草稿。提交途中不能放弃。 */
+  private cancelMessageEdit(): void {
+    if (this.editingMessageClientId.length === 0 || this.messageEditSubmitting) return;
+    const stash = this.messageEditStash;
+    this.finishMessageEdit();
+    this.messageEditStash = new ComposerDocument();
+    this.setComposerDocument(stash);
+  }
+
+  /** 编辑期间出现了更新的用户消息或排队内容：本条不再能编辑，退出编辑（对齐 Mobile）。 */
+  private reconcileMessageEdit(): void {
+    if (this.editingMessageClientId.length === 0 || this.messageEditSubmitting) return;
+    const latest = lastUserMessageClientId(this.items);
+    const queued = AppServices.instance.inputQueue.getProjection(this.sessionId, this.deviceId).pendingQueue.length;
+    if ((latest.length > 0 && latest !== this.editingMessageClientId) || queued > 0) this.cancelMessageEdit();
+  }
+
+  /**
+   * 发送编辑：回退到这条消息（requireLatestUser，运行中先停止并有限重试），再用编辑后的内容重发。
+   * 提交锁覆盖「回退 → 重发 → 恢复草稿」全程；回退失败时保持编辑态、内容不丢。
+   * 回退提交后用户离开了任务：替代内容与暂存草稿都写进该任务自己的草稿。
+   */
+  private async submitMessageEdit(): Promise<void> {
+    const clientId = this.editingMessageClientId;
+    const session = this.session();
+    if (clientId.length === 0 || session === undefined || this.messageEditSubmitting || this.sending) return;
+    if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
+      promptAction.showToast({ message: this.v12String('v135_edit_uploads_pending') });
+      return;
+    }
+    const document = this.composerDocument;
+    const serialized = serializeComposerDocument(document);
+    const trayImages = this.imageQueue.readyImages();
+    const trayFiles = this.fileQueue.readyFiles();
+    const images = this.messageEditImages.concat(trayImages);
+    const files = this.messageEditFiles.concat(trayFiles);
+    // 空文本又没有附件的重发会变成「只回退不重发」，那是「回到此处」不是编辑。
+    if (serialized.text.trim().length === 0 && images.length === 0 && files.length === 0) return;
+    if (AppServices.instance.inputQueue.getProjection(this.sessionId, this.deviceId).pendingQueue.length > 0) {
+      promptAction.showToast({ message: this.v12String('v135_edit_queue_not_empty') });
+      return;
+    }
+    if (sessionSendNeedsModelReselection(this.modelVisibilityOverrides, session, this.pendingAgentSwitchIntent)) {
+      this.error = this.v12String('v132_model_reselection_required');
+      this.openComposerControlPopup('model');
+      return;
+    }
+    const lifecycle = this.pageLifecycleGeneration;
+    const deviceId = this.deviceId;
+    const sessionId = this.sessionId;
+    const seq = this.messageEditSeq;
+    const stash = this.messageEditStash;
+    const onPage = (): boolean => this.isCurrentPageLifecycle(lifecycle)
+      && this.sessionId === sessionId && this.deviceId === deviceId;
+    const stillCurrent = (): boolean => seq === this.messageEditSeq && onPage();
+    const persistToTaskDraft = async (replacement: ComposerDocument | null): Promise<void> => {
+      const stored = await AppServices.instance.composerDrafts.read(sessionId, deviceId);
+      AppServices.instance.composerDrafts.save(sessionId, mergeMessageEditDraft(stored, stash, replacement), deviceId);
+    };
+    this.messageEditSubmitting = true;
+    this.sending = true;
+    this.error = '';
+    try {
+      let updated: RemoteSession | null = null;
+      try {
+        updated = await commitMessageEditRewind<RemoteSession | null>(
+          (options: MessageEditRewindOptions): Promise<RemoteSession | null> =>
+            AppServices.instance.messages.rewindCommit(deviceId, sessionId, clientId, options),
+          this.messageEditHint.kind === 'conversation-only',
+          (): void => { void AppServices.instance.inputQueue.stop(deviceId, sessionId).catch(() => {}); },
+          stillCurrent);
+      } catch (e) {
+        if (stillCurrent()) {
+          const key = messageEditErrorKey(e as Object);
+          this.error = key.length > 0 ? this.v12String(key)
+            : this.invokeFailureText(e as Object, this.v12String('v135_edit_failed'));
+        }
+        return;
+      }
+      if (updated !== null && updated.id.length > 0) AppServices.instance.tasks.upsertSession(deviceId, updated);
+      if (!stillCurrent()) {
+        // 旧回合已在被控端软删，用户途中离开了任务：内容落到该任务草稿，回来时可见。
+        await persistToTaskDraft(document);
+        void AppServices.instance.messages.reloadSession(deviceId, sessionId).catch(() => {});
+        return;
+      }
+      // 先退出编辑态，再按正常投递通道重发（不解释本地 / 桌面命令，重发的是已捕获的原文）。
+      this.finishMessageEdit();
+      this.composerDocument = emptyComposerDocument();
+      this.input = '';
+      this.composerInputRevision += 1;
+      this.imageQueue.removeSent(trayImages.length > 0
+        ? this.imageQueue.images.map((image: ComposerImage) => image.localId) : []);
+      this.fileQueue.removeSent(trayFiles.length > 0
+        ? this.fileQueue.files.map((file: ComposerFile) => file.localId) : []);
+      try {
+        await AppServices.instance.messages.reloadSession(deviceId, sessionId);
+      } catch (_error) {
+        // 消息窗口同步只是尽力而为，不能打断重发与草稿恢复。
+      }
+      const target = this.session() ?? session;
+      try {
+        await AppServices.instance.inputQueue.enqueueDocument(deviceId, target, serialized, images, files);
+        if (onPage()) this.takeOverTailAfterSend();
+      } catch (e) {
+        // 未确认的消息留在队列里可重试，内容不丢。
+        if (onPage()) this.error = `消息未确认发送：${e instanceof Error ? e.message : String(e)}`;
+      }
+      if (!onPage()) {
+        await persistToTaskDraft(null);
+        return;
+      }
+      // 一律合并：等待期间用户新输入的内容不能被暂存草稿覆盖。
+      this.setComposerDocument(mergeMessageEditDraft(this.composerDocument, stash, null));
+      this.messageEditStash = new ComposerDocument();
+    } finally {
+      if (this.isCurrentPageLifecycle(lifecycle)) {
+        this.messageEditSubmitting = false;
+        this.sending = false;
+      }
+    }
+  }
+
   private queueItem(clientId: string): QueuedInputItem | null {
     const queue = AppServices.instance.inputQueue.getProjection(
       this.sessionId, this.deviceId).pendingQueue;
@@ -2926,6 +3142,8 @@ export struct TaskPageContent {
 
   private beginQueueEdit(clientId: string): void {
     if (this.queueActionBlocked() || this.editingQueueClientId === clientId) return;
+    // 两种编辑共用输入框，不能并存。
+    if (this.editingMessageClientId.length > 0) return;
     const item = this.queueItem(clientId);
     if (item === null) return;
     const lifecycleGeneration = this.pageLifecycleGeneration;
@@ -3343,6 +3561,7 @@ export struct TaskPageContent {
     const prependCount = this.loadingOlder
       ? this.historyRenderPrependCount(previousItems, nextItems) : 0;
     this.items = nextItems;
+    this.reconcileMessageEdit();
     if (this.subagentDetailKey.length > 0
       && findSubagentGroupByKey(this.items, this.subagentDetailKey) === null) {
       this.subagentDetailKey = '';
@@ -5164,7 +5383,8 @@ export struct TaskPageContent {
 
   /** 释放 TextArea 焦点并回到单行工具栏；离页前同步执行，避免返回栈复用旧输入首帧。 */
   private collapseComposerSurface(): void {
-    if (this.editingQueueClientId.length === 0 && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
+    if (this.editingQueueClientId.length === 0 && this.editingMessageClientId.length === 0
+      && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
       AppServices.instance.composerDrafts.save(this.sessionId, this.composerDocument, this.deviceId);
       void AppServices.instance.composerDrafts.flush(this.sessionId, this.deviceId);
     }
@@ -5302,7 +5522,7 @@ export struct TaskPageContent {
     this.input = composerDocumentProjectedText(document);
     if (composerDocumentHasContent(document)) this.showComposerAfterScroll();
     this.composerInputRevision += 1;
-    if (persist && this.editingQueueClientId.length === 0) {
+    if (persist && this.editingQueueClientId.length === 0 && this.editingMessageClientId.length === 0) {
       AppServices.instance.composerDrafts.save(this.sessionId, document, this.deviceId);
     }
   }
@@ -7059,8 +7279,53 @@ export struct TaskPageContent {
   }
 
   @Builder
+  messageEditBanner() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.square_and_pencil'))
+        .fontSize(uiFontSize(14))
+        .fontColor([$r('app.color.text_secondary')])
+      Column({ space: 2 }) {
+        Text(this.v12String('v135_edit_editing'))
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+        if (this.messageEditHintText().length > 0) {
+          Text(this.messageEditHintText())
+            .fontSize(uiFontSize(12))
+            .lineHeight(uiLineHeight(17))
+            .fontColor($r('app.color.text_secondary'))
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      Button() {
+        SymbolGlyph($r('sys.symbol.xmark'))
+          .fontSize(uiFontSize(14))
+          .fontColor([$r('app.color.text_secondary')])
+      }
+      .type(ButtonType.Circle)
+      .width(44)
+      .height(44)
+      .backgroundColor(Color.Transparent)
+      .enabled(!this.messageEditSubmitting)
+      .accessibilityText(this.v12String('v135_edit_discard'))
+      .onClick(() => this.cancelMessageEdit())
+    }
+    .width('calc(100% - 24vp)')
+    .constraintSize({ maxWidth: CHAT_INSET_MAX_WIDTH })
+    .alignSelf(ItemAlign.Center)
+    .padding({ left: 12 })
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
+  }
+
+  @Builder
   composerBar() {
     Column({ space: 4 }) {
+      if (this.editingMessageClientId.length > 0) {
+        this.messageEditBanner()
+      }
       if (this.composerNeedsModelReselection()
         && (this.composerSurfaceVisible || this.composerFocused || composerDocumentHasContent(this.composerDocument)
           || this.composerImages.length > 0 || this.composerFiles.length > 0)) {
@@ -10244,6 +10509,10 @@ export struct TaskPageContent {
           if (this.canFork(item)) {
             this.messageActionButton($r('sys.symbol.split'), () => this.confirmFork(item))
           }
+          // 运行中编辑入口收进「…」菜单（点编辑不中断，发送时才中断）。
+          if (!this.sessionStreaming && this.canEditMessage(item)) {
+            this.messageActionButton($r('sys.symbol.square_and_pencil'), () => this.beginMessageEdit(item))
+          }
           this.messageActionButton($r('sys.symbol.ellipsis_circle'), () => this.showMessageActions(item))
           if (item.kind === 'assistant') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
@@ -11967,6 +12236,13 @@ export struct TaskPageContent {
             const item = this.messageActionItem();
             if (item !== null) this.selectMessageAction(() => this.copyMessageLink(item));
           })
+          if (this.sessionStreaming && this.messageActionItem() !== null
+            && this.canEditMessage(this.messageActionItem() as RenderMessageItem)) {
+            this.messageActionOption(this.v12String('v135_edit_action'), $r('sys.symbol.square_and_pencil'), false, () => {
+              const item = this.messageActionItem();
+              if (item !== null) this.selectMessageAction(() => this.beginMessageEdit(item));
+            })
+          }
           if (this.messageActionItem() !== null && this.canRewind(this.messageActionItem() as RenderMessageItem)) {
             this.messageActionOption('回到此处', $r('sys.symbol.arrow_clockwise'), false, () => {
               const item = this.messageActionItem();
