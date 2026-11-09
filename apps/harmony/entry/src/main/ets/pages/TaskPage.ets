@@ -74,6 +74,7 @@ import {
 } from '../core/interactions/InteractionPresentation';
 import { DlError, DlInvokeOptions } from '../core/device-link/DlClient';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
+import { MermaidDiagramView } from '../components/MermaidDiagramView';
 import { UsageLimitWaitState } from '../core/messages/UsageLimitWait';
 import { isRemoteBusyError, isRemoteBusyMessage } from '../core/device-link/RemoteInvokePresentation';
 import { GoalModeState } from '../core/goals/GoalModels';
@@ -592,6 +593,8 @@ export struct TaskPageContent {
   @State newSessionCreationClientId: string = '';
   @State selectedQueueClientId: string = '';
   @State editingQueueClientId: string = '';
+  /** 全屏查看中的 Mermaid 图表源码；空 = 未打开（v1.3.5 D1）。 */
+  @State mermaidViewerSource: string = '';
   /** 正在编辑的最后一条用户消息（v1.3.5 C3，对齐 Mobile 消息编辑）；与排队编辑共用输入框，互斥。 */
   @State editingMessageClientId: string = '';
   @State messageEditHint: MessageEditRollbackHint = new MessageEditRollbackHint();
@@ -5967,6 +5970,9 @@ export struct TaskPageContent {
   build() {
     Stack() {
       this.taskPageBody()
+      if (this.mermaidViewerSource.length > 0) {
+        this.mermaidViewer()
+      }
     }
     .width('100%')
     .height('100%')
@@ -11451,14 +11457,15 @@ export struct TaskPageContent {
       }
     } else if (b.type === 'math') {
       this.richSourceBlock('公式', b.code, 'math')
+    } else if (b.type === 'code' && b.lang.toLowerCase() === 'mermaid') {
+      this.mermaidBlock(b.code)
     } else if (b.type === 'code'
-      && (b.lang.toLowerCase() === 'mermaid' || b.lang.toLowerCase() === 'math'
+      && (b.lang.toLowerCase() === 'math'
         || b.lang.toLowerCase() === 'latex' || b.lang.toLowerCase() === 'tex'
         || b.lang.toLowerCase() === 'html' || b.lang.toLowerCase() === 'diff')) {
       this.richSourceBlock(
-        b.lang.toLowerCase() === 'mermaid' ? 'Mermaid 图表'
-          : (b.lang.toLowerCase() === 'html' ? 'HTML 预览'
-            : (b.lang.toLowerCase() === 'diff' ? '变更内容' : '公式')),
+        b.lang.toLowerCase() === 'html' ? 'HTML 预览'
+          : (b.lang.toLowerCase() === 'diff' ? '变更内容' : '公式'),
         b.code,
         b.lang.toLowerCase(),
       )
@@ -11512,6 +11519,70 @@ export struct TaskPageContent {
         .lineHeight(uiLineHeight(26))
         .fontColor($r('app.color.text_secondary'))
     }
+  }
+
+  /** 消息内的 Mermaid 预览（对齐 Mobile 内联预览高 220）；透明遮罩接住点按，列表滚动不被网页吞掉。 */
+  @Builder
+  mermaidBlock(source: string) {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        SymbolGlyph($r('sys.symbol.doc_text'))
+          .fontSize(uiFontSize(13)).fontColor([$r('app.color.text_secondary')])
+        Text(this.v12String('v135_mermaid_title')).fontSize(uiFontSize(12)).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary')).layoutWeight(1)
+      }.width('100%')
+      Stack() {
+        MermaidDiagramView({ source: source })
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(Color.Transparent)
+          .accessibilityText(this.v12String('v135_mermaid_open'))
+          .onClick(() => {
+            this.mermaidViewerSource = source;
+          })
+      }
+      .width('100%')
+      .height(220)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_CONTROL)
+      .clip(true)
+    }
+    .width('100%').padding(10).backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_CONTAINER)
+  }
+
+  /** 全屏查看 Mermaid：可双指缩放，首屏不闪源码。 */
+  @Builder
+  mermaidViewer() {
+    Column() {
+      Row() {
+        Text(this.v12String('v135_mermaid_title'))
+          .fontSize(uiFontSize(15)).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary')).layoutWeight(1)
+        Button() {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(uiFontSize(16))
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(44)
+        .height(44)
+        .backgroundColor(Color.Transparent)
+        .accessibilityText(this.v12String('v135_mermaid_close'))
+        .onClick(() => {
+          this.mermaidViewerSource = '';
+        })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 4 })
+      MermaidDiagramView({ source: this.mermaidViewerSource, zoomable: true, deferSource: true })
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.bg_page'))
+    .transition(uiOverlayTransition())
   }
 
   @Builder

@@ -204,6 +204,11 @@
     {"name":"v135_edit_uploads_pending","value":"첨부 파일을 업로드하는 중입니다. 완료된 후 메시지를 편집하세요."},
     {"name":"v135_edit_tray_not_empty","value":"입력창에 첨부 파일이 남아 있습니다. 전송하거나 제거한 후 메시지를 편집하세요."},
     {"name":"v135_edit_rollback_hint","value":"전송하면 이전 턴에서 변경된 파일 %d개가 되돌려집니다"},
-    {"name":"v135_edit_conversation_only","value":"전송해도 프로젝트 파일은 복원되지 않으며, 이전 파일 변경은 그대로 남습니다"}
+    {"name":"v135_edit_conversation_only","value":"전송해도 프로젝트 파일은 복원되지 않으며, 이전 파일 변경은 그대로 남습니다"},
+    {"name":"v135_mermaid_title","value":"Mermaid 다이어그램"},
+    {"name":"v135_mermaid_empty","value":"빈 Mermaid 다이어그램."},
+    {"name":"v135_mermaid_failed","value":"다이어그램을 렌더링할 수 없어 소스를 표시합니다"},
+    {"name":"v135_mermaid_open","value":"크게 보기"},
+    {"name":"v135_mermaid_close","value":"닫기"}
   ]
 }

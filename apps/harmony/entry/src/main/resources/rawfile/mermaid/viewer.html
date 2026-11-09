@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta id="viewport" name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <!--
+    Harmony Mermaid 查看页（v1.3.5 D1）。行为对齐 apps/mobile/src/session/mermaidWebViewHtml.ts：
+    零外链资源（运行时随包分发），首屏先画源码避免白条，原文解析失败用 autofix 修复版重试一次，
+    仍失败停留源码。图表源码与主题色由 ArkTS 在 onPageEnd 后经 cindyMermaidRender 注入。
+  -->
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      font-family: -apple-system, "HarmonyOS Sans", "Segoe UI", sans-serif;
+      overflow: auto;
+    }
+    #root {
+      min-height: 100vh;
+      box-sizing: border-box;
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    /* contain：SVG 撑满可视区，按 viewBox 等比缩放居中，任何容器长宽比都不变形、无内滚动。 */
+    #root > svg {
+      width: 100%;
+      height: calc(100vh - 24px) !important;
+    }
+    #root.source {
+      display: block;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, "HarmonyOS Sans Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .notice {
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+  </style>
+  <script src="mermaid.min.js"></script>
+  <script src="autofix.js"></script>
+</head>
+<body>
+  <div id="root" class="source"></div>
+  <script>
+    (function () {
+      var root = document.getElementById('root');
+      var generation = 0;
+
+      function showSource(options, label) {
+        root.className = 'source';
+        root.innerHTML = '';
+        if (label) {
+          var notice = document.createElement('div');
+          notice.className = 'notice';
+          notice.style.color = options.textTertiary;
+          notice.textContent = label;
+          root.appendChild(notice);
+        }
+        var pre = document.createElement('pre');
+        pre.style.color = options.textSecondary;
+        pre.textContent = options.source || options.emptyLabel;
+        root.appendChild(pre);
+      }
+
+      async function renderOnce(source, id) {
+        await window.mermaid.parse(source);
+        var rendered = await window.mermaid.render(id, source);
+        return rendered.svg;
+      }
+
+      window.cindyMermaidRender = async function (payloadJson) {
+        var options = JSON.parse(payloadJson);
+        var current = ++generation;
+        document.body.style.color = options.textPrimary;
+        document.getElementById('viewport').setAttribute('content', options.zoomable
+          ? 'width=device-width, initial-scale=1, maximum-scale=5'
+          : 'width=device-width, initial-scale=1, maximum-scale=1');
+        var source = String(options.source || '').trim();
+        // 全屏查看器首屏留空，源码只作降级；内联预览首屏就是源码，弱网也不出现空白条。
+        if (options.deferSource) root.innerHTML = '';
+        else showSource(options, '');
+        if (!source || !window.mermaid) {
+          showSource(options, source ? options.failedLabel : '');
+          return;
+        }
+        window.mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'strict',
+          theme: options.dark ? 'dark' : 'default',
+          fontFamily: 'inherit',
+          flowchart: { useMaxWidth: false, htmlLabels: false },
+          sequence: { useMaxWidth: false },
+          class: { useMaxWidth: false },
+          state: { useMaxWidth: false },
+          er: { useMaxWidth: false },
+          gantt: { useMaxWidth: false, useWidth: 760 },
+          journey: { useMaxWidth: false },
+          pie: { useMaxWidth: false }
+        });
+        var svg = '';
+        try {
+          svg = await renderOnce(source, 'cindy-mermaid-' + current);
+        } catch (error) {
+          var repaired = window.CindyMermaidAutofix ? window.CindyMermaidAutofix.repairMermaidSource(source) : source;
+          if (repaired && repaired !== source) {
+            try {
+              svg = await renderOnce(repaired, 'cindy-mermaid-fixed-' + current);
+            } catch (retryError) {
+              svg = '';
+            }
+          }
+        }
+        if (current !== generation) return;
+        if (!svg) {
+          showSource(options, options.failedLabel);
+          return;
+        }
+        root.className = '';
+        root.innerHTML = svg;
+      };
+    })();
+  </script>
+</body>
+</html>

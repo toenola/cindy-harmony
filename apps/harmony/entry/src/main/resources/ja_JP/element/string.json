@@ -204,6 +204,11 @@
     {"name":"v135_edit_uploads_pending","value":"添付ファイルをアップロード中です。完了してからメッセージを編集してください。"},
     {"name":"v135_edit_tray_not_empty","value":"入力欄に添付ファイルが残っています。送信または削除してからメッセージを編集してください。"},
     {"name":"v135_edit_rollback_hint","value":"送信すると前のターンで変更された %d 個のファイルが元に戻ります"},
-    {"name":"v135_edit_conversation_only","value":"送信してもプロジェクトファイルは復元されず、前回のファイル変更は残ります"}
+    {"name":"v135_edit_conversation_only","value":"送信してもプロジェクトファイルは復元されず、前回のファイル変更は残ります"},
+    {"name":"v135_mermaid_title","value":"Mermaid 図"},
+    {"name":"v135_mermaid_empty","value":"空の Mermaid 図。"},
+    {"name":"v135_mermaid_failed","value":"図を描画できないため、ソースを表示しています"},
+    {"name":"v135_mermaid_open","value":"拡大して表示"},
+    {"name":"v135_mermaid_close","value":"閉じる"}
   ]
 }

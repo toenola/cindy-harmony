@@ -204,6 +204,11 @@
     {"name":"v135_edit_uploads_pending","value":"Attachments are still uploading. Wait for them to finish before editing the message."},
     {"name":"v135_edit_tray_not_empty","value":"The input box still has attachments. Send or remove them before editing the message."},
     {"name":"v135_edit_rollback_hint","value":"Sending will undo changes to %d file(s) from the last turn"},
-    {"name":"v135_edit_conversation_only","value":"Sending will not restore project files; previous file changes will remain"}
+    {"name":"v135_edit_conversation_only","value":"Sending will not restore project files; previous file changes will remain"},
+    {"name":"v135_mermaid_title","value":"Mermaid diagram"},
+    {"name":"v135_mermaid_empty","value":"Empty Mermaid diagram."},
+    {"name":"v135_mermaid_failed","value":"The diagram couldn't be rendered; showing the source"},
+    {"name":"v135_mermaid_open","value":"View larger"},
+    {"name":"v135_mermaid_close","value":"Close"}
   ]
 }

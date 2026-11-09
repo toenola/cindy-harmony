@@ -204,6 +204,11 @@
     {"name":"v135_edit_uploads_pending","value":"還有附件正在上傳，等上傳完成後再編輯訊息。"},
     {"name":"v135_edit_tray_not_empty","value":"輸入框裡還有附件，先傳送或移除後再編輯訊息。"},
     {"name":"v135_edit_rollback_hint","value":"傳送將撤銷上一輪對 %d 個檔案的改動"},
-    {"name":"v135_edit_conversation_only","value":"傳送不會恢復專案檔案，上一輪的檔案改動會保留"}
+    {"name":"v135_edit_conversation_only","value":"傳送不會恢復專案檔案，上一輪的檔案改動會保留"},
+    {"name":"v135_mermaid_title","value":"Mermaid 圖表"},
+    {"name":"v135_mermaid_empty","value":"空 Mermaid 圖表。"},
+    {"name":"v135_mermaid_failed","value":"圖表無法渲染，顯示原始碼"},
+    {"name":"v135_mermaid_open","value":"檢視大圖"},
+    {"name":"v135_mermaid_close","value":"關閉"}
   ]
 }

@@ -608,6 +608,11 @@
     {"name":"v135_edit_uploads_pending","value":"还有附件正在上传，等上传完成后再编辑消息。"},
     {"name":"v135_edit_tray_not_empty","value":"输入框里还有附件，先发送或移除后再编辑消息。"},
     {"name":"v135_edit_rollback_hint","value":"发送将撤销上一轮对 %d 个文件的改动"},
-    {"name":"v135_edit_conversation_only","value":"发送不会恢复项目文件，上一轮的文件改动会保留"}
+    {"name":"v135_edit_conversation_only","value":"发送不会恢复项目文件，上一轮的文件改动会保留"},
+    {"name":"v135_mermaid_title","value":"Mermaid 图表"},
+    {"name":"v135_mermaid_empty","value":"空 Mermaid 图表。"},
+    {"name":"v135_mermaid_failed","value":"图表无法渲染，显示源码"},
+    {"name":"v135_mermaid_open","value":"查看大图"},
+    {"name":"v135_mermaid_close","value":"关闭"}
   ]
 }
