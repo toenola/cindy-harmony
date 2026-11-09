@@ -8,7 +8,7 @@
 
 import { DlClient, DlError, DlInvokeOptions } from '../device-link/DlClient';
 import { DlChannels } from '../device-link/DlProtocol';
-import { RemoteSession, parseSession, readNum, readObj, readStr, safeErrorMessage, sessionListActivityAt } from './TaskModels';
+import { RemoteSession, parseSession, readNum, readObj, readStr, safeErrorMessage, sessionListActivityAt, sessionProjectDirectory } from './TaskModels';
 import { TaskStore, unwrapInvokeResult } from './TaskStore';
 
 export const TASK_SEARCH_LIMIT = 24;
@@ -147,7 +147,7 @@ export function remoteTaskSearchIgnoredWorkingDirs(
   const allowed = normalizeTaskSearchWorkingDirSet(workingDirs);
   if (allowed === null) return false;
   for (let i = 0; i < page.results.length; i++) {
-    const current = normalizeTaskSearchWorkingDir(page.results[i].session.workingDir);
+    const current = normalizeTaskSearchWorkingDir(sessionProjectDirectory(page.results[i].session));
     if (current.length === 0 || !allowed.has(current)) return true;
   }
   return false;
@@ -187,7 +187,7 @@ export function searchCachedTaskSessions(
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     if (session.id.length === 0 || session.status === 'deleted' || session.orcaRole === 'worker') continue;
-    if (origin.deviceId.length > 0 && !matchesTaskSearchWorkingDir(session.workingDir, origin.workingDirs)) {
+    if (origin.deviceId.length > 0 && !matchesTaskSearchWorkingDir(sessionProjectDirectory(session), origin.workingDirs)) {
       continue;
     }
     const title = taskSearchDisplayTitle(session, request.unnamedLabel).toLowerCase();
@@ -271,13 +271,14 @@ export function listTaskSearchProjects(
     const session = sessions[i];
     if (session.status === 'deleted' || session.orcaRole === 'worker'
       || session.workspaceKind === 'dialogue') continue;
-    const workingDir = normalizeTaskSearchWorkingDir(session.workingDir);
+    const projectDir = sessionProjectDirectory(session);
+    const workingDir = normalizeTaskSearchWorkingDir(projectDir);
     if (workingDir.length === 0) continue;
     const key = `${deviceId}:${workingDir}`;
     const existing = byKey.get(key);
     if (existing !== undefined) {
       existing.count += 1;
-      const remoteWorkingDir = session.workingDir.trim();
+      const remoteWorkingDir = projectDir.trim();
       if (remoteWorkingDir.length > 0 && existing.remoteWorkingDirs.indexOf(remoteWorkingDir) < 0) {
         existing.remoteWorkingDirs.push(remoteWorkingDir);
       }
@@ -289,7 +290,7 @@ export function listTaskSearchProjects(
     option.deviceName = deviceName;
     option.workingDir = workingDir;
     option.title = taskSearchProjectTitle(workingDir);
-    option.remoteWorkingDirs = [session.workingDir.trim()];
+    option.remoteWorkingDirs = [projectDir.trim()];
     option.count = 1;
     byKey.set(key, option);
   }
@@ -478,7 +479,8 @@ function taskSearchResultMatchesFilters(
   result: TaskSearchResult,
   filters: TaskSearchFilters,
 ): boolean {
-  if (!matchesTaskSearchWorkingDir(result.session.workingDir, filters.workingDirs)) return false;
+  // 电脑端按 projectDir ?? workingDir 过滤项目，结果端复核用同一口径。
+  if (!matchesTaskSearchWorkingDir(sessionProjectDirectory(result.session), filters.workingDirs)) return false;
   if (result.session.status === 'deleted') return false;
   if (filters.status === 'active' && result.session.status !== 'active') return false;
   if (filters.status === 'archived' && result.session.status !== 'archived') return false;

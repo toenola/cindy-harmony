@@ -743,6 +743,7 @@ export class TaskStore {
     out['userId'] = s.userId;
     out['title'] = s.title;
     out['workingDir'] = s.workingDir;
+    if (s.projectDir.length > 0) out['projectDir'] = s.projectDir;
     out['worktreePath'] = s.worktreePath;
     out['extraDirs'] = s.extraDirs;
     out['remoteHostId'] = s.remoteHostId;

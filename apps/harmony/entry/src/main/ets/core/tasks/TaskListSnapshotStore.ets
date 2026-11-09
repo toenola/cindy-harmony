@@ -36,6 +36,7 @@ function sessionRecord(session: RemoteSession): Record<string, Object | null> {
   out['id'] = session.id;
   if (session.title.length > 0) out['title'] = truncated(session.title);
   if (session.workingDir.length > 0) out['workingDir'] = truncated(session.workingDir);
+  if (session.projectDir.length > 0) out['projectDir'] = truncated(session.projectDir);
   if (session.worktreePath.length > 0) out['worktreePath'] = truncated(session.worktreePath);
   out['workspaceKind'] = session.workspaceKind === 'dialogue' ? 'dialogue' : 'project';
   if (session.model.length > 0) out['model'] = truncated(session.model);

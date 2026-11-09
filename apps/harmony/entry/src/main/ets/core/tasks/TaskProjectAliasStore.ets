@@ -1,5 +1,5 @@
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
-import { RemoteSession, readStr, safeErrorMessage } from './TaskModels';
+import { RemoteSession, readStr, safeErrorMessage, sessionProjectDirectory } from './TaskModels';
 import { normalizeTaskProjectPath } from './TaskProjectOrderStore';
 import { unwrapInvokeResult } from './TaskStore';
 
@@ -29,8 +29,9 @@ export function resolveProjectAliasForSessions(deviceId: string, sessions: Remot
   aliases: Map<string, string>): string {
   let identity = '';
   for (const session of sessions) {
-    if (session.remoteHostId.length > 0 || session.workingDir.length === 0) return '';
-    const key = remoteProjectAliasKey(deviceId, session.workingDir);
+    const projectDir = sessionProjectDirectory(session);
+    if (session.remoteHostId.length > 0 || projectDir.length === 0) return '';
+    const key = remoteProjectAliasKey(deviceId, projectDir);
     if (identity.length > 0 && identity !== key) return '';
     identity = key;
   }

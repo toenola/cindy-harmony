@@ -1,10 +1,21 @@
 import { describe, expect, it } from '@ohos/hypium';
 import { DlClient, DlClientOptions, DlError, DlInvokeOptions } from '../main/ets/core/device-link/DlClient';
 import { Envelope } from '../main/ets/core/device-link/DlProtocol';
-import { InputQueueStore, parseInputProjection } from '../main/ets/core/messages/InputQueueStore';
+import {
+  InputQueueStore, parseInputProjection, parseQueuedInputItem, queuedInputDisplayText,
+} from '../main/ets/core/messages/InputQueueStore';
 import {
   readUsageLimitWait, shouldShowUsageLimitWait, usageLimitWaitCancelUnsupported,
 } from '../main/ets/core/messages/UsageLimitWait';
+
+/** 投影里的一条排队消息；extra 覆盖默认字段。 */
+function queuedRow(extra: string): Record<string, Object> {
+  const base = JSON.parse('{"clientId":"q","text":"agent-only","persistedContent":"shown","model":"m","workingDir":"/w",'
+    + '"createOpts":{},"chatMessage":{"role":"user","createdAt":"2026-11-09T00:00:00Z"}}') as Record<string, Object>;
+  const patch = JSON.parse(extra) as Record<string, Object>;
+  Object.keys(patch).forEach((key: string) => { base[key] = patch[key]; });
+  return base;
+}
 
 class QueueDeferredValue<T> {
   promise: Promise<T>;
@@ -361,6 +372,23 @@ export default function v132QueueTests(): void {
       expect(store.getUsageLimitWaitState('session', 'device').cancelError).assertEqual('');
       expect(store.getProjection('session', 'device').usageLimitWait?.resumeAt).assertEqual(3000);
       store.clearAll();
+    });
+
+    // v1.3.5：对齐 maker-shared queueItemVisibleText。自动化、其他任务、插件代发的条目 text 是给 Agent 的原文，
+    // 旧实现只认 session 来源，定时任务与插件会把 Agent 原文露给用户；粘贴段也未还原成折叠占位。
+    it('shows_auto_sent_queue_items_by_their_visible_content', 0, () => {
+      const display = (extra: string): string => queuedInputDisplayText(parseQueuedInputItem(queuedRow(extra))!);
+      expect(display('{}')).assertEqual('agent-only');
+      expect(display('{"origin":{"kind":"scheduler"}}')).assertEqual('shown');
+      expect(display('{"sourcePlugin":{"pluginId":"cards"}}')).assertEqual('shown');
+      expect(display('{"origin":{"kind":"session"},"persistedContent":""}')).assertEqual('');
+      const envelope = JSON.stringify(JSON.stringify({ text: 'see LONG end' }));
+      expect(display(`{"origin":{"kind":"scheduler"},"persistedContent":${envelope},`
+        + '"chatMessage":{"role":"user","pastedTextRanges":[{"start":4,"end":8,"display":"[粘贴 1 行]"}]}}'))
+        .assertEqual('see [粘贴 1 行] end');
+      expect(display(`{"origin":{"kind":"scheduler"},"persistedContent":${envelope},`
+        + '"chatMessage":{"role":"user","pastedTextRanges":[{"start":4,"end":99,"display":"x"}]}}'))
+        .assertEqual('see LONG end');
     });
 
     it('discards_late_cancel_unsupported_after_account_switch_without_poisoning_new_scope', 0, async () => {

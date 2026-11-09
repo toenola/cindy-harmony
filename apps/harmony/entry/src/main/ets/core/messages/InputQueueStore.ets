@@ -36,21 +36,61 @@ export class QueuedInputItem {
   files: RemoteSerializedAttachment[] = [];
 }
 
-function queuedInputDisplayText(item: QueuedInputItem): string {
-  if (readStr(readObj(item.raw, 'origin'), 'kind') !== 'session') return item.text;
-  let visible = item.persistedContent.length > 0 ? item.persistedContent : item.text;
+/** 自动化、其他任务或插件代发的排队条目（对齐 maker-shared isAutoSentQueueItem）。 */
+function queuedInputIsAutoSent(item: QueuedInputItem): boolean {
+  const kind = readStr(readObj(item.raw, 'origin'), 'kind');
+  if (kind === 'scheduler' || kind === 'session') return true;
+  return readStr(readObj(item.raw, 'sourcePlugin'), 'pluginId').trim().length > 0;
+}
+
+/**
+ * 排队条目给人看的正文（对齐 maker-shared queueItemVisibleText）：自动代发的条目 `text` 是发给 Agent 的原文，
+ * 显示落库内容；带附件时取 `{text}` 信封里的正文，并把粘贴段替换回折叠占位。
+ * 落库内容是投影必填字段，有意为空时照样显示为空。
+ */
+export function queuedInputDisplayText(item: QueuedInputItem): string {
+  if (!queuedInputIsAutoSent(item)) return item.text;
+  const persisted = item.persistedContent;
+  const rangesRaw = readObj(item.raw, 'chatMessage')['pastedTextRanges'];
+  const ranges = Array.isArray(rangesRaw) ? rangesRaw as Object[] : [];
   const files = item.raw['files'];
-  if (Array.isArray(files) && files.length > 0) {
-    try {
-      const content = JSON.parse(visible) as Object;
-      if (content !== null && typeof content === 'object' && !Array.isArray(content)) {
-        const text = (content as Record<string, Object>)['text'];
-        if (typeof text === 'string') visible = text;
-      }
-    } catch (_error) {
-    }
+  if ((!Array.isArray(files) || files.length === 0) && ranges.length === 0) {
+    return forwardedRequestDisplayText(persisted);
   }
-  return forwardedRequestDisplayText(visible);
+  let envelopeText: string | null = null;
+  try {
+    const content = JSON.parse(persisted) as Object;
+    if (content !== null && typeof content === 'object' && !Array.isArray(content)) {
+      const text = (content as Record<string, Object>)['text'];
+      if (typeof text === 'string') envelopeText = text as string;
+    }
+  } catch (_error) {
+    // 不是信封：落库内容本身就是可见正文。
+  }
+  if (envelopeText === null) return forwardedRequestDisplayText(persisted);
+  return forwardedRequestDisplayText(replacePastedRanges(envelopeText, ranges));
+}
+
+/** 区间不合法时整体放弃替换，退回信封正文。 */
+function replacePastedRanges(text: string, ranges: Object[]): string {
+  if (ranges.length === 0) return text;
+  let cursor = 0;
+  const parts: string[] = [];
+  for (let i = 0; i < ranges.length; i++) {
+    const item = ranges[i];
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return text;
+    const range = item as Record<string, Object>;
+    const start = range['start'];
+    const end = range['end'];
+    const display = range['display'];
+    if (typeof start !== 'number' || typeof end !== 'number' || !Number.isInteger(start) || !Number.isInteger(end)
+      || (start as number) < cursor || (end as number) <= (start as number) || (end as number) > text.length
+      || typeof display !== 'string') return text;
+    parts.push(text.slice(cursor, start as number), display as string);
+    cursor = end as number;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join('');
 }
 
 export class InputProjectionState {

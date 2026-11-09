@@ -34,7 +34,7 @@ import {
 import { AppServices } from '../core/AppServices';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
-import { RemoteSession, readStr } from '../core/tasks/TaskModels';
+import { RemoteSession, readStr, sessionProjectDirectory } from '../core/tasks/TaskModels';
 import { SessionLiveActivity, SessionMetaPatch } from '../core/tasks/TaskStore';
 import {
   listTaskSearchProjects,
@@ -1927,7 +1927,7 @@ struct TaskListPage {
     const key = taskProjectOrderKey(deviceId, workingDir);
     const members = AppServices.instance.tasks.getSessions(deviceId).filter((session: RemoteSession): boolean =>
       session.status !== 'deleted' && session.orcaRole !== 'worker' && taskListCategory(session) === 'projects'
-        && taskProjectOrderKey(deviceId, session.workingDir) === key);
+        && taskProjectOrderKey(deviceId, sessionProjectDirectory(session)) === key);
     return AppServices.instance.taskProjectAliases.resolve(deviceId, members);
   }
 
@@ -1937,14 +1937,15 @@ struct TaskListPage {
       const entry = entries[i];
       const session = entry.session;
       if (taskListCategory(session) !== 'projects') continue;
-      const key = taskProjectOrderKey(entry.deviceId, session.workingDir);
+      const projectDir = sessionProjectDirectory(session);
+      const key = taskProjectOrderKey(entry.deviceId, projectDir);
       let group = groups.get(key);
       if (group === undefined) {
         group = new TaskProjectGroup();
         group.key = key;
         group.deviceId = entry.deviceId;
-        group.workingDir = session.workingDir;
-        group.title = taskProjectName(session.workingDir);
+        group.workingDir = projectDir;
+        group.title = taskProjectName(projectDir);
         group.latestActivityAt = taskActivityAt(session);
         groups.set(key, group);
       }
@@ -2986,8 +2987,9 @@ struct TaskListPage {
   private taskSearchResultSubtitle(result: TaskSearchResult): string {
     const current = this.devices.find((item: PresenceSnapshot): boolean => item.deviceId === result.deviceId);
     const device = this.displayDeviceName(result.deviceId, current?.deviceName ?? result.deviceName);
+    const projectDir = sessionProjectDirectory(result.session);
     const project = result.session.workingDir.length > 0
-      ? (this.projectAlias(result.deviceId, result.session.workingDir) || taskProjectName(result.session.workingDir))
+      ? (this.projectAlias(result.deviceId, projectDir) || taskProjectName(projectDir))
       : taskListCategory(result.session) === 'automations'
         ? this.v12String('v12_automation') : this.v12String('v12_dialogue');
     return `${device} · ${project}`;

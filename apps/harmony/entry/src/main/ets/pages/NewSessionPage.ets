@@ -60,7 +60,7 @@ import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
-import { RemoteSession, readBool, readObj, readStr } from '../core/tasks/TaskModels';
+import { RemoteSession, readBool, readObj, readStr, sessionProjectDirectory } from '../core/tasks/TaskModels';
 import { normalizeTaskProjectPath } from '../core/tasks/TaskProjectOrderStore';
 import {
   NewSessionDirectoryDrive,
@@ -551,7 +551,7 @@ export struct NewSessionPageContent {
     const out: RecentProject[] = [];
     for (let i = 0; i < sessions.length; i++) {
       const session = sessions[i];
-      const path = session.workingDir;
+      const path = sessionProjectDirectory(session);
       if (session.status === 'deleted' || session.workspaceKind === 'dialogue' || path.length === 0) continue;
       let found = false;
       for (let j = 0; j < out.length; j++) {
@@ -580,7 +580,7 @@ export struct NewSessionPageContent {
     const normalized = normalizeTaskProjectPath(path);
     const sessions = AppServices.instance.tasks.getSessions(this.selectedDeviceId)
       .filter((session: RemoteSession): boolean => session.status !== 'deleted'
-        && session.workspaceKind !== 'dialogue' && normalizeTaskProjectPath(session.workingDir) === normalized);
+        && session.workspaceKind !== 'dialogue' && normalizeTaskProjectPath(sessionProjectDirectory(session)) === normalized);
     return AppServices.instance.taskProjectAliases.resolve(this.selectedDeviceId, sessions) || directoryTitle(path);
   }
 

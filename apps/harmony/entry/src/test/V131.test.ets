@@ -365,6 +365,9 @@ export default function v131Tests(): void {
       const remote = new RemoteSession(); remote.workingDir = '/repo'; remote.remoteHostId = 'ssh';
       expect(resolveProjectAliasForSessions('device', [session, remote], aliases)).assertEqual('');
       expect(resolveProjectAliasForSessions('other', [session], aliases)).assertEqual('');
+      // v1.3.5 C2：任意位置的兄弟 worktree 靠显式 projectDir 归到所属项目，别名一致。
+      const sibling = new RemoteSession(); sibling.workingDir = '/elsewhere/feature'; sibling.projectDir = '/repo';
+      expect(resolveProjectAliasForSessions('device', [session, sibling], aliases)).assertEqual('Named');
     });
     it('clears_a_stale_alias_when_an_old_host_rejects_the_channel', 0, async () => {
       const client = new AliasClient();

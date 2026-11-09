@@ -703,6 +703,28 @@ export default function localUnitTest() {
       expect(projects[0].count).assertEqual(2);
     });
 
+    // v1.3.5 C2：电脑端为任务记录显式项目归属 projectDir（upstream 8cff805d31），
+    // 不在 .worktrees 等约定目录下的兄弟 worktree 也必须归到所属项目；旧任务没有该字段时沿用 workingDir。
+    it('groupsExplicitProjectMembersAndSearchesThemUnderTheirProject', 0, () => {
+      const rawJson = '{"id":"sibling","title":"Sibling","workingDir":"/elsewhere/feature","projectDir":"/repo"}';
+      const raw = JSON.parse(rawJson) as Record<string, Object>;
+      const sibling = parseSession(raw);
+      expect(sibling.projectDir).assertEqual('/repo');
+      const legacy = searchSession('legacy', 'Legacy', '/repo/.cindy-worktrees/feature-a', '');
+      const projects = listTaskSearchProjects('desktop-a', 'Studio', [sibling, legacy]);
+      expect(projects.length).assertEqual(1);
+      expect(projects[0].key).assertEqual('desktop-a:/repo');
+      expect(JSON.stringify(projects[0].remoteWorkingDirs)).assertEqual('["/repo","/repo/.cindy-worktrees/feature-a"]');
+
+      const origin = new TaskSearchOrigin();
+      origin.deviceId = 'desktop-a';
+      origin.workingDirs = ['/repo'];
+      const request = new TaskSearchRequest();
+      request.query = 'sibling';
+      const page = searchCachedTaskSessions(origin, request, [sibling]);
+      expect(page.results.length).assertEqual(1);
+    });
+
     it('scopesSessionSnapshotLookupsToTheOwningDevice', 0, () => {
       const tasks = new TaskStore();
       const first = searchSession('same-session-id', 'Studio task', '/repo', '');

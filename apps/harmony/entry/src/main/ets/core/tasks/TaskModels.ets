@@ -151,6 +151,8 @@ export class RemoteSession {
   userId: string = '';
   title: string = '';
   workingDir: string = '';
+  /** 被控端记录的显式项目归属；为空时（旧任务 / 旧电脑端）沿用 workingDir。 */
+  projectDir: string = '';
   worktreePath: string = '';
   extraDirs: string[] = [];
   /** SSH 会话的被控端 host alias；本地会话为空。 */
@@ -197,12 +199,21 @@ export class RemoteSession {
   pendingLocalCreation: boolean = false;
 }
 
+/**
+ * 任务所属项目目录：显式归属优先于工作目录，任意兄弟 worktree 也能归到所属项目。
+ * 只用于展示与分组，不是执行路径（对齐 maker-shared sessionProjectDirectory）。
+ */
+export function sessionProjectDirectory(session: RemoteSession): string {
+  return session.projectDir.length > 0 ? session.projectDir : session.workingDir;
+}
+
 export function parseSession(raw: Record<string, Object>): RemoteSession {
   const s = new RemoteSession();
   s.id = readStr(raw, 'id');
   s.userId = readStr(raw, 'userId');
   s.title = readStr(raw, 'title');
   s.workingDir = readStr(raw, 'workingDir');
+  s.projectDir = readStr(raw, 'projectDir');
   s.worktreePath = readStr(raw, 'worktreePath');
   const rawExtraDirs = raw['extraDirs'];
   if (Array.isArray(rawExtraDirs)) {
