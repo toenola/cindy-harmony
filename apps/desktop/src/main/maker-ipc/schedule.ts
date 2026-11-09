@@ -73,6 +73,9 @@ import { getGhostManager } from '../cindy-brain/index.js';
 import { throwIpcError, requireString, requireObject } from '../utils/ipcValidate.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
 import { isDeviceLinkInvoke } from '../device-link/invoke-context.js';
+import { getScheduleWebhookHost, scheduleWebhookReceiver } from '../scheduler-host/webhook/runtime.js';
+import type { ScheduleWebhookHost } from '../scheduler-host/webhook/index.js';
+import { remoteCreateWorkingDirError } from './remoteScheduleWorkingDir.js';
 import { isTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
 import { getAgentIslandService } from '../agent-island/service.js';
 import { getSessionProvider } from '../maker-host/session-provider-store.js';
@@ -279,8 +282,12 @@ export function normalizeLegacyDeviceLinkModelSelection(
     || !Object.prototype.hasOwnProperty.call(patch, 'notify')
     || !(patch.targetSessionId ?? existing.targetSessionId)) return patch;
   const model = patch.model?.trim() || undefined;
-  if (patch.agentKind === existing.agentKind && model === (existing.model?.trim() || undefined)) return patch;
+  // A full form with no model follows its task. Its JSON-safe empty location
+  // clears the old selection; location-only partial patches still select local.
+  const clearsLocation = !model && patch.modelAgentDeviceId === '';
+  if (!clearsLocation && patch.agentKind === existing.agentKind && model === (existing.model?.trim() || undefined)) return patch;
   return { ...patch, modelAgentKind: model ? patch.agentKind : undefined,
+    ...(clearsLocation ? { modelAgentDeviceId: undefined } : {}),
     // The old bound form omits empty model/provider/effort and has no Fast control.
     // Clear the previous route when the visible selection changes instead of retaining
     // a provider or Fast preference belonging to the old Harness/model.
@@ -313,6 +320,7 @@ function buildCreateScheduleInput(
     agentKind: overrides.agentKind ?? template.agentKind ?? 'claude-code',
     agentDeviceId: overrides.agentDeviceId,
     modelAgentKind: overrides.modelAgentKind,
+    modelAgentDeviceId: overrides.modelAgentDeviceId,
     model: overrides.model ?? template.model,
     providerId: overrides.providerId ?? template.providerId,
     effort: overrides.effort ?? template.effort,
@@ -369,6 +377,10 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
 
   ipcMain.handle(MAKER_INVOKE.SCHEDULE_CREATE, async (_e, input: unknown) => {
     requireObject(input, 'input');
+    if (isDeviceLinkInvoke()) {
+      const workingDirError = await remoteCreateWorkingDirError((input as { workingDir?: unknown }).workingDir);
+      if (workingDirError) throwIpcError('INVALID_PARAMS', workingDirError);
+    }
     return withScheduler(async ({ scheduler }) => {
       const normalized = await stabilizePreRunHookForCreate(
         normalizeNullableIntervalMs(input as CreateScheduleInput & { intervalMs?: number | null }),
@@ -378,18 +390,26 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
     });
   });
 
-  ipcMain.handle(MAKER_INVOKE.SCHEDULE_UPDATE, async (_e, id: unknown, patch: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_UPDATE, async (_e, id: unknown, patch: unknown, expectedRaw?: unknown) => {
     const scheduleId = requireString(id, 'id');
     requireObject(patch, 'patch');
+    const expected = expectedRaw === undefined ? undefined : requireObject(expectedRaw, 'expected') as unknown as Schedule;
+    // JSON must keep null until this receiving boundary; undefined keys disappear
+    // in transit. Only model-selection axes gain explicit clearing semantics.
+    const normalizedPatch = { ...patch as Record<string, unknown> };
+    for (const key of ['modelAgentDeviceId', 'modelAgentKind', 'model', 'providerId', 'effort']) {
+      if (normalizedPatch[key] === null) normalizedPatch[key] = undefined;
+    }
     return withScheduler(({ scheduler }) =>
-      scheduler.updateFromCurrent(scheduleId, (existing) =>
-        stabilizePreRunHookForUpdate(
+      scheduler.updateFromCurrent(
+        scheduleId,
+        (existing) => stabilizePreRunHookForUpdate(
           existing,
           normalizeLegacyDeviceLinkModelSelection(
             existing,
             normalizeLegacyDeviceLinkIntervalClear(
               normalizeNullableIntervalMs(
-                patch as UpdateScheduleInput & { intervalMs?: number | null },
+                normalizedPatch as UpdateScheduleInput & { intervalMs?: number | null },
               ),
               isDeviceLinkInvoke(),
             ),
@@ -397,6 +417,7 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
           ),
           hookPathDeps,
         ),
+        expected,
       ),
     );
   });
@@ -438,14 +459,18 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
     });
   });
 
-  ipcMain.handle(MAKER_INVOKE.SCHEDULE_RESUME, async (_e, id: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_RESUME, async (_e, id: unknown, expectedRaw?: unknown) => {
     const scheduleId = requireString(id, 'id');
-    return withScheduler(({ scheduler }) => scheduler.resume(scheduleId));
+    const expected = expectedRaw === undefined ? undefined : requireObject(expectedRaw, 'expected') as unknown as Schedule;
+    return withScheduler(({ scheduler }) => scheduler.resume(scheduleId, expected));
   });
 
-  ipcMain.handle(MAKER_INVOKE.SCHEDULE_RUN_NOW, async (_e, id: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_RUN_NOW, async (_e, id: unknown, optionsRaw?: unknown) => {
     const scheduleId = requireString(id, 'id');
-    return withScheduler(({ scheduler }) => scheduler.runNow(scheduleId));
+    const options = optionsRaw && typeof optionsRaw === 'object' && !Array.isArray(optionsRaw)
+      ? optionsRaw as { expectedSchedule?: Schedule } : undefined;
+    return withScheduler(({ scheduler }) => scheduler.runNow(scheduleId,
+      options?.expectedSchedule ? { expectedSchedule: options.expectedSchedule } : undefined));
   });
 
   // 表单「AI 生成」:按用户自然语言描述生成前置检查脚本(utility model 单次生成,
@@ -476,6 +501,16 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
   ipcMain.handle(MAKER_INVOKE.SCHEDULE_GENERATE_PRE_RUN_HOOK, async (event, payload: unknown) => {
     const body = requireObject(payload, 'payload');
     const description = requireString(body.description, 'description');
+    // The script helper uses direct utility HTTP calls. Never interpret a remote
+    // provider id as a local credential (including a coincidentally identical id).
+    const unsupportedRemoteGeneration = (providerId: unknown, model: unknown, agentKind: unknown) => ({
+      ok: false as const, reason: 'no_candidate' as const,
+      attempts: [{ providerId: typeof providerId === 'string' ? providerId : '',
+        model: typeof model === 'string' ? model : '',
+        transport: agentKind === 'codex' ? 'codex-responses' as const : 'litellm-chat-completions' as const,
+        status: 'skipped' as const, reason: 'unsupported_transport' as const }],
+    });
+    if (body.modelAgentDeviceId) return unsupportedRemoteGeneration(body.providerId, body.model, body.agentKind);
     const maker = getMaker?.();
     if (!maker) throwIpcError('INTERNAL', 'maker not ready for hook script generation');
     const workingDir = await resolveHookWorkingDir(body);
@@ -494,7 +529,13 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
       targetSessionId,
       resolveBoundSessionRoute: body.resolveBoundSessionRoute === true,
     })) {
-      const session = await maker.getSessionMeta(targetSessionId).catch(() => null);
+      // Explicit local choices resolve only against the host catalog. The bound
+      // task still supplies cwd, but its remote model/provider must not leak in.
+      const explicitLocal = body.modelAgentDeviceId === '';
+      const session = explicitLocal
+        ? requestedAgentKind ? { agentKind: requestedAgentKind, model: model ?? '', agentDeviceId: null } : null
+        : await maker.getSessionMeta(targetSessionId).catch(() => null);
+      if (session?.agentDeviceId) return unsupportedRemoteGeneration(providerId, model ?? session.model, session.agentKind);
       // Bound-session fallback must use the same live connection snapshot as
       // the provider picker. Never turn an unconnected built-in provider into
       // a routable candidate just because it exists in the catalog.
@@ -507,7 +548,7 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
       });
       const route = resolveBoundSessionGenerationRoute({
         session,
-        sessionProviderId: getSessionProvider(targetSessionId),
+        sessionProviderId: explicitLocal ? undefined : getSessionProvider(targetSessionId),
         requestedProviderId: providerId,
         requestedModel: model,
         providers,
@@ -517,7 +558,7 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
           ok: false as const,
           reason: 'no_candidate' as const,
           attempts: [{
-            providerId: getSessionProvider(targetSessionId) ?? targetSessionId,
+            providerId: explicitLocal ? providerId ?? '' : getSessionProvider(targetSessionId) ?? targetSessionId,
             model: session?.model?.trim() ?? '',
             transport: session?.agentKind === 'codex' ? 'codex-responses' as const : 'litellm-chat-completions' as const,
             status: 'skipped' as const,
@@ -698,6 +739,74 @@ export function registerScheduleHandlers(getMaker?: () => Maker | null): void {
       return scheduler.create(normalized);
     });
   });
+
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_STATUS, async (_e, id: unknown) => {
+    const scheduleId = requireString(id, 'id');
+    return withScheduler(async ({ scheduler }) => {
+      const schedule = await scheduler.get(scheduleId);
+      await getScheduleWebhookHost()?.refreshStatus();
+      return schedule ? getScheduleWebhookHost()?.status(schedule) ?? null : null;
+    });
+  });
+
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_RECEIVER, async () => scheduleWebhookReceiver());
+
+  const manageWebhooks = async <T>(run: (host: ScheduleWebhookHost) => Promise<T>): Promise<T> => {
+    const host = getScheduleWebhookHost();
+    if (!host) throwIpcError('INTERNAL', 'WEBHOOK_MANAGEMENT_UNAVAILABLE');
+    try {
+      return await run(host);
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+      const message = error instanceof Error ? error.message : '';
+      const known = ['WEBHOOK_ENDPOINT_LIMIT', 'WEBHOOK_ENDPOINT_RELEASED', 'WEBHOOK_ACCOUNT_REQUIRED',
+        'WEBHOOK_MANAGEMENT_UNAVAILABLE', 'WEBHOOK_ACCOUNT_CHANGED'];
+      throwIpcError('INTERNAL', typeof code === 'string' && known.includes(code) ? code
+        : known.includes(message) ? message : 'WEBHOOK_MANAGEMENT_FAILED');
+    }
+  };
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_ACCOUNT, () => manageWebhooks((host) => host.accountOverview()));
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_RELEASE, (_e, id: unknown) => {
+    const endpointId = requireString(id, 'id');
+    if (!/^whk_[A-Za-z0-9_-]{1,128}$/.test(endpointId)) throwIpcError('INVALID_PARAMS', 'Invalid endpoint id');
+    return manageWebhooks((host) => host.releaseEndpoint(endpointId));
+  });
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_RESTORE, (_e, id: unknown) => {
+    const scheduleId = requireString(id, 'id');
+    return withScheduler(async ({ scheduler }) => {
+      const schedule = await scheduler.get(scheduleId);
+      if (!schedule) throwIpcError('NOT_FOUND', 'Schedule not found');
+      return manageWebhooks((host) => host.restoreEndpoint(schedule));
+    });
+  });
+
+  /** 地址和密钥只在任务所在电脑管理；两个通道都不在 Device Link 白名单内。 */
+  const withWebhookHost = <T>(id: unknown, run: (host: ScheduleWebhookHost, schedule: Schedule) => Promise<T>) => {
+    const scheduleId = requireString(id, 'id');
+    if (isDeviceLinkInvoke()) throwIpcError('INVALID_PARAMS', 'Webhook endpoints can only be managed on the computer running this schedule');
+    return withScheduler(async ({ scheduler }) => {
+      const schedule = await scheduler.get(scheduleId);
+      if (!schedule) throwIpcError('NOT_FOUND', `Schedule not found: ${scheduleId}`);
+      const host = getScheduleWebhookHost();
+      if (!host) throwIpcError('INTERNAL', 'Schedule webhooks are not running');
+      try {
+        return await run(host, schedule);
+      } catch (error) {
+        // 用户能修正的错误带上稳定的错误码，界面据此提示。
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'WEBHOOK_SECRET_INVALID' || message === 'WEBHOOK_UNSIGNED') throwIpcError('INVALID_PARAMS', message);
+        throw error;
+      }
+    });
+  };
+
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_SET_SECRET, async (_e, id: unknown, secret: unknown) => {
+    if (secret !== undefined && typeof secret !== 'string') throwIpcError('INVALID_PARAMS', 'secret must be a string');
+    return withWebhookHost(id, (host, schedule) => host.setSecret(schedule, secret === undefined ? undefined : secret.trim()));
+  });
+
+  ipcMain.handle(MAKER_INVOKE.SCHEDULE_WEBHOOK_ROTATE_URL, async (_e, id: unknown) =>
+    withWebhookHost(id, (host, schedule) => host.rotateUrl(schedule)));
 
   ipcMain.handle(MAKER_INVOKE.SCHEDULE_SCRIPT_CAPABILITY_STATUS, async () => {
     // 查询型 handler(规则 13 例外):探测失败不该挡住表单——返回空列表,

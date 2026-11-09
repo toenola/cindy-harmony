@@ -52,6 +52,7 @@ vi.mock('@/device-link/useMobileMakerTransport', () => ({
 vi.mock('@/inputHandoff/InputHandoffCard', () => ({ InputHandoffCard: () => null }));
 vi.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }) }));
 vi.mock('react-native', async () => {
+  const window = { width: 390, height: 844, scale: 3, fontScale: 1 };
   const { createElement } = await import('react');
   const view = (tag: string) => ({ children, onPress, disabled, testID, accessibilityState, accessibilityLabel, style }: {
     children?: ReactNode; onPress?: () => void; disabled?: boolean; testID?: string; accessibilityState?: { busy?: boolean }; accessibilityLabel?: string; style?: unknown;
@@ -63,7 +64,8 @@ vi.mock('react-native', async () => {
   };
   return { View: view('div'), Text, Pressable: view('button'), Linking: { openURL: evidence.openURL },
     ScrollView: view('div'), Image: () => null, ActivityIndicator: () => null,
-    useWindowDimensions: () => ({ width: 390, height: 844 }),
+    useWindowDimensions: () => window,
+    Dimensions: { get: () => window, addEventListener: () => ({ remove() {} }) },
     StyleSheet: { create: (s: unknown) => s, hairlineWidth: 1 } };
 });
 vi.mock('@/components/AppText', async () => {
@@ -79,7 +81,7 @@ vi.mock('@/components/AppText', async () => {
 vi.mock('lucide-react-native', async () => {
   const { createElement } = await import('react');
   return { ShieldCheck: () => null, MessageCircle: () => null, ChevronDown: () => null, ChevronUp: () => null, Check: () => null, CornerDownLeft: () => null,
-    Maximize2: () => null, Minimize2: () => null, Minus: () => null, Mic: ({ color }: { color: string }) => createElement('span', { 'data-mic-color': color }), Pencil: () => null, Plus: () => null };
+    Maximize2: () => null, Minimize2: () => null, Minus: () => null, Mic: ({ color }: { color: string }) => createElement('span', { 'data-mic-color': color }), Square: ({ color }: { color: string }) => createElement('span', { 'data-stop-color': color }), Pencil: () => null, Plus: () => null };
 });
 vi.mock('react-i18next', async (importOriginal) => ({
   ...await importOriginal<typeof import('react-i18next')>(),
@@ -136,7 +138,7 @@ async function type(id: string, value: string) {
 
 // #6778, unit: render the real card/hook and start/stop dictation. Earlier tests
 // only checked labels and clicks, missing the invisible inverse-colour mic.
-// Preserve the existing unfilled control; only startup replaces the mic.
+// Preserve the unfilled control; distinguish startup, recording and processing.
 // Minimal input: one question in each answer layout, in either theme.
 it.each(['light', 'dark'] as const)('keeps the recording mic visible in %s answer layouts', async (mode) => {
   theme.mode = mode;
@@ -170,7 +172,7 @@ it.each(['light', 'dark'] as const)('keeps the recording mic visible in %s answe
     expect(button().getAttribute('aria-label')).toBe('session.common.voiceStopRecording');
     expect(button().getAttribute('aria-busy')).toBe('false');
     expect(style()).toEqual(idleStyle);
-    expect(micColor()).toBe(colors.textSecondary);
+    expect(button().querySelector('[data-stop-color]')!.getAttribute('data-stop-color')).toBe(colors.textSecondary);
     await click('interaction.ask.voice');
     expect(button().getAttribute('aria-label')).toBe('session.screen.voiceStartInput');
     expect(style()).toEqual(idleStyle);
@@ -242,6 +244,38 @@ it('queues a submit before the voice handle exists without pretending to record'
   await act(async () => finish());
   expect(resolveInteraction).toHaveBeenCalledOnce();
   expect(JSON.stringify(resolveInteraction.mock.calls[0])).toContain('最终回答');
+});
+
+// Unit: real answer card/hook, fake microphone. Earlier fixtures never returned
+// the controller's caret with a transcript, so a second take inserted at the
+// stale selection instead of following the previous sentence.
+it('continues a second dictation after the first sentence and shows processing while stopping', async () => {
+  const selections: unknown[] = [];
+  let finish!: () => void;
+  voiceStarter.start.mockImplementation(async (input) => {
+    selections.push(input.getSelection());
+    input.onListening();
+    return {
+      stop: () => new Promise<void>((resolve) => {
+        finish = () => { input.setText('第一句', { start: 3, end: 3 }); resolve(); };
+      }),
+      cancel: async () => undefined,
+    };
+  });
+  remoteSessionStore.setPendingInteractions('s1', [{ request: {
+    kind: 'ask_user_question', requestId, questions: [{ question: 'Answer?' }],
+  } }]);
+  await act(async () => root.render(<AskCardAuthContext.Provider value={{
+    getAccessToken: async () => null, refreshAccessToken: async () => null, apiFetch: async () => null,
+  }}><Harness /></AskCardAuthContext.Provider>));
+  await click('interaction.ask.voice');
+  await click('interaction.ask.voice');
+  const button = host.querySelector('[data-testid="interaction.ask.voice"]')!;
+  expect(button.getAttribute('aria-busy')).toBe('true');
+  await act(async () => finish());
+  await click('interaction.ask.voice');
+  expect(selections).toEqual([{ start: 0, end: 0 }, { start: 3, end: 3 }]);
+  expect(resolveInteraction).not.toHaveBeenCalled();
 });
 
 it.each(['stop', 'live'] as const)('retains text and permits manual correction after a %s failure', async (failure) => {
@@ -412,7 +446,7 @@ it.each(['options', 'previous'])('protects the answer while submitting before th
 // Unit regression for PR #6306 review: a signed-out microphone tap used to
 // render hardcoded Chinese. Existing receipt tests never tapped this entry.
 // Exercise the real card and hook in each supported locale, without auth.
-it.each(['en', 'zh-CN', 'zh-TW', 'ja', 'ko'])('localizes the signed-out voice error in %s', async (locale) => {
+it.each(['en', 'zh-CN', 'zh-TW', 'ja', 'ko', "es", "fr", "de", "pt-PT", "pt-BR"])('localizes the signed-out voice error in %s', async (locale) => {
   const previousLanguage = i18n.language;
   try {
     await i18n.changeLanguage(locale);
@@ -865,6 +899,20 @@ it('keeps a typed custom answer when the pending request is refetched or the car
   expect(input()?.value).toBe('No, figure it out');
 });
 
+it('returns two same-title answers by stable question id', async () => {
+  remoteSessionStore.setPendingInteractions('s1', [{ request: { kind: 'ask_user_question', requestId, questions: [
+    { id: 'first', question: 'Choose?', options: [{ label: 'A' }, { label: 'B' }] },
+    { id: 'second', question: 'Choose?', options: [{ label: 'A' }, { label: 'B' }] },
+  ] } }]);
+  resolveInteraction.mockResolvedValueOnce({ accepted: true });
+  await act(async () => root.render(<Harness />));
+  await click('interaction.ask.option.1');
+  await click('interaction.ask.submitButton');
+  await click('interaction.ask.option.2');
+  await click('interaction.ask.submitButton');
+  expect(resolveInteraction).toHaveBeenCalledExactlyOnceWith(requestId, { kind: 'ask_user_question', answers: { first: 'A', second: 'B' } });
+});
+
 it('starts over when the same request replaces its questions', async () => {
   const first = { question: 'First?', options: [{ label: 'Yes' }, { label: 'No' }] };
   const second = { question: 'Second?', options: [{ label: 'A' }, { label: 'B' }] };
@@ -1071,4 +1119,45 @@ it('persistent setup cancellation waits for a host terminal update and allows re
   } } as unknown as NormalizedRemoteMessage} />));
   expect(cancel()).toBeNull();
   expect(host.textContent).toContain('interaction.pluginSetup.phase.cancelled');
+});
+
+// PR #9271 review, unit: actual mobile form + transport boundary. Invalid input
+// must leave both the card and previous field draft intact; enum Other is data.
+it('keeps MCP form validation local and preserves an exact Other enum', async () => {
+  remoteSessionStore.setPendingInteractions('s1', [{ request: { kind: 'ask_user_question', requestId, questions: [
+    { id: 'name', question: 'Name', answerConstraints: { required: true, minLength: 3, maxLength: 5 } },
+    { id: 'kind', question: 'Kind', options: [{ label: 'Personal' }, { label: 'Other' }],
+      answerConstraints: { required: true, choices: ['Personal', 'Other'] } },
+  ] } }]);
+  await act(async () => root.render(<Harness />));
+  await click('interaction.ask.skipButton');
+  expect(host.textContent).toContain('interaction.panel.validation.required');
+  await type('interaction.ask.textInput', 'ab');
+  await click('interaction.ask.submitButton');
+  expect(host.textContent).toContain('interaction.panel.validation.tooShort');
+  expect(host.querySelector<HTMLInputElement>('[data-testid="interaction.ask.textInput"]')!.value).toBe('ab');
+  await type('interaction.ask.textInput', 'abcdef');
+  await click('interaction.ask.submitButton');
+  expect(host.textContent).toContain('interaction.panel.validation.tooLong');
+  expect(resolveInteraction).not.toHaveBeenCalled();
+  await type('interaction.ask.textInput', 'Orbit');
+  await click('interaction.ask.submitButton');
+  expect(host.textContent).toContain('Other');
+  expect(host.querySelector('[data-testid="interaction.ask.showCustomButton"]')).toBeNull();
+  await click('interaction.ask.skipButton');
+  expect(resolveInteraction).not.toHaveBeenCalled();
+  await click('interaction.ask.option.2');
+  await click('interaction.ask.submitButton');
+  expect(resolveInteraction).toHaveBeenCalledWith(requestId,
+    { kind: 'ask_user_question', answers: { name: 'Orbit', kind: 'Other' } });
+});
+
+it('cancels an MCP form explicitly without submitting a partial draft', async () => {
+  remoteSessionStore.setPendingInteractions('s1', [{ request: { kind: 'ask_user_question', requestId, questions: [
+    { id: 'name', question: 'Name', answerConstraints: { required: true } },
+  ] } }]);
+  await act(async () => root.render(<Harness />));
+  await type('interaction.ask.textInput', 'unfinished');
+  await click('interaction.ask.cancelButton');
+  expect(resolveInteraction).toHaveBeenCalledWith(requestId, { kind: 'ask_user_question', answers: {} });
 });

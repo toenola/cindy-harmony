@@ -1,3 +1,5 @@
+import type { ScrollViewInstance } from 'react-native';
+import { askAnswerError, askQuestionOptions } from '@cindy/maker-shared/interaction';
 import { deviceDisplayName } from '@/device-link/deviceName';
 import { PluginSetupNativeActions } from '@/plugins/PluginSetupNativeActions';
 import { sha256 } from '@noble/hashes/sha256';
@@ -21,12 +23,14 @@ import {
   Maximize2,
   Minimize2,
   Mic,
+  Square,
   Minus,
   Pencil,
   Plus,
 } from 'lucide-react-native';
 import {
   ActivityIndicator,
+  Linking,
   Image,
   Pressable,
   type PressableProps,
@@ -74,7 +78,6 @@ import {
   selectionFromAnswer,
   sessionScopedPermissionSuggestions,
   sortPendingInteractions,
-  visibleAskOptions,
   type AskQuestion,
   type PermissionReviewPresentation,
   type PlanReviewEvidencePresentation,
@@ -547,6 +550,7 @@ function InteractionItem({
   const runStatus = useSessionRunStatus(sessionId);
   const [busy, setBusy] = useState(false);
   const submittingRequestIdRef = useRef<string | null>(null);
+  const snoozingQuestionRef = useRef<string | null>(null);
   const requestId = readRequestId(item);
   const kind = interactionKind(item);
 
@@ -669,6 +673,7 @@ function InteractionItem({
         item={item}
         onDecision={(decision) => void submitDecision(decision)}
         touchLayout={touchLayout}
+        onError={onError}
       />
     );
   }
@@ -679,7 +684,14 @@ function InteractionItem({
         deviceId={deviceId}
         item={item}
         onDecision={(decision) => void submitDecision(decision)}
-        onStartAnswer={() => remoteSessionStore.protectAsyncQuestion(sessionId, item)}
+        onStartAnswer={() => {
+          remoteSessionStore.protectAsyncQuestion(sessionId, item);
+          if (item.request.isBlocking === false && requestId && snoozingQuestionRef.current !== requestId) {
+            snoozingQuestionRef.current = requestId;
+            void maker.resolveInteraction(requestId, { kind: 'ask_user_question', answers: {}, inProgress: true })
+              .catch(() => { snoozingQuestionRef.current = null; });
+          }
+        }}
         resumeOnSubmit={item.retainedDraft && (inputProjection.queuePaused || !runStatus.isRunning)}
         touchLayout={touchLayout}
       />
@@ -773,17 +785,21 @@ function InteractionItem({
 }
 
 function PermissionCard({
+  onError,
   busy,
   item,
   onDecision,
   touchLayout,
 }: {
+  onError(message: string | null): void;
   busy: boolean;
   item: PendingInteraction;
   onDecision(decision: Record<string, unknown>): void;
   touchLayout: InteractionTouchLayout;
 }) {
   const styles = useInteractionStyles();
+  const isMcpUrl = item.request.toolName === 'mcp_url';
+  const url = (item.request.input as { url?: string })?.url;
   const { t, i18n: i18nInstance } = useTranslation();
   const presentation = useMemo(
     () => buildPermissionReviewPresentation(item.request, mobilePresentationLocalizer),
@@ -810,9 +826,9 @@ function PermissionCard({
   const denyButton = (
     <ResolveButton
       key="deny"
-      accessibilityLabel={t('interaction.permission.denyAccessibility')}
+      accessibilityLabel={t(isMcpUrl ? 'interaction.permission.mcpCancel' : 'interaction.permission.denyAccessibility')}
       busy={busy}
-      label={t('interaction.permission.deny')}
+      label={t(isMcpUrl ? 'interaction.permission.mcpCancel' : 'interaction.permission.deny')}
       onPress={() => onDecision(buildPermissionDecision('deny', { reason: 'User denied' }))}
       requestId={requestId}
       touchStyle={resolveButtonLayoutStyle(touchLayout, 'secondary', companion)}
@@ -841,11 +857,11 @@ function PermissionCard({
   const allowButton = (
     <ResolveButton
       key="allow"
-      accessibilityLabel={t('interaction.permission.allowOnceAccessibility')}
+      accessibilityLabel={t(isMcpUrl ? 'interaction.permission.mcpComplete' : 'interaction.permission.allowOnceAccessibility')}
       armed={armedDecision === 'allow-once'}
       busy={busy}
       confirmLabel={t('interaction.permission.allowOnceConfirm')}
-      label={t('interaction.permission.allowOnce')}
+      label={t(isMcpUrl ? 'interaction.permission.mcpComplete' : 'interaction.permission.allowOnce')}
       onPress={() => requestDecision('allow-once', buildPermissionDecision('allow'))}
       requestId={requestId}
       // K5: with three choices the primary takes its own full-width row on top.
@@ -868,13 +884,18 @@ function PermissionCard({
         <Text style={styles.kind}>{t('interaction.permission.kind')}</Text>
         <Text numberOfLines={1} style={styles.compactCardTitle}>{permissionState.title}</Text>
       </View>}
-      <PermissionEvidence
+      {isMcpUrl && url && /^https?:\/\//i.test(url) ? <Text accessibilityRole="link"
+        style={[styles.cardTitle, { textDecorationLine: 'underline' }]}
+        onPress={() => { void Linking.openURL(url).catch((error) => onError(formatRemoteError(error))); }}>
+        {url}
+      </Text> : null}
+      {isMcpUrl ? (!companion && presentation.description ? <Text style={styles.body}>{presentation.description}</Text> : null) : <PermissionEvidence
         input={item.request.input}
         armed={!!armedDecision}
         presentation={presentation}
         riskWarningText={permissionState.riskWarningText}
         touchLayout={touchLayout}
-      />
+      />}
       <InteractionActions touchLayout={touchLayout}>
         {companion && alwaysButton ? [allowButton, denyButton, alwaysButton] : [denyButton, alwaysButton, allowButton]}
       </InteractionActions>
@@ -1000,21 +1021,21 @@ type AskUserQuestionCardProps = {
   touchLayout: InteractionTouchLayout;
 };
 
-function AskCardVoiceButton({ listening, starting, disabled, onPress }: { listening: boolean; starting: boolean; disabled?: boolean; onPress: () => void }) {
+function AskCardVoiceButton({ listening, starting, stopping, disabled, onPress }: { listening: boolean; starting: boolean; stopping: boolean; disabled?: boolean; onPress: () => void }) {
   const { t } = useTranslation();
   const { colors } = useTheme();
   return (
     <Pressable
-      accessibilityLabel={listening || starting ? t('session.common.voiceStopRecording') : t('session.screen.voiceStartInput')}
+      accessibilityLabel={stopping ? t('session.presentation.composer.stop.processing') : listening || starting ? t('session.common.voiceStopRecording') : t('session.screen.voiceStartInput')}
       accessibilityRole="button"
-      accessibilityState={{ busy: starting, disabled: Boolean(disabled) }}
+      accessibilityState={{ busy: starting || stopping, disabled: Boolean(disabled) }}
       disabled={disabled}
       hitSlop={8}
       onPress={onPress}
       style={{ alignItems: 'center', height: 44, justifyContent: 'center', width: 44 }}
       testID="interaction.ask.voice"
     >
-      {starting ? <ActivityIndicator color={colors.textSecondary} size="small" /> : <Mic color={colors.textSecondary} size={iconSize.md} />}
+      {starting || stopping ? <ActivityIndicator color={colors.textSecondary} size="small" /> : listening ? <Square color={colors.textSecondary} fill={colors.textSecondary} size={iconSize.sm} /> : <Mic color={colors.textSecondary} size={iconSize.md} />}
     </Pressable>
   );
 }
@@ -1052,6 +1073,7 @@ function AskUserQuestionForm({
   const [answers, setAnswers] = useState<Record<string, string>>(() => initialDraft?.answers ?? {});
   const [selectedLabels, setSelectedLabels] = useState<Set<string>>(() => new Set(initialDraft?.selectedLabels ?? []));
   const [customInput, setCustomInput] = useState(() => initialDraft?.customInput ?? '');
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [showCustomInput, setShowCustomInput] = useState(() => initialDraft?.showCustomInput ?? false);
   const answerTextRef = useRef(customInput);
   answerTextRef.current = customInput;
@@ -1059,8 +1081,9 @@ function AskUserQuestionForm({
   const voice = useAskCardVoice({
     deviceId,
     getText: () => answerTextRef.current,
-    setText: (value) => {
+    setText: (value, selection) => {
       answerTextRef.current = value;
+      if (selection) selectionRef.current = selection;
       onStartAnswer();
       setCustomInput(value);
     },
@@ -1100,11 +1123,12 @@ function AskUserQuestionForm({
     if (!current || syncedIndexRef.current === currentIndex) return;
     syncedIndexRef.current = currentIndex;
     const next = selectionFromAnswer(
-      { ...current, options: visibleAskOptions(current.options) },
+      { ...current, options: askQuestionOptions(current) },
       answers[answerKey(current)],
     );
     setSelectedLabels(next.selectedLabels);
     setCustomInput(next.customInput);
+    selectionRef.current = { start: next.customInput.length, end: next.customInput.length };
     setShowCustomInput(next.showCustomInput);
   }, [answers, current, currentIndex]);
 
@@ -1147,7 +1171,7 @@ function AskUserQuestionForm({
   if (!current) return null;
 
   const isLast = currentIndex === questions.length - 1;
-  const options = visibleAskOptions(current.options);
+  const options = askQuestionOptions(current);
   optionsLengthRef.current = options.length;
   const isMulti = current.multiSelect === true;
   const currentAnswerKey = answerKey(current);
@@ -1160,12 +1184,18 @@ function AskUserQuestionForm({
   const optionsCaption = options.length > 0
     ? t('interaction.panel.askOptionCount', { count: options.length })
     : t('interaction.panel.askFreeInput');
-  const metaCaption = t('interaction.panel.askMetaCaption', {
+  const metaCaption = t(current.answerConstraints?.choices ? 'interaction.panel.askRestrictedMetaCaption' : 'interaction.panel.askMetaCaption', {
     options: optionsCaption,
     mode: isMulti ? t('interaction.panel.askModeMulti') : t('interaction.panel.askModeSingle'),
   });
 
   const advance = (answer: string) => {
+    const error = askAnswerError(current, answer);
+    if (error) {
+      setValidationError(t(`interaction.panel.validation.${error.key}`, { count: error.count }));
+      return;
+    }
+    setValidationError(null);
     const nextAnswers = { ...answers, [currentAnswerKey]: answer };
     setAnswers(nextAnswers);
     if (isLast) {
@@ -1297,7 +1327,7 @@ function AskUserQuestionForm({
               </InteractionTouchButton>
             );
           })}
-          {showCustomInput ? (
+          {!current.answerConstraints?.choices && (showCustomInput ? (
             <View style={[
               styles.customInputRow,
               { gap: touchLayout.actionGap },
@@ -1313,14 +1343,14 @@ function AskUserQuestionForm({
                   onStartAnswer();
                   setCustomInput(text);
                 }}
-                onSelectionChange={(event) => { selectionRef.current = event.nativeEvent.selection; }}
+                onSelectionChange={(event) => { if (!voice.busy) selectionRef.current = event.nativeEvent.selection; }}
                 placeholder={t('interaction.panel.customAnswerPlaceholder')}
                 placeholderTextColor={colors.textPlaceholder}
                 style={styles.inlineInput}
                 testID="interaction.ask.customInput"
                 value={customInput}
               />
-              <AskCardVoiceButton listening={voice.listening} starting={voice.starting} disabled={voice.stopping || voiceSubmitting} onPress={beginVoice} />
+              <AskCardVoiceButton listening={voice.listening} starting={voice.starting} stopping={voice.stopping} disabled={busy || voice.stopping || voiceSubmitting} onPress={beginVoice} />
             </View>
           ) : (
             <View style={[styles.customInputRow, { gap: touchLayout.actionGap }]}>
@@ -1347,9 +1377,9 @@ function AskUserQuestionForm({
               >
                 <Text style={styles.optionCustom}>{t('interaction.panel.customAnswerButtonText')}</Text>
               </InteractionTouchButton>
-              <AskCardVoiceButton listening={voice.listening} starting={voice.starting} disabled={voice.stopping || voiceSubmitting} onPress={beginVoice} />
+              <AskCardVoiceButton listening={voice.listening} starting={voice.starting} stopping={voice.stopping} disabled={busy || voice.stopping || voiceSubmitting} onPress={beginVoice} />
             </View>
-          )}
+          ))}
         </View>
       ) : (
         <View style={[
@@ -1367,21 +1397,30 @@ function AskUserQuestionForm({
               onStartAnswer();
               setCustomInput(text);
             }}
-            onSelectionChange={(event) => { selectionRef.current = event.nativeEvent.selection; }}
+            onSelectionChange={(event) => { if (!voice.busy) selectionRef.current = event.nativeEvent.selection; }}
             placeholder={t('interaction.panel.answerInput')}
             placeholderTextColor={colors.textPlaceholder}
             style={styles.inlineInput}
             testID="interaction.ask.textInput"
             value={customInput}
           />
-          <AskCardVoiceButton listening={voice.listening} starting={voice.starting} disabled={voice.stopping || voiceSubmitting} onPress={beginVoice} />
+          <AskCardVoiceButton listening={voice.listening} starting={voice.starting} stopping={voice.stopping} disabled={busy || voice.stopping || voiceSubmitting} onPress={beginVoice} />
         </View>
       )}
 
+      {validationError ? <Text accessibilityRole="alert" style={styles.voiceNotice} testID="interaction.ask.validationError">{validationError}</Text> : null}
+
       {/* Shown for both layouts: the option-less card has a microphone too. */}
-      {voice.error ? <Text testID="interaction.ask.voiceError">{voice.error}</Text> : null}
+      {voice.error ? <Text testID="interaction.ask.voiceError">{voice.error}</Text>
+        : voice.speakerFiltered ? <Text style={styles.voiceNotice} testID="interaction.ask.voiceNotice">{t('composer.voice.speakerFiltered')}</Text>
+        : null}
 
       <InteractionActions touchLayout={touchLayout}>
+        {current.answerConstraints ? <ResolveButton busy={busy} disabled={voiceLocked}
+          label={t('interaction.permission.mcpCancel')} accessibilityLabel={t('interaction.permission.mcpCancel')}
+          onPress={() => onDecision(buildAskUserQuestionDecision({}))} requestId={requestId}
+          touchStyle={resolveButtonLayoutStyle(touchLayout, 'secondary', companion)}
+          testID="interaction.ask.cancelButton" variant="secondary" /> : null}
         {item.retainedDraft ? (
           <ResolveButton busy={busy} label={t('interaction.panel.closeAnswer')}
             accessibilityLabel={t('interaction.panel.closeAnswer')}
@@ -1397,6 +1436,7 @@ function AskUserQuestionForm({
               const answer = isMulti
                 ? encodeMultiSelectAnswer(options, selectedLabels, customInput)
                 : customModeActive ? customInput : existingAnswer ?? '';
+              setValidationError(null);
               setAnswers((prev) => ({ ...prev, [currentAnswerKey]: answer }));
               setCurrentIndex((idx) => Math.max(0, idx - 1));
             }}
@@ -1479,7 +1519,7 @@ function PlanReviewCard({
   const [feedback, setFeedback] = useState(() => readPlanReviewDraft(requestId)?.feedback ?? '');
   const [feedbackOpen, setFeedbackOpen] = useState(() => readPlanReviewDraft(requestId)?.feedbackOpen ?? false);
   const [activeOutlineId, setActiveOutlineId] = useState<string | null>(null);
-  const previewScrollRef = useRef<ScrollView | null>(null);
+  const previewScrollRef = useRef<ScrollViewInstance | null>(null);
   const skipNextPlanDraftSaveRef = useRef(false);
   const filePath = planReviewFilePath(item.request);
   const originalPlan = planReviewPlan(item.request);
@@ -2213,6 +2253,11 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     justifyContent: 'center',
     minHeight: 44,
     paddingHorizontal: spacing.md,
+  },
+  voiceNotice: {
+    color: colors.textSecondary,
+    fontSize: typeScale.footnote,
+    lineHeight: lineHeight.caption,
   },
   taskCollapseText: {
     color: colors.textSecondary,

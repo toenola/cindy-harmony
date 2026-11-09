@@ -226,6 +226,15 @@ export function registerCodexMcpThreadContext(
   });
 }
 
+/** Capture only the current bridge generation; confirmation cannot target a replacement. */
+export function prepareCodexMcpToolCancellation(identity: {
+  sessionId: string; sessionInstanceId: string; threadId: string;
+}): () => void {
+  const bridge = activeBridge;
+  const cancel = bridge?.prepareToolCancellation(identity);
+  return () => { if (activeBridge === bridge) cancel?.(); };
+}
+
 export function unregisterCodexMcpThreadContext(
   threadId: string,
   expectedSessionInstanceId?: string,
@@ -455,6 +464,9 @@ async function doStart(
             // Telegram Bot API 直通同理: 只有带 Telegram 渠道标记(专线 chat / 伙伴绑了 Telegram)
             // 的线程看得到, 普通桌面任务按线程关掉。工具本身没有租约也 fail closed, 这里是让
             // 工具清单别在无关任务里出现。
+            ...(bridgeServerNames.includes('cindy_imessage')
+              && !hasImChannelVendorOptions(session?.vendorOptions, 'imessage')
+              ? { 'mcp_servers.cindy_imessage.enabled': false } : {}),
             ...(bridgeServerNames.includes(TELEGRAM_BOT_MCP_SERVER_NAME)
               && !hasImChannelVendorOptions(session?.vendorOptions, 'telegram')
               ? { [`mcp_servers.${TELEGRAM_BOT_MCP_SERVER_NAME}.enabled`]: false }

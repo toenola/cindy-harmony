@@ -27,6 +27,7 @@
  */
 
 import { createHmac, randomBytes } from 'node:crypto';
+import { BOT_DENIED_TOOLS_VENDOR_KEY } from '../../shared/botSystemSkills.js';
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
@@ -218,6 +219,7 @@ export async function getPiExtraSpawnConfig(
         server.name === 'cindy_telegram_bot'
         && !hasImChannelVendorOptions(sessionCtx?.vendorOptions, 'telegram')
       ) return false;
+      if (server.name === 'cindy_imessage' && !hasImChannelVendorOptions(sessionCtx?.vendorOptions, 'imessage')) return false;
       if (!isBotMcpServerAllowed(sessionCtx?.botMcpPolicy, server.name)) return false;
       if (!collabEnabled && REMOTE_COLLAB_SERVER_NAMES.has(server.name)) return false;
       // Custom HTTP MCPs are `s.remote` and skip the SSH URL rewriter. Desktop
@@ -264,6 +266,9 @@ export async function getPiExtraSpawnConfig(
       ...((sessionCtx?.botMcpPolicy || sessionCtx?.memoryScopeKey?.startsWith('bot:'))
         && servers.some((server) => server.name === 'cindy_memory' || server.name === 'cindy_helper')
         ? { botMemoryFacade: true }
+        : {}),
+      ...(Array.isArray(vendorOptions[BOT_DENIED_TOOLS_VENDOR_KEY])
+        ? { deniedTools: (vendorOptions[BOT_DENIED_TOOLS_VENDOR_KEY] as unknown[]).filter((name): name is string => typeof name === 'string') }
         : {}),
     };
   };

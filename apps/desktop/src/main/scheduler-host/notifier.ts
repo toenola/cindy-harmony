@@ -18,6 +18,7 @@ import type { Logger } from '@cindy/maker-scheduler';
 
 import { stripTrailingPathSeparators } from '../../shared/pathText';
 import { showDesktopSessionEvent } from '../notificationService';
+import { isSessionNotificationsMutedSync } from '../localDb/sessionFlagRegistry';
 import { getMobileNotifyGeneration, sendMobileSessionNotify } from '../device-link';
 import type { WecomGroupNotificationPublisher } from '../wecomGroupNotification';
 
@@ -30,8 +31,11 @@ export interface DesktopNotifierDeps {
   sendFeishuSessionNotification?: (sessionId: string, text: string) => Promise<void>;
   /** Global desktop preference, evaluated at send time. */
   shouldNotifyDesktop: () => boolean;
-  /** Whether Agent Island should arbitrate routine scheduler desktop notifications. */
-  isAgentIslandEnabled: () => boolean;
+  /**
+   * The task surface (Agent Notch, or the Live Activity while it can show) already alerts
+   * for this run, so the routine desktop notification would repeat it.
+   */
+  isRunAlertShownElsewhere: (run: ScheduleRun) => boolean;
   wecomGroupPublisher?: WecomGroupNotificationPublisher;
 }
 
@@ -51,10 +55,14 @@ export class DesktopNotifier implements Notifier {
       }
     }
     if (getMobileNotifyGeneration() !== generation) return;
+    // 「消息免打扰」任务不再发个人提醒。wecomGroup 是共享群通知,不跟个人静音走;
+    // 手机通道在 sendMobileSessionNotify 内另有同一道门,覆盖不走这里的调用方。
+    const muted = run.sessionId ? isSessionNotificationsMutedSync(run.sessionId) : false;
     if (
       schedule.notify.desktop &&
+      !muted &&
       this.deps.shouldNotifyDesktop() &&
-      (!this.deps.isAgentIslandEnabled() || (run.status === 'failed' && !run.sessionId))
+      (!this.deps.isRunAlertShownElsewhere(run) || (run.status === 'failed' && !run.sessionId))
     ) {
       try {
         this.notifyDesktop(schedule, run);
@@ -62,7 +70,7 @@ export class DesktopNotifier implements Notifier {
         this.deps.logger.warn?.('desktop notify failed', err);
       }
     }
-    if (schedule.notify.feishu) {
+    if (schedule.notify.feishu && !muted) {
       try {
         await this.notifyFeishu(schedule, run);
       } catch (err) {

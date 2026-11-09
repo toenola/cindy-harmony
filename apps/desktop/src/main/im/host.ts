@@ -15,6 +15,8 @@ import { app, ipcMain, BrowserWindow, net, shell } from 'electron';
 
 import {
   createIM,
+  BlueBubblesIM,
+  LocalWebhookReceiver,
   createDiscordIM,
   createDingTalkIM,
   createFeishuIM,
@@ -55,6 +57,7 @@ import { listTelegramKnownGroups } from './telegram/groupWindow';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import { imHostAccountScope } from './accountScopeBridge';
+import { blueBubblesStateStorage } from './imessage/storage';
 import { ownerScopedImSecrets } from './ownerScopedStorage';
 import { captureImAccountGeneration, isImAccountGenerationCurrent } from './accountBoundary';
 import { getDbClient } from '../localDb/client/current';
@@ -65,6 +68,7 @@ import {
 } from './wechat/compatibilityPolicy';
 import { fetchPublicImageBytes } from './publicImageFetch';
 import { buildPersonalBotCommandMenu } from './shared/botCommands';
+import { shouldAnnounceFeishuLifecycle } from './feishu/lifecycleAnnouncements';
 
 const log = createLogger('im/host');
 
@@ -190,13 +194,20 @@ const host: IMHost = {
   createLogger,
 };
 
-export const feishuIm = createFeishuIM(host);
+export const feishuIm = createFeishuIM(host, {
+  shouldAnnounceLifecycle: shouldAnnounceFeishuLifecycle,
+});
 /**
  * 伙伴自有飞书 / Lark 连接的传输层实例: 凭证与 TOFU 主人按连接前缀隔离、不注册设置卡
  * IPC、对外开放(非主人的私聊与群 @ 带非主人标记进业务层)。
  */
 export function createBotFeishuIM(secretKeyPrefix: string): FeishuIM {
-  return createFeishuIM(host, { secretKeyPrefix, ipc: false, guests: true });
+  return createFeishuIM(host, {
+    secretKeyPrefix,
+    ipc: false,
+    guests: true,
+    shouldAnnounceLifecycle: shouldAnnounceFeishuLifecycle,
+  });
 }
 export const discordIm = createDiscordIM(host, {
   resolveImageUrl: resolveManagedImageAbsPath,
@@ -372,3 +383,17 @@ export const im = createIM([
   dingtalkIm,
   wecomIm,
 ]);
+
+const localImReceivers = new Map<string, LocalWebhookReceiver>();
+export function createBotIMessageIM(secretKeyPrefix: string, connectionId: string): BlueBubblesIM {
+  return new BlueBubblesIM(host, {
+    secretPrefix: secretKeyPrefix,
+    storage: blueBubblesStateStorage(connectionId),
+    receiver: (listenHost, port) => {
+      const key = `${listenHost}:${port}`;
+      let receiver = localImReceivers.get(key);
+      if (!receiver) { receiver = new LocalWebhookReceiver(listenHost, port); localImReceivers.set(key, receiver); }
+      return receiver;
+    },
+  });
+}

@@ -22,6 +22,8 @@ vi.mock('../../localDb/ipc/messages.js', () => ({
 }));
 
 import { createBotDirectMessageService } from '../botDirectMessageService.js';
+import { captureAgentRequest } from '../forwardedRequest.js';
+import { verifiedOwnerRequestText } from '../../../shared/forwardedRequest.js';
 import { botDirectMessages, botDirectMessageThreads } from '../../localDb/schema.js';
 import { createBotMessageTransport } from '../botMessageTransport.js';
 import { GroupToolAuthorizationError, registerGroupToolAuthority } from '../botGroupToolAuthorization.js';
@@ -97,6 +99,7 @@ function createDatabase(): Database.Database {
       ('bot-missing', '缺主任务伙伴', 'active', 1);
     INSERT INTO sessions VALUES
       ('a-main', 'bot', 'active'),
+      ('a-routine', 'bot', 'active'),
       ('a-route', 'bot', 'active'),
       ('a-history', 'bot', 'active'),
       ('a-archived', 'bot', 'archived'),
@@ -105,6 +108,7 @@ function createDatabase(): Database.Database {
       ('ordinary', 'desktop', 'active');
     INSERT INTO bot_session_links VALUES
       ('a-main-link', 'bot-a', 'a-main', 'canonical', NULL),
+      ('a-routine-link', 'bot-a', 'a-routine', 'routine', NULL),
       ('a-route-link', 'bot-a', 'a-route', 'route', NULL),
       ('a-history-link', 'bot-a', 'a-history', 'history', 1),
       ('a-archived-link', 'bot-a', 'a-archived', 'history', 1),
@@ -117,6 +121,59 @@ function createDatabase(): Database.Database {
 describe('botDirectMessageService', () => {
   let sqlite: Database.Database;
   let dispatch: ReturnType<typeof vi.fn>;
+
+  // 2026-10-27: send_to_agent dropped a real owner handoff. 2026-11-05: the sender checks the
+  // hand-off and the peer reviews the delegated text. Unit/persistence: exercise the actual
+  // capture and send, relay the accepted receipt again, and reply into the original task.
+  it('delivers a checked owner hand-off through a peer and a second handoff', async () => {
+    const original = 'Sanitize the test fixtures and retain coverage.';
+    const authorize = vi.fn(async () => ({ kind: 'authorized' as const }));
+    const captureRequest = (sessionId: string, message: string) => captureAgentRequest(sessionId, message,
+      { clientId: 'owner-input', authoredText: original }, async () => [], true, true, { authorize });
+    const service = createBotDirectMessageService({ dispatch, captureRequest });
+    expect(await service.messageAgent({ callerSessionId: 'a-main', targetBotId: 'bot-b', message: 'Please handle the fixtures.' }))
+      .toMatchObject({ ok: true });
+    const delivered = dispatch.mock.calls[0]![0];
+    expect(verifiedOwnerRequestText(delivered.autoReviewUserText)).toBe('Please handle the fixtures.');
+    expect(delivered.autoReviewUserText.request).toEqual({ sessionId: 'a-main', clientId: 'owner-input',
+      plainBody: true, delegatedText: 'Please handle the fixtures.' });
+    expect(sqlite.prepare('SELECT content FROM bot_direct_messages').get()).toEqual({ content: 'Please handle the fixtures.' });
+    const next = await captureAgentRequest('b-main', 'Keep coverage', {
+      clientId: delivered.clientId, delegatedRequest: delivered.autoReviewUserText.request,
+    }, async () => [], true, false, { targetSessionId: 'c-main', authorize });
+    expect(next.autoReviewUserText.request).toMatchObject({ sessionId: 'a-main', delegatedText: 'Keep coverage' });
+    // The peer's answer into the task the owner spoke in keeps provenance only.
+    const reply = createBotDirectMessageService({ dispatch, captureRequest: (sessionId, message, target) => captureAgentRequest(sessionId, message,
+      { clientId: delivered.clientId, delegatedRequest: delivered.autoReviewUserText.request }, async () => [], true, false,
+      { targetSessionId: target?.sessionId, authorize }) });
+    expect(await reply.messageAgent({ callerSessionId: 'b-main', targetBotId: 'bot-a', message: 'Fixtures are clean.' }))
+      .toMatchObject({ ok: true });
+    expect(verifiedOwnerRequestText(dispatch.mock.calls.at(-1)![0].autoReviewUserText)).toBeUndefined();
+  });
+
+  // Review feedback on #9023: the target is resolved before capture, so a reply into the task the
+  // user's request came from skips the delegation review instead of being refused by it.
+  it('does not review a reply into the task the request came from', async () => {
+    const authorize = vi.fn(async () => ({ kind: 'blocked' as const, reason: 'unavailable' }));
+    const captureRequest = (sessionId: string, message: string, target?: { sessionId?: string }) => captureAgentRequest(sessionId, message,
+      { clientId: 'x', delegatedRequest: { sessionId: 'a-main', clientId: 'owner-input', plainBody: true, delegatedText: 'Fix it.' } },
+      async () => [], true, false, { targetSessionId: target?.sessionId, authorize });
+    const service = createBotDirectMessageService({ dispatch, captureRequest });
+    expect(await service.messageAgent({ callerSessionId: 'b-main', targetBotId: 'bot-a', message: 'Done.' })).toMatchObject({ ok: true });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(verifiedOwnerRequestText(dispatch.mock.calls.at(-1)![0].autoReviewUserText)).toBeUndefined();
+  });
+
+  it('sends nothing when the sender review refuses the hand-off', async () => {
+    const captureRequest = (sessionId: string, message: string) => captureAgentRequest(sessionId, message,
+      { clientId: 'owner-input', authoredText: 'Only check the fixtures.' }, async () => [], true, true,
+      { authorize: async () => ({ kind: 'blocked', reason: 'Not requested by the owner.' }) });
+    const service = createBotDirectMessageService({ dispatch, captureRequest });
+    expect(await service.messageAgent({ callerSessionId: 'a-main', targetBotId: 'bot-b', message: 'Delete the fixtures.' }))
+      .toMatchObject({ ok: false, errorCode: 'DELEGATION_NOT_AUTHORIZED', message: 'Not requested by the owner.' });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM bot_direct_messages').get()).toEqual({ n: 0 });
+  });
 
   // unit/persistence: peer messages must not acquire a task-delegation envelope
   // or treat labels typed by a model as verified owner words.
@@ -460,6 +517,21 @@ describe('botDirectMessageService', () => {
   });
 
   afterEach(() => sqlite.close());
+
+  // #7256: moving a rule out of canonical must preserve its companion identity.
+  // Unit/persistence: a routine must discover peers, send, and recover its queued receipt.
+  it('keeps routine messaging and queued delivery recovery bound to its companion', async () => {
+    const service = createBotDirectMessageService({ dispatch });
+    expect(await service.listAgents('a-routine')).toMatchObject({ ok: true,
+      agents: expect.arrayContaining([{ id: 'bot-b', name: 'Dash Bot', local: true }]) });
+    const sent = await service.messageAgent({ callerSessionId: 'a-routine', targetBotId: 'bot-b', message: 'Daily progress?' });
+    if (!sent.ok) throw new Error(sent.errorCode);
+    expect(sqlite.prepare('SELECT sender_bot_id, sender_session_id FROM bot_direct_messages').get())
+      .toEqual({ sender_bot_id: 'bot-a', sender_session_id: 'a-routine' });
+    await expect(service.assertRestoredQueuedDelivery('b-main', `bot-dm:${sent.threadId}:${sent.messageId}`)).resolves.toBeUndefined();
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch.mock.calls[0][0].message).toContain('(bot-a)');
+  });
 
   it('coalesces concurrent roster discovery across sessions and clears failed flights', async () => {
     let settle!: (value: { agents: []; unavailableDevices: [] }) => void;
@@ -1096,10 +1168,10 @@ describe('cross-device teammate messages', () => {
   });
   afterEach(() => { h.resolveDb = null; leftDb.close(); rightDb.close(); });
 
-  it('discovers a remote peer and routes a roundtrip by stable identity into both canonical timelines', async () => {
-    expect(await atLeft(() => left.listAgents('a-main'))).toMatchObject({ ok: true,
+  it.each(['a-main', 'a-routine'])('discovers a remote peer and routes a roundtrip by stable identity into both canonical timelines (%s)', async (callerSessionId) => {
+    expect(await atLeft(() => left.listAgents(callerSessionId))).toMatchObject({ ok: true,
       agents: expect.arrayContaining([{ id: 'right::bot-b', name: 'Mimi', deviceId: 'right', deviceName: 'Studio', local: false }]) });
-    const sent = await atLeft(() => left.messageAgent({ callerSessionId: 'a-main', targetBotId: 'right::bot-b', message: 'unique-marker' }));
+    const sent = await atLeft(() => left.messageAgent({ callerSessionId, targetBotId: 'right::bot-b', message: 'unique-marker' }));
     expect(sent).toMatchObject({ ok: true, accepted: true, delivered: false, targetBotId: 'right::bot-b' });
     expect(rightDispatch.mock.calls[0][0].message).toContain('(left::bot-a)');
     expect(rightDispatch.mock.calls[0][0].message).toContain('unique-marker');
@@ -1111,6 +1183,32 @@ describe('cross-device teammate messages', () => {
     expect(thread).toMatchObject({ ok: true, thread: { messageCount: 2,
       messages: [expect.objectContaining({ recipientBotName: 'Mimi' }), expect.objectContaining({ senderBotName: 'Mimi' })] } });
     expect(h.createMessage).toHaveBeenCalledTimes(4);
+  });
+
+  // #9198: the sender-side delegation review must see the confirmed remote teammate,
+  // not the "a new task" fallback — the contradicting target made an authorized
+  // cross-device hand-off refused even after the owner confirmed the recipient.
+  it('names the confirmed remote teammate for the sender delegation review', async () => {
+    const captureRequest = vi.fn((sessionId: string, message: string, target?: { sessionId?: string; peer?: string }) =>
+      captureAgentRequest(sessionId, message, { clientId: 'owner-input', authoredText: 'Ask Mimi on the other computer for the status.' },
+        async () => [], true, true,
+        { targetSessionId: target?.sessionId, authorize: async () => ({ kind: 'authorized' as const }) }));
+    const service = createBotDirectMessageService({
+      dispatch: leftDispatch, transport: {
+        selfDeviceId: () => 'left',
+        list: async () => ({ agents: [], unavailableDevices: [] }),
+        resolve: async () => ({ id: 'right::bot-b', name: 'Mimi' }),
+        verifySender: async () => false,
+        send: async () => ({ ok: true, targetBotId: 'right::bot-b', targetBotName: 'Mimi', targetSessionId: '',
+          wakeKind: 'queued', threadId: 'thread', messageId: 'message', messageCount: 1,
+          remainingMessages: 11, conversationEnded: false, accepted: true, delivered: false }),
+      }, captureRequest,
+    });
+    expect(await atLeft(() => service.messageAgent({ callerSessionId: 'a-main', targetBotId: 'right::bot-b', message: 'Please send the status.' })))
+      .toMatchObject({ ok: true });
+    // The service → register contract: a remote target carries the resolved teammate
+    // identity; the review action would otherwise label it "a new task" and refuse.
+    expect(captureRequest.mock.calls[0]![2]).toEqual({ targetTeammate: { name: 'Mimi', id: 'right::bot-b' } });
   });
 
   it('does not deadlock when both devices send concurrently', async () => {
@@ -1180,10 +1278,10 @@ describe('cross-device teammate messages', () => {
       targetBotId: 'bot-b', message: 'changed', messageId: result.messageId! }))).toMatchObject({ ok: false, errorCode: 'PERMISSION_DENIED' });
   });
 
-  it('reconciles a lost native receipt without dispatching again, refunding acceptance, or claiming a reply', async () => {
+  it.each(['a-main', 'a-routine'])('reconciles a lost native receipt without dispatching again, refunding acceptance, or claiming a reply (%s)', async (callerSessionId) => {
     failResponse = true;
-    const sent = await atLeft(() => left.messageAgent({ callerSessionId: 'a-main', targetBotId: 'right::bot-b', message: 'lost receipt' }));
-    const args = { callerSessionId: 'a-main', messageId: sent.messageId! };
+    const sent = await atLeft(() => left.messageAgent({ callerSessionId, targetBotId: 'right::bot-b', message: 'lost receipt' }));
+    const args = { callerSessionId, messageId: sent.messageId! };
     expect(await atLeft(() => left.checkMessage({ ...args, callerSessionId: 'b-main' }))).toMatchObject({ ok: false, errorCode: 'NOT_FOUND' });
     expect(await atLeft(() => left.checkMessage(args))).toMatchObject({ ok: true, source: 'native-receipt', accepted: true, delivered: null, replied: false });
     const anchorCount = h.createMessage.mock.calls.length;
@@ -1296,13 +1394,13 @@ describe('ordinary remote conversation reply bridge', () => {
     return { service, deps, readReply, send, dispatch, revoke: () => { current = false; },
       answer: () => { replies = [{ id: 'answer', content: 'Mimi ordinary reply' }]; } };
   }
-  it('retains the actual conversation across service recreation and bridges a reply only once without waking another turn', async () => {
+  it.each(['a-main', 'a-routine'])('retains the actual conversation across service recreation and bridges a reply only once without waking another turn (%s)', async (callerSessionId) => {
     const h = harness();
-    const sent = await h.service.messageAgent({ callerSessionId: 'a-main', targetBotId: 'old::mimi', message: 'Question' });
+    const sent = await h.service.messageAgent({ callerSessionId, targetBotId: 'old::mimi', message: 'Question' });
     if (!sent.ok) throw new Error('send failed');
     expect(sent.transport).toBe('remote-conversation');
     const resumed = createBotDirectMessageService(h.deps);
-    const check = { callerSessionId: 'a-main', messageId: sent.messageId };
+    const check = { callerSessionId, messageId: sent.messageId };
     expect(await resumed.checkMessage(check)).toMatchObject({ ok: true, replied: false, delivered: null });
     h.answer();
     expect(await resumed.checkMessage(check)).toMatchObject({ ok: true, replied: true, source: 'remote-conversation', replies: [{ id: 'answer', content: 'Mimi ordinary reply' }] });

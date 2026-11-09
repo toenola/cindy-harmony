@@ -17,8 +17,9 @@ export function supportsAsyncQuestionTool(context: LiziMcpSessionContext): boole
 
 export function registerAsyncQuestionTool(
   registry: XdtHelperToolRegistry,
-  getContext: () => LiziMcpSessionContext,
+  getContext: () => LiziMcpSessionContext | undefined,
   ask: AskUserQuestionAsyncCallback,
+  getSurface: () => Promise<ReadonlySet<string> | null>,
 ): void {
   registry.register({
     name: 'ask_user_question_async',
@@ -41,11 +42,15 @@ export function registerAsyncQuestionTool(
     },
     handler: async ({ questions }) => {
       const context = getContext();
-      if (!context.sessionId || !context.sessionInstanceId) {
+      if (!context?.sessionId || !context.sessionInstanceId) {
         return errorPayload('NO_SESSION_CONTEXT', 'No current task instance for this question.');
       }
       if (!supportsAsyncQuestionTool(context)) {
         return errorPayload('CAPABILITY_NOT_AVAILABLE', 'Use your native question tool.');
+      }
+      const surface = await getSurface();
+      if (surface && !surface.has('cindy')) {
+        return errorPayload('CAPABILITY_NOT_AVAILABLE', 'Async questions are not available in this task.');
       }
       if (context.mcpCallerKind !== 'root' || context.mcpCallerAttested !== true) {
         return errorPayload('ROOT_REQUIRED', 'Ask the parent agent to relay the question.');

@@ -161,7 +161,9 @@ import {
   generateImSessionTitleText,
   persistGeneratedSessionTitle,
 } from './fbotTitle';
-import { materializeLocalMarkdownImages } from './localMarkdownImages';
+import { localTaskImagePath, rewriteTaskImageReferences, taskImageReferences } from '../../cindy-media/taskImageMarkdown';
+import { materializeLocalMarkdownImageRefs, materializeLocalMarkdownImages } from './localMarkdownImages';
+import { unlinkLocalFileLinks } from './localFileLinks';
 import {
   applyStatusTokenRate,
   clearRunningIndicators,
@@ -296,7 +298,8 @@ interface TurnState {
    * Host turn lease held for the duration of a per-turn permission policy turn.
    * Keeps new sends and retirement behind this turn's background continuations;
    * the owner's live permission changes remain immediate. Released on every terminal / requeue /
-   * cleanup path via releaseTurnInteractionRoute. Null when the turn has no policy.
+   * cleanup path via releaseTurnInteractionRoute, after any temporary Auto restoration.
+   * Null when the turn has no policy.
    */
   hostTurnLeaseRelease: (() => void) | null;
   groupHistoryAccessRelease: (() => void) | null;
@@ -1664,6 +1667,38 @@ export function createTurnRunner(
           ...(item.autoReviewReferences ? { autoReviewReferences: item.autoReviewReferences } : {}),
         },
         ...(effectiveTurnPolicy ? { turnPermissionPolicy: effectiveTurnPolicy } : {}),
+        afterTurnReserved: async () => {
+          if (!effectiveTurnPolicy) return;
+          const session = state.makerSession;
+          const previous = session.stablePermissionModeState;
+          // A retained policy is mandatory, regardless of channel or whether its
+          // requester is known. Explicit channel/companion exemptions were resolved
+          // above; never remove a mandatory policy just to admit Full access.
+          if (previous?.mode !== 'bypassPermissions') return;
+          if (!session.capabilities.setPermissionModeMidSession?.supported
+              || !session.capabilities.permissionModes?.some((mode) => mode.id === 'auto')
+              || !session.capabilities.turnPermissionPolicy?.supported?.supported
+              || session.capabilities.turnPermissionPolicy.unsupportedPermissionModes?.includes('auto')) return;
+
+          // Reservation prevents stealing another turn's runtime. Keep the existing
+          // host lease through background continuation AND asynchronous restoration.
+          // CAS protects user changes; the persisted task preference is never changed.
+          const release = session.acquireTurnLease();
+          const switching = session.setPermissionModeIfUnchanged(previous, 'auto');
+          const originalMode = previous.mode;
+          item.turn.hostTurnLeaseRelease = () => {
+            void switching.then(async (changed) => {
+              if (changed) {
+                await session.setPermissionModeIfUnchanged(
+                  { mode: 'auto', generation: previous.generation + 1 }, originalMode,
+                );
+              }
+            }).catch((err) => {
+              log.warn(`temporary IM permission cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+            }).finally(release);
+          };
+          await switching;
+        },
         beforeProviderStart: async () => {
           const noticeSession = state.makerSession;
           const noticeScope = item.turn.scopeKey;
@@ -1679,7 +1714,7 @@ export function createTurnRunner(
           // 策略轮保留逻辑占用直到后台续跑和收尾结束；新输入仍须等待，
           // 主人在 Cindy 中切换权限则立即沿用普通任务的运行时切换。
           if (effectiveTurnPolicy) {
-            item.turn.hostTurnLeaseRelease = state.makerSession.acquireTurnLease();
+            item.turn.hostTurnLeaseRelease ??= state.makerSession.acquireTurnLease();
           }
           if (item.groupHistoryAccess) {
             item.turn.groupHistoryAccessRelease = beginGroupHistoryAccess({
@@ -2943,7 +2978,16 @@ export function createTurnRunner(
 
   /** Project only the outbound copy; persistence keeps the original component events. */
   function composeOutboundBody(source: string, final: boolean): string {
-    const body = stripInternalWebCitations(richAnswerText(source));
+    let body = unlinkLocalFileLinks(stripInternalWebCitations(richAnswerText(source)));
+    // Card channels patch the live body; a machine-local image path must not show before finalize imports it.
+    if (!final && output.kind === 'rich-card' && body.includes('![')) {
+      const local = new Map(
+        taskImageReferences(body)
+          .filter((ref) => localTaskImagePath(ref.url))
+          .map((ref) => [ref.url, ref.url] as const),
+      );
+      if (local.size > 0) body = rewriteTaskImageReferences(body, local, 'alt');
+    }
     // A partial component can legitimately project to nothing. Never fall back
     // to its protocol source; wait while streaming and explain an unreadable final.
     return final && !body.trim() && hasRichAnswer(source) ? t('richAnswer.incomplete') : body;
@@ -3214,6 +3258,9 @@ export function createTurnRunner(
         for (const absPath of materialized.absPaths) {
           if (!t.mediaAbsPaths.includes(absPath)) t.mediaAbsPaths.push(absPath);
         }
+      } else if (output.kind === 'rich-card' && !state.makerSession.remoteHostId && projectedBody.includes('![')) {
+        t.buffer = await materializeLocalMarkdownImageRefs({ text: projectedBody, sessionId: state.makerSession.id })
+          .catch(() => projectedBody);
       }
       if (sessionStates.get(state.makerSession.id) !== state) return;
       const base = composeTranspondView(state, t, true);
@@ -3280,8 +3327,8 @@ export function createTurnRunner(
     const lease = turn.interactionRouteLease;
     turn.interactionRouteLease = null;
     lease?.release(reason);
-    // Release the host turn lease on the same terminal / requeue / cleanup paths
-    // so an unsupported permission-mode switch can proceed once the policy turn ends.
+    // All terminal / requeue / cleanup paths release the same lease. Temporary
+    // Auto turns retain the underlying lease until their asynchronous restore settles.
     const releaseHostLease = turn.hostTurnLeaseRelease;
     turn.hostTurnLeaseRelease = null;
     releaseHostLease?.();
@@ -3912,15 +3959,17 @@ export function createTurnRunner(
   }
 
   async function materializeTurnLocalImages(state: SessionState, turn: TurnState): Promise<void> {
-    if (
-      output.kind !== 'chunked-text' ||
-      turn.allowedFileRoots.length === 0
-    ) {
-      return;
-    }
+    if (turn.allowedFileRoots.length === 0) return;
     const projectedBody = composeOutboundBody(turn.presenter.wholeText(), true);
     if (!projectedBody.includes('![')) return;
     try {
+      if (output.kind === 'rich-card') {
+        // Card channels upload managed references in place, keeping images beside their text.
+        turn.presenter.replaceBody(
+          await materializeLocalMarkdownImageRefs({ text: projectedBody, sessionId: state.makerSession.id }),
+        );
+        return;
+      }
       const materialized = await materializeLocalMarkdownImages({
         text: projectedBody,
         workingDir: state.workingDir,

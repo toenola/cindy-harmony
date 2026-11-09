@@ -87,7 +87,14 @@ export const CLIENT_ENDPOINT_KEYS = [
   // that omits the key entirely) means X has not rolled out yet — the Settings
   // card stays hidden, which is the intended gradual-rollout switch.
   'xHookWsUrl',
+  // Official Feishu / Lark hook: one overseas deployment serves both regions,
+  // like Telegram. Empty (or omitted) keeps the Settings card hidden until the
+  // service rolls out — the same gradual-rollout switch as X.
+  'feishuHookWsUrl',
   'slackHookWsUrl',
+  // webhook-server（自动化任务的外部事件）基址，按区域部署。纯增可选字段：留空时客户端
+  // 隐藏 Webhook 触发入口，也是灰度开关。长连接地址由它派生。
+  'webhookApiBaseUrl',
   'websiteUrl',
   // model-access-server(登录后自动下发 LLM 网关凭据)的 API 基址。
   'modelAccessApiBaseUrl',
@@ -103,6 +110,8 @@ export const CLIENT_ENDPOINT_KEYS = [
   'cindySkillHubApiBaseUrl',
   // plugin-server(Plugin/Skill 市场、组织管理与发布)的 API 基址。
   'pluginApiBaseUrl',
+  // Independent sharing website. Missing disables preparation; never guess a domain.
+  'shareBaseUrl',
   // 更新/hotfix 链的 CDN base(manifest-*.json / hotfix 包 / agent 二进制)。
   'cdnBaseUrl',
   // 自建线手机整包发现的 mobile-update-server 基址(`${base}/latest`)。仅
@@ -159,7 +168,9 @@ const FIELD_PROTOCOLS: Record<ClientEndpointKey, readonly string[]> = {
   heartbeatUrl: ['https:'],
   telegramHookWsUrl: ['wss:'],
   xHookWsUrl: ['wss:'],
+  feishuHookWsUrl: ['wss:'],
   slackHookWsUrl: ['wss:'],
+  webhookApiBaseUrl: ['https:'],
   websiteUrl: ['https:'],
   modelAccessApiBaseUrl: ['https:'],
   voiceApiBaseUrl: ['https:'],
@@ -167,6 +178,7 @@ const FIELD_PROTOCOLS: Record<ClientEndpointKey, readonly string[]> = {
   skillhubApiBaseUrl: ['https:'],
   cindySkillHubApiBaseUrl: ['https:'],
   pluginApiBaseUrl: ['https:'],
+  shareBaseUrl: ['https:'],
   cdnBaseUrl: ['https:'],
   mobileUpdateBaseUrl: ['https:'],
 };
