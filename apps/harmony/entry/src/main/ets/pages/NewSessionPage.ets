@@ -35,6 +35,7 @@ import {
   ComposerChoiceOption as RuntimeChoiceOption,
   ComposerModelGroup,
   ComposerModelOption as RuntimeModelOption,
+  ModelSelectionHint,
   ProviderListOptions,
   composerModelKey,
   effortLevelLabel,
@@ -50,6 +51,13 @@ import {
   reconcileModelEffort,
   selectedPermissionModeLabel,
 } from '../core/ComposerCatalog';
+import {
+  RemoteAgentCatalog,
+  RemoteAgentDevice,
+  remoteAgentLocationSupported,
+  remoteAgentModelOptions,
+  selectRemoteAgentDevices,
+} from '../core/tasks/RemoteAgentCatalogs';
 import { pickImageUris, pickScreenshotUris, takePhotoUri, buildImageCandidate } from '../core/attachments/ImagePicker';
 import {
   uploadImage, deleteUpload, presignGet, isUploadRevisionCurrent,
@@ -224,6 +232,8 @@ export struct NewSessionPageContent {
   @State showHiddenDirectories: boolean = false;
   @State model: string = '';
   @State providerId: string = '';
+  /** 远程 Agent：选中的模型来自哪台电脑的目录；空 = 被控电脑（v1.3.5 D2）。 */
+  @State agentDeviceId: string = '';
   @State effort: string = '';
   @State permissionMode: string = '';
   @State permissionModeBeforePlan: string = 'auto';
@@ -236,6 +246,13 @@ export struct NewSessionPageContent {
   @State modelOptions: RuntimeModelOption[] = [];
   @State providerModelOptions: RuntimeModelOption[] = [];
   @State providerModelAgent: string = '';
+  /** 被控电脑认得新建时的 agentDeviceId 才提供远程模型（目录带「允许被远程调用」标记）。 */
+  @State remoteAgentLocationSupported: boolean = false;
+  @State remoteAgentRevision: number = 0;
+  private remoteAgentDevices: RemoteAgentDevice[] = [];
+  private remoteAgentCatalogList: RemoteAgentCatalog[] = [];
+  private remoteOptionsKey: string = '';
+  private remoteOptionsCache: RuntimeModelOption[] = [];
   @State modelVisibilityOverrides: Map<string, boolean> = new Map();
   @State effortOptions: RuntimeChoiceOption[] = [];
   @State permissionOptions: RuntimeChoiceOption[] = [];
@@ -325,6 +342,7 @@ export struct NewSessionPageContent {
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
     }));
+    this.unsubs.push(AppServices.instance.remoteAgentCatalogs.onChanged(() => this.syncRemoteAgentCatalogs()));
     this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => {
       this.projectAliasRevision += 1;
     }));
@@ -474,6 +492,7 @@ export struct NewSessionPageContent {
       || this.editDraftAgentKind(draft.agentKind) !== agent) return;
     this.model = draft.model;
     this.providerId = draft.providerId;
+    this.agentDeviceId = '';
     this.effort = draft.effort;
     this.permissionMode = draft.permissionMode;
     this.permissionModeBeforePlan = draft.permissionMode;
@@ -593,8 +612,9 @@ export struct NewSessionPageContent {
   }
 
   private selectModel(option: RuntimeModelOption): void {
-    if (option.suspended || modelNeedsReselection(
-      this.modelVisibilityOverrides, this.selectedAgentKind, option.id, option.providerId)) {
+    // 被控电脑的模型隐藏设置不适用于其他电脑的目录（那份目录已按它自己的设置过滤）。
+    if (option.suspended || (option.agentDeviceId.length === 0 && modelNeedsReselection(
+      this.modelVisibilityOverrides, this.selectedAgentKind, option.id, option.providerId))) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
       return;
     }
@@ -613,6 +633,7 @@ export struct NewSessionPageContent {
     const nextFastTier = this.modelFastTierForRow(option);
     this.model = option.id;
     this.providerId = option.providerId;
+    this.agentDeviceId = option.agentDeviceId;
     this.effort = nextEffort;
     this.fastMode = nextFastMode;
     this.fastModeTier = nextFastTier;
@@ -692,6 +713,7 @@ export struct NewSessionPageContent {
     this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
+    if (page === 'model') this.refreshRemoteAgentCatalogs(true);
   }
 
   private dismissComposerControlPopup(page: string): void {
@@ -1086,6 +1108,7 @@ export struct NewSessionPageContent {
   private resetRuntimeDefaults(): void {
     this.model = '';
     this.providerId = '';
+    this.agentDeviceId = '';
     this.effort = 'medium';
     this.permissionMode = 'auto';
     this.permissionModeBeforePlan = 'auto';
@@ -1136,7 +1159,8 @@ export struct NewSessionPageContent {
    */
   private parseProviderModelOptions(value: Object | undefined, agent: NewAgentKind): RuntimeModelOption[] {
     return parseComposerProviderModelOptions(value, agent, this.modelVisibilityOverrides,
-      this.model.length === 0 ? undefined : { model: this.model, providerId: this.providerId });
+      this.model.length === 0 || this.agentDeviceId.length > 0
+        ? undefined : { model: this.model, providerId: this.providerId });
   }
 
   private currentRuntimeScope(): string {
@@ -1161,6 +1185,8 @@ export struct NewSessionPageContent {
 
   private writeRuntimeChoice(markModelChoice: boolean, option: RuntimeModelOption | undefined = undefined): void {
     if (this.selectedDeviceId.length === 0) return;
+    // 其他电脑的模型不在被控电脑目录里，不能写成被控电脑的新建默认。
+    if (option !== undefined ? option.agentDeviceId.length > 0 : this.agentDeviceId.length > 0) return;
     const active = option === undefined || this.modelOptionIsCurrent(option);
     const runtime = this.currentRuntimeChoice();
     if (option !== undefined) {
@@ -1220,6 +1246,7 @@ export struct NewSessionPageContent {
       this.runtimeCatalogReady = true;
       const providerOptions = this.parseProviderModelOptions(result, agent);
       this.providerModelOptions = providerOptions;
+      this.remoteAgentLocationSupported = remoteAgentLocationSupported(result);
       this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
         this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
@@ -1235,6 +1262,7 @@ export struct NewSessionPageContent {
       this.providerModelAgent = unsupported ? '' : agent;
       this.runtimeCatalogReady = unsupported;
       this.modelVisibilityOverrides = new Map();
+      if (unsupported) this.remoteAgentLocationSupported = false;
     }
   }
 
@@ -1255,7 +1283,8 @@ export struct NewSessionPageContent {
   }
 
   private findModelOption(modelId: string, preferredProviderId: string = ''): RuntimeModelOption | undefined {
-    const source = this.visibleModelOptions();
+    const source = this.visibleModelOptions()
+      .filter((option: RuntimeModelOption): boolean => option.agentDeviceId === this.agentDeviceId);
     if (preferredProviderId.length > 0) {
       for (let i = 0; i < source.length; i++) {
         if (source[i].id === modelId && source[i].providerId === preferredProviderId) return source[i];
@@ -1270,9 +1299,48 @@ export struct NewSessionPageContent {
 
   private visibleModelOptions(): RuntimeModelOption[] {
     if (this.providerModelAgent.length > 0 && this.providerModelAgent === this.selectedAgentKind) {
-      return this.providerModelOptions;
+      const remote = this.remoteModelOptions();
+      return remote.length > 0 ? this.providerModelOptions.concat(remote) : this.providerModelOptions;
     }
     return this.modelOptions;
+  }
+
+  private hostModelNeedsReselection(agent: NewAgentKind): boolean {
+    return this.agentDeviceId.length === 0
+      && modelNeedsReselection(this.modelVisibilityOverrides, agent, this.model, this.providerId);
+  }
+
+  /** 读其他电脑的远程目录：选择器打开时列出所有可用电脑，否则只读已选模型所在那台。 */
+  private refreshRemoteAgentCatalogs(pickerOpen: boolean): void {
+    const keep: string[] = this.agentDeviceId.length > 0 ? [this.agentDeviceId] : [];
+    const listAll = pickerOpen && this.remoteAgentLocationSupported;
+    const devices = listAll || keep.length > 0
+      ? selectRemoteAgentDevices(AppServices.instance.tasks.deviceList, this.selectedDeviceId, keep,
+        harmonyV12String(this.getUIContext().getHostContext(), 'v134_unnamed_computer'))
+        .filter((device: RemoteAgentDevice): boolean => listAll || keep.indexOf(device.deviceId) >= 0)
+      : [];
+    this.remoteAgentDevices = devices;
+    AppServices.instance.remoteAgentCatalogs.refresh(devices);
+    this.syncRemoteAgentCatalogs();
+  }
+
+  private syncRemoteAgentCatalogs(): void {
+    this.remoteAgentCatalogList = AppServices.instance.remoteAgentCatalogs.catalogs(this.remoteAgentDevices);
+    this.remoteAgentRevision += 1;
+  }
+
+  private remoteModelOptions(): RuntimeModelOption[] {
+    if (!this.remoteAgentLocationSupported) return [];
+    const agent = this.selectedAgentKind;
+    const selected = this.agentDeviceId.length > 0 ? this.agentDeviceId : null;
+    const key = JSON.stringify([this.remoteAgentRevision, agent, this.model, this.providerId, selected ?? '']);
+    if (key !== this.remoteOptionsKey) {
+      this.remoteOptionsKey = key;
+      let hint: ModelSelectionHint | undefined = undefined;
+      if (selected !== null && this.model.length > 0) hint = { model: this.model, providerId: this.providerId };
+      this.remoteOptionsCache = remoteAgentModelOptions(this.remoteAgentCatalogList, agent, hint, selected);
+    }
+    return this.remoteOptionsCache;
   }
 
   private groupedModelOptions(): ComposerModelGroup[] {
@@ -1288,7 +1356,8 @@ export struct NewSessionPageContent {
   }
 
   private modelOptionIsCurrent(option: RuntimeModelOption): boolean {
-    return option.id === this.model && option.providerId === this.providerId;
+    return option.id === this.model && option.providerId === this.providerId
+      && option.agentDeviceId === this.agentDeviceId;
   }
 
   private modelEffortForRow(option: RuntimeModelOption): string {
@@ -1417,7 +1486,7 @@ export struct NewSessionPageContent {
   }
 
   private currentModelLabel(): string {
-    if (modelNeedsReselection(this.modelVisibilityOverrides, this.selectedAgentKind, this.model, this.providerId)) {
+    if (this.hostModelNeedsReselection(this.selectedAgentKind)) {
       return harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselect');
     }
     const model = this.findModelOption(this.model, this.providerId);
@@ -1459,6 +1528,7 @@ export struct NewSessionPageContent {
     if (localChoice !== null) {
       this.model = localChoice.model;
       this.providerId = localChoice.providerId;
+      this.agentDeviceId = '';
       this.effort = localChoice.effort;
       this.fastMode = localChoice.fastMode;
       this.fastModeTier = localChoice.fastMode ? localChoice.fastModeTier : '';
@@ -1508,6 +1578,7 @@ export struct NewSessionPageContent {
       if (this.runtimeModelTouchedGeneration !== generation && preferredRuntime !== null) {
         this.model = preferredRuntime.model;
         this.providerId = preferredRuntime.providerId;
+        this.agentDeviceId = '';
       }
       await this.loadProviderModelOptions(agent, deviceId, generation);
       if (!this.runtimeRequestIsCurrent(deviceId, agent, generation) || !this.runtimeCatalogReady) return;
@@ -1532,6 +1603,7 @@ export struct NewSessionPageContent {
         const runtime = pickNewSessionRuntime(agent, preferredRuntime, source, this.modelVisibilityOverrides);
         this.model = runtime.model;
         this.providerId = runtime.providerId;
+        this.agentDeviceId = '';
         if (!effortTouched) this.effort = runtime.effort;
         if (!fastTouched) {
           this.fastMode = this.fastModeCapability && runtime.fastMode;
@@ -1580,7 +1652,7 @@ export struct NewSessionPageContent {
         this.runtimeDefaultsSettled = true;
         if (!this.runtimeCatalogReady) {
           this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
-        } else if (modelNeedsReselection(this.modelVisibilityOverrides, agent, this.model, this.providerId)) {
+        } else if (this.hostModelNeedsReselection(agent)) {
           this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
         } else if (this.model.trim().length === 0) {
           this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_required');
@@ -1720,6 +1792,8 @@ export struct NewSessionPageContent {
     options['planMode'] = this.planModeNative && this.planModeEnabled;
     options['fastMode'] = fastModeWireValue(this.fastMode, this.fastModeTier);
     if (this.providerId.trim().length > 0) options['providerId'] = this.providerId.trim();
+    // 远程 Agent：Agent 在选中模型所在的电脑运行（对齐 Mobile newSession 的 agentDeviceId）。
+    if (this.agentDeviceId.length > 0) options['agentDeviceId'] = this.agentDeviceId;
     if (this.effort.trim().length > 0) options['effort'] = this.effort.trim();
     if (this.workspaceKind === 'project') options['workingDir'] = this.workingDir;
     if (sessionId.length > 0) options['id'] = sessionId;
@@ -1825,7 +1899,7 @@ export struct NewSessionPageContent {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       return;
     }
-    if (modelNeedsReselection(this.modelVisibilityOverrides, agent, this.model, this.providerId)) {
+    if (this.hostModelNeedsReselection(agent)) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
       return;
     }
@@ -2609,7 +2683,7 @@ export struct NewSessionPageContent {
       selected: this.modelOptionIsCurrent(option),
       subscription: option.subscription,
       paymentRequired: option.availability === 'requires_payment',
-      disabled: this.creating,
+      disabled: this.creating || (option.suspended && !this.modelOptionIsCurrent(option)),
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
       effortPickerOpen: this.modelEffortPickerKey === this.modelOptionKey(option),

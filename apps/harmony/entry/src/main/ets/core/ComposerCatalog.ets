@@ -42,6 +42,10 @@ export class ComposerModelOption {
   newSessionDefaultAgents: string[] = [];
   /** 远端陈列顺序；缺省用一个大值排到已标记项之后，保留稳定回退。 */
   sortOrder: number = Number.MAX_SAFE_INTEGER;
+  /** 远程 Agent：这一行来自哪台电脑的目录；空 = 被控电脑自己的目录。 */
+  agentDeviceId: string = '';
+  /** 远程目录所在电脑的展示名，分组标题用。 */
+  agentDeviceName: string = '';
 }
 
 export class ComposerModelGroup {
@@ -117,7 +121,9 @@ export function effortLevelLabel(id: string, fallback: string): string {
 }
 
 export function composerModelKey(option: ComposerModelOption): string {
-  return option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
+  const key = option.providerId.length > 0 ? `${option.providerId}::${option.id}` : option.id;
+  // 两台电脑可以有同名供应商与模型，远程目录的行必须带上电脑才能区分。
+  return option.agentDeviceId.length > 0 ? `device:${option.agentDeviceId}::${key}` : key;
 }
 
 /** 新建任务与任务详情按同一供应商口径组织模型目录。 */
@@ -127,8 +133,9 @@ export function groupComposerModelOptions(source: ComposerModelOption[]): Compos
     const option = source[i];
     const providerId = option.providerId.trim();
     const providerName = option.providerName.trim();
-    const key = providerId.length > 0
+    const providerKey = providerId.length > 0
       ? providerId : providerName.length > 0 ? providerName : 'default-provider';
+    const key = option.agentDeviceId.length > 0 ? `device:${option.agentDeviceId}::${providerKey}` : providerKey;
     let group: ComposerModelGroup | undefined = undefined;
     for (let j = 0; j < groups.length; j++) {
       if (groups[j].key === key) {
@@ -141,6 +148,8 @@ export function groupComposerModelOptions(source: ComposerModelOption[]): Compos
       group.key = key;
       group.name = providerName.length > 0
         ? providerName : providerId.length > 0 ? providerId : '默认供应商';
+      // 远程目录每个供应商一段，标题写成「供应商 · 电脑名」（对齐 Mobile 远程 Agent 目录）。
+      if (option.agentDeviceName.length > 0) group.name += ' · ' + option.agentDeviceName;
       groups.push(group);
     }
     group.options.push(option);

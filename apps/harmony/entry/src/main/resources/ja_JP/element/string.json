@@ -181,6 +181,13 @@
     {"name":"v133_image_delivery_retrying","value":"転送中…"},
     {"name":"v133_image_delivery_retry_failed","value":"転送できません。画像を生成したパソコンがオンラインか確認してください。"},
     {"name":"v133_source_mcp_app_named","value":"MCP App「%s」から送信"},
-    {"name":"v133_source_mcp_server_id","value":"MCP サーバー ID：%s"}
+    {"name":"v133_source_mcp_server_id","value":"MCP サーバー ID：%s"},
+    {"name":"v135_relocate_title_other","value":"Agent を「%s」で実行しますか？"},
+    {"name":"v135_relocate_title_host","value":"Agent を「%s」で実行し直しますか？"},
+    {"name":"v135_relocate_title_host_unnamed","value":"Agent をセッションのあるパソコンで実行し直しますか？"},
+    {"name":"v135_relocate_message","value":"元のパソコンにある会話の記録は移せないため、引き継ぎの要約から続けます。思考内容などは完全には引き継がれない場合があります。次のメッセージを送信したときに反映されます。"},
+    {"name":"v135_relocate_message_native","value":"会話の記録をすべてコピーして、続きから再開します。復元できない場合は引き継ぎの要約から続けるため、思考内容などは完全には引き継がれない場合があります。次のメッセージを送信したときに反映されます。"},
+    {"name":"v135_relocate_confirm","value":"パソコンを切り替える"},
+    {"name":"v135_relocate_cancel","value":"このままにする"}
   ]
 }

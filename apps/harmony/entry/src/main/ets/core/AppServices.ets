@@ -27,6 +27,7 @@ import { TaskSearchStore } from './tasks/TaskSearchStore';
 import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
 import { TaskAccountTransition } from './tasks/ResidentTaskPanes';
 import { PROJECT_ALIASES_CHANGED, TaskProjectAliasStore } from './tasks/TaskProjectAliasStore';
+import { RemoteAgentCatalogStore } from './tasks/RemoteAgentCatalogs';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
 import { DeviceView, parseDeviceView, readStr, recordOrEmpty, safeErrorMessage } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
@@ -66,6 +67,8 @@ export class AppServices {
   readonly taskSearch: TaskSearchStore = new TaskSearchStore();
   readonly taskProjectOrder: TaskProjectOrderStore = new TaskProjectOrderStore();
   readonly taskProjectAliases: TaskProjectAliasStore = new TaskProjectAliasStore();
+  /** 同账号其他电脑上开放远程调用的模型目录（远程 Agent，v1.3.5 D2）。 */
+  readonly remoteAgentCatalogs: RemoteAgentCatalogStore = new RemoteAgentCatalogStore();
   readonly messages: MessageStore = new MessageStore();
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
@@ -136,6 +139,8 @@ export class AppServices {
     );
     this.taskProjectAliases.attach(this.client, (deviceId: string) => this.openLink(deviceId),
       (): string => JSON.stringify([this.auth.sessionEpoch, this.auth.cacheAccountId]));
+    this.remoteAgentCatalogs.attach(this.client, (deviceId: string) => this.openLink(deviceId),
+      (): string => JSON.stringify([this.auth.sessionEpoch, this.auth.cacheAccountId]));
     this.tasks.onChanged(() => {
       this.syncSessionSubscriptions();
       this.taskListSnapshot.save(() => snapshotDevices(
@@ -164,6 +169,7 @@ export class AppServices {
       await this.taskListSnapshot.clear();
       this.taskProjectOrder.clearAll();
       this.taskProjectAliases.clearAll();
+      this.remoteAgentCatalogs.clearAll();
       this.goals.clearAll();
       this.selfDeviceName = '';
       await this.voiceDictionary.clear();
@@ -484,6 +490,7 @@ export class AppServices {
         this.linkedDevices.clear();
         this.taskProjectOrder.resetConnectionFence();
         this.taskProjectAliases.resetConnection();
+        this.remoteAgentCatalogs.resetConnection();
         this.resetSessionSubscriptions();
         this.messages.invalidateLiveTailTrust();
         if (status === 'stopped') {
@@ -691,6 +698,7 @@ export class AppServices {
       await this.taskListSnapshot.clear();
       this.taskProjectOrder.clearAll();
       this.taskProjectAliases.clearAll();
+      this.remoteAgentCatalogs.clearAll();
       this.goals.clearAll();
     }
     if (accountEpoch !== this.auth.sessionEpoch) {

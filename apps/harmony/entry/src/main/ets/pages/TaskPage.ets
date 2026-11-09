@@ -69,6 +69,7 @@ import {
   sortPendingInteractions,
 } from '../core/interactions/InteractionPresentation';
 import { DlError, DlInvokeOptions } from '../core/device-link/DlClient';
+import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { UsageLimitWaitState } from '../core/messages/UsageLimitWait';
 import { isRemoteBusyError, isRemoteBusyMessage } from '../core/device-link/RemoteInvokePresentation';
 import { GoalModeState } from '../core/goals/GoalModels';
@@ -138,6 +139,7 @@ import {
 import {
   SessionAgentSwitchIntent,
   agentLocationLabel,
+  effectiveAgentDeviceId,
   runtimeRouteNeedsRemoteCatalog,
   sessionAgentSwitchIntentApplied,
   sessionSendNeedsModelReselection,
@@ -145,6 +147,15 @@ import {
   parseSessionAgentSwitchIntent,
   supportsSessionAgentSwitch,
 } from '../core/tasks/SessionAgentSwitch';
+import {
+  AgentLocationArgument,
+  RemoteAgentCatalog,
+  RemoteAgentDevice,
+  remoteAgentLocationSupported,
+  remoteAgentModelOptions,
+  resolveAgentLocationPick,
+  selectRemoteAgentDevices,
+} from '../core/tasks/RemoteAgentCatalogs';
 import {
   RenderItem, RenderMessageItem, RenderThinkingItem,
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
@@ -785,6 +796,14 @@ export struct TaskPageContent {
   /** 被控端 provider:list 的真实目录；为空时才回退 capabilities.availableModels。 */
   @State providerModelOptions: ComposerModelOption[] = [];
   @State providerModelAgent: string = '';
+  /** 被控电脑的目录带远程调用标记：它认得远程 Agent 的位置参数（v1.3.5 D2）。 */
+  @State remoteAgentLocationSupported: boolean = false;
+  /** 远程目录每次变化递增，驱动模型列表与当前模型重算。 */
+  @State remoteAgentRevision: number = 0;
+  private remoteAgentDevices: RemoteAgentDevice[] = [];
+  private remoteAgentCatalogList: RemoteAgentCatalog[] = [];
+  private remoteOptionsKey: string = '';
+  private remoteOptionsCache: ComposerModelOption[] = [];
   @State modelVisibilityOverrides: Map<string, boolean> = new Map();
   @State effortOptions: ComposerChoiceOption[] = [];
   @State fastModeCapability: boolean = false;
@@ -1147,6 +1166,7 @@ export struct TaskPageContent {
     this.unsubs.push(AppServices.instance.goals.onChanged(() => {
       this.goalState = AppServices.instance.goals.getState(this.sessionId, this.deviceId);
     }));
+    this.unsubs.push(AppServices.instance.remoteAgentCatalogs.onChanged(() => this.syncRemoteAgentCatalogs()));
     this.goalState = AppServices.instance.goals.getState(this.sessionId, this.deviceId);
     this.restoreComposerDraft();
 
@@ -1546,9 +1566,12 @@ export struct TaskPageContent {
       if (capabilityGeneration >= 0
         && capabilityGeneration !== this.composerCapabilitiesGeneration) return;
       this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
+      // Agent 在其他电脑时，当前模型属于那台的目录，不能拿来匹配被控电脑的同名模型。
+      const hint = this.currentAgentDeviceId() === null ? this.currentModelSelectionHint() : undefined;
       this.providerModelOptions = parseProviderModelOptions(
-        result, agent, this.modelVisibilityOverrides, this.currentModelSelectionHint(), true);
+        result, agent, this.modelVisibilityOverrides, hint, hint !== undefined);
       this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
+      this.remoteAgentLocationSupported = remoteAgentLocationSupported(result);
     } catch (e) {
       if (!current()) return;
       if (capabilityGeneration >= 0
@@ -1557,6 +1580,7 @@ export struct TaskPageContent {
       const unsupported = providerCatalogUnavailable(e instanceof Error ? e.message : String(e));
       if (unsupported || this.providerModelAgent !== agent) this.providerModelOptions = [];
       this.providerModelAgent = unsupported ? '' : agent;
+      if (unsupported) this.remoteAgentLocationSupported = false;
     }
   }
 
@@ -1587,6 +1611,9 @@ export struct TaskPageContent {
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
       this.modelAgentTab = this.currentAgentTab();
       await this.loadPendingAgentSwitchIntent();
+      if (generation !== this.composerCapabilitiesGeneration) return;
+      // Agent 已在其他电脑（或挂着换过去的意图）时，按那台的目录显示当前模型。
+      this.refreshRemoteAgentCatalogs(false);
       if (this.session()?.permissionMode === 'plan') {
         let rememberedSupported = false;
         for (let i = 0; i < this.permissionOptions.length; i++) {
@@ -1631,8 +1658,95 @@ export struct TaskPageContent {
       && supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
   }
 
+  /**
+   * Agent 在其他电脑时：被控电脑认得远程 Agent 位置才放开模型 / Agent / 档位切换（对齐 Mobile），
+   * 否则保持 v1.3.2 的只读防护，不能静默改回本机。SSH 与 Orca 不支持换位置，仍只读。
+   */
   private runtimeRouteLocked(): boolean {
-    return runtimeRouteNeedsRemoteCatalog(this.session(), this.pendingAgentSwitchIntent);
+    return runtimeRouteNeedsRemoteCatalog(this.session(), this.pendingAgentSwitchIntent)
+      && !this.agentLocationMovable();
+  }
+
+  /** Agent 现在所在的电脑；null = 被控电脑。 */
+  private currentAgentDeviceId(): string | null {
+    const session = this.session();
+    if (session === undefined || session.remoteHostId.length > 0 || session.agentDeviceId.length === 0) return null;
+    return session.agentDeviceId;
+  }
+
+  /** 下一条消息时 Agent 所在的电脑（挂着换位置的意图就按意图）。 */
+  private nextAgentDeviceId(): string | null {
+    return effectiveAgentDeviceId(this.session(), this.pendingAgentSwitchIntent);
+  }
+
+  private optionAgentDeviceId(option: ComposerModelOption): string | null {
+    return option.agentDeviceId.length > 0 ? option.agentDeviceId : null;
+  }
+
+  /** 能把 Agent 换到其他电脑：被控电脑认得位置参数，且任务支持切换 Agent（对齐 Mobile agentLocationMovable）。 */
+  private agentLocationMovable(): boolean {
+    return this.remoteAgentLocationSupported
+      && supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
+  }
+
+  /**
+   * 读其他电脑的远程目录。选择器打开时列出所有可用电脑；否则只读 Agent 当前 / 挂着的那台，
+   * 用来显示当前模型。读不到只影响那一台。
+   */
+  private refreshRemoteAgentCatalogs(pickerOpen: boolean): void {
+    const keep: string[] = [];
+    const current = this.currentAgentDeviceId();
+    const next = this.nextAgentDeviceId();
+    if (current !== null) keep.push(current);
+    if (next !== null && keep.indexOf(next) < 0) keep.push(next);
+    const listAll = pickerOpen && this.agentLocationMovable();
+    const devices = listAll || keep.length > 0
+      ? selectRemoteAgentDevices(AppServices.instance.tasks.deviceList, this.deviceId, keep,
+        this.v12String('v134_unnamed_computer'))
+        .filter((device: RemoteAgentDevice): boolean => listAll || keep.indexOf(device.deviceId) >= 0)
+      : [];
+    this.remoteAgentDevices = devices;
+    AppServices.instance.remoteAgentCatalogs.refresh(devices);
+    this.syncRemoteAgentCatalogs();
+  }
+
+  /** 换电脑运行的确认（文案与 Mobile confirmMobileAgentRelocation 一致）；取消 = 什么都不变。 */
+  private confirmAgentRelocation(target: string | null, targetName: string, sameAgent: boolean,
+    onConfirm: () => void): void {
+    let title = '';
+    if (target !== null) {
+      title = this.v12String('v135_relocate_title_other', targetName.length > 0 ? targetName : target);
+    } else {
+      const host = AppServices.instance.tasks.deviceList
+        .find((device: PresenceSnapshot): boolean => device.deviceId === this.deviceId)?.deviceName.trim() ?? '';
+      title = host.length > 0 ? this.v12String('v135_relocate_title_host', host)
+        : this.v12String('v135_relocate_title_host_unnamed');
+    }
+    this.getUIContext().showAlertDialog({
+      title: title,
+      // 同引擎优先复制原生记录，跨引擎只能走交接摘要。
+      message: this.v12String(sameAgent ? 'v135_relocate_message_native' : 'v135_relocate_message'),
+      primaryButton: { value: this.v12String('v135_relocate_cancel'), action: (): void => {} },
+      secondaryButton: { value: this.v12String('v135_relocate_confirm'), action: (): void => onConfirm() },
+    });
+  }
+
+  private syncRemoteAgentCatalogs(): void {
+    this.remoteAgentCatalogList = AppServices.instance.remoteAgentCatalogs.catalogs(this.remoteAgentDevices);
+    this.remoteAgentRevision += 1;
+  }
+
+  private remoteModelOptions(): ComposerModelOption[] {
+    const agent = this.composerAgentKind();
+    const hint = this.browsingCurrentAgent() ? this.currentModelSelectionHint() : undefined;
+    const current = this.currentAgentDeviceId();
+    const key = JSON.stringify([this.remoteAgentRevision, agent, hint?.model ?? '', hint?.providerId ?? '',
+      current ?? '']);
+    if (key !== this.remoteOptionsKey) {
+      this.remoteOptionsKey = key;
+      this.remoteOptionsCache = remoteAgentModelOptions(this.remoteAgentCatalogList, agent, hint, current);
+    }
+    return this.remoteOptionsCache;
   }
 
   private agentLocationText(): string {
@@ -1849,7 +1963,8 @@ export struct TaskPageContent {
 
   private visibleModelOptions(): ComposerModelOption[] {
     if (this.providerModelAgent.length > 0 && this.providerModelAgent === this.composerAgentKind()) {
-      return this.providerModelOptions;
+      const remote = this.remoteModelOptions();
+      return remote.length > 0 ? this.providerModelOptions.concat(remote) : this.providerModelOptions;
     }
     return this.browsingCurrentAgent() ? this.modelOptions : this.alternateModelOptions;
   }
@@ -1874,6 +1989,7 @@ export struct TaskPageContent {
     const session = this.session();
     if (!this.browsingCurrentAgent() || session === undefined
       || option.id !== this.effectiveModelId(session)) return false;
+    if (this.optionAgentDeviceId(option) !== this.currentAgentDeviceId()) return false;
     const providerId = this.effectiveProviderId(session);
     if (providerId.length > 0) return option.providerId === providerId;
     if (option.providerId.length === 0) return true;
@@ -2027,8 +2143,9 @@ export struct TaskPageContent {
     }
     const session = this.session();
     const modelId = session === undefined ? '' : this.effectiveModelId(session);
+    const agentDeviceId = this.currentAgentDeviceId();
     for (let i = 0; i < source.length; i++) {
-      if (source[i].id === modelId) return source[i];
+      if (source[i].id === modelId && this.optionAgentDeviceId(source[i]) === agentDeviceId) return source[i];
     }
     return null;
   }
@@ -2126,6 +2243,7 @@ export struct TaskPageContent {
       || this.isCreationBlockingRemoteOps()) return;
     if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
     if (page === 'model') {
+      this.refreshRemoteAgentCatalogs(true);
       const targetAgent = this.composerAgentKind();
       if (this.providerModelAgent !== targetAgent) {
         // 模型弹窗可能在页面复用期间才收到 provider:list；用当前能力代次
@@ -2295,7 +2413,8 @@ export struct TaskPageContent {
     }
   }
 
-  private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false): Promise<void> {
+  private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false,
+    locationConfirmed: boolean = false): Promise<void> {
     if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
@@ -2308,11 +2427,27 @@ export struct TaskPageContent {
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const targetAgent = this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
     const currentAgent = this.currentAgentTab();
+    // 远程 Agent：选另一台电脑（或被控电脑）目录里的模型 = 把 Agent 挪过去，先确认，下一条消息生效；
+    // 同一台电脑内换模型直接切（对齐 Mobile confirmAgentLocationForPick）。
+    const pick = resolveAgentLocationPick(this.currentAgentDeviceId(), this.nextAgentDeviceId(),
+      this.optionAgentDeviceId(option));
+    if (pick.relocates && !this.agentLocationMovable()) {
+      promptAction.showToast({ message: this.v12String('v132_remote_runtime_read_only') });
+      return;
+    }
+    if (pick.needsConfirm && !locationConfirmed) {
+      this.confirmAgentRelocation(pick.relocateTo, option.agentDeviceName, currentAgent === targetAgent, () => {
+        if (!this.isCurrentPageLifecycle(lifecycleGeneration) || this.sessionId !== session.id) return;
+        void this.selectComposerModel(option, windowConfirmed, true);
+      });
+      return;
+    }
     if (targetAgent !== currentAgent && !this.canSwitchSessionAgent()) {
       promptAction.showToast({ message: '当前任务不支持切换 Agent' });
       return;
     }
-    if (targetAgent !== currentAgent && !this.agentSwitchConfirmed) {
+    // 换电脑与换引擎是同一份交接风险：换电脑那一步已经确认过，不再叠一层换引擎确认。
+    if (targetAgent !== currentAgent && !this.agentSwitchConfirmed && !pick.relocates) {
       this.getUIContext().showAlertDialog({
         title: `切换到 ${modelAgentLabel(targetAgent)}`,
         message: '当前任务的上下文会保留，Agent 将在安全边界切换；正在运行时会等本轮结束后生效。',
@@ -2326,7 +2461,7 @@ export struct TaskPageContent {
           action: () => {
             if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
             this.agentSwitchConfirmed = true;
-            void this.selectComposerModel(option);
+            void this.selectComposerModel(option, windowConfirmed, locationConfirmed);
           },
         },
       });
@@ -2350,7 +2485,7 @@ export struct TaskPageContent {
           action: (): void => {
             if (windowDecision === 'blocked' || !this.isCurrentPageLifecycle(lifecycleGeneration)
               || this.sessionId !== session.id) return;
-            void this.selectComposerModel(option, true);
+            void this.selectComposerModel(option, true, locationConfirmed);
           },
         },
       });
@@ -2366,12 +2501,16 @@ export struct TaskPageContent {
     this.contextRpcBusy = true;
     try {
       let result: Object | undefined;
-      if (targetAgent !== currentAgent) {
+      if (targetAgent !== currentAgent || pick.relocates) {
         const writeGeneration = ++this.agentSwitchWriteGeneration;
         const effort = nextEffort;
-        result = await this.invokeContextRpc('maker:switch-session-agent', [
-          session.id, targetAgent, option.id, option.providerId, effort, nextFastWire,
-        ]);
+        const args: Object[] = [session.id, targetAgent, option.id, option.providerId, effort, nextFastWire];
+        if (pick.relocates) {
+          const location = new AgentLocationArgument();
+          location.agentDeviceId = pick.relocateTo;
+          args.push(location);
+        }
+        result = await this.invokeContextRpc('maker:switch-session-agent', args);
         if (!this.isCurrentPageLifecycle(lifecycleGeneration)
           || writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) {
           if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.pendingModelSelectionKey = '';
@@ -7376,7 +7515,8 @@ export struct TaskPageContent {
       selected: this.modelOptionIsCurrent(option),
       subscription: option.subscription,
       paymentRequired: option.availability === 'requires_payment',
-      disabled: this.contextRpcBusy || this.runtimeRouteLocked(),
+      disabled: this.contextRpcBusy || this.runtimeRouteLocked()
+        || (option.suspended && !this.modelOptionIsCurrent(option)),
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
       effortPickerOpen: this.modelEffortPickerKey === composerModelKey(option),

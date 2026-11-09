@@ -181,6 +181,13 @@
     {"name":"v133_image_delivery_retrying","value":"正在交付…"},
     {"name":"v133_image_delivery_retry_failed","value":"暫時無法交付，請確認產生圖片的電腦在線。"},
     {"name":"v133_source_mcp_app_named","value":"由 MCP App「%s」傳送"},
-    {"name":"v133_source_mcp_server_id","value":"MCP 伺服器 ID：%s"}
+    {"name":"v133_source_mcp_server_id","value":"MCP 伺服器 ID：%s"},
+    {"name":"v135_relocate_title_other","value":"改到「%s」上執行 Agent？"},
+    {"name":"v135_relocate_title_host","value":"改回「%s」上執行 Agent？"},
+    {"name":"v135_relocate_title_host_unnamed","value":"改回任務所在的電腦執行 Agent？"},
+    {"name":"v135_relocate_message","value":"原來那台電腦上的對話記錄帶不過來，會整理成交接摘要接上，思考內容等不能保證完美繼承。下一則訊息送出時生效。"},
+    {"name":"v135_relocate_message_native","value":"完整對話記錄會複製過去接著用；如果恢復不了，會改用交接摘要接上，思考內容等不能保證完美繼承。下一則訊息送出時生效。"},
+    {"name":"v135_relocate_confirm","value":"換電腦執行"},
+    {"name":"v135_relocate_cancel","value":"保持不變"}
   ]
 }
