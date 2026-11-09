@@ -398,6 +398,20 @@ export class InputQueueStore {
   /** 同一任务的恢复拉取 single-flight；authority epoch 负责隔离清理后的旧结果。 */
   private refreshOperations: Map<string, Promise<boolean>> = new Map();
   private sendSequence: number = 0;
+  private acceptedListeners: Array<(deviceId: string, sessionId: string) => void> = [];
+
+  /** 电脑已接收一条用户输入（离线时是重连后才送达）。 */
+  onInputAccepted(listener: (deviceId: string, sessionId: string) => void): () => void {
+    this.acceptedListeners.push(listener);
+    return (): void => {
+      const index = this.acceptedListeners.indexOf(listener);
+      if (index >= 0) this.acceptedListeners.splice(index, 1);
+    };
+  }
+
+  private emitInputAccepted(deviceId: string, sessionId: string): void {
+    for (const listener of this.acceptedListeners.slice()) listener(deviceId, sessionId);
+  }
   private usageLimitScopeGeneration: number = 0;
   private usageLimitCancelUnsupportedScopes: Map<string, string> = new Map();
   private usageLimitCancellations: Map<string, UsageLimitWaitCancellation> = new Map();
@@ -1407,6 +1421,7 @@ export class InputQueueStore {
       this.enqueueingClientIds.delete(item.clientId);
       this.failedByClientId.delete(item.clientId);
       this.notify();
+      this.emitInputAccepted(deviceId, session.id);
       return item.clientId;
     } catch (e) {
       if (isSafeUnsentDlError(e)) {
@@ -1480,6 +1495,7 @@ export class InputQueueStore {
       this.enqueueingClientIds.delete(clientId);
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
+      this.emitInputAccepted(deviceId, sessionId);
       void this.pumpDeferred(sessionId);
       void this.pumpConnectionWaiting(sessionId);
     } catch (e) {
@@ -2093,6 +2109,7 @@ export class InputQueueStore {
           this.enqueueingClientIds.delete(item.clientId);
           this.failedByClientId.delete(item.clientId);
           this.notify();
+          this.emitInputAccepted(currentTarget.deviceId, sessionId);
         } catch (e) {
           if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
             || this.connectionPumps.get(sessionId) !== pumpToken) {

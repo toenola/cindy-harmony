@@ -22,7 +22,7 @@ import {
   HelloPayload, HelloAckPayload, PresenceSnapshot, DlChannels, SESSIONS_TOPIC,
   CONTROLLER_CAPABILITIES, MAKER_EVENT_BATCH_CHANNEL, expandMakerEventBatchPayload,
 } from './device-link/DlProtocol';
-import { TaskStore, unwrapInvokeResult } from './tasks/TaskStore';
+import { SessionMetaPatch, TaskStore, unwrapInvokeResult } from './tasks/TaskStore';
 import { TaskSearchStore } from './tasks/TaskSearchStore';
 import { TaskProjectOrderStore } from './tasks/TaskProjectOrderStore';
 import { TaskAccountTransition } from './tasks/ResidentTaskPanes';
@@ -69,6 +69,7 @@ export class AppServices {
   readonly taskProjectAliases: TaskProjectAliasStore = new TaskProjectAliasStore();
   /** 同账号其他电脑上开放远程调用的模型目录（远程 Agent，v1.3.5 D2）。 */
   readonly remoteAgentCatalogs: RemoteAgentCatalogStore = new RemoteAgentCatalogStore();
+  private unarchiveRuns: Map<string, Promise<void>> = new Map();
   readonly messages: MessageStore = new MessageStore();
   readonly inputQueue: InputQueueStore = new InputQueueStore();
   readonly composerDrafts: ComposerDraftStore = new ComposerDraftStore();
@@ -184,6 +185,8 @@ export class AppServices {
     this.messages.setSessionSnapshotResolver(
       (sessionId: string, deviceId: string) => this.tasks.findSessionById(sessionId, deviceId));
     this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
+    this.inputQueue.onInputAccepted((deviceId: string, sessionId: string): void =>
+      this.unarchiveAfterSend(deviceId, sessionId));
     this.interactions.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.newSessionCreations.attach(
@@ -226,6 +229,26 @@ export class AppServices {
    * 所有跨设备 invoke（订阅 / 历史 / 发送 / 交互）都依赖它。
    * 连接未就绪时先等待（最多 5s）；link-accept 8s 超时不阻塞后续（失败走重试）。
    */
+  /**
+   * 与桌面 / Mobile 一致：电脑接收了已归档任务里的消息，任务自动取消归档。属于任务本身而不是页面，
+   * 用户离开页面也照做；同一任务按顺序执行，后一笔在前一笔结束后按当时状态重新判断。
+   * 失败不影响已送达的消息，任务保持已归档、不弹错误（对齐 Mobile unarchiveAfterSend）。
+   */
+  private unarchiveAfterSend(deviceId: string, sessionId: string): void {
+    const key = `${deviceId}:${sessionId}`;
+    const run = (this.unarchiveRuns.get(key) ?? Promise.resolve()).then(async (): Promise<void> => {
+      const session = this.tasks.findSessionById(sessionId, deviceId);
+      if (session === undefined || session.status !== 'archived' || session.orcaRole === 'worker') return;
+      const patch = new SessionMetaPatch();
+      patch.status = 'active';
+      await this.tasks.patchSession(deviceId, sessionId, patch);
+    }).catch((): void => {});
+    this.unarchiveRuns.set(key, run);
+    void run.finally((): void => {
+      if (this.unarchiveRuns.get(key) === run) this.unarchiveRuns.delete(key);
+    });
+  }
+
   async openLink(deviceId: string): Promise<void> {
     if (this.linkedDevices.has(deviceId)) {
       return;

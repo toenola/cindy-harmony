@@ -3168,7 +3168,7 @@ struct TaskListPage {
       SymbolGlyph($r('sys.symbol.archivebox'))
         .fontSize(17)
         .fontColor([$r('app.color.chat_cta_text')])
-      Text(entry.session.status === 'archived' ? '恢复' : '归档')
+      Text(entry.session.status === 'archived' ? '取消归档' : '归档')
         .fontSize(11)
         .fontColor($r('app.color.chat_cta_text'))
     }
@@ -3363,7 +3363,7 @@ struct TaskListPage {
         .layoutWeight(1)
       this.bulkActionButton('置顶', () => this.bulkAction('pin'))
       this.bulkActionButton('归档', () => this.bulkAction('archive'))
-      this.bulkActionButton('恢复', () => this.bulkAction('restore'))
+      this.bulkActionButton('取消归档', () => this.bulkAction('restore'))
       this.bulkActionButton('删除', () => this.bulkAction('delete'), true)
     }
     .width('calc(100% - 24vp)')

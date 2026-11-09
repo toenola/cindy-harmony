@@ -1,6 +1,8 @@
 import { describe, expect, it } from '@ohos/hypium';
 import { DlClient, DlClientOptions, DlError, DlInvokeOptions } from '../main/ets/core/device-link/DlClient';
 import { Envelope } from '../main/ets/core/device-link/DlProtocol';
+import { SerializedComposerDocument } from '../main/ets/core/messages/ComposerDocument';
+import { RemoteSession } from '../main/ets/core/tasks/TaskModels';
 import {
   InputQueueStore, parseInputProjection, parseQueuedInputItem, queuedInputDisplayText,
 } from '../main/ets/core/messages/InputQueueStore';
@@ -73,6 +75,8 @@ class UsageWaitQueueClient extends DlClient {
   cancelResponse: Envelope = queueResponse(true);
   projectionResponse: Envelope = queueResponse(queueProjection('session'));
   cancelFailure: DlError | undefined = undefined;
+  enqueueFailure: Error | undefined = undefined;
+  online: boolean = false;
   delayedCancel: QueueDeferredValue<Envelope> | undefined = undefined;
   delayedProjection: QueueDeferredValue<Envelope> | undefined = undefined;
   projectionRequested: QueueDeferredValue<boolean> = new QueueDeferredValue<boolean>();
@@ -85,6 +89,10 @@ class UsageWaitQueueClient extends DlClient {
     return String(this.epochs.get(deviceId) ?? 1);
   }
 
+  getStatus(): string {
+    return this.online ? 'online' : super.getStatus();
+  }
+
   invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
     if (options.preSend !== undefined) options.preSend();
     const call = new QueueInvokeCall();
@@ -95,6 +103,10 @@ class UsageWaitQueueClient extends DlClient {
     if (options.channel === 'maker:input:cancel-usage-limit-wait') {
       if (this.cancelFailure !== undefined) return Promise.reject(this.cancelFailure);
       return this.delayedCancel?.promise ?? Promise.resolve(this.cancelResponse);
+    }
+    if (options.channel === 'maker:input:enqueue') {
+      return this.enqueueFailure !== undefined ? Promise.reject(this.enqueueFailure)
+        : Promise.resolve(queueResponse(queueProjection('session', 0, '')));
     }
     if (options.channel === 'maker:input:get-projection') {
       this.projectionRequested.resolve(true);
@@ -389,6 +401,31 @@ export default function v132QueueTests(): void {
       expect(display(`{"origin":{"kind":"scheduler"},"persistedContent":${envelope},`
         + '"chatMessage":{"role":"user","pastedTextRanges":[{"start":4,"end":99,"display":"x"}]}}'))
         .assertEqual('see LONG end');
+    });
+
+    // v1.3.5：对齐 Mobile unarchiveSessionAfterSend——只有电脑确认收到用户输入后，已归档任务才取消归档；
+    // 这个事件是应用级取消归档的唯一触发点，发送失败不能触发。
+    it('reports_only_accepted_user_input_for_unarchiving', 0, async () => {
+      const client = new UsageWaitQueueClient();
+      client.online = true;
+      const store = new InputQueueStore();
+      store.attach(client);
+      store.activateSession('device', 'session');
+      const accepted: string[] = [];
+      store.onInputAccepted((deviceId: string, sessionId: string): void => {
+        accepted.push(`${deviceId}/${sessionId}`);
+      });
+      const session = new RemoteSession();
+      session.id = 'session';
+      session.status = 'archived';
+      const document = new SerializedComposerDocument();
+      document.text = 'hello';
+      client.enqueueFailure = new Error('INTERNAL_ERROR');
+      await store.enqueueDocument('device', session, document, [], []).catch((): string => '');
+      expect(accepted.length).assertEqual(0);
+      client.enqueueFailure = undefined;
+      await store.enqueueDocument('device', session, document, [], []);
+      expect(accepted.join(',')).assertEqual('device/session');
     });
 
     it('discards_late_cancel_unsupported_after_account_switch_without_poisoning_new_scope', 0, async () => {

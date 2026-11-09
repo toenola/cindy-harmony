@@ -33,6 +33,8 @@ import {
   collapsedUserMessageLineLimit,
   toolResultHasError,
   buildRenderItems,
+  withoutActiveErrorRow,
+  RenderItem,
   RenderToolGroupItem,
   RenderToolItem,
   RenderToolMediaItem,
@@ -2331,6 +2333,54 @@ export default function localUnitTest() {
 
       const legacy = projectToolUseActions('Bash', JSON.stringify(JSON.stringify(input)), '');
       expect(legacy[0].label).assertEqual('读取鸿蒙消息实现');
+    });
+
+    // v1.3.5：对齐 Mobile activeErrorClientId（upstream 8cf57302a6）。错误后面跟着隐藏的续跑行时它不在末尾，
+    // 错误条与历史会各显示一次；只按终止事件的落库身份隐藏，新一轮开始后恢复。
+    it('hidesOnlyTheTerminalErrorShownByTheQueueBanner', 0, () => {
+      const store = new MessageStore();
+      const errorData: Record<string, Object> = {};
+      errorData['message'] = 'No capacity';
+      errorData['isTerminal'] = true;
+      const errorEvent: Record<string, Object> = {};
+      errorEvent['type'] = 'error';
+      errorEvent['data'] = errorData;
+      store.handleMakerEvent('err-session', errorEvent, 'client-3');
+      expect(store.activeErrorClientId('err-session', '', 'No capacity')).assertEqual('client-3');
+      expect(store.activeErrorClientId('err-session', '', 'Other failure')).assertEqual('');
+
+      const row = (id: string, role: string, content: string): RemoteMessage => {
+        const message = new RemoteMessage();
+        message.id = id;
+        message.clientId = id;
+        message.role = role;
+        message.content = content;
+        return message;
+      };
+      const items = withoutActiveErrorRow(buildRenderItems([
+        row('client-0', 'user', 'Earlier'), row('client-1', 'error', 'No capacity'),
+        row('client-2', 'user', 'Current'), row('client-3', 'error', 'No capacity'),
+        row('client-4', 'user', 'Continue'),
+      ]), 'client-3');
+      const errors: string[] = [];
+      const visit = (list: RenderItem[]): void => list.forEach((item: RenderItem) => {
+        if (item.type === 'message' && (item as RenderMessageItem).kind === 'error') {
+          errors.push((item as RenderMessageItem).message?.clientId ?? '');
+        }
+        if (item.type === 'work_group') visit((item as RenderWorkGroupItem).children);
+      });
+      visit(items);
+      expect(errors.join(',')).assertEqual('client-1');
+
+      // 新一轮开始（可重试错误让任务回到运行中），上一轮的错误不再是当前错误。
+      const retryData: Record<string, Object> = {};
+      retryData['message'] = 'Retrying';
+      retryData['willRetry'] = true;
+      const retryEvent: Record<string, Object> = {};
+      retryEvent['type'] = 'error';
+      retryEvent['data'] = retryData;
+      store.handleMakerEvent('err-session', retryEvent, 'retry-1');
+      expect(store.activeErrorClientId('err-session', '', 'No capacity')).assertEqual('');
     });
 
     it('batchesRapidTextNotificationsAndFlushesBeforeToolBoundaries', 0, () => {

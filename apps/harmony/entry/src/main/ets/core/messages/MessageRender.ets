@@ -2048,6 +2048,31 @@ class SubagentResultMeta {
  * 五层 parentUuid 递归分组。父 Agent 不在当前分页窗口、超深、环和未消费桶
  * 一律回退平铺；每条原始消息只进入一个线性构建窗口。
  */
+/**
+ * 错误条正在展示的终止错误不在历史里重复出现（对齐 Mobile mobileHistoryRender activeErrorClientId：
+ * 在渲染结果上过滤）。只认事件里的落库身份，不按文本猜；清除后历史行恢复显示。
+ */
+export function withoutActiveErrorRow(items: RenderItem[], activeErrorClientId: string): RenderItem[] {
+  if (activeErrorClientId.length === 0) return items;
+  const isActive = (item: RenderItem): boolean => {
+    if (item.type !== 'message') return false;
+    const row = item as RenderMessageItem;
+    const message = row.message;
+    return row.kind === 'error' && message !== undefined
+      && (message.clientId === activeErrorClientId || message.id === activeErrorClientId);
+  };
+  const out: RenderItem[] = [];
+  for (const item of items) {
+    if (isActive(item)) continue;
+    if (item.type === 'work_group') {
+      const group = item as RenderWorkGroupItem;
+      if (group.children.some(isActive)) group.children = group.children.filter((child: RenderItem) => !isActive(child));
+    }
+    out.push(item);
+  }
+  return out;
+}
+
 export function buildRenderItems(
   messages: RemoteMessage[],
   isSessionStreaming: boolean = false,

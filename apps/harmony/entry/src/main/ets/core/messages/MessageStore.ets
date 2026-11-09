@@ -213,6 +213,12 @@ class HistoryRefreshOperation {
   requestedVersion: number = 1;
 }
 
+/** 当前终止错误的落库身份（maker:event 的 persistId），用于错误条与历史行去重。 */
+export class TerminalErrorIdentity {
+  clientId: string = '';
+  message: string = '';
+}
+
 export class MessageStore {
   private historyRetries: RemoteReadRetries = new RemoteReadRetries();
   private snapshotReads: SnapshotReadPool<HistoryPage> = new SnapshotReadPool();
@@ -513,6 +519,7 @@ export class MessageStore {
   private runningStateRevisions: Map<string, number> = new Map();
   /** maker status 的真实 turn 边界；孤儿 Agent 卡只能在本边界内显示。 */
   private makerTurnRunningBySession: Map<string, boolean> = new Map();
+  private terminalErrorsBySession: Map<string, TerminalErrorIdentity> = new Map();
   /** maker status 的输出 token / 生成时长；实时速率只认服务端可靠字段。 */
   private generationStatusBySession: Map<string, SessionGenerationStatus> = new Map();
   private taskUpdatesBySession: Map<string, Map<string, AgentTaskUpdate>> = new Map();
@@ -669,6 +676,7 @@ export class MessageStore {
     this.runningBySession.clear();
     this.runStartedAtBySession.clear();
     this.makerTurnRunningBySession.clear();
+    this.terminalErrorsBySession.clear();
     this.generationStatusBySession.clear();
     this.taskUpdatesBySession.clear();
     this.parkedTaskUpdatesBySession.clear();
@@ -826,6 +834,7 @@ export class MessageStore {
     this.runningBySession.delete(sessionId);
     this.runStartedAtBySession.delete(sessionId);
     this.makerTurnRunningBySession.delete(sessionId);
+    this.terminalErrorsBySession.delete(sessionId);
     this.generationStatusBySession.delete(sessionId);
     this.taskUpdatesBySession.delete(sessionId);
     this.parkedTaskUpdatesBySession.delete(sessionId);
@@ -1987,6 +1996,16 @@ export class MessageStore {
       this.consumePendingTextDeltaNotification(sessionId);
       const terminal = readBool(data, 'isTerminal', !readBool(data, 'willRetry', false));
       if (terminal) {
+        // 终止事件带落库身份：错误条展示同一条错误时，历史里按这个身份隐藏（对齐 Mobile terminalError）。
+        const errorMessage = readStr(data, 'message');
+        if (persistId.length > 0 && errorMessage.length > 0) {
+          const identity = new TerminalErrorIdentity();
+          identity.clientId = persistId;
+          identity.message = errorMessage;
+          this.terminalErrorsBySession.set(sessionId, identity);
+        } else {
+          this.terminalErrorsBySession.delete(sessionId);
+        }
         if (eventSource === 'codex') {
           const active = this.streamingBySession.get(sessionId);
           if (active !== undefined) {
@@ -2129,8 +2148,17 @@ export class MessageStore {
     return next;
   }
 
+  /** 错误条正在展示的那条终止错误的落库身份；错误条文本不是这条时返回空串。 */
+  activeErrorClientId(sessionId: string, deviceId: string, bannerError: string): string {
+    if (bannerError.length === 0 || !this.acceptDeviceScopedSessionEvent(sessionId, deviceId)) return '';
+    const identity = this.terminalErrorsBySession.get(sessionId);
+    return identity !== undefined && identity.message === bannerError ? identity.clientId : '';
+  }
+
   private markSessionRunning(sessionId: string, running: boolean): void {
     const wasRunning = this.runningBySession.get(sessionId) === true;
+    // 新一轮开始：上一轮的终止错误不再是「当前错误」。
+    if (running && !wasRunning) this.terminalErrorsBySession.delete(sessionId);
     if (running) {
       this.runningBySession.set(sessionId, true);
       let generation = this.generationStatusBySession.get(sessionId);

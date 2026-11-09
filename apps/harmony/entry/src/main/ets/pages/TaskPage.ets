@@ -164,7 +164,7 @@ import {
   RenderItem, RenderMessageItem, RenderThinkingItem,
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem, RenderRichPart,
-  buildRenderItems, summarizeText, collapsedUserMessageLineLimit,
+  buildRenderItems, withoutActiveErrorRow, summarizeText, collapsedUserMessageLineLimit,
   orcaCollabCanExpand, orcaCollabExpansionKey,
   latestTaskPlanWindowResolved,
   todoCardContentSignature, todoCardIndexAtRankFromTail, todoCardRankFromTail,
@@ -3318,7 +3318,7 @@ export struct TaskPageContent {
       this.reconcilingDeliveredClientIds = false;
     }
     const streaming = AppServices.instance.messages.isSessionStreaming(this.sessionId, this.deviceId);
-    const nextItems = buildRenderItems(
+    const builtItems = buildRenderItems(
       messages,
       streaming,
       AppServices.instance.messages.getTaskUpdates(this.sessionId, this.deviceId),
@@ -3328,6 +3328,9 @@ export struct TaskPageContent {
       AppServices.instance.messages.isMakerTurnRunning(this.sessionId, this.deviceId),
       this.hasOlderMessages,
     );
+    // 错误条已展示这条终止错误：历史里不再重复显示（错误后跟隐藏续跑行时它不在末尾，末尾规则管不到）。
+    const nextItems = withoutActiveErrorRow(builtItems,
+      AppServices.instance.messages.activeErrorClientId(this.sessionId, this.deviceId, projection.error));
     const nextTailToken = this.renderTailToken(nextItems);
     const tailChanged = previousTailToken.length > 0 && previousTailToken !== nextTailToken;
     if (streaming && !this.sessionStreaming) this.showComposerAfterScroll();
@@ -5998,7 +6001,7 @@ export struct TaskPageContent {
             }
             this.sessionActionOption((this.session()?.pinnedAt ?? '').length > 0 ? '取消置顶' : '置顶',
               $r('sys.symbol.pin'), false, () => this.toggleSessionPinned())
-            this.sessionActionOption(this.session()?.status === 'archived' ? '恢复任务' : '归档任务',
+            this.sessionActionOption(this.session()?.status === 'archived' ? '取消归档' : '归档任务',
               $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
 
             this.sessionActionOption('会话信息', $r('sys.symbol.doc_text'), false,
