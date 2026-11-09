@@ -59,6 +59,8 @@ class InteractionScopeParts {
 export class InteractionStore {
   private readRetries: RemoteReadRetries = new RemoteReadRetries();
   private client: DlClient | undefined = undefined;
+  /** 已通知电脑端「开始作答」的非阻塞提问（scope + requestId）。 */
+  private questionsInProgress: Set<string> = new Set();
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
   private listeners: Array<() => void> = [];
   /** deviceId + sessionId 复合键，避免跨设备同名任务共享 pending。 */
@@ -340,6 +342,7 @@ export class InteractionStore {
     this.pendingByScope.clear();
     this.resolvingRequestIds.clear();
     this.resolveErrors.clear();
+    this.questionsInProgress.clear();
     this.askDrafts.clear();
     this.planDrafts.clear();
     this.mutationGenerations.clear();
@@ -348,6 +351,32 @@ export class InteractionStore {
     this.refreshOperations.clear();
     this.nextRefreshSequence += 1;
     this.notify();
+  }
+
+  /**
+   * 非阻塞的原生提问（isBlocking === false）在电脑端 2 分钟无人作答会自动关闭；用户开始作答时
+   * 通知一次以暂停计时（对齐 Mobile onStartAnswer）。不改本地状态，失败后允许下次再试。
+   */
+  markQuestionInProgress(deviceId: string, sessionId: string, requestId: string): void {
+    const client = this.client;
+    const key = interactionRequestKey(interactionScopeKey(deviceId, sessionId), requestId);
+    if (client === undefined || this.questionsInProgress.has(key)) return;
+    this.questionsInProgress.add(key);
+    const answers: Record<string, Object> = {};
+    const decision: Record<string, Object> = {};
+    decision['kind'] = 'ask_user_question';
+    decision['answers'] = answers;
+    decision['inProgress'] = true;
+    const opener = this.linkOpener;
+    void (async (): Promise<void> => {
+      if (opener !== undefined) await opener(deviceId);
+      const opts = new DlInvokeOptions();
+      opts.channel = 'maker:resolve-interaction';
+      opts.args = [requestId, decision];
+      await client.invoke(deviceId, opts);
+    })().catch((): void => {
+      this.questionsInProgress.delete(key);
+    });
   }
 
   /** 提交决策（对齐 maker:resolve-interaction [requestId, decision]）。 */

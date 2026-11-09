@@ -188,6 +188,10 @@
     {"name":"v135_relocate_message","value":"元のパソコンにある会話の記録は移せないため、引き継ぎの要約から続けます。思考内容などは完全には引き継がれない場合があります。次のメッセージを送信したときに反映されます。"},
     {"name":"v135_relocate_message_native","value":"会話の記録をすべてコピーして、続きから再開します。復元できない場合は引き継ぎの要約から続けるため、思考内容などは完全には引き継がれない場合があります。次のメッセージを送信したときに反映されます。"},
     {"name":"v135_relocate_confirm","value":"パソコンを切り替える"},
-    {"name":"v135_relocate_cancel","value":"このままにする"}
+    {"name":"v135_relocate_cancel","value":"このままにする"},
+    {"name":"v135_ask_required","value":"この必須項目を入力してください。"},
+    {"name":"v135_ask_choice","value":"一覧の選択肢から選んでください。"},
+    {"name":"v135_ask_too_short","value":"%d文字以上で入力してください。"},
+    {"name":"v135_ask_too_long","value":"%d文字以内で入力してください。"}
   ]
 }

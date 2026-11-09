@@ -41,23 +41,119 @@ function readRecord(record: Record<string, Object>, key: string): Record<string,
   return {};
 }
 
-/** AskUserQuestion 选项的副标题是用户判断依据，不能在 ArkTS 归一化时丢弃。 */
+/** 只有服务端签发的表单字段（如 Codex MCP 表单）才带这些限制（对齐 maker-shared AskAnswerConstraints）。 */
+export class AskAnswerConstraints {
+  required: boolean = false;
+  /** 限定只能从这些值里选；为 null 时可自由作答。 */
+  choices: string[] | null = null;
+  minLength: number = -1;
+  maxLength: number = -1;
+}
+
+export class AskAnswerError {
+  /** required | choice | tooShort | tooLong */
+  key: string = '';
+  count: number = 0;
+}
+
+export function askAnswerConstraints(question: Record<string, Object>): AskAnswerConstraints | null {
+  const raw = question['answerConstraints'];
+  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, Object>;
+  if (typeof record['required'] !== 'boolean') return null;
+  const out = new AskAnswerConstraints();
+  out.required = record['required'] as boolean;
+  const choices = record['choices'];
+  if (Array.isArray(choices) && (choices as Object[]).every((value: Object): boolean => typeof value === 'string')) {
+    out.choices = (choices as Object[]).map((value: Object): string => value as string);
+  }
+  const minLength = record['minLength'];
+  if (typeof minLength === 'number' && Number.isSafeInteger(minLength) && (minLength as number) >= 0) {
+    out.minLength = minLength as number;
+  }
+  const maxLength = record['maxLength'];
+  if (typeof maxLength === 'number' && Number.isSafeInteger(maxLength) && (maxLength as number) >= 0) {
+    out.maxLength = maxLength as number;
+  }
+  return out;
+}
+
+/** 字段限定只能从列出的值里选：不提供自定义回答。 */
+export function askHasRestrictedChoices(question: Record<string, Object>): boolean {
+  const rules = askAnswerConstraints(question);
+  return rules !== null && rules.choices !== null;
+}
+
+/** 答案键：Codex 原生提问带稳定 id，旧问题沿用问题文本（电脑端两者都认）。 */
+export function askAnswerKey(question: Record<string, Object>): string {
+  const id = readString(question, 'id').trim();
+  return id.length > 0 ? id : readString(question, 'question');
+}
+
+/** 按 Unicode 码点计数（与 JS Array.from 同口径）；ArkTS 运行时的 Array.from(string) 按 UTF-16 单元计。 */
+function codePointLength(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) i++;
+    }
+    count++;
+  }
+  return count;
+}
+
+/** 提交前按服务端约束校验；没有约束的问题一律放行（对齐 maker-shared askAnswerError）。 */
+export function askAnswerError(question: Record<string, Object>, answer: string): AskAnswerError | null {
+  const rules = askAnswerConstraints(question);
+  if (rules === null) return null;
+  const error = new AskAnswerError();
+  if (answer.trim().length === 0) {
+    if (!rules.required) return null;
+    error.key = 'required';
+    return error;
+  }
+  if (rules.choices !== null && rules.choices.indexOf(answer) < 0) {
+    error.key = 'choice';
+    return error;
+  }
+  const length = codePointLength(answer);
+  if (rules.minLength >= 0 && length < rules.minLength) {
+    error.key = 'tooShort';
+    error.count = rules.minLength;
+    return error;
+  }
+  if (rules.maxLength >= 0 && length > rules.maxLength) {
+    error.key = 'tooLong';
+    error.count = rules.maxLength;
+    return error;
+  }
+  return null;
+}
+
+/**
+ * AskUserQuestion 选项的副标题是用户判断依据，不能在 ArkTS 归一化时丢弃。
+ * 限定选项的表单字段按原样显示（值必须逐字匹配），不隐藏「其他」类选项。
+ */
 export function askOptionPresentations(question: Record<string, Object>): AskOptionPresentation[] {
   const raw = question['options'];
   const out: AskOptionPresentation[] = [];
   if (!Array.isArray(raw)) return out;
+  const restricted = askHasRestrictedChoices(question);
   const rows = raw as Object[];
   for (let index = 0; index < rows.length; index++) {
     if (rows[index] === null || typeof rows[index] !== 'object' || Array.isArray(rows[index])) continue;
     const record = rows[index] as Record<string, Object>;
-    const label = readString(record, 'label').trim();
+    const rawLabel = readString(record, 'label');
+    const label = restricted && rawLabel.trim().length > 0 ? rawLabel : rawLabel.trim();
     if (label.length === 0) continue;
     const option = new AskOptionPresentation();
     option.label = label;
     option.description = readString(record, 'description').trim();
     out.push(option);
   }
-  return visibleAskOptions(out);
+  return restricted ? out : visibleAskOptions(out);
 }
 
 export function isFreeTextAskOptionLabel(label: string): boolean {

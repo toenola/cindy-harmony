@@ -55,6 +55,10 @@ import {
   AskOptionPresentation,
   PlanOutlinePresentation,
   PlanReviewEvidencePresentation,
+  askAnswerConstraints,
+  askAnswerError,
+  askAnswerKey,
+  askHasRestrictedChoices,
   askOptionPresentations,
   buildPlanReviewEvidence,
   buildPermissionDecision,
@@ -794,6 +798,8 @@ export struct TaskPageContent {
   @State permissionOptions: ComposerChoiceOption[] = [];
   @State modelOptions: ComposerModelOption[] = [];
   /** 被控端 provider:list 的真实目录；为空时才回退 capabilities.availableModels。 */
+  /** 提问卡按服务端约束校验失败的提示（requestId → 文案）。 */
+  @State askValidationErrors: Map<string, string> = new Map();
   @State providerModelOptions: ComposerModelOption[] = [];
   @State providerModelAgent: string = '';
   /** 被控电脑的目录带远程调用标记：它认得远程 Agent 的位置参数（v1.3.5 D2）。 */
@@ -9405,18 +9411,27 @@ export struct TaskPageContent {
             `${item.requestId}-${this.askCurrentIndex(item)}-${opt.label}`)
         }
 
-        TextInput({ placeholder: '自定义回答…', text: this.askCustomInput(item) })
-          .onChange((v: string) => this.updateAskCustomInput(item, v))
-          .fontSize(uiFontSize(13))
-          .fontColor($r('app.color.text_primary'))
-          .placeholderColor($r('app.color.text_placeholder'))
-          .caretColor($r('app.color.chat_input_caret'))
-          .height(40)
-          .padding({ left: 12, right: 12 })
-          .backgroundColor($r('app.color.bg_page'))
-          .border({ width: 1, color: $r('app.color.border') })
-          .borderRadius(UI_RADIUS_PILL)
-          .enabled(!this.interactionBusy(item))
+        if (!this.askRestrictedChoices(item)) {
+          TextInput({ placeholder: '自定义回答…', text: this.askCustomInput(item) })
+            .onChange((v: string) => this.updateAskCustomInput(item, v))
+            .fontSize(uiFontSize(13))
+            .fontColor($r('app.color.text_primary'))
+            .placeholderColor($r('app.color.text_placeholder'))
+            .caretColor($r('app.color.chat_input_caret'))
+            .height(40)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor($r('app.color.bg_page'))
+            .border({ width: 1, color: $r('app.color.border') })
+            .borderRadius(UI_RADIUS_PILL)
+            .enabled(!this.interactionBusy(item))
+        }
+
+        if ((this.askValidationErrors.get(item.requestId) ?? '').length > 0) {
+          Text(this.askValidationErrors.get(item.requestId) ?? '')
+            .fontSize(uiFontSize(12))
+            .fontColor($r('app.color.danger'))
+            .width('100%')
+        }
 
         if (this.interactionResolveError(item).length > 0) {
           Text(this.interactionResolveError(item))
@@ -9426,6 +9441,11 @@ export struct TaskPageContent {
         }
 
         Row({ space: 8 }) {
+          if (this.askHasConstraints(item)) {
+            // 服务端表单（如 MCP）可整体取消，对齐 Mobile interaction.permission.mcpCancel。
+            this.interactionSecondaryButton('取消', false,
+              () => this.resolveInteraction(item, this.askEmptyDecision()), !this.interactionBusy(item))
+          }
           if (this.askCurrentIndex(item) > 0) {
             this.interactionSecondaryButton('上一题', false,
               () => this.moveAskQuestion(item, -1), !this.interactionBusy(item))
@@ -12660,6 +12680,41 @@ export struct TaskPageContent {
     }
     this.recordCurrentAskAnswer(item, draft);
     this.saveAskDraft(item, draft);
+    this.onAskAnswerEdited(item);
+  }
+
+  /** 用户开始作答：清掉上次的校验提示；非阻塞的原生提问通知电脑端暂停自动关闭。 */
+  private onAskAnswerEdited(item: PendingInteraction): void {
+    this.setAskValidationError(item, '');
+    if (item.raw['isBlocking'] === false) {
+      AppServices.instance.interactions.markQuestionInProgress(this.deviceId, item.sessionId, item.requestId);
+    }
+  }
+
+  private setAskValidationError(item: PendingInteraction, text: string): void {
+    if ((this.askValidationErrors.get(item.requestId) ?? '') === text) return;
+    const next = new Map(this.askValidationErrors);
+    if (text.length > 0) next.set(item.requestId, text);
+    else next.delete(item.requestId);
+    this.askValidationErrors = next;
+  }
+
+  /** 按服务端约束校验当前题的答案；不通过时显示提示并返回 false。 */
+  private validateAskAnswer(item: PendingInteraction, answer: string): boolean {
+    const error = askAnswerError(this.currentAskQuestion(item), answer);
+    if (error === null) return true;
+    const name = error.key === 'required' ? 'v135_ask_required' : error.key === 'choice' ? 'v135_ask_choice'
+      : error.key === 'tooShort' ? 'v135_ask_too_short' : 'v135_ask_too_long';
+    this.setAskValidationError(item, this.v12String(name, error.count));
+    return false;
+  }
+
+  private askRestrictedChoices(item: PendingInteraction): boolean {
+    return askHasRestrictedChoices(this.currentAskQuestion(item));
+  }
+
+  private askHasConstraints(item: PendingInteraction): boolean {
+    return askAnswerConstraints(this.currentAskQuestion(item)) !== null;
   }
 
   private updateAskCustomInput(item: PendingInteraction, value: string): void {
@@ -12669,6 +12724,7 @@ export struct TaskPageContent {
     if (!this.askMultiSelect(item) && value.length > 0) draft.selectedLabels = [];
     this.recordCurrentAskAnswer(item, draft);
     this.saveAskDraft(item, draft);
+    this.onAskAnswerEdited(item);
   }
 
   private askCurrentAnswer(item: PendingInteraction): string {
@@ -12691,15 +12747,21 @@ export struct TaskPageContent {
   }
 
   private recordCurrentAskAnswer(item: PendingInteraction, draft: AskUserDraft): void {
-    const question = this.askQuestion(item);
-    if (question.length > 0) draft.answers.set(question, this.answerFromAskDraft(item, draft));
+    const key = this.askKeyAt(item, this.askCurrentIndex(item));
+    if (key.length > 0) draft.answers.set(key, this.answerFromAskDraft(item, draft));
+  }
+
+  /** 答案键：原生提问用稳定 id，旧问题用问题文本（对齐 maker-shared answerKey）。 */
+  private askKeyAt(item: PendingInteraction, index: number): string {
+    const questions = this.askQuestions(item);
+    return index < 0 || index >= questions.length ? '' : askAnswerKey(questions[index]);
   }
 
   private restoreAskControls(item: PendingInteraction, draft: AskUserDraft): void {
     draft.selectedLabels = [];
     draft.customInput = '';
     draft.showCustomInput = false;
-    const answer = draft.answers.get(this.askQuestionAt(item, draft.currentIndex)) ?? '';
+    const answer = draft.answers.get(this.askKeyAt(item, draft.currentIndex)) ?? '';
     if (answer.length === 0) return;
     const options = this.askOptionsAt(item, draft.currentIndex);
     if (this.askMultiSelectAt(item, draft.currentIndex)) {
@@ -12745,6 +12807,7 @@ export struct TaskPageContent {
   }
 
   private moveAskQuestion(item: PendingInteraction, delta: number): void {
+    this.setAskValidationError(item, '');
     const draft = this.mutableAskDraft(item);
     this.recordCurrentAskAnswer(item, draft);
     const max = Math.max(0, this.askQuestionCount(item) - 1);
@@ -12761,6 +12824,7 @@ export struct TaskPageContent {
     const draft = this.mutableAskDraft(item);
     const answer = this.answerFromAskDraft(item, draft);
     if (answer.trim().length === 0) return;
+    if (!this.validateAskAnswer(item, answer)) return;
     this.recordCurrentAskAnswer(item, draft);
     if (!this.askIsLast(item)) {
       draft.currentIndex += 1;
@@ -12772,8 +12836,9 @@ export struct TaskPageContent {
   }
 
   private skipAskQuestion(item: PendingInteraction): void {
+    if (!this.validateAskAnswer(item, '')) return;
     const draft = this.mutableAskDraft(item);
-    draft.answers.set(this.askQuestion(item), '');
+    draft.answers.set(this.askKeyAt(item, this.askCurrentIndex(item)), '');
     if (!this.askIsLast(item)) {
       draft.currentIndex += 1;
       this.restoreAskControls(item, draft);

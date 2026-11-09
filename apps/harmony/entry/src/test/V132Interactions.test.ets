@@ -5,7 +5,7 @@ import {
   AskUserDraft, InteractionStore, PlanReviewDraft, INTERACTION_DECISION_NOT_ACCEPTED,
 } from '../main/ets/core/interactions/InteractionStore';
 import {
-  AskOptionPresentation, askOptionPresentations, isFreeTextAskOptionLabel,
+  AskOptionPresentation, askAnswerError, askAnswerKey, askOptionPresentations, isFreeTextAskOptionLabel,
   permissionAutoReviewUnavailableNotice, permissionDescription, permissionSourceDescription, visibleAskOptions,
 } from '../main/ets/core/interactions/InteractionPresentation';
 
@@ -491,6 +491,53 @@ export default function v132InteractionTests(): void {
       expect(permissionDescription(request)).assertEqual(source + '\nRead the requested file');
       request['description'] = 'Read the requested file\n\n' + source;
       expect(permissionDescription(request)).assertEqual('Read the requested file\n\n' + source);
+    });
+
+    // v1.3.5 C4：对齐 maker-shared interaction.ts（Codex 原生提问，upstream 53fd350e82 / b3b1781a90）。
+    // 原生提问带稳定 id 作答案键；MCP 表单字段带约束，提交前校验；限定选项逐字显示。
+    it('keys_native_questions_by_id_and_validates_server_form_constraints', 0, () => {
+      const question = (json: string): Record<string, Object> => JSON.parse(json) as Record<string, Object>;
+      expect(askAnswerKey(question('{"id":"q-1","question":"Name?"}'))).assertEqual('q-1');
+      expect(askAnswerKey(question('{"question":"Name?"}'))).assertEqual('Name?');
+
+      const errorOf = (json: string, answer: string): string => {
+        const error = askAnswerError(question(json), answer);
+        return error === null ? 'ok' : `${error.key}:${error.count}`;
+      };
+      const name = '{"question":"Name","answerConstraints":{"required":true,"minLength":3,"maxLength":5}}';
+      expect(errorOf(name, ' ')).assertEqual('required:0');
+      expect(errorOf(name, '你好')).assertEqual('tooShort:3');
+      expect(errorOf(name, '😀😀😀')).assertEqual('ok');
+      expect(errorOf(name, 'abcdef')).assertEqual('tooLong:5');
+      const kind = '{"question":"Kind","answerConstraints":{"required":false,"choices":["Personal","Other"]},'
+        + '"options":[{"label":"Personal"},{"label":"Other"}]}';
+      expect(errorOf(kind, '')).assertEqual('ok');
+      expect(errorOf(kind, 'personal')).assertEqual('choice:0');
+      expect(errorOf(kind, 'Other')).assertEqual('ok');
+      // 没有约束的普通提问不校验；约束缺 required 视为无约束。
+      expect(errorOf('{"question":"Free"}', '')).assertEqual('ok');
+      expect(errorOf('{"question":"Bad","answerConstraints":{"choices":["a"]}}', 'b')).assertEqual('ok');
+      // 限定选项按原样列出，不把「Other」当成自由回答入口隐藏。
+      expect(askOptionPresentations(question(kind)).map((option: AskOptionPresentation): string => option.label)
+        .join('|')).assertEqual('Personal|Other');
+    });
+
+    it('tells_the_desktop_once_that_an_optional_native_question_is_being_answered', 0, async () => {
+      const client = new MockDlClient();
+      client.resolveError = 'NOT_CONNECTED';
+      const store = attachStore(client);
+      const settle = async (): Promise<void> => {
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      };
+      store.markQuestionInProgress('device', 'session', 'request');
+      await settle();
+      // 失败后允许下次编辑再通知；本地提问保持待答。
+      client.resolveError = '';
+      store.markQuestionInProgress('device', 'session', 'request');
+      store.markQuestionInProgress('device', 'session', 'request');
+      await settle();
+      expect(client.resolveCalls).assertEqual(2);
+      expect(store.getPending('session', 'device').length).assertEqual(1);
     });
 
     it('keeps_legacy_permission_descriptions_when_source_is_missing', 0, () => {

@@ -188,6 +188,10 @@
     {"name":"v135_relocate_message","value":"The conversation record on the other computer can’t be moved over, so it continues from a handoff summary. Thinking and similar details may not carry over completely. Takes effect when you send the next message."},
     {"name":"v135_relocate_message_native","value":"The full conversation record is copied over and continues from where it left off. If it can’t be restored, it continues from a handoff summary instead, and thinking and similar details may not carry over completely. Takes effect when you send the next message."},
     {"name":"v135_relocate_confirm","value":"Switch computer"},
-    {"name":"v135_relocate_cancel","value":"Keep as is"}
+    {"name":"v135_relocate_cancel","value":"Keep as is"},
+    {"name":"v135_ask_required","value":"Complete this required field."},
+    {"name":"v135_ask_choice","value":"Choose one of the listed options."},
+    {"name":"v135_ask_too_short","value":"Enter at least %d characters."},
+    {"name":"v135_ask_too_long","value":"Enter no more than %d characters."}
   ]
 }

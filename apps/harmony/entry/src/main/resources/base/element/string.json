@@ -592,6 +592,10 @@
     {"name":"v135_relocate_message","value":"原来那台电脑上的对话记录带不过来，会整理成交接摘要接上，思考内容等不能保证完美继承。下一条消息发出时生效。"},
     {"name":"v135_relocate_message_native","value":"完整对话记录会复制过去接着用；如果恢复不了，会改用交接摘要接上，思考内容等不能保证完美继承。下一条消息发出时生效。"},
     {"name":"v135_relocate_confirm","value":"换电脑运行"},
-    {"name":"v135_relocate_cancel","value":"保持不变"}
+    {"name":"v135_relocate_cancel","value":"保持不变"},
+    {"name":"v135_ask_required","value":"请填写此必填项。"},
+    {"name":"v135_ask_choice","value":"请选择列出的选项。"},
+    {"name":"v135_ask_too_short","value":"请至少输入 %d 个字符。"},
+    {"name":"v135_ask_too_long","value":"请最多输入 %d 个字符。"}
   ]
 }

@@ -188,6 +188,10 @@
     {"name":"v135_relocate_message","value":"原來那台電腦上的對話記錄帶不過來，會整理成交接摘要接上，思考內容等不能保證完美繼承。下一則訊息送出時生效。"},
     {"name":"v135_relocate_message_native","value":"完整對話記錄會複製過去接著用；如果恢復不了，會改用交接摘要接上，思考內容等不能保證完美繼承。下一則訊息送出時生效。"},
     {"name":"v135_relocate_confirm","value":"換電腦執行"},
-    {"name":"v135_relocate_cancel","value":"保持不變"}
+    {"name":"v135_relocate_cancel","value":"保持不變"},
+    {"name":"v135_ask_required","value":"請填寫此必填項目。"},
+    {"name":"v135_ask_choice","value":"請選擇列出的選項。"},
+    {"name":"v135_ask_too_short","value":"請至少輸入 %d 個字元。"},
+    {"name":"v135_ask_too_long","value":"請最多輸入 %d 個字元。"}
   ]
 }
