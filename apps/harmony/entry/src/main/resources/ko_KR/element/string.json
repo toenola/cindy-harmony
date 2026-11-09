@@ -167,6 +167,8 @@
     {"name":"v134_rich_sent","value":"제출됨"},
     {"name":"v134_rich_send_failed","value":"메시지가 제출되지 않았습니다. 입력한 내용은 유지됩니다."},
     {"name":"v134_unnamed_computer","value":"이름 없는 컴퓨터"},
+    {"name":"v134_pane_list_collapse","value":"작업 목록 닫기"},
+    {"name":"v134_pane_list_expand","value":"작업 목록 열기"},
     {"name":"v133_rich_open_video","value":"원본 동영상 열기"},
     {"name":"v133_rich_open_media","value":"미디어 열기"},
     {"name":"v133_speed_label","value":"속도"},

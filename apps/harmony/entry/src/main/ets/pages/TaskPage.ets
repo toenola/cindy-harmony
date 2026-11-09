@@ -124,6 +124,8 @@ import {
   handoffTaskSplitRouteSelection,
   effectiveTaskSafeWindow,
   isWideTaskLayout,
+  TaskHeaderTitleInsets,
+  taskHeaderTitleInsets,
   TaskSafeWindowSize,
 } from './TaskSplitLayout';
 import { readTaskWindowMetrics } from './TaskWindowMetrics';
@@ -307,6 +309,13 @@ const TODO_STATUS_STROKE_WIDTH = 1.5;
 const TODO_STATUS_CHECKMARK_SIZE = 10;
 const TODO_STATUS_ACTIVE_DOT_SIZE = 6;
 const MESSAGE_LIST_HORIZONTAL_PADDING = 16;
+/**
+ * 会话内容区的宽度上限。聊天流按设计规范铺满所在区域，只在超宽窗口留白；
+ * 展开屏收起任务列表后（约 1105vp）原 760 / 736 两侧各空约 172vp，用户要求缩减一半。
+ */
+const CHAT_STREAM_MAX_WIDTH = 940;
+const CHAT_INSET_MAX_WIDTH = 916;
+const CHAT_COMPOSER_MAX_WIDTH = 900;
 const USER_MESSAGE_BUBBLE_MAX_RATIO = 0.86;
 const USER_MESSAGE_BUBBLE_FALLBACK_AREA_WIDTH = 360;
 const TODO_STATUS_FRAME_RATE: ExpectedFrameRateRange = {
@@ -512,6 +521,13 @@ export struct TaskPageContent {
   /** 父页面每次选择任务递增；同一条消息再次选择时也要重新定位。 */
   @Prop @Watch('onPaneMessageChanged') paneMessageRevision: number = 0;
   @Prop @Watch('onPaneActiveChanged') paneActive: boolean = true;
+  /** 双栏父页面：任务列表是否已收起，决定标题栏最左侧按钮的图标与读屏文字。 */
+  @Prop paneListCollapsed: boolean = false;
+  /** 双栏父页面提供；存在时标题栏最左侧显示收起 / 展开任务列表按钮（D-015）。 */
+  onTogglePaneList: (() => void) | undefined = undefined;
+  @State headerBarWidth: number = 0;
+  @State headerLeadingWidth: number = 0;
+  @State headerTrailingWidth: number = 0;
   @State paneActivationRevision: number = 0;
   /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
@@ -4046,7 +4062,7 @@ export struct TaskPageContent {
       .width('100%')
     }
     .width('calc(100% - 24vp)')
-    .constraintSize({ maxWidth: 736 })
+    .constraintSize({ maxWidth: CHAT_INSET_MAX_WIDTH })
     .alignSelf(ItemAlign.Center)
     .margin({ left: 12, right: 12, top: 4, bottom: 10 })
     .padding({ left: 10, right: 10, top: 8, bottom: 8 })
@@ -5327,7 +5343,7 @@ export struct TaskPageContent {
           .constraintSize({ maxHeight: 240 })
         }
         .width('100%')
-        .constraintSize({ maxWidth: 760, maxHeight: 286 })
+        .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH, maxHeight: 286 })
         .alignSelf(ItemAlign.Center)
         .padding({ left: 16, right: 16, top: 4, bottom: 4 })
       }
@@ -5337,7 +5353,7 @@ export struct TaskPageContent {
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.danger'))
           .width('100%')
-          .constraintSize({ maxWidth: 760 })
+          .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH })
           .alignSelf(ItemAlign.Center)
           .padding({ left: 16, right: 16, top: 4 })
       }
@@ -6096,11 +6112,8 @@ export struct TaskPageContent {
   /** 双栏两侧 Header 统一为 44vp 内容高；保留 40vp 动作槽，避免详情侧雾化下沿额外下探。 */
   @Builder
   taskHeader() {
-    Row({ space: 4 }) {
-      if (!this.isEmbedded()) {
-        this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => this.leaveDetailPage())
-      }
-
+    // 标题单独一层并居中；按钮层叠在上方，左右两组各自贴边（D-015）。
+    Stack() {
       Column({ space: 1 }) {
         Text(this.sessionTitle())
           .fontSize(uiFontSize(16))
@@ -6109,6 +6122,7 @@ export struct TaskPageContent {
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .textAlign(TextAlign.Center)
           .width('100%')
         if (this.headerNotice().length > 0) {
           Text(this.headerNotice())
@@ -6119,28 +6133,99 @@ export struct TaskPageContent {
               : $r('app.color.chat_text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(TextAlign.Center)
             .width('100%')
         }
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
-      .padding({ left: 4 })
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+      .padding(this.headerTitlePadding())
 
-      if (this.gitBranchName.length > 0) {
-        this.gitBranchBadge()
+      Row() {
+        Row() {
+          if (!this.isEmbedded()) {
+            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => this.leaveDetailPage())
+          } else if (this.onTogglePaneList !== undefined) {
+            this.paneListToggleButton()
+          }
+        }
+        .onAreaChange((_old: Area, next: Area) => {
+          this.headerLeadingWidth = Number(next.width);
+        })
+
+        Blank()
+
+        Row({ space: 4 }) {
+          if (this.gitBranchName.length > 0) {
+            this.gitBranchBadge()
+          }
+
+          if ((this.session()?.workingDir ?? '').length > 0) {
+            this.taskIconButton($r('sys.symbol.folder'), 40, false,
+              !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
+          }
+
+          this.sessionActionButton()
+        }
+        .onAreaChange((_old: Area, next: Area) => {
+          this.headerTrailingWidth = Number(next.width);
+        })
       }
-
-      if ((this.session()?.workingDir ?? '').length > 0) {
-        this.taskIconButton($r('sys.symbol.folder'), 40, false,
-          !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
-      }
-
-      this.sessionActionButton()
+      .width('100%')
+      .height('100%')
     }
     .width('100%')
     .height(44)
     .padding({ left: 8, right: 8, top: 2, bottom: 2 })
     .backgroundColor(Color.Transparent)
+    .onAreaChange((_old: Area, next: Area) => {
+      this.headerBarWidth = Math.max(0, Number(next.width) - 16);
+    })
+  }
+
+  /** 双栏时收起 / 展开左侧任务列表；图标表示点击后的动作。 */
+  @Builder
+  paneListToggleButton() {
+    Button() {
+      SymbolGlyph(this.paneListCollapsed ? $r('sys.symbol.open_sidebar') : $r('sys.symbol.close_sidebar'))
+        .fontSize(uiFontSize(20))
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .type(ButtonType.Circle)
+    .width(44)
+    .height(44)
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .accessibilityText(this.v12String(this.paneListCollapsed ? 'v134_pane_list_expand' : 'v134_pane_list_collapse'))
+    .onClick(() => this.onTogglePaneList?.())
+  }
+
+  private headerTitlePadding(): Padding {
+    const insets = this.headerTitleInsets();
+    const padding: Padding = { left: insets.left, right: insets.right };
+    return padding;
+  }
+
+  /** 标题与第二行提示中较宽者的实际宽度，用于判断能否严格居中。 */
+  private headerTitleInsets(): TaskHeaderTitleInsets {
+    const measure = this.getUIContext().getMeasureUtils();
+    let titleWidth = Number(measure.measureTextSize({
+      textContent: this.sessionTitle(),
+      fontSize: uiFontSize(16),
+      fontWeight: FontWeight.Medium,
+    }).width);
+    const notice = this.headerNotice();
+    if (notice.length > 0) {
+      titleWidth = Math.max(titleWidth, Number(measure.measureTextSize({
+        textContent: notice,
+        fontSize: uiFontSize(11),
+      }).width));
+    }
+    return taskHeaderTitleInsets(this.headerBarWidth, this.headerLeadingWidth, this.headerTrailingWidth,
+      this.getUIContext().px2vp(titleWidth), 4);
   }
 
   @Builder
@@ -6750,7 +6835,7 @@ export struct TaskPageContent {
       }
     }
     .width('100%')
-    .constraintSize({ maxWidth: 760 })
+    .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH })
     .alignSelf(ItemAlign.Center)
     .layoutWeight(1)
     .onAreaChange((oldArea: Area, newArea: Area) => {
@@ -6816,7 +6901,7 @@ export struct TaskPageContent {
       }
     }
     .width('calc(100% - 24vp)')
-    .constraintSize({ maxWidth: 736 })
+    .constraintSize({ maxWidth: CHAT_INSET_MAX_WIDTH })
     .alignSelf(ItemAlign.Center)
     .margin({ left: 12, right: 12, top: 4 })
     .backgroundColor($r('app.color.task_list_menu_surface'))
@@ -6873,6 +6958,7 @@ export struct TaskPageContent {
         showAddButton: true,
         showStreamingStatus: true,
         floatingGlass: true,
+        maxContentWidth: CHAT_COMPOSER_MAX_WIDTH,
         compactToolbar: true,
         floatingBottomInset: this.paneComposerBottomInset,
         inputId: this.composerInputId,
@@ -12708,6 +12794,9 @@ struct TaskPage {
   @State safeWindowHeight: number = 0;
   /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
   @State safeWindowMetricsUnavailable: boolean = false;
+  /** 系统分屏或悬浮窗时一律单栏（D-015）。 */
+  @State safeWindowMultiWindow: boolean = false;
+  private windowStatusListening: boolean = false;
   /** 独立详情页的键盘高度；展开横屏转入 TaskListPage 后由右侧详情栏继续接管。 */
   @State keyboardHeight: number = 0;
   private splitNavigationPending: boolean = false;
@@ -12718,6 +12807,11 @@ struct TaskPage {
   private keyboardHeightListener: (height: number) => void = (height: number): void => {
     this.keyboardHeight = Math.max(0, this.getUIContext().px2vp(height));
   };
+  private windowStatusListener: (status: window.WindowStatusType) => void =
+    (_status: window.WindowStatusType): void => {
+      this.refreshSafeWindowMetrics();
+      this.openSplitLayoutIfNeeded();
+    };
   private avoidAreaListener: (options: window.AvoidAreaOptions) => void = (options: window.AvoidAreaOptions): void => {
     if (options.type === window.AvoidAreaType.TYPE_KEYBOARD) return;
     this.refreshSafeWindowMetrics();
@@ -12759,6 +12853,12 @@ struct TaskPage {
       } catch (_error) {
         this.avoidAreaListening = false;
       }
+      try {
+        hostWindow.on('windowStatusChange', this.windowStatusListener);
+        this.windowStatusListening = true;
+      } catch (_error) {
+        this.windowStatusListening = false;
+      }
       this.refreshSafeWindowMetrics();
       this.openSplitLayoutIfNeeded();
     } catch (_err) {
@@ -12773,12 +12873,14 @@ struct TaskPage {
     try {
       if (this.keyboardHeightListening) this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
       if (this.avoidAreaListening) this.keyboardWindow.off('avoidAreaChange', this.avoidAreaListener);
+      if (this.windowStatusListening) this.keyboardWindow.off('windowStatusChange', this.windowStatusListener);
     } catch (_err) {
       // 页面退出时窗口可能已先被系统回收。
     }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
     this.avoidAreaListening = false;
+    this.windowStatusListening = false;
   }
 
   private refreshSafeWindowMetrics(): void {
@@ -12788,6 +12890,7 @@ struct TaskPage {
         this.getUIContext().px2vp(value));
       this.safeWindowWidth = metrics.safeWidth;
       this.safeWindowHeight = metrics.safeHeight;
+      this.safeWindowMultiWindow = metrics.multiWindow;
       this.safeWindowMetricsUnavailable = false;
     } catch (_error) {
       this.safeWindowMetricsUnavailable = true;
@@ -12820,7 +12923,7 @@ struct TaskPage {
   private openSplitLayoutIfNeeded(): void {
     const safe = this.safeWindowSize();
     if (this.splitNavigationPending
-      || !isWideTaskLayout(this.viewportWidth, safe.width, safe.height)) {
+      || !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) {
       return;
     }
     const params = recordOrEmpty(router.getParams());

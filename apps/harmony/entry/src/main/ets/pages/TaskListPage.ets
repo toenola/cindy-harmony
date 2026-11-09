@@ -211,7 +211,15 @@ struct TaskListPage {
   @State safeWindowHeight: number = 0;
   /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
   @State safeWindowMetricsUnavailable: boolean = false;
+  /** 系统分屏或悬浮窗时一律单栏（D-015）。 */
+  @State safeWindowMultiWindow: boolean = false;
+  private windowStatusListening: boolean = false;
   @State requestedListPaneWidth: number = 0;
+  /**
+   * 双栏时用户收起了任务列表（详情标题栏最左侧按钮）。只保存在本次页面生命周期内，
+   * 退出双栏即恢复展开；与列表宽度一样不写入偏好（D-015）。
+   */
+  @State listPaneCollapsed: boolean = false;
   @State keyboardHeight: number = 0;
 
   private routeParamsInitialized: boolean = false;
@@ -223,6 +231,8 @@ struct TaskListPage {
   private taskListReconcileGeneration: number = 0;
   private taskSearchGeneration: number = 0;
   private taskSearchTimer: number = -1;
+  /** 上次发起搜索时的条件；任务列表推送只在条件真的变化时才重搜（对齐 Mobile 的依赖项）。 */
+  private lastTaskSearchKey: string = '';
   private projectOrderScopeGeneration: number = 0;
   private projectOrderSuppressClick: boolean = false;
   private projectDragStartY: number = 0;
@@ -241,6 +251,12 @@ struct TaskListPage {
   private avoidAreaListener: (options: window.AvoidAreaOptions) => void =
     (options: window.AvoidAreaOptions): void => {
       if (options.type === window.AvoidAreaType.TYPE_KEYBOARD) return;
+      const wasSplit = this.splitLayoutEnabled();
+      this.refreshSafeWindowMetrics();
+      this.handleSplitLayoutChange(wasSplit);
+    };
+  private windowStatusListener: (status: window.WindowStatusType) => void =
+    (_status: window.WindowStatusType): void => {
       const wasSplit = this.splitLayoutEnabled();
       this.refreshSafeWindowMetrics();
       this.handleSplitLayoutChange(wasSplit);
@@ -481,7 +497,11 @@ struct TaskListPage {
     // 选中的已删除任务要等 ensureWideSelection 换走选择后才能释放。
     this.pruneResidentPanes();
     this.tryOpenPendingDeepLink();
-    if (this.taskSearchActive()) this.scheduleTaskSearch();
+    // 运行中的任务每隔几秒就推送一次活动；只有搜索条件或范围变化才重搜，
+    // 否则结果会被反复清空、重新请求，点结果后的定位也会被挤在请求队列后面。
+    if (this.taskSearchActive() && this.taskSearchInputsKey() !== this.lastTaskSearchKey) {
+      this.scheduleTaskSearch();
+    }
   }
 
   /**
@@ -569,7 +589,10 @@ struct TaskListPage {
   private handleSplitLayoutChange(wasSplit: boolean): void {
     const splitEnabled = this.splitLayoutEnabled();
     if (splitEnabled) this.ensureWideSelection();
-    if (wasSplit && !splitEnabled) this.residentPanes = [];
+    if (wasSplit && !splitEnabled) {
+      this.residentPanes = [];
+      this.listPaneCollapsed = false;
+    }
     if (wasSplit && !splitEnabled && !this.newSessionDraftOpen) {
       void this.openSelectedTaskAfterSplitExit();
     }
@@ -614,7 +637,7 @@ struct TaskListPage {
 
   private splitLayoutEnabled(): boolean {
     const safe = this.safeWindowSize();
-    return isWideTaskLayout(this.viewportWidth, safe.width, safe.height);
+    return isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow);
   }
 
   private refreshSafeWindowMetrics(): void {
@@ -624,6 +647,7 @@ struct TaskListPage {
         this.getUIContext().px2vp(value));
       this.safeWindowWidth = metrics.safeWidth;
       this.safeWindowHeight = metrics.safeHeight;
+      this.safeWindowMultiWindow = metrics.multiWindow;
       this.safeWindowMetricsUnavailable = false;
     } catch (_error) {
       this.safeWindowMetricsUnavailable = true;
@@ -672,6 +696,12 @@ struct TaskListPage {
       } catch (_error) {
         this.avoidAreaListening = false;
       }
+      try {
+        hostWindow.on('windowStatusChange', this.windowStatusListener);
+        this.windowStatusListening = true;
+      } catch (_error) {
+        this.windowStatusListening = false;
+      }
       const wasSplit = this.splitLayoutEnabled();
       this.refreshSafeWindowMetrics();
       this.handleSplitLayoutChange(wasSplit);
@@ -689,12 +719,14 @@ struct TaskListPage {
     try {
       if (this.keyboardHeightListening) this.keyboardWindow.off('keyboardHeightChange', this.keyboardHeightListener);
       if (this.avoidAreaListening) this.keyboardWindow.off('avoidAreaChange', this.avoidAreaListener);
+      if (this.windowStatusListening) this.keyboardWindow.off('windowStatusChange', this.windowStatusListener);
     } catch (_err) {
       // 页面退出时监听已被系统清理，不影响后续路由恢复默认避让。
     }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
     this.avoidAreaListening = false;
+    this.windowStatusListening = false;
   }
 
   private floatingBarBottomMargin(): number {
@@ -712,7 +744,8 @@ struct TaskListPage {
 
   private detailKeyboardInset(): number {
     const safe = this.safeWindowSize();
-    return taskDetailKeyboardInset(this.viewportWidth, safe.width, safe.height, this.keyboardHeight);
+    return taskDetailKeyboardInset(this.viewportWidth, safe.width, safe.height, this.keyboardHeight,
+      this.safeWindowMultiWindow);
   }
 
   private newSessionKeyboardInset(): number {
@@ -726,7 +759,24 @@ struct TaskListPage {
   }
 
   private detailPaneWidth(): number {
+    if (!this.listPaneShown()) return this.viewportWidth;
     return taskDetailPaneWidth(this.viewportWidth, this.requestedListPaneWidth);
+  }
+
+  /**
+   * 列表是否可见。没有选中任务或正在新建任务时必须显示列表，否则详情栏没有收起按钮，
+   * 用户会被困在没有任务列表的界面里。
+   */
+  private listPaneShown(): boolean {
+    return !this.splitLayoutEnabled() || !this.listPaneCollapsed
+      || this.selectedTaskKey().length === 0 || this.newSessionDraftOpen;
+  }
+
+  private toggleListPane(): void {
+    if (!this.splitLayoutEnabled()) return;
+    uiAnimateState(this.getUIContext(), () => {
+      this.listPaneCollapsed = !this.listPaneCollapsed;
+    });
   }
 
   private selectedTaskKey(): string {
@@ -1460,7 +1510,17 @@ struct TaskListPage {
     return request;
   }
 
+  /** 决定搜索结果的全部输入：关键词、排序与筛选、设备范围与项目范围。 */
+  private taskSearchInputsKey(): string {
+    const origins = this.taskSearchOrigins().map((origin: TaskSearchOrigin): string => JSON.stringify([
+      origin.deviceId, origin.deviceName, origin.reachable,
+      origin.workingDirs === null ? null : origin.workingDirs.slice().sort(),
+    ])).sort();
+    return JSON.stringify([this.taskSearchRequest(), origins]);
+  }
+
   private scheduleTaskSearch(): void {
+    this.lastTaskSearchKey = this.taskSearchInputsKey();
     this.taskSearchGeneration += 1;
     const generation = this.taskSearchGeneration;
     if (this.taskSearchTimer >= 0) {
@@ -1506,6 +1566,7 @@ struct TaskListPage {
   }
 
   private cancelTaskSearch(): void {
+    this.lastTaskSearchKey = '';
     this.taskSearchGeneration += 1;
     if (this.taskSearchTimer >= 0) {
       clearTimeout(this.taskSearchTimer);
@@ -2150,7 +2211,7 @@ struct TaskListPage {
           .transition(uiRevealTransition())
       }
 
-      if (this.splitLayoutEnabled()) {
+      if (this.splitLayoutEnabled() && this.listPaneShown()) {
         this.splitDivider()
       }
 
@@ -2314,6 +2375,8 @@ struct TaskListPage {
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
     .height('100%')
     .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
+    // 收起时只隐藏、不销毁，展开后列表滚动位置与 Tab 状态保持不变。
+    .visibility(this.listPaneShown() ? Visibility.Visible : Visibility.None)
   }
 
   @Builder
@@ -2426,6 +2489,8 @@ struct TaskListPage {
           paneMessageClientId: this.paneSelected(pane) ? this.selectedMessageClientId : '',
           paneMessageRevision: this.paneSelected(pane) ? this.selectedMessageRevision : 0,
           paneActive: this.paneSelected(pane),
+          paneListCollapsed: !this.listPaneShown(),
+          onTogglePaneList: (): void => this.toggleListPane(),
           paneComposerBottomInset: this.detailComposerBottomInset(),
           paneKeyboardInset: this.detailKeyboardInset(),
         })

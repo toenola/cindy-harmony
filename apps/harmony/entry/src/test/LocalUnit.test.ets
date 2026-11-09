@@ -135,6 +135,8 @@ import {
   handoffTaskSplitRouteSelection,
   isWideTaskLayout,
   taskDetailKeyboardInset,
+  taskHeaderTitleInsets,
+  taskWindowIsMultiWindow,
   taskDetailPaneWidth,
   taskListPaneWidth,
   taskSplitWidthForDrag,
@@ -4747,6 +4749,31 @@ export default function localUnitTest() {
 
     // 回归：安全区读取失败时 safeWidth 恒为 0，任何窗口都进不了双栏；读取中仍须保持 0，
     // 否则冷启动先进双栏、拿到真实挖孔避让后退出，会误触发单栏详情跳转。
+    // 真机：Pura X Max 当前显示设置下竖屏上下分屏约 782×540vp，尺寸达标却被挤成双栏。
+    it('keepsSplitScreenAndFloatingWindowsSinglePane', 0, () => {
+      expect(taskWindowIsMultiWindow(5)).assertTrue();
+      expect(taskWindowIsMultiWindow(4)).assertTrue();
+      expect(taskWindowIsMultiWindow(1)).assertFalse();
+      expect(taskWindowIsMultiWindow(2)).assertFalse();
+      expect(isWideTaskLayout(782, 782, 500, true)).assertFalse();
+      expect(isWideTaskLayout(782, 782, 500, false)).assertTrue();
+      expect(taskDetailKeyboardInset(782, 782, 500, 300, true)).assertEqual(0);
+    });
+
+    it('centersHeaderTitleOnlyWhenItFitsBetweenTheWiderButtonGroup', 0, () => {
+      const centered = taskHeaderTitleInsets(700, 44, 220, 120, 4);
+      expect(centered.left).assertEqual(224);
+      expect(centered.right).assertEqual(224);
+      // 竖屏双栏约 480vp：对称留白只剩约 30vp，改为填满两组按钮之间。
+      const crowded = taskHeaderTitleInsets(466, 44, 220, 180, 4);
+      expect(crowded.left).assertEqual(48);
+      expect(crowded.right).assertEqual(224);
+      // 尚未测量到栏宽时不假装居中。
+      const unmeasured = taskHeaderTitleInsets(0, 0, 0, 100, 4);
+      expect(unmeasured.left).assertEqual(4);
+      expect(unmeasured.right).assertEqual(4);
+    });
+
     it('fallsBackToViewportOnlyWhenWindowMetricsAreUnavailable', 0, () => {
       const pending = effectiveTaskSafeWindow(939, 664, 0, 0, false);
       expect(isWideTaskLayout(939, pending.width, pending.height)).assertFalse();

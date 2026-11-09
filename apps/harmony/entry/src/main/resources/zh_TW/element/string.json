@@ -167,6 +167,8 @@
     {"name":"v134_rich_sent","value":"已提交"},
     {"name":"v134_rich_send_failed","value":"訊息未提交，已保留填寫內容"},
     {"name":"v134_unnamed_computer","value":"未命名電腦"},
+    {"name":"v134_pane_list_collapse","value":"收起任務列表"},
+    {"name":"v134_pane_list_expand","value":"展開任務列表"},
     {"name":"v133_rich_open_video","value":"開啟原影片"},
     {"name":"v133_rich_open_media","value":"開啟媒體"},
     {"name":"v133_speed_label","value":"速度"},

@@ -87,6 +87,8 @@ export struct ConversationComposer {
   /** 浮动背板距当前可用区域底边的间距，由分栏父页面与 HdsTabs 共用同一口径。 */
   @Prop floatingBottomInset: number = 2;
   @Prop inputId: string = 'task-composer-input';
+  /** 宽度上限；0 时沿用默认（悬浮样式 720，普通样式 760）。会话详情会传入更宽的值。 */
+  @Prop maxContentWidth: number = 0;
   @Prop placeholder: string = '输入远程消息';
 
   onInputChange: (value: string) => void = () => {};
@@ -1010,7 +1012,7 @@ export struct ConversationComposer {
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     }
     .width('100%')
-    .constraintSize({ maxWidth: this.floatingGlass ? 720 : 760 })
+    .constraintSize({ maxWidth: this.maxContentWidth > 0 ? this.maxContentWidth : (this.floatingGlass ? 720 : 760) })
     .alignSelf(ItemAlign.Center)
     .padding({
       left: 12,

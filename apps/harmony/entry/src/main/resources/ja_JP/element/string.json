@@ -167,6 +167,8 @@
     {"name":"v134_rich_sent","value":"送信済み"},
     {"name":"v134_rich_send_failed","value":"メッセージを送信できませんでした。入力内容は保持されています。"},
     {"name":"v134_unnamed_computer","value":"名前のないコンピューター"},
+    {"name":"v134_pane_list_collapse","value":"タスク一覧を閉じる"},
+    {"name":"v134_pane_list_expand","value":"タスク一覧を開く"},
     {"name":"v133_rich_open_video","value":"元の動画を開く"},
     {"name":"v133_rich_open_media","value":"メディアを開く"},
     {"name":"v133_speed_label","value":"速度"},

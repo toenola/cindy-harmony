@@ -2,6 +2,7 @@
  * 任务页宽屏双栏布局的纯计算。
  *
  * 窗口与安全区共同决定是否分栏，不依赖设备折叠状态或横竖屏。
+ * 系统分屏与悬浮窗一律单栏（D-015，Harmony 有意差异）。
  * 列表标题的四个操作需要保留 300vp；分隔条不占布局宽度。
  */
 
@@ -13,6 +14,14 @@ export const TASK_SPLIT_DIVIDER_WIDTH = 20;
 export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
 export const TASK_SPLIT_MIN_DETAIL_WIDTH = 400;
 export const TASK_SPLIT_MAX_LIST_WIDTH = 420;
+/** `window.WindowStatusType` 中的悬浮窗与分屏取值。 */
+export const TASK_WINDOW_STATUS_FLOATING = 4;
+export const TASK_WINDOW_STATUS_SPLIT_SCREEN = 5;
+
+/** 系统分屏或悬浮窗：窗口只占屏幕一部分，即使尺寸达标也不分栏。 */
+export function taskWindowIsMultiWindow(status: number): boolean {
+  return status === TASK_WINDOW_STATUS_FLOATING || status === TASK_WINDOW_STATUS_SPLIT_SCREEN;
+}
 
 /**
  * 独立详情页转入宽屏双栏时，先把当前任务交还给仍在路由栈中的列表页。
@@ -48,8 +57,10 @@ export function isWideTaskLayout(
   viewportWidth: number,
   safeWidth: number,
   safeHeight: number,
+  multiWindow: boolean = false,
 ): boolean {
-  return Number.isFinite(viewportWidth)
+  return !multiWindow
+    && Number.isFinite(viewportWidth)
     && Number.isFinite(safeWidth)
     && Number.isFinite(safeHeight)
     && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH
@@ -120,8 +131,40 @@ export function taskDetailKeyboardInset(
   safeWidth: number,
   safeHeight: number,
   keyboardHeight: number,
+  multiWindow: boolean = false,
 ): number {
-  if (!isWideTaskLayout(viewportWidth, safeWidth, safeHeight)) return 0;
+  if (!isWideTaskLayout(viewportWidth, safeWidth, safeHeight, multiWindow)) return 0;
   if (!Number.isFinite(keyboardHeight) || keyboardHeight <= 0) return 0;
   return keyboardHeight;
+}
+
+export class TaskHeaderTitleInsets {
+  left: number = 0;
+  right: number = 0;
+}
+
+/**
+ * 会话详情标题居中（D-015）。左右按钮组宽度不同：标题放得下时两侧都按较宽一组留白，
+ * 严格对准标题栏中线；放不下时改为填满两组按钮之间的空间并由省略号截断，
+ * 不为了居中把标题挤到几乎不可见。宽度单位均为 vp，gap 是标题与按钮组的间距。
+ */
+export function taskHeaderTitleInsets(
+  barWidth: number,
+  leadingWidth: number,
+  trailingWidth: number,
+  titleWidth: number,
+  gap: number,
+): TaskHeaderTitleInsets {
+  const insets = new TaskHeaderTitleInsets();
+  const leading = Math.max(0, leadingWidth) + gap;
+  const trailing = Math.max(0, trailingWidth) + gap;
+  const side = Math.max(leading, trailing);
+  if (Number.isFinite(barWidth) && Number.isFinite(titleWidth) && titleWidth <= barWidth - side * 2) {
+    insets.left = side;
+    insets.right = side;
+  } else {
+    insets.left = leading;
+    insets.right = trailing;
+  }
+  return insets;
 }
