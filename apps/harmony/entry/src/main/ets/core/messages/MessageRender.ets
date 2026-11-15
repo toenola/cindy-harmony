@@ -607,6 +607,27 @@ export class RenderWorkGroupItem extends RenderItem {
 
 // ─── 工具函数 ────────────────────────────────────────────────────────────────
 
+/** 旧回复行可能只存了给模型的原生格式；历史气泡显示题目和答案。 */
+export function asyncQuestionReplyDisplayText(raw: string): string {
+  const context = '\n\n<cindy_question_context>\nThis is a delayed answer to an earlier question. Check the current task state and whether the question still applies before acting; do not repeat work already completed. This context is added by Cindy, not part of the user\'s answer or new authorization.\n</cindy_question_context>';
+  const text = raw.endsWith(context) ? raw.slice(0, -context.length) : raw;
+  const open = '<send_user_message_question_reply>\n';
+  const close = '\n</send_user_message_question_reply>';
+  if (!text.startsWith(open) || !text.endsWith(close)) return text;
+  try {
+    const parsed = JSON.parse(text.slice(open.length, -close.length)) as Object;
+    if (!Array.isArray(parsed)) return text;
+    const lines: string[] = [];
+    for (const value of parsed as Object[]) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return text;
+      const row = value as Record<string, Object>;
+      if (typeof row['question'] !== 'string' || typeof row['answer'] !== 'string') return text;
+      lines.push(`${(row['question'] as string).split('\n').map((part: string) => `> ${part}`).join('\n')}\n\n${row['answer'] as string}`);
+    }
+    return lines.length > 0 ? lines.join('\n\n') : text;
+  } catch (_error) { return text; }
+}
+
 /** content → 预览文本（对齐 messageContentToPreview）。 */
 export function contentPreview(content: Object | undefined): string {
   if (content === undefined) {
@@ -1946,7 +1967,8 @@ function buildLinearRenderItems(
       const item = new RenderMessageItem();
       item.type = 'message';
       item.key = m.id;
-      if (m.isSyntheticTrigger) {
+      // The answer is already on the async question card. Keep its timeline slot without a duplicate bubble.
+      if (m.isSyntheticTrigger || m.clientId.startsWith('question-reply:answered:')) {
         item.kind = 'user';
         item.label = '你';
         item.body = '';
@@ -1982,8 +2004,10 @@ function buildLinearRenderItems(
       const parsed = parseUserContent(m.content);
       const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
       const identity = rawIdentity.length > 0 ? `${m.sessionId}:${rawIdentity}` : '';
+      const displayText = m.clientId.startsWith('question-reply:')
+        ? asyncQuestionReplyDisplayText(parsed.text) : parsed.text;
       item.body = readStr(readObj(m.agentMeta, 'origin'), 'kind') === 'session'
-        ? forwardedRequestDisplayText(parsed.text) : parsed.text;
+        ? forwardedRequestDisplayText(displayText) : displayText;
       if (item.body !== parsed.text) item.originalBody = parsed.text;
       item.segments = buildSegments(item.body, item.originalBody === undefined ? parsed.ranges : [],
         m.automationOrigin, identity);

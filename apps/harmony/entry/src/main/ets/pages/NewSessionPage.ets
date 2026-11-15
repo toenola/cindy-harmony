@@ -31,6 +31,7 @@ import {
   SelectMode, PickerOrientation, SingleLineConfig, DataType,
 } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import { remoteModelPreferenceKey } from '../core/tasks/RemoteModelPreferenceStore';
 import {
   ComposerChoiceOption as RuntimeChoiceOption,
   ComposerModelGroup,
@@ -1355,6 +1356,10 @@ export struct NewSessionPageContent {
     return this.currentRuntimeScope() + ':' + this.modelOptionKey(option);
   }
 
+  private remoteModelMemoryKey(option: RuntimeModelOption): string {
+    return remoteModelPreferenceKey(this.selectedAgentKind, option.agentDeviceId, option.providerId, option.id);
+  }
+
   private modelOptionIsCurrent(option: RuntimeModelOption): boolean {
     return option.id === this.model && option.providerId === this.providerId
       && option.agentDeviceId === this.agentDeviceId;
@@ -1362,7 +1367,9 @@ export struct NewSessionPageContent {
 
   private modelEffortForRow(option: RuntimeModelOption): string {
     if (this.modelOptionIsCurrent(option) && this.effort.length > 0) return this.effort;
-    const remembered = this.modelEffortMemory.get(this.modelRuntimeKey(option));
+    const remembered = option.agentDeviceId.length > 0
+      ? AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'effort')
+      : this.modelEffortMemory.get(this.modelRuntimeKey(option));
     if (remembered !== undefined && this.modelSupportsEffort(option, remembered)) return remembered;
     if (option.defaultEffort.length > 0) return option.defaultEffort;
     return option.efforts.length > 0 ? option.efforts[0] : '';
@@ -1373,13 +1380,20 @@ export struct NewSessionPageContent {
     if (this.modelOptionIsCurrent(option)) return this.fastMode;
     const key = this.modelRuntimeKey(option);
     // 记忆的超快档在目标模型撤回能力时整体关闭（对齐 Mobile isFastRestorable）。
-    return (this.modelFastMemory.get(key) ?? false) && ultrafastRestorable(
-      this.modelFastTierMemory.get(key) ?? '', this.selectedAgentKind, option.supportsUltrafastMode);
+    const remembered = option.agentDeviceId.length > 0
+      ? AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'speed') : '';
+    return (remembered.length > 0 ? remembered !== 'standard' : this.modelFastMemory.get(key) ?? false)
+      && ultrafastRestorable(remembered === 'ultrafast' ? MODEL_SPEED_ULTRAFAST
+        : this.modelFastTierMemory.get(key) ?? '', this.selectedAgentKind, option.supportsUltrafastMode);
   }
 
   private modelFastTierForRow(option: RuntimeModelOption): string {
     if (!this.modelFastForRow(option)) return '';
     if (this.modelOptionIsCurrent(option)) return this.fastModeTier;
+    if (option.agentDeviceId.length > 0
+      && AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'speed') === 'ultrafast') {
+      return MODEL_SPEED_ULTRAFAST;
+    }
     return this.modelFastTierMemory.get(this.modelRuntimeKey(option)) ?? '';
   }
 
@@ -1410,6 +1424,9 @@ export struct NewSessionPageContent {
     const next = new Map(this.modelEffortMemory);
     next.set(this.modelRuntimeKey(option), effort);
     this.modelEffortMemory = next;
+    if (option.agentDeviceId.length > 0) {
+      AppServices.instance.remoteModelPreferences.save(this.remoteModelMemoryKey(option), 'effort', effort);
+    }
     if (this.modelOptionIsCurrent(option)) {
       this.runtimeEffortTouchedGeneration = this.runtimeLoadGeneration;
       this.effort = effort;
@@ -1434,6 +1451,9 @@ export struct NewSessionPageContent {
     const tiers = new Map(this.modelFastTierMemory);
     tiers.set(key, tier);
     this.modelFastTierMemory = tiers;
+    if (option.agentDeviceId.length > 0) {
+      AppServices.instance.remoteModelPreferences.save(this.remoteModelMemoryKey(option), 'speed', speed);
+    }
     if (this.modelOptionIsCurrent(option)) {
       this.runtimeFastTouchedGeneration = this.runtimeLoadGeneration;
       this.fastMode = enabled;

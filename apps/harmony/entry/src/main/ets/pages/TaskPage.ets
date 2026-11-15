@@ -27,6 +27,8 @@ import { accessibility } from '@kit.AccessibilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { PhotoPickerComponent, PickerController, PickerOptions, DataType } from '@kit.MediaLibraryKit';
 import { AppServices } from '../core/AppServices';
+import { AppConfig } from '../AppConfig';
+import { remoteModelPreferenceKey } from '../core/tasks/RemoteModelPreferenceStore';
 import {
   initialTaskPaneMessage, residentPaneAllowsPositioning, taskComposerInputId,
 } from '../core/tasks/ResidentTaskPanes';
@@ -48,6 +50,7 @@ import { ComposerImageQueue, MAX_COMPOSER_IMAGES, createRecentPickerOptions } fr
 import { ComposerFile, ComposerFileQueue } from '../core/attachments/ComposerFileQueue';
 import {
   AskUserDraft,
+  IssueConfirmDraft,
   PendingInteraction,
   PlanReviewDraft,
 } from '../core/interactions/InteractionStore';
@@ -794,6 +797,14 @@ export struct TaskPageContent {
   private accountUsageRefreshTimer: number = -1;
   /** 主操作与低频会话信息分层展示，避免展开屏菜单被元信息撑成近全屏面板。 */
   @State sessionActionInfoMode: boolean = false;
+  @State sessionActionProjectMode: boolean = false;
+  @State sessionActionProjects: string[] = [];
+  @State sessionActionProjectPath: string = '';
+  @State sessionActionProjectLoading: boolean = false;
+  @State sessionActionProjectSupported: boolean = false;
+  @State sessionActionProjectError: string = '';
+  private projectMoveGeneration: number = 0;
+  @State protectedAskBusyId: string = '';
   @State sessionRenameMode: boolean = false;
   @State sessionRenameDraft: string = '';
   @State sessionActionBusy: boolean = false;
@@ -882,6 +893,8 @@ export struct TaskPageContent {
   @State pendingInteractions: PendingInteraction[] = [];
   /** Ask User 草稿的页面级响应式快照；Store 的普通 Map 本身不会触发 ArkUI 局部重绘。 */
   @State askDraftSnapshots: Map<string, AskUserDraft> = new Map();
+  @State issueDraftSnapshots: Map<string, IssueConfirmDraft> = new Map();
+  @State issueEditingRequestId: string = '';
   /** 多卡时只展示一个 active request；新快照优先保留用户正在处理的卡。 */
   @State activeInteractionRequestId: string = '';
   /** 高风险 Permission 首击只进入确认态；同一 request 的第二击才真正提交。 */
@@ -1325,12 +1338,18 @@ export struct TaskPageContent {
       AppServices.instance.interactions.getPending(this.sessionId, this.deviceId));
     this.pendingInteractions = sorted;
     const askDraftSnapshots: Map<string, AskUserDraft> = new Map();
+    const issueDraftSnapshots: Map<string, IssueConfirmDraft> = new Map();
     for (let i = 0; i < sorted.length; i++) {
-      if (sorted[i].kind !== 'ask_user_question') continue;
-      const draft = AppServices.instance.interactions.readAskDraft(sorted[i].requestId, this.deviceId, this.sessionId);
-      if (draft !== null) askDraftSnapshots.set(sorted[i].requestId, draft);
+      if (sorted[i].kind === 'ask_user_question') {
+        const draft = AppServices.instance.interactions.readAskDraft(sorted[i].requestId, this.deviceId, this.sessionId);
+        if (draft !== null) askDraftSnapshots.set(sorted[i].requestId, draft);
+      } else if (sorted[i].kind === 'issue_confirm') {
+        const draft = AppServices.instance.interactions.readIssueDraft(sorted[i].requestId, this.deviceId, this.sessionId);
+        if (draft !== null) issueDraftSnapshots.set(sorted[i].requestId, draft);
+      }
     }
     this.askDraftSnapshots = askDraftSnapshots;
+    this.issueDraftSnapshots = issueDraftSnapshots;
     let activeExists = false;
     for (let i = 0; i < sorted.length; i++) {
       if (sorted[i].requestId === this.activeInteractionRequestId) {
@@ -2037,13 +2056,19 @@ export struct TaskPageContent {
     return `${this.modelAgentTab}:${composerModelKey(option)}`;
   }
 
+  private remoteModelMemoryKey(option: ComposerModelOption): string {
+    return remoteModelPreferenceKey(this.modelAgentTab, option.agentDeviceId, option.providerId, option.id);
+  }
+
   private modelEffortForRow(option: ComposerModelOption): string {
     const session = this.session();
     if (this.modelOptionIsCurrent(option) && session !== undefined
       && this.effectiveEffort(session).length > 0) {
       return this.effectiveEffort(session);
     }
-    const remembered = this.modelEffortMemory.get(this.modelRuntimeKey(option));
+    const remembered = option.agentDeviceId.length > 0
+      ? AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'effort')
+      : this.modelEffortMemory.get(this.modelRuntimeKey(option));
     if (remembered !== undefined && option.efforts.indexOf(remembered) >= 0) return remembered;
     if (option.defaultEffort.length > 0) return option.defaultEffort;
     return option.efforts.length > 0 ? option.efforts[0] : '';
@@ -2057,8 +2082,11 @@ export struct TaskPageContent {
     }
     const key = this.modelRuntimeKey(option);
     // 记忆的超快档在目标模型撤回能力时整体关闭（对齐 Mobile isFastRestorable）。
-    return (this.modelFastMemory.get(key) ?? false) && ultrafastRestorable(
-      this.modelFastTierMemory.get(key) ?? '', this.composerAgentKind(), option.supportsUltrafastMode);
+    const remembered = option.agentDeviceId.length > 0
+      ? AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'speed') : '';
+    return (remembered.length > 0 ? remembered !== 'standard' : this.modelFastMemory.get(key) ?? false)
+      && ultrafastRestorable(remembered === 'ultrafast' ? MODEL_SPEED_ULTRAFAST
+        : this.modelFastTierMemory.get(key) ?? '', this.composerAgentKind(), option.supportsUltrafastMode);
   }
 
   private modelFastTierForRow(option: ComposerModelOption): string {
@@ -2066,6 +2094,10 @@ export struct TaskPageContent {
     if (this.modelOptionIsCurrent(option)) {
       const session = this.session();
       return session === undefined ? '' : this.effectiveFastTier(session);
+    }
+    if (option.agentDeviceId.length > 0
+      && AppServices.instance.remoteModelPreferences.read(this.remoteModelMemoryKey(option), 'speed') === 'ultrafast') {
+      return MODEL_SPEED_ULTRAFAST;
     }
     return this.modelFastTierMemory.get(this.modelRuntimeKey(option)) ?? '';
   }
@@ -2126,6 +2158,9 @@ export struct TaskPageContent {
     const next = new Map(this.modelEffortMemory);
     next.set(this.modelRuntimeKey(option), effort.id);
     this.modelEffortMemory = next;
+    if (option.agentDeviceId.length > 0) {
+      AppServices.instance.remoteModelPreferences.save(this.remoteModelMemoryKey(option), 'effort', effort.id);
+    }
   }
 
   private setModelRowEffortById(option: ComposerModelOption, effortId: string): void {
@@ -2163,6 +2198,10 @@ export struct TaskPageContent {
     const tiers = new Map(this.modelFastTierMemory);
     tiers.set(key, enabled ? tier : '');
     this.modelFastTierMemory = tiers;
+    if (option.agentDeviceId.length > 0) {
+      AppServices.instance.remoteModelPreferences.save(this.remoteModelMemoryKey(option), 'speed',
+        enabled ? (tier === MODEL_SPEED_ULTRAFAST ? 'ultrafast' : 'fast') : 'standard');
+    }
   }
 
   private currentModelOption(): ComposerModelOption | null {
@@ -6092,7 +6131,7 @@ export struct TaskPageContent {
     Scroll() {
       Column({ space: 8 }) {
           Row({ space: 10 }) {
-            if (this.sessionActionInfoMode) {
+            if (this.sessionActionInfoMode || this.sessionActionProjectMode) {
               Button() {
                 SymbolGlyph($r('sys.symbol.chevron_left'))
                   .fontSize(uiFontSize(16))
@@ -6105,16 +6144,16 @@ export struct TaskPageContent {
               .backgroundColor(Color.Transparent)
               .clickEffect(UI_ICON_CLICK_EFFECT)
               .accessibilityText('返回任务操作')
-              .onClick(() => this.sessionActionInfoMode = false)
+              .onClick(() => { this.sessionActionInfoMode = false; this.sessionActionProjectMode = false; })
             }
             Column({ space: 2 }) {
-              Text(this.sessionActionInfoMode ? '会话信息' : this.sessionTitle())
+              Text(this.sessionActionProjectMode ? '移到项目' : this.sessionActionInfoMode ? '会话信息' : this.sessionTitle())
                 .fontSize(uiFontSize(16))
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text(this.sessionActionInfoMode
+              Text(this.sessionActionInfoMode || this.sessionActionProjectMode
                 ? this.sessionTitle()
                 : `${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.currentModelLabel() || '默认模型'}`)
                 .fontSize(uiFontSize(12))
@@ -6145,7 +6184,37 @@ export struct TaskPageContent {
               .width('100%')
           }
 
-          if (this.sessionActionInfoMode) {
+          if (this.sessionActionProjectMode) {
+            Text('选择电脑上的项目，或输入目标目录。运行中的任务不能迁移。')
+              .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+            if (this.sessionActionProjectLoading) {
+              Text('正在读取项目…').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+            }
+            if (this.sessionActionProjectError.length > 0) {
+              Text(this.sessionActionProjectError).fontSize(uiFontSize(13)).fontColor($r('app.color.danger'))
+            }
+            if (this.sessionActionProjectSupported) {
+              this.sessionActionOption('移出项目，作为普通任务', $r('sys.symbol.folder'), false,
+                () => void this.moveSessionProject(null))
+              ForEach(this.sessionActionProjects, (path: string) => {
+                this.sessionActionOption(path, $r('sys.symbol.folder'), false,
+                  () => void this.moveSessionProject(path))
+              }, (path: string) => path)
+            }
+            TextInput({ text: this.sessionActionProjectPath, placeholder: '其他项目目录' })
+              .onChange((value: string) => this.sessionActionProjectPath = value)
+              .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+              .backgroundColor($r('app.color.bg_page'))
+              .border({ width: 1, color: $r('app.color.border') })
+              .borderRadius(UI_RADIUS_CONTROL).padding(10)
+            Button(this.sessionActionBusy ? '迁移中…' : '移到此目录')
+              .width('100%').height(40).fontSize(uiFontSize(14))
+              .fontColor($r('app.color.chat_cta_text')).backgroundColor($r('app.color.chat_cta'))
+              .borderRadius(UI_RADIUS_PILL)
+              .enabled(this.sessionActionProjectSupported && !this.sessionActionBusy && !this.sessionActionProjectLoading
+                && this.sessionActionProjectPath.trim().length > 0)
+              .onClick(() => void this.moveSessionProject(this.sessionActionProjectPath.trim()))
+          } else if (this.sessionActionInfoMode) {
             if ((this.session()?.workingDir ?? '').length > 0) {
               this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
                 this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
@@ -6229,6 +6298,10 @@ export struct TaskPageContent {
               $r('sys.symbol.pin'), false, () => this.toggleSessionPinned())
             this.sessionActionOption(this.session()?.status === 'archived' ? '取消归档' : '归档任务',
               $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
+            if (this.sessionAllowsProjectMove()) {
+              this.sessionActionOption('移到项目', $r('sys.symbol.folder'), false,
+                () => void this.openSessionProjectMove())
+            }
 
             this.sessionActionOption('会话信息', $r('sys.symbol.doc_text'), false,
               () => this.sessionActionInfoMode = true)
@@ -9352,9 +9425,13 @@ export struct TaskPageContent {
     } else if (item.kind === 'plan_review') {
       this.planReviewCard(item)
     } else if (item.kind === 'issue_confirm') {
-      this.desktopOnlyInteractionCard(item,
-        this.v12String('v12_interaction_issue_title'),
-        this.v12String('v12_interaction_issue_message'))
+      if (this.issueCanConfirm(item)) {
+        this.issueConfirmCard(item)
+      } else {
+        this.desktopOnlyInteractionCard(item,
+          this.v12String('v12_interaction_issue_title'),
+          this.v12String('v12_interaction_issue_message'))
+      }
     } else if (item.kind === 'rename_sessions_confirm') {
       this.desktopOnlyInteractionCard(item,
         this.v12String('v12_interaction_rename_title'),
@@ -9401,6 +9478,99 @@ export struct TaskPageContent {
     .border({ width: 1, color: $r('app.color.border') })
     .borderRadius(UI_RADIUS_CONTAINER)
     .transition(uiOverlayTransition())
+  }
+
+  /** Preview the exact public Issue payload before the user explicitly submits it. */
+  @Builder
+  issueConfirmCard(item: PendingInteraction) {
+    Column({ space: 10 }) {
+      this.interactionCardHeader($r('sys.symbol.doc_text'), '公开反馈预览')
+      if (this.issueEditingRequestId === item.requestId) {
+        Row({ space: 8 }) {
+          this.interactionSecondaryButton('问题', false, () => this.updateIssueDraft(item, 'type', 'bug'))
+          this.interactionSecondaryButton('建议', false, () => this.updateIssueDraft(item, 'type', 'feature'))
+        }
+        TextInput({ text: this.issueDraft(item).title, placeholder: '标题' })
+          .onChange((value: string) => this.updateIssueDraft(item, 'title', value.slice(0, 200)))
+          .fontSize(uiFontSize(15))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_page'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .padding(10)
+        TextArea({ text: this.issueDraft(item).body, placeholder: '反馈内容' })
+          .onChange((value: string) => this.updateIssueDraft(item, 'body', value.slice(0, 4500)))
+          .fontSize(uiFontSize(15))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_page'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .height(160)
+          .padding(10)
+        this.interactionSecondaryButton('完成编辑', false, () => this.issueEditingRequestId = '')
+      } else {
+        Text(this.issueDraft(item).title)
+          .fontSize(uiFontSize(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+        Text(this.issueDraft(item).body)
+          .fontSize(uiFontSize(14))
+          .lineHeight(uiLineHeight(20))
+          .fontColor($r('app.color.text_secondary'))
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+        this.interactionSecondaryButton('编辑', false, () => this.issueEditingRequestId = item.requestId)
+      }
+      Text('确认后会公开提交以上内容。')
+        .fontSize(uiFontSize(13))
+        .lineHeight(uiLineHeight(19))
+        .fontColor($r('app.color.text_secondary'))
+        .width('100%')
+      if (readStr(this.requestObj(item, 'submissionIdentity'), 'kind') === 'platform'
+        && readStr(this.requestObj(item, 'githubUserIdentity'), 'kind') === 'github-user') {
+        Row({ space: 8 }) {
+          this.interactionSecondaryButton('Cindy 署名', false,
+            () => this.updateIssueDraft(item, 'identityKind', 'platform'))
+          this.interactionSecondaryButton('GitHub 账号', false,
+            () => this.updateIssueDraft(item, 'identityKind', 'github-user'))
+        }
+      }
+      if (!this.issuePlatformIdentity(item)) {
+        Text(`@${readStr(this.issueIdentityOption(item, 'github-user'), 'login')}`)
+          .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      }
+      if (this.issuePlatformIdentity(item)) {
+        TextInput({ text: this.issueDraft(item).publicName, placeholder: '公开署名' })
+          .onChange((value: string) => this.updateIssueDraft(item, 'publicName', value.slice(0, 100)))
+          .fontSize(uiFontSize(14))
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_page'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .borderRadius(UI_RADIUS_CONTROL)
+          .padding(10)
+      }
+      if (this.interactionResolveError(item).length > 0) {
+        Text(this.interactionResolveError(item))
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.danger'))
+      }
+      Row({ space: 8 }) {
+        this.interactionSecondaryButton('取消提交', false,
+          () => this.resolveInteraction(item, this.issueDecision(item, false)), !this.interactionBusy(item))
+        Row().layoutWeight(1)
+        this.interactionPrimaryButton('公开提交',
+          () => this.resolveInteraction(item, this.issueDecision(item, true)),
+          !this.interactionBusy(item) && this.issueEditingRequestId !== item.requestId && this.issueDraftIsValid(item))
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(14)
+    .backgroundColor($r('app.color.bg_card'))
+    .border({ width: 1, color: $r('app.color.border') })
+    .borderRadius(UI_RADIUS_CONTAINER)
   }
 
   @Builder
@@ -9506,7 +9676,7 @@ export struct TaskPageContent {
   /** Ask User 主按钮需在 Builder 内直接读取草稿，确保选项点击后 enabled 当帧刷新。 */
   @Builder
   askUserPrimaryButton(item: PendingInteraction) {
-    Button(this.askIsLast(item) ? '提交回答' : '下一题')
+    Button(this.askIsLast(item) ? (item.retainedDraft ? '发送回答' : '提交回答') : '下一题')
       .type(ButtonType.Normal)
       .height(34)
       .fontSize(uiFontSize(13))
@@ -9515,8 +9685,10 @@ export struct TaskPageContent {
       .backgroundColor($r('app.color.chat_cta'))
       .borderRadius(UI_RADIUS_PILL)
       .padding({ left: 16, right: 16 })
-      .enabled(!this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0)
-      .opacity(!this.interactionBusy(item) && this.askCurrentAnswer(item).trim().length > 0 ? 1 : 0.55)
+      .enabled(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
+        && this.askCurrentAnswer(item).trim().length > 0)
+      .opacity(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
+        && this.askCurrentAnswer(item).trim().length > 0 ? 1 : 0.55)
       .clickEffect(UI_CLICK_EFFECT)
       .onClick(() => this.submitAskQuestion(item))
   }
@@ -9607,6 +9779,10 @@ export struct TaskPageContent {
   askUserCard(item: PendingInteraction) {
     Column({ space: 10 }) {
       this.interactionCardHeader($r('sys.symbol.ellipsis_message'), '请确认')
+      if (item.retainedDraft && this.requestStr(item, 'withdrawalReason').length > 0) {
+        Text('原问题已被撤回。发送前会确认原回答状态；只有确认取消后才会作为补充消息发送。')
+          .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+      }
       if (this.askQuestionCount(item) === 0) {
         Text('问题内容暂不可用，可继续让电脑端处理。')
           .fontSize(uiFontSize(13))
@@ -9715,7 +9891,7 @@ export struct TaskPageContent {
         }
 
         Row({ space: 8 }) {
-          if (this.askHasConstraints(item)) {
+          if (this.askHasConstraints(item) && !item.retainedDraft) {
             // 服务端表单（如 MCP）可整体取消，对齐 Mobile interaction.permission.mcpCancel。
             this.interactionSecondaryButton('取消', false,
               () => this.resolveInteraction(item, this.askEmptyDecision()), !this.interactionBusy(item))
@@ -9724,8 +9900,10 @@ export struct TaskPageContent {
             this.interactionSecondaryButton('上一题', false,
               () => this.moveAskQuestion(item, -1), !this.interactionBusy(item))
           }
-          this.interactionSecondaryButton('跳过', false,
-            () => this.skipAskQuestion(item), !this.interactionBusy(item))
+          if (!item.retainedDraft) {
+            this.interactionSecondaryButton('跳过', false,
+              () => this.skipAskQuestion(item), !this.interactionBusy(item))
+          }
           Row().layoutWeight(1)
           this.askUserPrimaryButton(item)
         }
@@ -12000,6 +12178,7 @@ export struct TaskPageContent {
     if (this.isCreationBlockingRemoteOps()) return;
     this.sessionRenameDraft = this.sessionTitle();
     this.sessionActionInfoMode = false;
+    this.sessionActionProjectMode = false;
     this.sessionRenameMode = false;
     void this.loadAccountUsage();
     uiAnimateState(this.getUIContext(), () => {
@@ -12007,13 +12186,107 @@ export struct TaskPageContent {
     });
   }
 
+  private sessionAllowsProjectMove(): boolean {
+    const session = this.session();
+    return session !== null && session !== undefined && session.status === 'active'
+      && session.remoteHostId.length === 0 && session.source !== 'review' && session.source !== 'bot'
+      && session.orcaRole !== 'worker' && this.deviceId.length > 0 && this.deviceId.length <= 128
+      && !this.isCreationBlockingRemoteOps();
+  }
+
+  private async openSessionProjectMove(): Promise<void> {
+    if (!this.sessionAllowsProjectMove()) return;
+    const generation = ++this.projectMoveGeneration;
+    this.sessionActionProjectMode = true;
+    this.sessionActionProjectLoading = true;
+    this.sessionActionProjectSupported = false;
+    this.sessionActionProjectError = '';
+    this.sessionActionProjects = [];
+    this.sessionActionProjectPath = '';
+    try {
+      const request: Record<string, Object> = {};
+      request['action'] = 'caps';
+      const raw = await this.invokeContextRpc('maker:task-copy', [request]);
+      if (!this.sessionActionProjectMode || generation !== this.projectMoveGeneration) return;
+      const emptyCaps: Record<string, Object> = {};
+      const caps = raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+        ? raw as Record<string, Object> : emptyCaps;
+      if (caps['supported'] !== true) throw new Error('MIGRATION_UNSUPPORTED');
+      this.sessionActionProjectSupported = true;
+      const projects = caps['projects'];
+      const unique: string[] = [];
+      if (Array.isArray(projects)) {
+        for (const value of projects as Object[]) {
+          if (typeof value === 'string' && value.length > 0 && unique.indexOf(value) < 0) unique.push(value);
+        }
+      }
+      this.sessionActionProjects = unique;
+    } catch (_error) {
+      if (this.sessionActionProjectMode && generation === this.projectMoveGeneration)
+        this.sessionActionProjectError = '这台电脑暂不支持迁移，或项目列表读取失败。';
+    } finally {
+      if (this.sessionActionProjectMode && generation === this.projectMoveGeneration)
+        this.sessionActionProjectLoading = false;
+    }
+  }
+
+  private async moveSessionProject(workingDir: string | null): Promise<void> {
+    if (this.sessionActionBusy || this.sessionActionProjectLoading || !this.sessionActionProjectSupported
+      || !this.sessionAllowsProjectMove()) return;
+    if (this.sessionStreaming) {
+      this.sessionActionProjectError = '任务正在运行，结束后再迁移。';
+      return;
+    }
+    const session = this.session();
+    if (!session || (workingDir !== null && session.workspaceKind === 'project'
+      && (session.projectDir || session.workingDir) === workingDir)) return;
+    this.sessionActionBusy = true;
+    this.sessionActionProjectError = '';
+    const deviceId = this.deviceId;
+    const sessionId = this.sessionId;
+    const generation = this.projectMoveGeneration;
+    try {
+      const request: Record<string, Object> = {};
+      request['action'] = 'move-project';
+      request['sessionId'] = sessionId;
+      (request as Record<string, Object | null>)['workingDir'] = workingDir;
+      const raw = await this.invokeContextRpc('maker:task-copy', [request]);
+      const emptyResult: Record<string, Object> = {};
+      const result = raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+        ? raw as Record<string, Object> : emptyResult;
+      const moved = result['projectMove'];
+      const view = moved !== undefined && moved !== null && typeof moved === 'object' && !Array.isArray(moved)
+        ? moved as Record<string, Object> : emptyResult;
+      if (view['sessionId'] !== sessionId
+        || (view['workspaceKind'] !== 'project' && view['workspaceKind'] !== 'dialogue')) {
+        throw new Error('MIGRATION_UNSUPPORTED');
+      }
+      if (generation !== this.projectMoveGeneration) return;
+      if (!await AppServices.instance.tasks.loadSessions(deviceId)) throw new Error('session refresh failed');
+      this.sessionActionBusy = false;
+      this.sessionActionProjectMode = false;
+      this.closeSessionActions();
+    } catch (_error) {
+      // A lost reply may follow a committed host move. Refresh the authoritative list; never replay the write.
+      if (generation === this.projectMoveGeneration) {
+        await AppServices.instance.tasks.loadSessions(deviceId).catch(() => false);
+        if (this.sessionActionProjectMode)
+          this.sessionActionProjectError = '迁移结果未确认。已刷新任务列表，请核对后再操作。';
+      }
+    } finally {
+      this.sessionActionBusy = false;
+    }
+  }
+
   private closeSessionActions(): void {
     if (this.sessionActionBusy) return;
+    this.projectMoveGeneration += 1;
     if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
     this.accountUsageRefreshTimer = -1;
     uiAnimateFastState(this.getUIContext(), () => {
       this.sessionActionOpen = false;
       this.sessionActionInfoMode = false;
+      this.sessionActionProjectMode = false;
       this.sessionRenameMode = false;
     });
   }
@@ -12848,6 +13121,74 @@ export struct TaskPageContent {
     return v === true;
   }
 
+  private issueCanConfirm(item: PendingInteraction): boolean {
+    return this.requestBool(item, 'remoteConfirmSupported') && this.deviceId.length > 0
+      && this.deviceId.length <= 128;
+  }
+
+  private issueDraft(item: PendingInteraction): IssueConfirmDraft {
+    const saved = this.issueDraftSnapshots.get(item.requestId);
+    if (saved !== undefined) return saved;
+    const source = this.requestObj(item, 'draft');
+    const draft = new IssueConfirmDraft();
+    draft.title = readStr(source, 'title');
+    draft.body = readStr(source, 'body');
+    draft.type = readStr(source, 'type') === 'feature' ? 'feature' : 'bug';
+    draft.publicName = this.requestStr(item, 'suggestedPublicName') || '匿名';
+    draft.identityKind = readStr(this.requestObj(item, 'submissionIdentity'), 'kind') || 'platform';
+    return draft;
+  }
+
+  private updateIssueDraft(item: PendingInteraction, field: string, value: string): void {
+    const draft = this.issueDraft(item);
+    const next = new IssueConfirmDraft();
+    next.title = field === 'title' ? value : draft.title;
+    next.body = field === 'body' ? value : draft.body;
+    next.type = field === 'type' ? value : draft.type;
+    next.publicName = field === 'publicName' ? value : draft.publicName;
+    next.identityKind = field === 'identityKind' ? value : draft.identityKind;
+    AppServices.instance.interactions.saveIssueDraft(item.requestId, next, this.deviceId, item.sessionId);
+    const snapshots = new Map(this.issueDraftSnapshots);
+    snapshots.set(item.requestId, next);
+    this.issueDraftSnapshots = snapshots;
+  }
+
+  private issuePlatformIdentity(item: PendingInteraction): boolean {
+    return this.issueDraft(item).identityKind === 'platform';
+  }
+
+  private issueIdentityOption(item: PendingInteraction, kind: string): Record<string, Object> {
+    const initial = this.requestObj(item, 'submissionIdentity');
+    if (kind === readStr(initial, 'kind')) return initial;
+    const github = this.requestObj(item, 'githubUserIdentity');
+    if (kind === 'github-user' && readStr(github, 'kind') === kind) return github;
+    return initial;
+  }
+
+  private issueDraftIsValid(item: PendingInteraction): boolean {
+    const draft = this.issueDraft(item);
+    const name = draft.publicName.trim();
+    return draft.title.trim().length > 0 && draft.body.trim().length > 0
+      && (!this.issuePlatformIdentity(item) || (name.length > 0 && name.length <= 100
+        && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name)));
+  }
+
+  private issueDecision(item: PendingInteraction, confirmed: boolean): Record<string, Object> {
+    const decision: Record<string, Object> = {};
+    decision['kind'] = 'issue_confirm';
+    decision['confirmed'] = confirmed;
+    if (!confirmed) return decision;
+    const draft = this.issueDraft(item);
+    decision['title'] = draft.title.trim();
+    decision['body'] = draft.body.trim();
+    decision['type'] = draft.type;
+    const identity = this.issueIdentityOption(item, draft.identityKind);
+    decision['submissionIdentity'] = identity;
+    if (this.issuePlatformIdentity(item)) decision['publicName'] = draft.publicName.trim();
+    decision['uiLanguage'] = AppConfig.locale;
+    return decision;
+  }
+
   private pluginSetupTitle(item: PendingInteraction): string {
     const ghostName = this.requestStr(item, 'ghostName');
     if (ghostName.length > 0) return ghostName;
@@ -13182,7 +13523,102 @@ export struct TaskPageContent {
       this.saveAskDraft(item, draft);
       return;
     }
-    this.resolveInteraction(item, this.askDecisionFromDraft(draft));
+    if (item.retainedDraft) void this.submitProtectedAskQuestion(item, draft);
+    else this.resolveInteraction(item, this.askDecisionFromDraft(draft));
+  }
+
+  private async submitProtectedAskQuestion(item: PendingInteraction, draft: AskUserDraft): Promise<void> {
+    if (this.interactionBusy(item) || this.protectedAskBusyId === item.requestId) return;
+    this.protectedAskBusyId = item.requestId;
+    try {
+      await this.sendProtectedAskQuestion(item, draft);
+    } finally {
+      if (this.protectedAskBusyId === item.requestId) this.protectedAskBusyId = '';
+    }
+  }
+
+  private async sendProtectedAskQuestion(item: PendingInteraction, draft: AskUserDraft): Promise<void> {
+    const lifecycle = this.pageLifecycleGeneration;
+    const account = AppServices.instance.auth.cacheAccountId;
+    const current = (): boolean => this.isCurrentPageLifecycle(lifecycle)
+      && AppServices.instance.auth.cacheAccountId === account
+      && AppServices.instance.interactions.getPending(item.sessionId, item.deviceId)
+        .some((entry: PendingInteraction) => entry.requestId === item.requestId && entry.retainedDraft);
+    this.setAskValidationError(item, '');
+    let accepted = false;
+    try {
+      const raw = await this.invokeContextRpc('maker:resolve-interaction',
+        [item.requestId, this.askDecisionFromDraft(draft)]);
+      const emptyReceipt: Record<string, Object> = {};
+      const receipt = raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+        ? raw as Record<string, Object> : emptyReceipt;
+      accepted = receipt['accepted'] === true;
+    } catch (_error) { /* Resolve may have reached Host; read the persisted row before any other delivery. */ }
+    if (!current()) return;
+    if (accepted) {
+      AppServices.instance.interactions.finishProtectedQuestion(item.deviceId, item.sessionId, item.requestId);
+      return;
+    }
+    try {
+      if (!item.persistId) throw new Error('missing persistId');
+      const around: Record<string, Object> = {};
+      around['radius'] = 0;
+      const raw = await this.invokeContextRpc('local-db:messages:around-client-id',
+        [item.sessionId, item.persistId, around]);
+      if (!current()) return;
+      if (!Array.isArray(raw)) throw new Error('missing original row');
+      const rows = raw as Object[];
+      let status = '';
+      for (const row of rows) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+        const record = row as Record<string, Object>;
+        if (record['clientId'] !== item.persistId || record['role'] !== 'ask_user') continue;
+        const content = record['content'];
+        const parsed = typeof content === 'string' ? JSON.parse(content as string) as Object : content;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const body = parsed as Record<string, Object>;
+          if (body['requestId'] === item.requestId && typeof body['status'] === 'string') {
+            status = body['status'] as string;
+          }
+        }
+      }
+      if (status === 'answered') {
+        AppServices.instance.interactions.finishProtectedQuestion(item.deviceId, item.sessionId, item.requestId);
+        return;
+      }
+      if (status !== 'cancelled') throw new Error('ambiguous decision');
+      const session = this.session();
+      if (!session) throw new Error('missing session');
+      const replies: Record<string, Object>[] = [];
+      const readable: string[] = [];
+      const questions = this.askQuestions(item);
+      for (const question of questions) {
+        const name = readStr(question, 'question');
+        const answer = draft.answers.get(askAnswerKey(question)) ?? '';
+        if (!answer.trim()) continue;
+        const reply: Record<string, Object> = {};
+        reply['question'] = name;
+        reply['answer'] = answer.trim();
+        const id = readStr(question, 'id');
+        if (id) reply['questionItemId'] = id;
+        replies.push(reply);
+        readable.push(`${name.split('\n').map((line: string) => `> ${line}`).join('\n')}\n\n${answer.trim()}`);
+      }
+      if (replies.length === 0) throw new Error('empty answer');
+      const native = questions.every((question: Record<string, Object>) =>
+        readStr(question, 'id').startsWith('["request_user_input_async",'));
+      let text = native
+        ? `<send_user_message_question_reply>\n${JSON.stringify(replies)}\n</send_user_message_question_reply>`
+        : readable.join('\n\n');
+      if (!this.sessionStreaming) text += '\n\n<cindy_question_context>\nThis is a delayed answer to an earlier question. Check the current task state and whether the question still applies before acting; do not repeat work already completed. This context is added by Cindy, not part of the user\'s answer or new authorization.\n</cindy_question_context>';
+      const clientId = `question-reply:${item.requestId}`;
+      const sent = await AppServices.instance.inputQueue.enqueueText(item.deviceId, session, text, [], clientId);
+      if (!current()) return;
+      if (!sent) throw new Error('queue unavailable');
+      AppServices.instance.interactions.finishProtectedQuestion(item.deviceId, item.sessionId, item.requestId);
+    } catch (_error) {
+      if (current()) this.setAskValidationError(item, '无法确认原问题状态或发送回答。草稿已保留，请重试。');
+    }
   }
 
   private skipAskQuestion(item: PendingInteraction): void {

@@ -133,6 +133,28 @@ async function rejectedMessage(operation: Promise<void>): Promise<string> {
 
 export default function v132InteractionTests(): void {
   describe('V132Interactions', () => {
+    // 测试价值：生产入口 saveAskDraft / dismissed / getPending；保护 v1.3.6 异步问题
+    // 撤回时用户仍能看到已填草稿，resolved 后消失。旧覆盖只测普通 dismiss 清理。
+    // 最小输入：同一请求 delivery=async，先保存答案再发 question_withdrawn；tier: unit。
+    it('retains_async_answer_on_withdrawal_and_clears_it_after_resolution', 0, () => {
+      const store = new InteractionStore();
+      const request = recordFixture('{"requestId":"r","kind":"ask_user_question","delivery":"async"}');
+      const pushed: Record<string, Object> = {};
+      pushed['sessionId'] = 's'; pushed['request'] = request; pushed['persistId'] = 'persist-r';
+      store.handleInteractionRequest(pushed, 'device');
+      const draft = new AskUserDraft();
+      draft.answers.set('Question', 'answer');
+      store.saveAskDraft('r', draft, 'device', 's');
+      const withdrawn = recordFixture('{"sessionId":"s","requestId":"r","reason":"question_withdrawn","withdrawalReason":"agent_resumed"}');
+      store.handleInteractionDismissed(withdrawn, 'device');
+      expect(store.getPending('s', 'device').length).assertEqual(1);
+      expect(store.getPending('s', 'device')[0].retainedDraft).assertTrue();
+      expect(store.readAskDraft('r', 'device', 's')?.answers.get('Question')).assertEqual('answer');
+      const resolved = recordFixture('{"sessionId":"s","requestId":"r","reason":"resolved"}');
+      store.handleInteractionDismissed(resolved, 'device');
+      expect(store.getPending('s', 'device').length).assertEqual(0);
+      expect(store.readAskDraft('r', 'device', 's')).assertNull();
+    });
     it('rejects_explicit_refusals_for_every_resolvable_kind_without_pending_reconciliation', 0, async () => {
       for (const kind of ['permission', 'ask_user_question', 'plan_review']) {
         const client = new MockDlClient();

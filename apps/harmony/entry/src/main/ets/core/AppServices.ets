@@ -39,6 +39,7 @@ import { RichInteractionMemory, RichSubmissionController, SecureStoreRichStateSt
 import { ComposerDraftStore } from './messages/ComposerDraftStore';
 import { TaskListPreferenceStore } from './tasks/TaskListPreferenceStore';
 import { NewSessionPreferenceStore } from './tasks/NewSessionPreferenceStore';
+import { RemoteModelPreferenceStore } from './tasks/RemoteModelPreferenceStore';
 import { NewSessionCreationStore } from './tasks/NewSessionCreationStore';
 import { SessionDeepLinkIntent, parseSessionDeepLink } from './navigation/SessionDeepLink';
 import { TaskCompletionPushPreferenceStore } from './notifications/TaskCompletionPushPreferenceStore';
@@ -79,6 +80,7 @@ export class AppServices {
   readonly richAnswerSubmissions: RichSubmissionController = new RichSubmissionController(this.richAnswerMemory);
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
   readonly newSessionPreferences: NewSessionPreferenceStore = new NewSessionPreferenceStore();
+  readonly remoteModelPreferences: RemoteModelPreferenceStore = new RemoteModelPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
   readonly taskCompletionPushPreference: TaskCompletionPushPreferenceStore =
     new TaskCompletionPushPreferenceStore();
@@ -157,6 +159,7 @@ export class AppServices {
       // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
       this.securityObservability.clearUser();
       await this.newSessionPreferences.setAccountScope('');
+      await this.remoteModelPreferences.setAccountScope('');
       // 自动 token 失效路径不会经过 SettingsPage 的 client.stop()；这里也必须
       // 断开旧账号链路并清掉队列、交互和新建任务，避免下一账号读取旧投影。
       this.client.stop();
@@ -302,6 +305,7 @@ export class AppServices {
       this.richAnswerStorage.init(context),
       this.taskListPreferences.init(context),
       this.newSessionPreferences.init(context),
+      this.remoteModelPreferences.init(context),
       this.taskListSnapshot.init(context),
       this.taskCompletionPushPreference.init(context),
       this.voiceDictionary.init(context),
@@ -310,6 +314,7 @@ export class AppServices {
     ]);
     this.selfDeviceName = (await this.settingsStore.get(KEY_SELF_DEVICE_NAME, '')).trim();
     await this.newSessionPreferences.setAccountScope(this.auth.cacheAccountId);
+    await this.remoteModelPreferences.setAccountScope(this.auth.cacheAccountId);
     await this.taskCompletionPush.init(context);
   }
 
@@ -317,6 +322,7 @@ export class AppServices {
   restoreTaskListSnapshot(): void {
     const accountId = this.auth.cacheAccountId;
     void this.newSessionPreferences.setAccountScope(accountId);
+    void this.remoteModelPreferences.setAccountScope(accountId);
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
     this.voiceDictionary.setAccountScope(accountId);
@@ -710,6 +716,7 @@ export class AppServices {
       this.tasks.clearAll();
     }
     const preferencesReady = this.newSessionPreferences.setAccountScope(accountId);
+    const remotePreferencesReady = this.remoteModelPreferences.setAccountScope(accountId);
     if (switchingAccount) {
       // hello-ack 发现账号变化时同样丢弃旧账号 topic lease；当前连接可能已
       // 属于新账号，不能把旧账号的 pending unsubscribe 发到新账号。
@@ -734,6 +741,7 @@ export class AppServices {
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);
     await preferencesReady;
+    await remotePreferencesReady;
     if (accountEpoch !== this.auth.sessionEpoch) {
       if (switchingAccount) this.taskAccountTransition.complete(accountEpoch);
       return;

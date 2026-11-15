@@ -2,6 +2,7 @@ import { LocalAttachmentPreviews } from '../main/ets/core/attachments/LocalAttac
 import { describe, it, expect } from '@ohos/hypium';
 import { hasProviderCatalog, groupComposerModelOptions, modelWindowSwitchDecision, parseProviderModelOptions } from '../main/ets/core/ComposerCatalog';
 import { parseNewSessionPreferences, NewSessionPreferenceStore, WorkspacePreferenceStorage } from '../main/ets/core/tasks/NewSessionPreferenceStore';
+import { RemoteModelPreferenceStore, remoteModelPreferenceKey } from '../main/ets/core/tasks/RemoteModelPreferenceStore';
 import { parseHistoryProjection, historyViewUnavailable, HistoryViewAdapter, projectedHistoryPrefix } from '../main/ets/core/messages/HistoryViewAdapter';
 import { SnapshotReadPool } from '../main/ets/core/messages/SnapshotReadPool';
 import { ProjectMachine, projectMachineLabel } from '../main/ets/core/tasks/ProjectMachineIdentity';
@@ -155,6 +156,28 @@ export default function v131Tests(): void {
       await store.setAccountScope('');
       expect(Object.keys(store.read().workingDirByDevice).length).assertEqual(0);
       expect(disk.writes.length).assertEqual(4);
+    });
+    // 测试价值：生产偏好 Store 的账号切换及持久化结果；旧工作目录偏好测试没有模型/设备隔离。
+    // 最小输入：两个设备同名模型，账号 A 保存后重建 Store 并切到账号 B；tier: unit。
+    it('remembers_remote_model_effort_and_speed_per_account_and_device', 0, async () => {
+      const disk = new TestPreferenceStorage();
+      const first = new RemoteModelPreferenceStore(disk);
+      const a = remoteModelPreferenceKey('codex', 'device-a', 'provider', 'model');
+      const b = remoteModelPreferenceKey('codex', 'device-b', 'provider', 'model');
+      await first.setAccountScope('account-a');
+      first.save(a, 'effort', 'high');
+      first.save(a, 'speed', 'fast');
+      await first.setAccountScope('account-b');
+      expect(first.read(a, 'effort')).assertEqual('');
+      const restored = new RemoteModelPreferenceStore(disk);
+      await restored.setAccountScope('account-a');
+      expect(restored.read(a, 'effort')).assertEqual('high');
+      expect(restored.read(a, 'speed')).assertEqual('fast');
+      expect(restored.read(b, 'effort')).assertEqual('');
+      restored.save(a, 'speed', '');
+      await restored.setAccountScope('account-b');
+      await restored.setAccountScope('account-a');
+      expect(restored.read(a, 'speed')).assertEqual('');
     });
     it('does_not_replace_a_new_workspace_edit_with_slow_hydration', 0, async () => {
       const disk = new TestPreferenceStorage(); disk.delayedRead = new DeferredValue<string>();

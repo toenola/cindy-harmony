@@ -26,6 +26,7 @@ export class PendingInteraction {
   /** 完整 request（字段按 kind 解释：permission / ask_user_question / plan_review）。 */
   raw: Record<string, Object> = {};
   persistId: string = '';
+  retainedDraft: boolean = false;
 }
 
 /** Ask User 草稿按 requestId 保存在 Store，页面重建/前后台切换不丢。 */
@@ -43,6 +44,14 @@ export class PlanReviewDraft {
   editMode: boolean = false;
   expanded: boolean = false;
   feedbackOpen: boolean = false;
+}
+
+export class IssueConfirmDraft {
+  title: string = '';
+  body: string = '';
+  type: string = 'bug';
+  publicName: string = '';
+  identityKind: string = 'platform';
 }
 
 class ActiveInteractionTarget {
@@ -69,6 +78,8 @@ export class InteractionStore {
   private resolveErrors: Map<string, string> = new Map();
   private askDrafts: Map<string, AskUserDraft> = new Map();
   private planDrafts: Map<string, PlanReviewDraft> = new Map();
+  private issueDrafts: Map<string, IssueConfirmDraft> = new Map();
+  private protectedQuestions: Map<string, PendingInteraction[]> = new Map();
   /** push/dismiss 会抬高代次，防打开页面时的慢快照覆盖刚到的实时事件。 */
   private mutationGenerations: Map<string, number> = new Map();
   /** 同一任务可并发补拉；只允许最后启动的一次快照提交。 */
@@ -107,7 +118,11 @@ export class InteractionStore {
   }
 
   getPending(sessionId: string, deviceId: string = ''): PendingInteraction[] {
-    return this.pendingByScope.get(interactionScopeKey(deviceId, sessionId)) ?? [];
+    const scope = interactionScopeKey(deviceId, sessionId);
+    const pending = this.pendingByScope.get(scope) ?? [];
+    const retained = this.protectedQuestions.get(scope) ?? [];
+    return retained.concat(pending.filter((item: PendingInteraction) =>
+      !retained.some((saved: PendingInteraction) => saved.requestId === item.requestId)));
   }
 
   /** 是否有任意待处理交互（仅决定是否显示面板，不等同于 Composer 阻塞）。 */
@@ -132,6 +147,27 @@ export class InteractionStore {
   saveAskDraft(requestId: string, draft: AskUserDraft, deviceId: string = '', sessionId: string = ''): void {
     if (requestId.length === 0) return;
     this.askDrafts.set(this.requestStateKey(requestId, deviceId, sessionId), cloneAskDraft(draft));
+    const scope = interactionScopeKey(deviceId, sessionId);
+    const item = (this.pendingByScope.get(scope) ?? []).find((entry: PendingInteraction) => entry.requestId === requestId);
+    if (item !== undefined && item.kind === 'ask_user_question' && item.raw['delivery'] === 'async') {
+      const retained = this.protectedQuestions.get(scope) ?? [];
+      if (!retained.some((entry: PendingInteraction) => entry.requestId === requestId)) {
+        const copy = new PendingInteraction();
+        copy.sessionId = item.sessionId; copy.deviceId = item.deviceId; copy.requestId = item.requestId;
+        copy.kind = item.kind; copy.raw = item.raw; copy.persistId = item.persistId; copy.retainedDraft = true;
+        this.protectedQuestions.set(scope, retained.concat([copy]));
+      }
+    }
+    this.notify();
+  }
+
+  finishProtectedQuestion(deviceId: string, sessionId: string, requestId: string): void {
+    const scope = interactionScopeKey(deviceId, sessionId);
+    this.protectedQuestions.set(scope,
+      (this.protectedQuestions.get(scope) ?? []).filter((item: PendingInteraction) => item.requestId !== requestId));
+    this.pendingByScope.set(scope,
+      (this.pendingByScope.get(scope) ?? []).filter((item: PendingInteraction) => item.requestId !== requestId));
+    this.clearRequestState(scope, requestId);
     this.notify();
   }
 
@@ -143,6 +179,17 @@ export class InteractionStore {
   savePlanDraft(requestId: string, draft: PlanReviewDraft, deviceId: string = '', sessionId: string = ''): void {
     if (requestId.length === 0) return;
     this.planDrafts.set(this.requestStateKey(requestId, deviceId, sessionId), clonePlanDraft(draft));
+    this.notify();
+  }
+
+  readIssueDraft(requestId: string, deviceId: string = '', sessionId: string = ''): IssueConfirmDraft | null {
+    const draft = this.issueDrafts.get(this.requestStateKey(requestId, deviceId, sessionId));
+    return draft === undefined ? null : cloneIssueDraft(draft);
+  }
+
+  saveIssueDraft(requestId: string, draft: IssueConfirmDraft, deviceId: string = '', sessionId: string = ''): void {
+    if (!requestId) return;
+    this.issueDrafts.set(this.requestStateKey(requestId, deviceId, sessionId), cloneIssueDraft(draft));
     this.notify();
   }
 
@@ -163,6 +210,7 @@ export class InteractionStore {
     this.resolveErrors.delete(key);
     this.askDrafts.delete(key);
     this.planDrafts.delete(key);
+    this.issueDrafts.delete(key);
     let stillPending = false;
     this.pendingByScope.forEach((items: PendingInteraction[]) => {
       if (items.some((item: PendingInteraction) => item.requestId === requestId)) stillPending = true;
@@ -172,6 +220,7 @@ export class InteractionStore {
       this.resolveErrors.delete(requestId);
       this.askDrafts.delete(requestId);
       this.planDrafts.delete(requestId);
+      this.issueDrafts.delete(requestId);
     }
   }
 
@@ -203,6 +252,12 @@ export class InteractionStore {
       return;
     }
     const scope = interactionScopeKey(sourceDeviceId, sessionId);
+    const protectedList = this.protectedQuestions.get(scope) ?? [];
+    if (protectedList.some((saved: PendingInteraction) => saved.requestId === item.requestId)) {
+      item.retainedDraft = true;
+      this.protectedQuestions.set(scope, protectedList.map((saved: PendingInteraction) =>
+        saved.requestId === item.requestId ? item : saved));
+    }
     const list = this.pendingByScope.get(scope) ?? [];
     // 按 requestId 去重（重复 push 覆盖）。
     const filtered = list.filter((x: PendingInteraction) => x.requestId !== item.requestId);
@@ -221,6 +276,7 @@ export class InteractionStore {
     const sessionId = readStr(p, 'sessionId');
     const sourceDeviceId = deviceId.length > 0 ? deviceId : readStr(p, 'deviceId');
     const requestId = readStr(p, 'requestId');
+    const reason = readStr(p, 'reason');
     if (sessionId.length === 0 || requestId.length === 0) {
       return;
     }
@@ -237,6 +293,10 @@ export class InteractionStore {
           }
         }
       });
+      this.protectedQuestions.forEach((list: PendingInteraction[], scope: string) => {
+        if (list.some((item: PendingInteraction) => item.sessionId === sessionId && item.requestId === requestId)
+          && scopes.indexOf(scope) < 0) scopes.push(scope);
+      });
     }
     let changed = false;
     for (let i = 0; i < scopes.length; i++) {
@@ -244,11 +304,31 @@ export class InteractionStore {
       const list = this.pendingByScope.get(scope);
       if (list === undefined) continue;
       const filtered = list.filter((x: PendingInteraction) => x.requestId !== requestId);
-      if (filtered.length === list.length) continue;
+      const protectedList = this.protectedQuestions.get(scope) ?? [];
+      if (filtered.length === list.length
+        && !protectedList.some((item: PendingInteraction) => item.requestId === requestId)) continue;
       this.pendingByScope.set(scope, filtered);
+      if (reason === 'question_withdrawn' && typeof p['withdrawalReason'] === 'string') {
+        this.protectedQuestions.set(scope, (this.protectedQuestions.get(scope) ?? []).map((item: PendingInteraction) => {
+          if (item.requestId !== requestId) return item;
+          const updated = new PendingInteraction();
+          updated.sessionId = item.sessionId; updated.deviceId = item.deviceId;
+          updated.requestId = item.requestId; updated.kind = item.kind;
+          const copied: Record<string, Object> = {};
+          for (const key of Object.keys(item.raw)) copied[key] = item.raw[key];
+          copied['withdrawalReason'] = p['withdrawalReason'];
+          updated.raw = copied;
+          updated.persistId = item.persistId; updated.retainedDraft = true;
+          return updated;
+        }));
+      } else {
+        this.protectedQuestions.set(scope,
+          (this.protectedQuestions.get(scope) ?? []).filter((item: PendingInteraction) => item.requestId !== requestId));
+      }
       const parts = splitInteractionScope(scope);
       this.bumpMutationGeneration(parts.deviceId, parts.sessionId);
-      this.clearRequestState(scope, requestId);
+      if (!(reason === 'question_withdrawn' && (this.protectedQuestions.get(scope) ?? [])
+        .some((item: PendingInteraction) => item.requestId === requestId))) this.clearRequestState(scope, requestId);
       changed = true;
     }
     if (changed) {
@@ -345,6 +425,8 @@ export class InteractionStore {
     this.questionsInProgress.clear();
     this.askDrafts.clear();
     this.planDrafts.clear();
+    this.issueDrafts.clear();
+    this.protectedQuestions.clear();
     this.mutationGenerations.clear();
     this.refreshSequences.clear();
     this.activeTargets.clear();
@@ -569,5 +651,15 @@ function clonePlanDraft(draft: PlanReviewDraft): PlanReviewDraft {
   clone.editMode = draft.editMode;
   clone.expanded = draft.expanded;
   clone.feedbackOpen = draft.feedbackOpen;
+  return clone;
+}
+
+function cloneIssueDraft(draft: IssueConfirmDraft): IssueConfirmDraft {
+  const clone = new IssueConfirmDraft();
+  clone.title = draft.title;
+  clone.body = draft.body;
+  clone.type = draft.type;
+  clone.publicName = draft.publicName;
+  clone.identityKind = draft.identityKind;
   return clone;
 }

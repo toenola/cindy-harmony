@@ -72,6 +72,18 @@ function renderingTypes(items: RenderItem[]): string {
 
 export default function v132RenderingTests() {
   describe('V132Rendering', () => {
+    // 测试价值：真实 buildRenderItems 历史入口；Mobile v1.3.6 的已答问题仅在卡片显示一次。
+    // 旧覆盖未测该 clientId，最小输入是一条 answered 回复和一条旧格式补充；tier: unit。
+    it('keeps_answered_async_question_in_timeline_without_duplicate_bubble', 0, () => {
+      const answered = renderingMessage('answered', 'user', 'already on card');
+      answered.clientId = 'question-reply:answered:r';
+      const reply = renderingMessage('supplement', 'user',
+        '<send_user_message_question_reply>\n[{"question":"Which?","answer":"Yes"}]\n</send_user_message_question_reply>', 1);
+      reply.clientId = 'question-reply:r';
+      const items = buildRenderItems([answered, reply]);
+      expect(rootRenderingMessage(items, 'answered')).assertUndefined();
+      expect((rootRenderingMessage(items, 'supplement') as RenderMessageItem).body).assertEqual('> Which?\n\nYes');
+    });
     it('renders_complete_forwarded_envelopes_without_changing_the_original', 0, () => {
       const raw = '[来源] 任务 A\n用户原话："第一行\\n第二行"\nAgent补充："请处理\\t附件"';
       const forwarded = renderingMessage('forwarded', 'user', raw);
