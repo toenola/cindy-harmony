@@ -12,8 +12,55 @@ import {
   redactSensitiveTextDeep,
   parseAgentErrorCode,
   requiresAgentErrorConfigurationChange,
+  parseGeminiInputRateLimit,
   localizeSubscriptionAccountError,
 } from './errorRedaction.js';
+
+// #7356 follow-up, unit: fixed Host causes must survive presentation without
+// promoting arbitrary reviewer text (or a known sentence embedded in it).
+describe('MCP automatic review cause presentation', () => {
+  const prefix = '[MCP_APPROVAL_AUTO_BLOCKED] Automatic approval review blocked this tool call. No user rejection was received. ';
+  it.each([
+    ['File-write review needs a concrete destination path.', 'MISSING_EVIDENCE'],
+    ['Command review needs concrete command text.', 'MISSING_EVIDENCE'],
+    ['Network review needs a concrete destination or query.', 'MISSING_EVIDENCE'],
+    ['Unknown actions cannot be reviewed without concrete action details.', 'MISSING_EVIDENCE'],
+    ['File-change review needs concrete paths.', 'MISSING_EVIDENCE'],
+    ['User instructions changed; retry against the current request.', 'INSTRUCTIONS_CHANGED'],
+    ['User instructions changed; retry against the latest authorization.', 'INSTRUCTIONS_CHANGED'],
+    ['Current user instructions are not synchronized with task history; automatic authorization is blocked.', 'INSTRUCTIONS_CHANGED'],
+    ['Directory permissions changed; retry with the current scope.', 'PERMISSIONS_CHANGED'],
+    ['Delegated authorization changed; retry against the current scope.', 'AUTHORIZATION_CHANGED'],
+    ['Plugin or task Auto authorization is no longer active.', 'AUTHORIZATION_INACTIVE'],
+    ['No user request authorizes this action; only reads may run without one.', 'NO_USER_AUTHORIZATION'],
+    ['Team plan exceeds the supported size; automatic authorization is blocked.', 'PLAN_TOO_LARGE'],
+    ['Coordinator does not match its registered route.', 'PLAN_MISMATCH'],
+    ['Worker does not match the active registered plan.', 'PLAN_MISMATCH'],
+    ['Task working directory changed.', 'WORKING_DIRECTORY_CHANGED'],
+    ['Host-registered delegated task scope is missing or invalid.', 'DELEGATION_MISSING'],
+  ])('retains the fixed cause: %s', (cause, suffix) => {
+    for (const wrapper of ['', "Error invoking remote method 'maker:send': Error: [IPC_ERROR] LAZY_CREATE_FAILED: "]) {
+      const message = `${wrapper}${prefix}${cause}`;
+      expect(parseAgentErrorCode(message)).toEqual({
+        code: `MCP_APPROVAL_AUTO_BLOCKED_${suffix}`,
+        fallback: message.slice(message.indexOf('Automatic approval')),
+      });
+    }
+  });
+  it.each([
+    '',
+    'Reviewer text containing /private/path and api_key=private-value',
+    'User instructions changed; retry against the current request. api_key=private-value',
+    'Reviewer says: User instructions changed; retry against the current request.',
+  ])('keeps unknown or extended causes on generic guidance: %s', cause => {
+    expect(parseAgentErrorCode(prefix + cause)?.code).toBe('MCP_APPROVAL_AUTO_BLOCKED');
+  });
+  it('does not infer a cause from text outside the fixed runtime envelope', () => {
+    expect(parseAgentErrorCode('[MCP_APPROVAL_AUTO_BLOCKED] User instructions changed; retry against the current request.')?.code)
+      .toBe('MCP_APPROVAL_AUTO_BLOCKED');
+    expect(parseAgentErrorCode('[REMOTE_AGENT_INVALID] ' + prefix)?.code).toBe('REMOTE_AGENT_INVALID');
+  });
+});
 
 // #10187: unit coverage for the host's explicit guest resume refusal. Existing
 // code-only cases cannot distinguish it from other REMOTE_AGENT_INVALID errors.
@@ -399,6 +446,11 @@ describe('isGatewayProxyTokenInvalidError', () => {
 
 
 describe('agent error envelopes shared by desktop and mobile', () => {
+  it('does not offer retry for an unsupported SSH Codex source', () => {
+    expect(requiresAgentErrorConfigurationChange(
+      'LAZY_CREATE_FAILED: [REMOTE_CODEX_SOURCE_UNSUPPORTED] select the native connection',
+    )).toBe(true);
+  });
   it.each(['REMOTE_LOCAL_ONLY_PROVIDER', 'DEVICE_LINK_MEDIA_TRANSFER_FAILED', 'DEVICE_LINK_MEDIA_ACCESS_DENIED', 'DEVICE_LINK_BUSY', 'MCP_APPROVAL_CONFIRMATION_TIMEOUT', 'AUTO_REVIEW_UNAVAILABLE', 'SSH_HARNESS_SWITCH_UNSUPPORTED', 'MODEL_SELECTION_UNAVAILABLE', 'HARNESS_SWITCH_NOT_READY', 'SUBSCRIPTION_ACCOUNTS_FULL'])(
     'parses %s directly and inside an IPC error', code => {
       for (const prefix of ['', '[IPC_ERROR] ', "Error invoking remote method 'maker:send': Error: ", 'LAZY_CREATE_FAILED: ']) {
@@ -464,5 +516,26 @@ describe('remote native resume rejection', () => {
   ])('does not reinterpret a different rejection: %s', message => {
     expect(parseAgentErrorCode(message)?.code).not.toBe('REMOTE_AGENT_RESUME_UNAVAILABLE');
     expect(requiresAgentErrorConfigurationChange(message)).toBe(false);
+  });
+});
+
+describe('Gemini minute-limit retry advice', () => {
+  const metric = 'generativelanguage.googleapis.com/generate_content_paid_tier_input_token_count';
+  const error = { code: 429, status: 'RESOURCE_EXHAUSTED',
+    message: `Quota exceeded for metric: ${metric}. Generate content input tokens per minute limit exceeded on Tier 1.`,
+    details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '56s' }] };
+  it('accepts the structured Google delay and excludes undated, billing and mixed quota responses', () => {
+    const parse = (fields: object) => parseGeminiInputRateLimit(JSON.stringify({ error: { ...error, ...fields } }));
+    expect(parse({})).toEqual({ retryDelayMs: 56_000 });
+    expect(parse({ details: [] })).toEqual({ retryDelayMs: null });
+    expect(parse({ message: 'Quota exceeded.', details: [...error.details, {
+      '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{
+        quotaMetric: metric, quotaId: 'GenerateContentPaidTierInputTokensPerModelPerMinute',
+      }],
+    }] })).toEqual({ retryDelayMs: 56_000 });
+    expect(parse({ code: 402 })).toBeNull();
+    expect(parse({ message: 'Prepaid balance exhausted' })).toBeNull();
+    expect(parse({ details: [...error.details, { '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+      violations: [{ quotaMetric: metric, quotaId: 'InputTokensPerDay' }] }] })).toBeNull();
   });
 });
