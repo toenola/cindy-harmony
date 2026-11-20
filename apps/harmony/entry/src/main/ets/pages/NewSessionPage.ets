@@ -67,6 +67,7 @@ import { RemoteImageRef, RemoteSerializedAttachment } from '../core/attachments/
 import { ComposerFile, ComposerFileQueue } from '../core/attachments/ComposerFileQueue';
 import { parseAttachmentOssRef } from '../core/attachments/AttachmentOssRef';
 import { DlInvokeOptions } from '../core/device-link/DlClient';
+import { ModelPickerQuota, modelQuotaKey, modelQuotaLine, readModelPickerQuotas } from '../core/messages/ModelPickerQuota';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
 import { RemoteSession, readBool, readObj, readStr, sessionProjectDirectory } from '../core/tasks/TaskModels';
@@ -96,6 +97,7 @@ import {
 } from '../components/ComposerModelOptionRow';
 import {
   ComposerDocument,
+  SerializedComposerDocument,
   composerDocumentProjectedText,
   textComposerDocument,
 } from '../core/messages/ComposerDocument';
@@ -211,6 +213,15 @@ export struct NewSessionPageContent {
   @State composerPermissionPopupOpen: boolean = false;
   @State composerAgentPopupOpen: boolean = false;
   @State composerModelPopupOpen: boolean = false;
+  @State private modelQuotaValues: ModelPickerQuota[] = [];
+  private modelQuotaGeneration: number = 0;
+  private modelQuotaRequested: Set<string> = new Set();
+  private modelPickerScroller: Scroller = new Scroller();
+  private modelPickerTop: number = 0;
+  private modelPickerHeight: number = 0;
+  private modelPickerPositionPending: boolean = false;
+  private modelPickerUserMoved: boolean = false;
+  private selectedModelArea: Area | null = null;
   /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
   private composerPopupRestoreFocus: boolean = false;
   /** 模型 Popup 关闭时暂存目标选项，由统一收口路径提交模型并销毁锚点。 */
@@ -698,8 +709,16 @@ export struct NewSessionPageContent {
       // Picker 尚未挂载时无需清理；下一次打开仍从空选择开始。
     }
     if (page === 'model') this.composerSurfaceVisible = true;
+    if (page === 'model') {
+      this.modelPickerPositionPending = true;
+      this.modelPickerUserMoved = false;
+      this.modelPickerHeight = 0;
+      this.modelQuotaRequested.clear();
+      this.modelQuotaValues = [];
+    }
     this.getUIContext().getFocusController().clearFocus();
     this.contextSheetOpen = true;
+    if (page === 'model') void this.refreshModelQuotas();
   }
 
   private openComposerControlPopup(page: string): void {
@@ -709,12 +728,65 @@ export struct NewSessionPageContent {
     this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
     if (page === 'model') this.pendingPopupModelSelection = null;
+    if (page === 'model') {
+      this.modelPickerPositionPending = true;
+      this.modelPickerUserMoved = false;
+      this.modelPickerHeight = 0;
+      this.modelQuotaRequested.clear();
+      this.modelQuotaValues = [];
+    }
     this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
     this.getUIContext().getFocusController().clearFocus();
     this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
     if (page === 'model') this.refreshRemoteAgentCatalogs(true);
+    if (page === 'model') void this.refreshModelQuotas();
+  }
+
+  private async refreshModelQuotas(): Promise<void> {
+    const generation = ++this.modelQuotaGeneration;
+    const deviceId = this.selectedDeviceId;
+    const accountId = AppServices.instance.auth.cacheAccountId;
+    const options = this.visibleModelOptions().filter((option: RuntimeModelOption): boolean => {
+      if (!option.subscription && !option.openAiSubscription) return false;
+      const key = modelQuotaKey(deviceId, option);
+      if (this.modelQuotaRequested.has(key)) return false;
+      this.modelQuotaRequested.add(key);
+      return true;
+    });
+    const values = await readModelPickerQuotas(deviceId, options,
+      async (target: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+        if (!this.pageActive || generation !== this.modelQuotaGeneration
+          || accountId !== AppServices.instance.auth.cacheAccountId
+          || deviceId !== this.selectedDeviceId) return undefined;
+        await AppServices.instance.openLink(target);
+        if (!this.pageActive || generation !== this.modelQuotaGeneration
+          || accountId !== AppServices.instance.auth.cacheAccountId
+          || deviceId !== this.selectedDeviceId) return undefined;
+        const rpc = new DlInvokeOptions();
+        rpc.channel = channel;
+        rpc.args = args;
+        return unwrapInvokeResult(await AppServices.instance.client.invoke(target, rpc));
+      });
+    if (generation !== this.modelQuotaGeneration || !this.pageActive
+      || deviceId !== this.selectedDeviceId || accountId !== AppServices.instance.auth.cacheAccountId) return;
+    this.modelQuotaValues = this.modelQuotaValues.concat(values);
+  }
+
+  private positionSelectedModel(area: Area): void {
+    this.selectedModelArea = area;
+    if (!this.modelPickerPositionPending || this.modelPickerUserMoved || this.modelPickerHeight <= 0) return;
+    const top = Number(area.globalPosition.y);
+    if (!Number.isFinite(top)) return;
+    const delta = top - this.modelPickerTop - (this.modelPickerHeight - Number(area.height)) / 2;
+    if (!Number.isFinite(delta)) return;
+    this.modelPickerPositionPending = false;
+    this.modelPickerScroller.scrollTo({
+      xOffset: 0,
+      yOffset: Math.max(0, this.modelPickerScroller.currentOffset().yOffset + delta),
+      animation: false,
+    });
   }
 
   private dismissComposerControlPopup(page: string): void {
@@ -1247,6 +1319,10 @@ export struct NewSessionPageContent {
       this.runtimeCatalogReady = true;
       const providerOptions = this.parseProviderModelOptions(result, agent);
       this.providerModelOptions = providerOptions;
+      if (!this.modelPickerUserMoved && this.composerModelPopupOpen) this.modelPickerPositionPending = true;
+      if (this.composerModelPopupOpen || (this.contextSheetOpen && this.contextSheetPage === 'model')) {
+        void this.refreshModelQuotas();
+      }
       this.remoteAgentLocationSupported = remoteAgentLocationSupported(result);
       this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
@@ -1328,6 +1404,9 @@ export struct NewSessionPageContent {
   private syncRemoteAgentCatalogs(): void {
     this.remoteAgentCatalogList = AppServices.instance.remoteAgentCatalogs.catalogs(this.remoteAgentDevices);
     this.remoteAgentRevision += 1;
+    if (this.composerModelPopupOpen || (this.contextSheetOpen && this.contextSheetPage === 'model')) {
+      void this.refreshModelQuotas();
+    }
   }
 
   private remoteModelOptions(): RuntimeModelOption[] {
@@ -1954,6 +2033,16 @@ export struct NewSessionPageContent {
         AppServices.instance.localAttachmentPreviews.remember(this.selectedDeviceId, image.ref.url, image.uri);
       }
     }
+    try {
+      const firstDocument = new SerializedComposerDocument();
+      firstDocument.text = text;
+      AppServices.instance.inputQueue.reserveDocument(
+        params.deviceId, params.session, firstDocument, readyImages, readyFiles, firstMessageClientId);
+    } catch (e) {
+      this.creating = false;
+      this.error = `消息未保存：${e instanceof Error ? e.message : String(e)}`;
+      return;
+    }
     AppServices.instance.newSessionCreations.start(params);
     this.cancelNewSessionDraftCheckpoint();
     AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
@@ -1975,6 +2064,21 @@ export struct NewSessionPageContent {
     uiAnimateFastState(this.getUIContext(), () => {
       this.previewImageUrl = '';
     });
+  }
+
+  private previewImageOptions(): string[] {
+    const options: string[] = [];
+    for (const image of this.composerImages) {
+      if (image.uri.length > 0 && !options.includes(image.uri)) options.push(image.uri);
+    }
+    return options;
+  }
+
+  private stepImagePreview(direction: number): void {
+    const options = this.previewImageOptions();
+    const index = options.indexOf(this.previewImageUrl);
+    if (index < 0 || options.length < 2) return;
+    this.previewImageUrl = options[(index + direction + options.length) % options.length];
   }
 
   build() {
@@ -2027,6 +2131,28 @@ export struct NewSessionPageContent {
             .width('100%')
             .height('100%')
             .objectFit(ImageFit.Contain)
+          if (this.previewImageOptions().length > 1) {
+            Column() {
+              Blank().layoutWeight(1)
+              Row({ space: 16 }) {
+                Button('上一张')
+                  .fontColor($r('app.color.chat_overlay_text'))
+                  .backgroundColor($r('app.color.overlay'))
+                  .onClick(() => this.stepImagePreview(-1))
+                Text(`${this.previewImageOptions().indexOf(this.previewImageUrl) + 1} / ${this.previewImageOptions().length}`)
+                  .fontColor($r('app.color.chat_overlay_text'))
+                Button('下一张')
+                  .fontColor($r('app.color.chat_overlay_text'))
+                  .backgroundColor($r('app.color.overlay'))
+                  .onClick(() => this.stepImagePreview(1))
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+              .padding({ bottom: 42 })
+            }
+            .width('100%')
+            .height('100%')
+          }
           Button() {
             SymbolGlyph($r('sys.symbol.xmark'))
               .fontSize(uiFontSize(16))
@@ -2047,7 +2173,6 @@ export struct NewSessionPageContent {
         .zIndex(99)
         .backgroundColor($r('app.color.chat_overlay_surface'))
         .transition(uiOverlayTransition())
-        .onClick(() => this.closeImagePreview())
       }
     }
     .width('100%')
@@ -2704,6 +2829,7 @@ export struct NewSessionPageContent {
       subscription: option.subscription,
       paymentRequired: option.availability === 'requires_payment',
       disabled: this.creating || (option.suspended && !this.modelOptionIsCurrent(option)),
+      quotaLine: modelQuotaLine(option, this.selectedDeviceId, this.modelQuotaValues),
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
       effortPickerOpen: this.modelEffortPickerKey === this.modelOptionKey(option),
@@ -2723,6 +2849,7 @@ export struct NewSessionPageContent {
       },
       onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
       onSpeedChange: (speed: string): void => this.setModelRowSpeed(option, speed),
+      onSelectedArea: (area: Area): void => this.positionSelectedModel(area),
     })
   }
 
@@ -2746,7 +2873,7 @@ export struct NewSessionPageContent {
   @Builder
   modelContextView() {
     Column() {
-      Scroll() {
+      Scroll(this.modelPickerScroller) {
         Column() {
           if (this.groupedModelOptions().length === 0) {
             Text('当前电脑未提供模型列表')
@@ -2767,6 +2894,14 @@ export struct NewSessionPageContent {
       .width('100%')
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
+      .onTouch((event: TouchEvent) => {
+        if (event.type === TouchType.Down) this.modelPickerUserMoved = true;
+      })
+      .onAreaChange((_old: Area, next: Area) => {
+        this.modelPickerTop = Number(next.globalPosition.y);
+        this.modelPickerHeight = Number(next.height);
+        if (this.selectedModelArea !== null) this.positionSelectedModel(this.selectedModelArea);
+      })
     }
     .width('100%')
     .layoutWeight(1)

@@ -33,6 +33,7 @@ import {
   initialTaskPaneMessage, residentPaneAllowsPositioning, taskComposerInputId,
 } from '../core/tasks/ResidentTaskPanes';
 import { AccountUsageSummary, projectAccountUsage } from '../core/messages/AccountUsage';
+import { ModelPickerQuota, modelQuotaKey, modelQuotaLine, readModelPickerQuotas } from '../core/messages/ModelPickerQuota';
 import { HistoryWorkPresentation } from '../core/messages/HistoryWorkPresentation';
 import { formatHistoryWorkLine } from '../core/messages/HistoryLinePresentation';
 import { harmonyV12String } from '../core/HarmonyStrings';
@@ -174,7 +175,7 @@ import {
   selectRemoteAgentDevices,
 } from '../core/tasks/RemoteAgentCatalogs';
 import {
-  RenderItem, RenderMessageItem, RenderThinkingItem,
+  RenderItem, RenderMessageItem, RenderAskHistoryPair, RenderThinkingItem,
   RenderToolGroupItem, RenderToolItem, RenderToolMediaItem, RenderTodoCardItem, RenderTodoItem,
   RenderWorkGroupItem, RenderTextSegment, RenderAgentTaskItem, RenderSubagentGroupItem, RenderRichPart,
   buildRenderItems, withoutActiveErrorRow, summarizeText, collapsedUserMessageLineLimit,
@@ -775,6 +776,15 @@ export struct TaskPageContent {
   @State composerPermissionPopupOpen: boolean = false;
   @State composerAgentPopupOpen: boolean = false;
   @State composerModelPopupOpen: boolean = false;
+  @State private modelQuotaValues: ModelPickerQuota[] = [];
+  private modelQuotaGeneration: number = 0;
+  private modelQuotaRequested: Set<string> = new Set();
+  private modelPickerScroller: Scroller = new Scroller();
+  private modelPickerTop: number = 0;
+  private modelPickerHeight: number = 0;
+  private modelPickerPositionPending: boolean = false;
+  private modelPickerUserMoved: boolean = false;
+  private selectedModelArea: Area | null = null;
   /** 仅当打开选择器前键盘可见时，关闭 Popup 后才恢复输入焦点。 */
   private composerPopupRestoreFocus: boolean = false;
   private restoreComposerFocusOnSheetDisappear: boolean = false;
@@ -884,6 +894,7 @@ export struct TaskPageContent {
   @State filePreviewDownloadRaw: string = '';
   @State filePreviewMimeType: string = '';
   @State filePreviewText: string = '';
+  @State filePreviewImageUrl: string = '';
   @State filePreviewStatus: string = 'idle';
   @State filePreviewError: string = '';
   @State fileShareBusy: boolean = false;
@@ -1045,6 +1056,7 @@ export struct TaskPageContent {
     this.filePreviewOpen = false;
     this.filePreviewStatus = 'idle';
     this.filePreviewText = '';
+    this.filePreviewImageUrl = '';
     this.filePreviewError = '';
     this.sessionTreeLoading = false;
     this.sessionTreeSwitchingId = '';
@@ -1236,6 +1248,7 @@ export struct TaskPageContent {
     this.filePreviewOpen = false;
     this.filePreviewStatus = 'idle';
     this.filePreviewText = '';
+    this.filePreviewImageUrl = '';
     this.filePreviewError = '';
     // 页面销毁必须收口分享：释放 PixelMap、临时文件与面板订阅，并解绑 UIContext。
     this.shareService.release();
@@ -1618,6 +1631,10 @@ export struct TaskPageContent {
       const hint = this.currentAgentDeviceId() === null ? this.currentModelSelectionHint() : undefined;
       this.providerModelOptions = parseProviderModelOptions(
         result, agent, this.modelVisibilityOverrides, hint, hint !== undefined);
+      if (!this.modelPickerUserMoved && this.composerModelPopupOpen) this.modelPickerPositionPending = true;
+      if (this.composerModelPopupOpen || (this.contextSheetOpen && this.contextSheetPage === 'model')) {
+        void this.refreshModelQuotas();
+      }
       this.providerModelAgent = hasProviderCatalog(result) ? agent : '';
       this.remoteAgentLocationSupported = remoteAgentLocationSupported(result);
     } catch (e) {
@@ -1782,6 +1799,9 @@ export struct TaskPageContent {
   private syncRemoteAgentCatalogs(): void {
     this.remoteAgentCatalogList = AppServices.instance.remoteAgentCatalogs.catalogs(this.remoteAgentDevices);
     this.remoteAgentRevision += 1;
+    if (this.composerModelPopupOpen || (this.contextSheetOpen && this.contextSheetPage === 'model')) {
+      void this.refreshModelQuotas();
+    }
   }
 
   private remoteModelOptions(): ComposerModelOption[] {
@@ -2311,7 +2331,13 @@ export struct TaskPageContent {
       || this.isCreationBlockingRemoteOps()) return;
     if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
     if (page === 'model') {
+      this.modelPickerPositionPending = true;
+      this.modelPickerUserMoved = false;
+      this.modelPickerHeight = 0;
+      this.modelQuotaRequested.clear();
+      this.modelQuotaValues = [];
       this.refreshRemoteAgentCatalogs(true);
+      void this.refreshModelQuotas();
       const targetAgent = this.composerAgentKind();
       if (this.providerModelAgent !== targetAgent) {
         // 模型弹窗可能在页面复用期间才收到 provider:list；用当前能力代次
@@ -2328,6 +2354,55 @@ export struct TaskPageContent {
     this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
+  }
+
+  private async refreshModelQuotas(): Promise<void> {
+    const generation = ++this.modelQuotaGeneration;
+    const deviceId = this.deviceId;
+    const sessionId = this.sessionId;
+    const accountId = AppServices.instance.auth.cacheAccountId;
+    const options: ComposerModelOption[] = [];
+    for (const group of this.groupedModelOptions()) {
+      for (const option of group.options) {
+        if (!option.subscription && !option.openAiSubscription) continue;
+        const key = modelQuotaKey(deviceId, option);
+        if (this.modelQuotaRequested.has(key)) continue;
+        this.modelQuotaRequested.add(key);
+        options.push(option);
+      }
+    }
+    const values = await readModelPickerQuotas(deviceId, options,
+      async (target: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+        if (generation !== this.modelQuotaGeneration || !this.paneActive
+          || accountId !== AppServices.instance.auth.cacheAccountId
+          || deviceId !== this.deviceId || sessionId !== this.sessionId) return undefined;
+        await AppServices.instance.openLink(target);
+        if (generation !== this.modelQuotaGeneration || !this.paneActive
+          || accountId !== AppServices.instance.auth.cacheAccountId
+          || deviceId !== this.deviceId || sessionId !== this.sessionId) return undefined;
+        const rpc = new DlInvokeOptions();
+        rpc.channel = channel;
+        rpc.args = args;
+        return unwrapInvokeResult(await AppServices.instance.client.invoke(target, rpc));
+      });
+    if (generation !== this.modelQuotaGeneration || deviceId !== this.deviceId
+      || sessionId !== this.sessionId || accountId !== AppServices.instance.auth.cacheAccountId) return;
+    this.modelQuotaValues = this.modelQuotaValues.concat(values);
+  }
+
+  private positionSelectedModel(area: Area): void {
+    this.selectedModelArea = area;
+    if (!this.modelPickerPositionPending || this.modelPickerUserMoved || this.modelPickerHeight <= 0) return;
+    const top = Number(area.globalPosition.y);
+    if (!Number.isFinite(top)) return;
+    const delta = top - this.modelPickerTop - (this.modelPickerHeight - Number(area.height)) / 2;
+    if (!Number.isFinite(delta)) return;
+    this.modelPickerPositionPending = false;
+    this.modelPickerScroller.scrollTo({
+      xOffset: 0,
+      yOffset: Math.max(0, this.modelPickerScroller.currentOffset().yOffset + delta),
+      animation: false,
+    });
   }
 
   private dismissComposerControlPopup(page: string): void {
@@ -2873,6 +2948,20 @@ export struct TaskPageContent {
     const sentFileIds = this.fileQueue.files.map((file: ComposerFile) => file.localId);
     const deferForCreation = this.isCreationBlockingRemoteOps()
       || AppServices.instance.inputQueue.shouldDeferNewInput(this.sessionId);
+    let reservedClientId = '';
+    try {
+      if (deferForCreation) {
+        reservedClientId = AppServices.instance.inputQueue.deferDocument(
+          this.deviceId, s, serialized, readyImages, readyFiles);
+      } else {
+        reservedClientId = AppServices.instance.inputQueue.reserveDocument(
+          this.deviceId, s, serialized, readyImages, readyFiles);
+      }
+      if (!reservedClientId) throw new Error('任务输入队列未就绪');
+    } catch (e) {
+      this.error = `消息未保存：${e instanceof Error ? e.message : String(e)}`;
+      return;
+    }
     // 点发送后当帧清空 composer；同一个 clientId 的 pending 气泡立即进入消息流。
     this.composerDocument = emptyComposerDocument();
     this.input = '';
@@ -2883,15 +2972,13 @@ export struct TaskPageContent {
     this.error = '';
     this.collapseComposerAfterSend();
     if (deferForCreation) {
-      AppServices.instance.inputQueue.deferDocument(
-        this.deviceId, s, serialized, readyImages, readyFiles);
       this.takeOverTailAfterSend();
       return;
     }
     this.sending = true;
     this.error = '';
     AppServices.instance.inputQueue.enqueueDocument(
-      this.deviceId, s, serialized, readyImages, readyFiles).then(() => {
+      this.deviceId, s, serialized, readyImages, readyFiles, reservedClientId).then(() => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       this.sending = false;
       this.takeOverTailAfterSend();
@@ -5799,6 +5886,28 @@ export struct TaskPageContent {
             .width('100%')
             .height('100%')
             .objectFit(ImageFit.Contain)
+          if (this.previewImageOptions().length > 1) {
+            Column() {
+              Blank().layoutWeight(1)
+              Row({ space: 16 }) {
+                Button('上一张')
+                  .fontColor($r('app.color.chat_overlay_text'))
+                  .backgroundColor($r('app.color.overlay'))
+                  .onClick(() => this.stepImagePreview(-1))
+                Text(`${this.previewImageOptions().indexOf(this.previewImageUrl) + 1} / ${this.previewImageOptions().length}`)
+                  .fontColor($r('app.color.chat_overlay_text'))
+                Button('下一张')
+                  .fontColor($r('app.color.chat_overlay_text'))
+                  .backgroundColor($r('app.color.overlay'))
+                  .onClick(() => this.stepImagePreview(1))
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+              .padding({ bottom: 42 })
+            }
+            .width('100%')
+            .height('100%')
+          }
           Button() {
             SymbolGlyph($r('sys.symbol.xmark'))
               .fontSize(uiFontSize(16))
@@ -5819,7 +5928,6 @@ export struct TaskPageContent {
         .zIndex(99)
         .backgroundColor($r('app.color.chat_overlay_surface'))
         .transition(uiOverlayTransition())
-        .onClick(() => this.closeImagePreview())
       }
 
       if (this.filePreviewOpen) {
@@ -5876,7 +5984,14 @@ export struct TaskPageContent {
               .layoutWeight(1)
               .justifyContent(FlexAlign.Center)
             } else if (this.filePreviewStatus === 'ready') {
-              Scroll() {
+              if (this.filePreviewImageUrl.length > 0) {
+                Image(this.filePreviewImageUrl)
+                  .width('100%')
+                  .layoutWeight(1)
+                  .objectFit(ImageFit.Contain)
+                  .onError(() => { this.filePreviewImageUrl = ''; })
+              } else {
+                Scroll() {
                 Text(this.filePreviewText)
                   .fontSize(uiFontSize(13))
                   .fontFamily('monospace')
@@ -5891,6 +6006,7 @@ export struct TaskPageContent {
               .backgroundColor($r('app.color.bg_code'))
               .border({ width: 1, color: $r('app.color.border') })
               .borderRadius(UI_RADIUS_CONTROL)
+              }
             } else {
               Column({ space: 6 }) {
                 Text(this.filePreviewStatus === 'error'
@@ -5906,7 +6022,7 @@ export struct TaskPageContent {
               .justifyContent(FlexAlign.Center)
             }
 
-            Button(this.fileShareBusy ? '正在准备…' : '分享给其他应用')
+            Button(this.fileShareBusy ? '正在准备…' : this.filePreviewIsPdf() ? '用系统阅读器打开' : '分享给其他应用')
               .fontSize(uiFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.chat_cta_text'))
@@ -7870,6 +7986,7 @@ export struct TaskPageContent {
       paymentRequired: option.availability === 'requires_payment',
       disabled: this.contextRpcBusy || this.runtimeRouteLocked()
         || (option.suspended && !this.modelOptionIsCurrent(option)),
+      quotaLine: modelQuotaLine(option, this.deviceId, this.modelQuotaValues),
       effortIds: option.efforts,
       selectedEffort: this.modelEffortForRow(option),
       effortPickerOpen: this.modelEffortPickerKey === composerModelKey(option),
@@ -7890,13 +8007,14 @@ export struct TaskPageContent {
       onSelectEffort: (effort: string): void => this.setModelRowEffortById(option, effort),
       onFastModeChange: (enabled: boolean): void => this.setModelRowFast(option, enabled),
       onSpeedChange: (speed: string): void => this.setModelRowSpeed(option, speed),
+      onSelectedArea: (area: Area): void => this.positionSelectedModel(area),
     })
   }
 
   @Builder
   modelContextView() {
     Column() {
-      Scroll() {
+      Scroll(this.modelPickerScroller) {
         Column({ space: 12 }) {
           if (this.pendingAgentSwitchIntent !== null) {
             Row({ space: 9 }) {
@@ -7973,6 +8091,14 @@ export struct TaskPageContent {
       .width('100%')
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
+      .onTouch((event: TouchEvent) => {
+        if (event.type === TouchType.Down) this.modelPickerUserMoved = true;
+      })
+      .onAreaChange((_old: Area, next: Area) => {
+        this.modelPickerTop = Number(next.globalPosition.y);
+        this.modelPickerHeight = Number(next.height);
+        if (this.selectedModelArea !== null) this.positionSelectedModel(this.selectedModelArea);
+      })
     }
     .width('100%')
     .layoutWeight(1)
@@ -8204,7 +8330,9 @@ export struct TaskPageContent {
   @Builder
   renderItem(item: RenderItem) {
     if (item.type === 'message') {
-      if ((item as RenderMessageItem).orcaCard !== null) {
+      if ((item as RenderMessageItem).kind === 'ask_user') {
+        this.askHistoryBlock(item as RenderMessageItem)
+      } else if ((item as RenderMessageItem).orcaCard !== null) {
         this.orcaCollabBlock(item as RenderMessageItem)
       } else if ((item as RenderMessageItem).kind === 'system'
         && (item as RenderMessageItem).message !== undefined
@@ -10133,6 +10261,7 @@ export struct TaskPageContent {
     this.filePreviewDownloadRaw = downloadableRaw;
     this.filePreviewMimeType = mimeType;
     this.filePreviewText = '';
+    this.filePreviewImageUrl = '';
     this.filePreviewError = '';
     const remotePath = this.absoluteRemoteFilePath(raw);
     const textPreviewable = isTextFileReference(remotePath)
@@ -10150,6 +10279,7 @@ export struct TaskPageContent {
           || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
         if (readBool(result, 'success', false) && typeof result['data'] === 'string') {
           this.filePreviewText = result['data'] as string;
+          this.prepareSvgPreview();
           this.filePreviewStatus = 'ready';
           return;
         }
@@ -10172,6 +10302,7 @@ export struct TaskPageContent {
         || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (bytes.byteLength > 4 * 1024 * 1024) throw new Error('文件超过 4MB，请使用分享打开');
       this.filePreviewText = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(bytes));
+      this.prepareSvgPreview();
       this.filePreviewStatus = 'ready';
     } catch (e) {
       if (generation !== this.filePreviewGeneration
@@ -10186,7 +10317,23 @@ export struct TaskPageContent {
     this.filePreviewOpen = false;
     this.filePreviewStatus = 'idle';
     this.filePreviewText = '';
+    this.filePreviewImageUrl = '';
     this.filePreviewError = '';
+  }
+
+  private filePreviewIsPdf(): boolean {
+    return this.filePreviewMimeType.toLowerCase() === 'application/pdf'
+      || /\.pdf(?:$|[?#])/i.test(this.filePreviewTitle)
+      || /\.pdf(?:$|[?#])/i.test(this.filePreviewPath);
+  }
+
+  private prepareSvgPreview(): void {
+    if (this.filePreviewMimeType.toLowerCase() !== 'image/svg+xml'
+      && !/\.svg(?:$|[?#])/i.test(this.filePreviewTitle)
+      && !/\.svg(?:$|[?#])/i.test(this.filePreviewPath)) return;
+    if (!/^\s*<svg[\s>]/i.test(this.filePreviewText) && !/^\s*<\?xml[\s\S]*?<svg[\s>]/i.test(this.filePreviewText)) return;
+    const bytes = util.TextEncoder.create('utf-8').encodeInto(this.filePreviewText);
+    this.filePreviewImageUrl = 'data:image/svg+xml;base64,' + new util.Base64Helper().encodeToStringSync(bytes);
   }
 
   private async sharePreviewFile(): Promise<void> {
@@ -10206,7 +10353,8 @@ export struct TaskPageContent {
         || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (url.length === 0) throw new Error('文件暂时无法下载');
       const context = getContext(this) as common.UIAbilityContext;
-      await this.remoteFileService.shareUrl(context, url, title);
+      if (this.filePreviewIsPdf()) await this.remoteFileService.openPdfUrl(context, url, title);
+      else await this.remoteFileService.shareUrl(context, url, title);
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         promptAction.showToast({
@@ -10478,6 +10626,51 @@ export struct TaskPageContent {
     }
     .width(item.kind === 'user' ? '86%' : '100%')
     .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
+  }
+
+  @Builder
+  askHistoryBlock(item: RenderMessageItem) {
+    Column({ space: 6 }) {
+      Column({ space: 14 }) {
+        ForEach(item.askHistoryPairs, (pair: RenderAskHistoryPair, index?: number) => {
+          Column({ space: 10 }) {
+            Row() {
+              Text(pair.question)
+                .fontSize(uiFontSize(15))
+                .lineHeight(uiLineHeight(22))
+                .fontColor($r('app.color.text_primary'))
+                .width('100%')
+            }
+            .width('100%')
+            .padding({ left: 10 })
+            .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
+
+            Text(pair.answer)
+              .fontSize(uiFontSize(15))
+              .lineHeight(uiLineHeight(22))
+              .fontColor(pair.answered ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+              .width('100%')
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+        }, (pair: RenderAskHistoryPair, index?: number) => `${item.key}:ask:${index ?? 0}`)
+      }
+      .width(this.userMessageBubbleMaxWidth())
+      .padding(12)
+      .alignItems(HorizontalAlign.Start)
+      .backgroundColor($r('app.color.bg_card'))
+      .border({ width: 1, color: $r('app.color.chat_bubble_border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
+
+      Row({ space: 4 }) {
+        Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
+          .fontSize(uiFontSize(12))
+          .fontColor($r('app.color.chat_text_secondary'))
+        this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), () => this.copyMessage(item))
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.End)
   }
 
   @Builder
@@ -13077,6 +13270,27 @@ export struct TaskPageContent {
         this.previewImageUrl = src;
       });
     }
+  }
+
+  private previewImageOptions(): string[] {
+    const options: string[] = [];
+    for (const source of this.imageSources.values()) {
+      if (source.length > 0 && !options.includes(source)) options.push(source);
+    }
+    for (const image of this.composerImages) {
+      if (image.uri.length > 0 && !options.includes(image.uri)) options.push(image.uri);
+    }
+    if (this.previewImageUrl.length > 0 && !options.includes(this.previewImageUrl)) {
+      options.push(this.previewImageUrl);
+    }
+    return options;
+  }
+
+  private stepImagePreview(direction: number): void {
+    const options = this.previewImageOptions();
+    const index = options.indexOf(this.previewImageUrl);
+    if (index < 0 || options.length < 2) return;
+    this.previewImageUrl = options[(index + direction + options.length) % options.length];
   }
 
   // ─── 交互确认（Permission / Ask User / Plan Review）──────────────────────────

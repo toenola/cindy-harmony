@@ -15,6 +15,7 @@ export struct ComposerModelOptionRow {
   @Prop subscription: boolean = false;
   @Prop paymentRequired: boolean = false;
   @Prop disabled: boolean = false;
+  @Prop quotaLine: string = '';
   @Prop effortIds: string[] = [];
   @Prop selectedEffort: string = '';
   @Prop effortPickerOpen: boolean = false;
@@ -31,6 +32,7 @@ export struct ComposerModelOptionRow {
   onSelectEffort: (effort: string) => void = (_effort: string): void => {};
   onFastModeChange: (enabled: boolean) => void = (_enabled: boolean): void => {};
   onSpeedChange: (speed: string) => void = (_speed: string): void => {};
+  onSelectedArea: (area: Area) => void = (_area: Area): void => {};
 
   private speedLabel(speed: string): Resource {
     if (speed === 'ultrafast') return $r('app.string.v133_speed_ultrafast');
@@ -165,6 +167,16 @@ export struct ComposerModelOptionRow {
       .width('100%')
       .constraintSize({ minHeight: 38 })
 
+      if (this.quotaLine.length > 0) {
+        Text(this.quotaLine)
+          .fontSize(uiFontSize(11))
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .padding({ left: 26, right: 6, bottom: 3 })
+      }
+
       if (this.effortPickerOpen) {
         Row({ space: 4 }) {
           ForEach(this.effortIds, (effort: string) => {
@@ -214,6 +226,9 @@ export struct ComposerModelOptionRow {
     .borderRadius(UI_RADIUS_CONTROL)
     .opacity(this.disabled || (this.paymentRequired && !this.selected) ? 0.55 : 1)
     .enabled(!this.disabled && (!this.paymentRequired || this.selected))
+    .onAreaChange((_old: Area, next: Area) => {
+      if (this.selected) this.onSelectedArea(next);
+    })
   }
 }
 

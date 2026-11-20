@@ -19,6 +19,20 @@ export type TaskListCategory = 'projects' | 'dialogues' | 'automations';
 export type TaskListSortMode = 'default' | 'recency' | 'alphabetic';
 export type TaskRightStatusKind = 'error' | 'waiting' | 'running' | 'done' | 'time';
 
+/** Keep visible rows in place while asynchronous metadata arrives; deleted rows leave, new rows append. */
+export function stableTaskKeys(sortedKeys: string[], previousKeys: string[]): string[] {
+  if (previousKeys.length === 0) return sortedKeys.slice();
+  const remaining = new Set<string>(sortedKeys);
+  const ordered: string[] = [];
+  for (const key of previousKeys) {
+    if (remaining.delete(key)) ordered.push(key);
+  }
+  for (const key of sortedKeys) {
+    if (remaining.delete(key)) ordered.push(key);
+  }
+  return ordered;
+}
+
 /**
  * 列表位于任一真实边界时必须展示底部浮栏。
  *

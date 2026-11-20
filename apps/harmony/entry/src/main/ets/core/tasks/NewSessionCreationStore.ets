@@ -319,6 +319,7 @@ export class NewSessionCreationStore {
     if (removeSyntheticSession) {
       this.tasksStore?.removeLocalSession(task.deviceId, sessionId);
       this.inputQueue?.clearSession(sessionId, task.deviceId);
+      this.inputQueue?.discardReserved(task.deviceId, sessionId, task.firstMessageClientId);
     }
     this.notify();
   }

@@ -120,6 +120,7 @@ import {
   taskListCategory,
   taskListEntryPresentationState,
   taskListShouldShowFloatingBarAtBoundary,
+  stableTaskKeys,
   taskPreviewText,
   taskProjectKey,
   taskProjectName,
@@ -1043,6 +1044,34 @@ export default function localUnitTest() {
   });
 
   describe('harmonyMessageAlignment', () => {
+    it('rendersAnsweredAskUserAsQuestionAndAnswerInsteadOfJson', 0, () => {
+      // 生产入口 buildRenderItems：已回答的异步提问必须在历史中显示问答，不能露出原始 JSON。
+      // 截图回归：string content + 稳定问题 id 的 answers；此前直接展示整个 JSON。
+      const message = new RemoteMessage();
+      message.id = 'answered-question';
+      message.role = 'ask_user';
+      message.content = '{"requestId":"question-request","status":"answered",' +
+        '"questions":[{"id":"q1","question":"手机已解锁？"}],"answers":{"q1":"已解锁"}}';
+      const rendered = buildRenderItems([message])[0] as RenderMessageItem;
+      expect(rendered.body).assertEqual('Q: 手机已解锁？\nA: 已解锁');
+      expect(rendered.body.includes('requestId')).assertEqual(false);
+      expect(rendered.askHistoryPairs.length).assertEqual(1);
+      expect(rendered.askHistoryPairs[0].question).assertEqual('手机已解锁？');
+      expect(rendered.askHistoryPairs[0].answer).assertEqual('已解锁');
+
+      message.content = '{"status":"answered","questions":[' +
+        '{"id":"first","question":"选择？"},{"id":"second","question":"选择？"}],' +
+        '"answers":{"first":"甲","second":"乙"}}';
+      const multiple = buildRenderItems([message])[0] as RenderMessageItem;
+      expect(multiple.askHistoryPairs.length).assertEqual(2);
+      expect(multiple.askHistoryPairs[0].answer).assertEqual('甲');
+      expect(multiple.askHistoryPairs[1].answer).assertEqual('乙');
+
+      message.content = '{"requestId":"question-request","status":"pending",' +
+        '"questions":[{"id":"q1","question":"手机已解锁？"}]}';
+      expect(buildRenderItems([message]).length).assertEqual(0);
+    });
+
     it('treatsMissingTaskRouteParamsAndJsonRecordsAsEmpty', 0, () => {
       const params = recordOrEmpty(undefined);
       expect(readStr(params, 'deviceId')).assertEqual('');
@@ -4974,6 +5003,14 @@ export default function localUnitTest() {
       expect(taskListShouldShowFloatingBarAtBoundary(0, true)).assertEqual(true);
       expect(taskListShouldShowFloatingBarAtBoundary(160, true)).assertEqual(true);
       expect(taskListShouldShowFloatingBarAtBoundary(160, false)).assertEqual(false);
+    });
+
+    // v1.3.7: activity pushes must update rows without moving them during reading.
+    // Existing sort tests miss late metadata; minimum input is B,A,C after A,B. Tier: Local Test.
+    it('keepsVisibleTaskRowsStableUntilAnExplicitOrderReset', 0, () => {
+      expect(JSON.stringify(stableTaskKeys(['b', 'a', 'c'], ['a', 'b']))).assertEqual('["a","b","c"]');
+      expect(JSON.stringify(stableTaskKeys(['c', 'a'], ['a', 'b', 'c']))).assertEqual('["a","c"]');
+      expect(JSON.stringify(stableTaskKeys(['b', 'a'], []))).assertEqual('["b","a"]');
     });
 
     it('hidesAndShowsDetailComposerAfterClearDirectionalScroll', 0, () => {

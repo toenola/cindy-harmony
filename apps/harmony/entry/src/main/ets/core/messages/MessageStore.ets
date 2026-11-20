@@ -871,7 +871,8 @@ export class MessageStore {
     const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
     if (deviceId.length === 0) return;
     this.sessionMessageCache.save(deviceId, sessionId, (this.messagesBySession.get(sessionId) ?? [])
-      .filter((row: RemoteMessage) => !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)));
+      .filter((row: RemoteMessage) => !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)),
+      this.hasMoreBySession.get(sessionId) ?? false);
   }
 
   private rememberLivePlanSnapshot(sessionId: string, snapshot: LivePlanSnapshot): void {
@@ -946,9 +947,11 @@ export class MessageStore {
   /** 只在内存仍为空时种入冷启动快照，网络先返回时绝不让慢缓存反向覆盖。 */
   private hydrateCachedMessagesIfEmpty(deviceId: string, sessionId: string): boolean {
     if ((this.messagesBySession.get(sessionId)?.length ?? 0) > 0) return false;
-    const cached = this.sessionMessageCache.read(deviceId, sessionId);
+    const history = this.sessionMessageCache.readHistory(deviceId, sessionId);
+    const cached = history.messages.length > 0 ? history.messages : this.sessionMessageCache.read(deviceId, sessionId);
     if (cached.length === 0) return false;
     this.messagesBySession.set(sessionId, cached);
+    if (history.messages.length > 0) this.hasMoreBySession.set(sessionId, history.hasMore);
     this.touchSessionCache(sessionId);
     this.notify();
     return true;
@@ -2702,6 +2705,7 @@ export class MessageStore {
 
   private setOlderAvailability(sessionId: string, sourceHasMore: boolean): void {
     this.hasMoreBySession.set(sessionId, sourceHasMore);
+    this.persistSessionMessages(sessionId);
   }
 
   /**

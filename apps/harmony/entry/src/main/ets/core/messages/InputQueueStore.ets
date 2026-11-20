@@ -1,4 +1,6 @@
 import { RemoteReadRetries } from './RemoteReadRetries';
+import { common } from '@kit.AbilityKit';
+import { PersistentInputOutbox } from './PersistentInputOutbox';
 /**
  * Harmony 输入队列。
  *
@@ -340,6 +342,47 @@ export function parseInputProjection(
 }
 
 export class InputQueueStore {
+  private readonly persistentOutbox: PersistentInputOutbox = new PersistentInputOutbox();
+
+  initPersistence(context: common.Context): void {
+    this.persistentOutbox.init(context);
+  }
+
+  setAccountScope(accountId: string): void {
+    this.persistentOutbox.setAccountScope(accountId);
+  }
+
+  clearPersistent(): void {
+    this.persistentOutbox.clear();
+  }
+
+  private recoveredInputs(deviceId: string, sessionId: string): QueuedInputItem[] {
+    const rows: QueuedInputItem[] = [];
+    for (const record of this.persistentOutbox.forSession(deviceId, sessionId)) {
+      const item = parseQueuedInputItem(record.item);
+      if (item === null) continue;
+      this.ownInputDelivery(deviceId, sessionId, item.clientId);
+      const delivery = this.localDeliveries.get(sessionId)?.get(item.clientId);
+      if (delivery !== undefined && delivery.sendingAttempts === 0 && !delivery.hostObserved) {
+        delivery.versionKnown = true;
+        delivery.locallyProvenUnsent = !record.sendStarted;
+      }
+      rows.push(item);
+    }
+    return rows;
+  }
+
+  private removeOutboxIfHostOwns(deviceId: string, sessionId: string, projection: InputProjectionState): void {
+    const owned = new Set<string>();
+    for (const item of projection.pendingQueue) owned.add(item.clientId);
+    for (const receipt of projection.deliveryReceipts) {
+      if (receipt.state !== 'unknown') owned.add(receipt.clientId);
+    }
+    for (const item of this.persistentOutbox.forSession(deviceId, sessionId)) {
+      const clientId = readStr(item.item, 'clientId');
+      if (owned.has(clientId)) this.persistentOutbox.remove(deviceId, sessionId, clientId);
+    }
+  }
   private readRetries: RemoteReadRetries = new RemoteReadRetries();
   private client: DlClient | undefined = undefined;
   private linkOpener: ((deviceId: string) => Promise<void>) | undefined = undefined;
@@ -499,12 +542,14 @@ export class InputQueueStore {
   }
 
   canRetryInputDelivery(sessionId: string, clientId: string, deviceId: string): boolean {
+    this.recoveredInputs(deviceId, sessionId);
     return this.sessionDeviceMatches(sessionId, deviceId) && !this.enqueueingClientIds.has(clientId)
       && this.canSendInputDelivery(deviceId, sessionId, clientId);
   }
 
   getInputDeliveryClientIds(sessionId: string, deviceId: string): string[] {
     if (!this.sessionDeviceMatches(sessionId, deviceId)) return [];
+    this.recoveredInputs(deviceId, sessionId);
     const deliveries = this.localDeliveries.get(sessionId);
     if (deliveries === undefined) return [];
     const candidates: string[] = [];
@@ -739,6 +784,7 @@ export class InputQueueStore {
     if (stableClientId.length > 0 && current.some((item: QueuedInputItem): boolean =>
       item.clientId === stableClientId)) return stableClientId;
     const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
+    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
     this.ownInputDelivery(deviceId, session.id, item.clientId);
     this.deferredBySession.set(session.id, current.concat([item]));
     this.notify();
@@ -750,6 +796,8 @@ export class InputQueueStore {
     const items = this.deferredBySession.get(sessionId) ?? [];
     this.deferredBySession.delete(sessionId);
     this.deferredDispatchTargets.delete(sessionId);
+    const deviceId = this.sessionDevices.get(sessionId) ?? '';
+    for (const item of items) this.persistentOutbox.remove(deviceId, sessionId, item.clientId);
     if (items.length > 0) this.notify();
     return items;
   }
@@ -829,6 +877,17 @@ export class InputQueueStore {
         ? 'sending' : 'connection-waiting';
       bubbles.push(bubble);
     }
+    for (const item of this.recoveredInputs(deviceId, sessionId)) {
+      if (bubbles.some((bubble: PendingQueueBubble) => bubble.clientId === item.clientId)) continue;
+      const bubble = new PendingQueueBubble();
+      bubble.clientId = item.clientId;
+      bubble.text = queuedInputDisplayText(item);
+      bubble.images = item.images;
+      bubble.files = item.files;
+      bubble.phase = 'failed';
+      bubble.errorText = '发送状态待核对，请连接原电脑后重试或移除';
+      bubbles.push(bubble);
+    }
     const ownerDeviceId = deviceId || this.sessionDevices.get(sessionId) || '';
     for (const bubble of bubbles) {
       bubble.deliveryState = this.getInputDeliveryState(sessionId, bubble.clientId, ownerDeviceId);
@@ -866,6 +925,8 @@ export class InputQueueStore {
   setDeliveredClientIds(sessionId: string, clientIds: Set<string>, deviceId: string = ''): void {
     if (sessionId.length === 0 || clientIds.size === 0) return;
     if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.recoveredInputs(deviceId, sessionId);
+    clientIds.forEach((clientId: string) => this.persistentOutbox.remove(deviceId, sessionId, clientId));
     const tracked = new Set<string>();
     this.localDeliveries.get(sessionId)?.forEach((delivery: LocalInputDelivery) => {
       if (!delivery.historyConfirmed && clientIds.has(delivery.clientId)) tracked.add(delivery.clientId);
@@ -992,6 +1053,7 @@ export class InputQueueStore {
       }
     });
     this.projections.set(sessionId, next);
+    if (deviceId.length > 0) this.removeOutboxIfHostOwns(deviceId, sessionId, next);
     if (removalResolved) void this.pumpDeferred(sessionId);
   }
 
@@ -1368,6 +1430,18 @@ export class InputQueueStore {
     return this.enqueueDocument(deviceId, session, serialized, images, [], stableClientId);
   }
 
+  /** Composer 清空前同步取得本机所有权；失败时页面仍保留输入与附件。 */
+  reserveDocument(deviceId: string, session: RemoteSession, serialized: SerializedComposerDocument,
+    images: RemoteImageRef[], files: RemoteSerializedAttachment[], stableClientId: string = ''): string {
+    const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
+    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
+    return item.clientId;
+  }
+
+  discardReserved(deviceId: string, sessionId: string, clientId: string): void {
+    this.persistentOutbox.remove(deviceId, sessionId, clientId);
+  }
+
   async enqueueDocument(
     deviceId: string,
     session: RemoteSession,
@@ -1388,6 +1462,7 @@ export class InputQueueStore {
     }
     const item = this.buildQueuedMessage(
       session, serialized, images, files, stableClientId, planModeOverride);
+    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
     this.ownInputDelivery(deviceId, session.id, item.clientId);
     if (!this.canSendInputDelivery(deviceId, session.id, item.clientId)) return item.clientId;
     const remoteEvidenceAtRequestStart = this.captureRemoteEvidenceEpoch(session.id);
@@ -1410,6 +1485,7 @@ export class InputQueueStore {
     const sendOptions: Record<string, Object> = {};
     sendOptions['sendAtMs'] = Date.now();
     try {
+      this.persistentOutbox.put(deviceId, session.id, item.raw, true);
       const expectedEpoch = this.captureAuthorityEpoch(session.id);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [session.id, item.raw, sendOptions]);
       if (!this.dispatchEpochIsCurrent(session.id, dispatchEpoch)) {
@@ -1420,6 +1496,7 @@ export class InputQueueStore {
         session.id, result, expectedEpoch, item.clientId, deviceId);
       this.enqueueingClientIds.delete(item.clientId);
       this.failedByClientId.delete(item.clientId);
+      this.persistentOutbox.remove(deviceId, session.id, item.clientId);
       this.notify();
       this.emitInputAccepted(deviceId, session.id);
       return item.clientId;
@@ -1456,8 +1533,21 @@ export class InputQueueStore {
 
   async retry(deviceId: string, sessionId: string, clientId: string): Promise<void> {
     if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.recoveredInputs(deviceId, sessionId);
     if (!this.canSendInputDelivery(deviceId, sessionId, clientId)) return;
     let item = this.findItem(sessionId, clientId, deviceId);
+    if (item === null) {
+      const recovered = this.recoveredInputs(deviceId, sessionId)
+        .find((candidate: QueuedInputItem) => candidate.clientId === clientId);
+      if (recovered !== undefined) {
+        item = recovered;
+        const projection = this.getProjection(sessionId, deviceId);
+        projection.sessionId = sessionId;
+        projection.pendingQueue = projection.pendingQueue.concat([recovered]);
+        this.projections.set(sessionId, projection);
+        this.bumpAuthorityEpoch(sessionId);
+      }
+    }
     const delivery = this.localDeliveries.get(sessionId)?.get(clientId);
     if (item === null && delivery?.deviceId === deviceId
       && (delivery.locallyProvenUnsent || delivery.hostConfirmedAbsent)) {
@@ -1485,6 +1575,7 @@ export class InputQueueStore {
     const sendOptions: Record<string, Object> = {};
     sendOptions['sendAtMs'] = Date.now();
     try {
+      this.persistentOutbox.put(deviceId, sessionId, item.raw, true);
       const expectedEpoch = this.captureAuthorityEpoch(sessionId);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [sessionId, item.raw, sendOptions]);
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
@@ -1494,6 +1585,7 @@ export class InputQueueStore {
       this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, clientId, deviceId);
       this.enqueueingClientIds.delete(clientId);
       this.deferredDispatchClientIds.delete(clientId);
+      this.persistentOutbox.remove(deviceId, sessionId, clientId);
       this.notify();
       this.emitInputAccepted(deviceId, sessionId);
       void this.pumpDeferred(sessionId);
@@ -1548,6 +1640,7 @@ export class InputQueueStore {
         this.connectionDispatchTargets.delete(sessionId);
       }
       if (!this.enqueueingClientIds.has(clientId)) {
+        this.persistentOutbox.remove(deviceId, sessionId, clientId);
         this.clearTransientClient(clientId);
         this.notify();
         return;
@@ -1564,6 +1657,7 @@ export class InputQueueStore {
         this.deferredPumpRestartSessions.add(sessionId);
       }
       this.clearTransientClient(clientId);
+      this.persistentOutbox.remove(deviceId, sessionId, clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
       return;
@@ -1589,6 +1683,7 @@ export class InputQueueStore {
       const result = await this.invoke(deviceId, 'maker:input:remove', [sessionId, clientId]);
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
+      this.persistentOutbox.remove(deviceId, sessionId, clientId);
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
@@ -1596,6 +1691,7 @@ export class InputQueueStore {
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       if ((e instanceof DlError && e.code === 'NOT_FOUND')
         || (e instanceof Error && e.message.indexOf('[NOT_FOUND]') >= 0)) {
+        this.persistentOutbox.remove(deviceId, sessionId, clientId);
         this.clearTransientClient(clientId);
         this.notify();
         void this.pumpDeferred(sessionId);

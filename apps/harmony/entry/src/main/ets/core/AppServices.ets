@@ -168,6 +168,7 @@ export class AppServices {
       this.newSessionCreations.clearAll(false);
       this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
+      this.inputQueue.clearPersistent();
       this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
@@ -299,6 +300,7 @@ export class AppServices {
   }
 
   async init(context: common.Context): Promise<void> {
+    this.inputQueue.initPersistence(context);
     await Promise.all([
       this.auth.init(context),
       this.composerDrafts.init(context),
@@ -325,6 +327,7 @@ export class AppServices {
     void this.remoteModelPreferences.setAccountScope(accountId);
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
+    this.inputQueue.setAccountScope(accountId);
     this.voiceDictionary.setAccountScope(accountId);
     this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
   }
@@ -723,6 +726,7 @@ export class AppServices {
       this.newSessionCreations.clearAll(false);
       this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
+      this.inputQueue.clearPersistent();
       this.interactions.clearAll();
       await this.messages.clearAllCachedSessions();
       await this.taskListSnapshot.clear();
@@ -737,6 +741,7 @@ export class AppServices {
     }
     this.taskListSnapshot.setAccountScope(accountId);
     this.messages.setCacheAccountScope(accountId);
+    this.inputQueue.setAccountScope(accountId);
     this.voiceDictionary.setAccountScope(accountId);
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);

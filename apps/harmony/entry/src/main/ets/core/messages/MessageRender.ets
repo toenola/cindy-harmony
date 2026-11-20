@@ -192,6 +192,14 @@ export class RenderMessageItem extends RenderItem {
   /** 旧历史缺 turn seal 时，由用户轮次边界推导出的最终 assistant。 */
   isTurnFinalAssistant: boolean = false;
   orcaCard: OrcaCollabPresentation | null = null;
+  /** 提问历史的结构化问答；页面据此绘制卡片，不重新解析 JSON 或 Markdown。 */
+  askHistoryPairs: RenderAskHistoryPair[] = [];
+}
+
+export class RenderAskHistoryPair {
+  question: string = '';
+  answer: string = '';
+  answered: boolean = false;
 }
 
 export class OrcaCollabPresentation {
@@ -215,6 +223,44 @@ function renderRecord(value: Object | undefined): Record<string, Object> {
   }
   return parsed !== undefined && parsed !== null && typeof parsed === 'object'
     && !Array.isArray(parsed) ? parsed as Record<string, Object> : {};
+}
+
+/** 已结束的提问历史按 Mobile 的问答语义投影；待回答项由实时交互卡承载。 */
+function askUserHistoryPairs(content: Object | undefined): RenderAskHistoryPair[] {
+  const record = renderRecord(content);
+  const status = readStr(record, 'status');
+  if (status === 'pending' || (status !== 'answered' && status !== 'cancelled' && status !== 'expired')) {
+    return [];
+  }
+  const answers = readObj(record, 'answers');
+  const questions = record['questions'];
+  const pairs: RenderAskHistoryPair[] = [];
+  const unanswered = status === 'cancelled' && readStr(record, 'withdrawalReason').length > 0
+    ? `无需再回答 · ${readStr(record, 'withdrawalReason')}` : '未回答';
+  if (Array.isArray(questions)) {
+    (questions as Object[]).forEach((raw: Object) => {
+      const question = renderRecord(raw);
+      const title = readStr(question, 'question');
+      if (title.length === 0) return;
+      const key = readStr(question, 'id') || title;
+      const answer = readStr(answers, key) || readStr(answers, title);
+      const pair = new RenderAskHistoryPair();
+      pair.question = title;
+      pair.answer = status === 'answered' ? answer || '(skipped)' : unanswered;
+      pair.answered = status === 'answered';
+      pairs.push(pair);
+    });
+  }
+  if (pairs.length === 0) {
+    const title = readStr(record, 'question');
+    if (title.length === 0) return [];
+    const pair = new RenderAskHistoryPair();
+    pair.question = title;
+    pair.answer = status === 'answered' ? readStr(record, 'reply') || '(skipped)' : unanswered;
+    pair.answered = status === 'answered';
+    pairs.push(pair);
+  }
+  return pairs;
 }
 
 export function projectOrcaPersistedMessage(message: RemoteMessage): OrcaCollabPresentation | null {
@@ -2020,12 +2066,17 @@ function buildLinearRenderItems(
       continue;
     }
 
+    const askPairs = role === 'ask_user' ? askUserHistoryPairs(m.content) : [];
+    if (role === 'ask_user' && askPairs.length === 0) continue;
     const item = new RenderMessageItem();
     item.type = 'message';
     item.key = m.id;
     item.kind = normalizeKind(role);
     item.label = labelOf(role);
-    item.body = item.kind === 'assistant' ? assistantDisplayBody(m) : contentPreview(m.content);
+    item.askHistoryPairs = askPairs;
+    item.body = role === 'ask_user' ? askPairs.map((pair: RenderAskHistoryPair) =>
+      `Q: ${pair.question}\n${pair.answered ? `A: ${pair.answer}` : pair.answer}`).join('\n\n')
+      : item.kind === 'assistant' ? assistantDisplayBody(m) : contentPreview(m.content);
     // 空的 assistant 是协议占位，不应在真实答复下方制造一条空消息。
     if (item.kind === 'assistant' && item.body.trim().length === 0) continue;
     const rawIdentity = m.id.length > 0 ? m.id : m.clientId;
@@ -2813,6 +2864,7 @@ function normalizeKind(role: string): string {
   if (role === 'assistant') return 'assistant';
   if (role === 'error') return 'error';
   if (role === 'agent_switch') return 'agent_switch';
+  if (role === 'ask_user') return 'ask_user';
   return 'system';
 }
 

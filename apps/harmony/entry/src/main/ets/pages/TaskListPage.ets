@@ -90,6 +90,7 @@ import {
   taskListEntryPresentationState,
   taskListCategory,
   taskListShouldShowFloatingBarAtBoundary,
+  stableTaskKeys,
   TaskListCategory,
   TaskRightStatusKind,
   TaskListSortMode,
@@ -245,6 +246,10 @@ struct TaskListPage {
   private pageActive: boolean = false;
   /** 页面重进后，旧的刷新/任务操作 Promise 不能再改写新页面状态。 */
   private pageLifecycleGeneration: number = 0;
+  /** Display order is a view snapshot, not task truth; reset for a new scope or deliberate refresh. */
+  private displayOrderScope: string = '';
+  private displayEntryKeys: string[] = [];
+  private displayProjectKeys: string[] = [];
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private avoidAreaListening: boolean = false;
@@ -282,6 +287,7 @@ struct TaskListPage {
   private residentSessionStatuses: Map<string, string> = new Map();
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
+    this.resetDisplayOrder();
     this.pageActive = true;
     this.singlePaneNavigationPending = false;
     this.taskListReconcileGeneration += 1;
@@ -457,6 +463,12 @@ struct TaskListPage {
     AppServices.instance.taskListPreferences.save(prefs);
   }
 
+  private resetDisplayOrder(scope: string = ''): void {
+    this.displayOrderScope = scope;
+    this.displayEntryKeys = [];
+    this.displayProjectKeys = [];
+  }
+
   private refreshProjection(): void {
     this.syncResidentAccount();
     if (AppServices.instance.taskAccountTransition.active) {
@@ -488,8 +500,21 @@ struct TaskListPage {
         return a.key.localeCompare(b.key);
       });
     }
+    const scope = JSON.stringify([AppServices.instance.auth.cacheAccountId, this.selectedDeviceId,
+      this.activeListTab, this.sortMode, this.searchOpen ? this.searchQuery : '']);
+    if (scope !== this.displayOrderScope) this.resetDisplayOrder(scope);
+    const byKey = new Map<string, TaskListEntry>();
+    for (const entry of next) byKey.set(entry.key, entry);
+    this.displayEntryKeys = stableTaskKeys(next.map((entry: TaskListEntry) => entry.key), this.displayEntryKeys);
+    const stable: TaskListEntry[] = [];
+    for (const key of this.displayEntryKeys) {
+      const entry = byKey.get(key);
+      if (entry !== undefined) stable.push(entry);
+    }
     this.devices = devices;
-    this.entries = next;
+    this.entries = stable;
+    const groups = this.projectGroupsFrom(stable);
+    this.displayProjectKeys = groups.map((group: TaskProjectGroup) => group.key);
     this.pruneResidentPanes();
     this.reconcileTaskSearchProjectKeys();
     this.collapseProjectGroupsOnce();
@@ -1114,6 +1139,7 @@ struct TaskListPage {
       this.sortMode = mode;
       this.sortMenuOpen = false;
     });
+    this.resetDisplayOrder();
     this.refreshProjection();
     this.persistPreferences();
   }
@@ -1700,6 +1726,10 @@ struct TaskListPage {
         if (outcomes[i]) loadedCount += 1;
       }
       const success = deviceSnapshotLoaded && (eligibleCount === 0 || loadedCount === eligibleCount);
+      if (visible && success) {
+        this.resetDisplayOrder();
+        this.refreshProjection();
+      }
       if (visible && !success) promptAction.showToast({ message: '部分任务刷新失败，请重试' });
       return success;
     } finally {
@@ -1980,6 +2010,16 @@ struct TaskListPage {
         }
         return a.key.localeCompare(b.key);
       });
+    }
+    if (this.displayProjectKeys.length > 0 && this.displayedProjectOrderMode() !== 'custom') {
+      const orderedKeys = stableTaskKeys(out.map((group: TaskProjectGroup) => group.key), this.displayProjectKeys);
+      const byKey = new Map<string, TaskProjectGroup>();
+      for (const group of out) byKey.set(group.key, group);
+      out.length = 0;
+      for (const key of orderedKeys) {
+        const group = byKey.get(key);
+        if (group !== undefined) out.push(group);
+      }
     }
     for (const group of out) {
       const alias = this.projectAlias(group.deviceId, group.workingDir);
