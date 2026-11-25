@@ -1,4 +1,6 @@
 import { describe, it, expect } from '@ohos/hypium';
+import { parseOrcaWorkers } from '../main/ets/core/tasks/OrcaCollaboration';
+import { parseTeammateRoster } from '../main/ets/core/tasks/TeammateRoster';
 import {
   parseMessage,
   parseSession,
@@ -138,6 +140,7 @@ import {
   effectiveTaskSafeWindow,
   handoffTaskSplitRouteSelection,
   isWideTaskLayout,
+  orcaLeadPaneWidth,
   taskDetailKeyboardInset,
   taskHeaderTitleInsets,
   taskWindowIsMultiWindow,
@@ -601,6 +604,23 @@ class ActiveSnapshotTestClient extends DlClient {
   }
 }
 
+class TeammateSessionTestClient extends DlClient {
+  constructor() {
+    super(new DlClientOptions());
+  }
+
+  invoke(_deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
+    if (options.channel === DlChannels.SESSIONS_GET) {
+      const session: Record<string, Object> = {};
+      session['id'] = 'main';
+      session['source'] = 'bot';
+      session['workingDir'] = '/buddy';
+      return Promise.resolve(successfulInvokeEnvelope(session));
+    }
+    return Promise.resolve(successfulInvokeEnvelope([]));
+  }
+}
+
 /** 旧 Desktop 搜索 channel 回退测试替身：明确返回错误码而不是拼在 message 中。 */
 class LegacyTaskSearchTestClient extends DlClient {
   channels: string[] = [];
@@ -686,6 +706,53 @@ function searchSession(
 }
 
 export default function localUnitTest() {
+  describe('teammateAndOrcaProjection', () => {
+    // Unit coverage for the host roster projection. A running phase must survive parsing even without generation details.
+    it('reads the partner conversation, read cursor and running phase from the host roster', 0, () => {
+      const rows = parseTeammateRoster(JSON.parse('{"items":[{"ref":{"collectionId":"teammates",'
+        + '"kind":"bot","id":"buddy"},"display":{"title":"Sora","lastReadAt":20,"lastReplyAt":20,'
+        + '"teammateActivity":{"phase":"running"}},"links":[{"rel":"conversation",'
+        + '"target":{"kind":"session","sessionId":"main"}}]}]}') as Object, 'desktop');
+      expect(rows.length).assertEqual(1);
+      expect(rows[0].session.id).assertEqual('main');
+      expect(rows[0].deviceId).assertEqual('desktop');
+      expect(rows[0].name).assertEqual('Sora');
+      expect(rows[0].readAt).assertEqual(20);
+      expect(rows[0].replyAt).assertEqual(20);
+      expect(rows[0].running).assertTrue();
+    });
+
+    // Unit regression for the production detail lookup after a normal task refresh.
+    // The private main conversation exists in GET and is intentionally absent from LIST.
+    it('keeps partner send metadata after a task list refresh and clears it on deletion', 0, async () => {
+      const tasks = new TaskStore();
+      tasks.attach(new TeammateSessionTestClient());
+      expect((await tasks.loadSession('desktop', 'main'))?.workingDir).assertEqual('/buddy');
+      expect(await tasks.loadSessions('desktop')).assertTrue();
+      expect(tasks.getSessions('desktop').length).assertEqual(0);
+      expect(tasks.findSessionById('main', 'desktop')?.workingDir).assertEqual('/buddy');
+      const patch: Record<string, Object> = {};
+      patch['status'] = 'deleted';
+      const payload: Record<string, Object> = {};
+      payload['sessionId'] = 'main';
+      payload['patch'] = patch;
+      tasks.handleSessionsPush('desktop', DlChannels.SESSIONS_PATCHED, payload);
+      expect(tasks.findSessionById('main', 'desktop') === undefined).assertTrue();
+    });
+
+    it('opens the real remote Worker task and drops a malformed remote target', 0, () => {
+      const rows = parseOrcaWorkers(JSON.parse('[{"id":"remote","sessionId":"proxy","executionDevice":'
+        + '{"deviceId":"runner","remoteSessionId":"actual","reachable":false}},'
+        + '{"id":"local","sessionId":"local-task"},'
+        + '{"id":"invalid","sessionId":"bad","executionDevice":{"deviceId":"runner"}}]') as Object,
+        'lead-computer');
+      expect(rows.length).assertEqual(2);
+      expect(rows[0].deviceId).assertEqual('runner');
+      expect(rows[0].sessionId).assertEqual('actual');
+      expect(rows[0].reachable).assertFalse();
+      expect(rows[1].deviceId).assertEqual('lead-computer');
+    });
+  });
   describe('taskSearchAlignment', () => {
     it('normalizesWorktreesAndKeepsProjectKeysDeviceScoped', 0, () => {
       expect(normalizeTaskSearchWorkingDir('/repo/.cindy-worktrees/feature-a'))
@@ -4892,6 +4959,14 @@ export default function localUnitTest() {
       expect(store.getState('same-goal-session', 'desktop-a')?.status).assertEqual('active');
       expect(store.getState('same-goal-session', 'desktop-b')?.status).assertEqual('paused');
       expect(store.getState('same-goal-session', 'desktop-a')?.objective).assertEqual('来自 A');
+    });
+
+    // Unit. The existing list/detail geometry does not protect the separate Lead/Worker divider.
+    // A drag to either edge must preserve both readable panes, including at the smallest split width.
+    it('clamps the worker divider so either drag direction leaves both panes visible', 0, () => {
+      expect(orcaLeadPaneWidth(800, 0.6)).assertEqual(476);
+      expect(orcaLeadPaneWidth(800, 0.2)).assertEqual(324);
+      expect(orcaLeadPaneWidth(648, 0.8)).assertEqual(324);
     });
 
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {

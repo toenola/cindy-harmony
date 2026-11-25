@@ -14,6 +14,13 @@ export const TASK_SPLIT_DIVIDER_WIDTH = 20;
 export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
 export const TASK_SPLIT_MIN_DETAIL_WIDTH = 400;
 export const TASK_SPLIT_MAX_LIST_WIDTH = 420;
+const ORCA_MIN_PANE_WIDTH = 324;
+export const ORCA_DETAIL_MIN_WIDTH = ORCA_MIN_PANE_WIDTH * 2;
+
+export function orcaLeadPaneWidth(width: number, fraction: number): number {
+  if (width < ORCA_DETAIL_MIN_WIDTH) return Math.max(0, width);
+  return Math.round(Math.min(width - ORCA_MIN_PANE_WIDTH, Math.max(ORCA_MIN_PANE_WIDTH, width * fraction)));
+}
 /** `window.WindowStatusType` 中的悬浮窗与分屏取值。 */
 export const TASK_WINDOW_STATUS_FLOATING = 4;
 export const TASK_WINDOW_STATUS_SPLIT_SCREEN = 5;

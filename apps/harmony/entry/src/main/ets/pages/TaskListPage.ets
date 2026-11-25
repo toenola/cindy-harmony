@@ -1,3 +1,5 @@
+import { TeammateAvatar } from '../components/TeammateAvatar';
+import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachineIdentity';
 import { deviceDisplayName } from '../core/tasks/DeviceDisplayName';
 /**
@@ -64,7 +66,8 @@ import {
   TASK_LIST_RECONCILE_INTERVAL_MS,
   TaskListReconcileBackoff,
 } from '../core/tasks/TaskListReconcilePolicy';
-import { TaskPageContent } from './TaskPage';
+import { OrcaTaskDetail } from './TaskPage';
+import { ORCA_DETAIL_MIN_WIDTH } from './TaskSplitLayout';
 import {
   ResidentTaskPane, rememberResidentTaskPane, residentPaneSurvives, residentTaskPaneKey,
 } from '../core/tasks/ResidentTaskPanes';
@@ -197,6 +200,11 @@ struct TaskListPage {
   @State bulkMode: boolean = false;
   @State selectedEntryKeys: string[] = [];
   // 置顶和单个项目组每次打开应用默认收起；手动展开状态只在本页面存活期间保留。
+  @State teammateRoster: TeammateRosterEntry[] = [];
+  private residentBackHandlers: Map<string, () => boolean> = new Map();
+  private rosterReadInFlight: Map<string, boolean> = new Map();
+  private teammateOpenRevision: number = 0;
+  private rosterTimers: Map<string, number> = new Map();
   @State pinnedCollapsed: boolean = true;
   @State collapsedProjectKeys: string[] = [];
   @State expandedProjectKeys: string[] = [];
@@ -310,6 +318,7 @@ struct TaskListPage {
     this.hydratePreferences();
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
+    if (this.activeListTab === 'dialogues') this.refreshTeammates();
     // KeyboardAvoidMode 是 UIContext 级状态；从新建页等单栏页面返回时，
     // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
     this.updateKeyboardAvoidance();
@@ -317,6 +326,9 @@ struct TaskListPage {
 
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshProjection();
+    }));
+    this.unsubs.push(AppServices.instance.teammateRoster.onChanged((device: string): void => {
+      if (this.activeListTab === 'dialogues') this.scheduleTeammateRead(device);
     }));
     this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => this.refreshProjection()));
     this.unsubs.push(AppServices.instance.auth.onChanged(() => {
@@ -341,6 +353,7 @@ struct TaskListPage {
       this.connectionStatus = status;
       if (status === 'online') {
         if (this.selectedDeviceId.length > 0) void this.refreshProjectOrderForScope();
+        if (this.activeListTab === 'dialogues') this.refreshTeammates();
       } else {
         // 连接代次变化时，旧主机快照不能继续作为当前正本；页面暂时使用本机投影。
         this.projectOrderScopeGeneration += 1;
@@ -403,6 +416,7 @@ struct TaskListPage {
     this.projectOrderScopeGeneration += 1;
     this.projectOrderPendingKeys = [];
     this.projectOrderDraggingKey = '';
+    this.clearRosterTimers();
   }
 
   onBackPress(): boolean {
@@ -423,6 +437,10 @@ struct TaskListPage {
       this.updateKeyboardAvoidance();
       this.ensureWideSelection();
       return true;
+    }
+    if (this.splitLayoutEnabled()) {
+      const key = residentTaskPaneKey(this.residentAccountEpoch, this.selectedSessionDeviceId, this.selectedSessionId);
+      return this.residentBackHandlers.get(key)?.() ?? false;
     }
     return false;
   }
@@ -484,12 +502,13 @@ struct TaskListPage {
       const sessions = AppServices.instance.tasks.getSessions(device.deviceId);
       for (let sessionIndex = 0; sessionIndex < sessions.length; sessionIndex++) {
         const session = sessions[sessionIndex];
-        if (session.status === 'deleted' || session.orcaRole === 'worker') continue;
+        if (session.status === 'deleted') continue;
         const entry = new TaskListEntry();
         entry.key = `${device.deviceId}:${session.id}`;
         entry.deviceId = device.deviceId;
         entry.deviceName = this.displayDeviceName(device.deviceId, device.deviceName, devices);
         entry.session = session;
+        if (session.orcaRole === 'worker') continue;
         next.push(entry);
       }
     }
@@ -578,6 +597,11 @@ struct TaskListPage {
         return;
       }
       this.setSelectedTask(results[0].deviceId, results[0].session.id, results[0].contentMessageClientId);
+      return;
+    }
+    if (this.activeListTab === 'dialogues' && this.scopedTeammates().some((row: TeammateRosterEntry) =>
+      row.deviceId === this.selectedSessionDeviceId && row.session.id === this.selectedSessionId)) {
+      this.rememberSelectedTask();
       return;
     }
     const scoped = this.activeListEntries();
@@ -829,6 +853,8 @@ struct TaskListPage {
     const epoch = AppServices.instance.auth.sessionEpoch;
     if (epoch === this.residentAccountEpoch) return;
     this.residentAccountEpoch = epoch;
+    this.teammateRoster = [];
+    this.clearRosterTimers();
     this.residentPanes = [];
     this.residentSessionStatuses.clear();
     this.selectedSessionDeviceId = '';
@@ -909,6 +935,7 @@ struct TaskListPage {
   private setActiveListTab(tab: TaskListCategory): void {
     const index = this.listTabIndex(tab);
     this.activeListTab = tab;
+    if (tab === 'dialogues') this.refreshTeammates();
     if (!this.listTabsAppeared) {
       this.initialListTabIndex = index;
       return;
@@ -932,6 +959,7 @@ struct TaskListPage {
     const category = this.listTabCategory(index);
     if (category === this.activeListTab) return;
     this.activeListTab = category;
+    if (category === 'dialogues') this.refreshTeammates();
     const visibleCount = this.taskSearchActive()
       ? this.taskSearchResultsForCategory(category).length
       : this.scopedEntries().length;
@@ -1049,12 +1077,18 @@ struct TaskListPage {
   }
 
   private openSession(entry: TaskListEntry): void {
+    this.teammateOpenRevision += 1;
     if (this.bulkMode) {
       this.toggleBulkEntry(entry);
       return;
     }
     this.selectSession(entry);
-    if (this.splitLayoutEnabled()) return;
+    if (this.splitLayoutEnabled()) {
+      if (entry.session.orcaRole === 'lead' && this.detailPaneWidth() < ORCA_DETAIL_MIN_WIDTH) {
+        this.listPaneCollapsed = true;
+      }
+      return;
+    }
     router.pushUrl({
       url: 'pages/TaskPage',
       params: { deviceId: entry.deviceId, sessionId: entry.session.id },
@@ -1384,6 +1418,7 @@ struct TaskListPage {
       this.scopeMenuOpen = false;
     });
     void this.refreshProjectOrderForScope();
+    if (this.activeListTab === 'dialogues') this.refreshTeammates();
     this.ensureWideSelection();
     if (this.taskSearchActive()) this.scheduleTaskSearch();
     this.persistPreferences();
@@ -1730,6 +1765,7 @@ struct TaskListPage {
         this.resetDisplayOrder();
         this.refreshProjection();
       }
+      if (this.activeListTab === 'dialogues') this.refreshTeammates();
       if (visible && !success) promptAction.showToast({ message: '部分任务刷新失败，请重试' });
       return success;
     } finally {
@@ -1933,7 +1969,8 @@ struct TaskListPage {
     const scoped = this.scopedEntries();
     for (let i = 0; i < scoped.length; i++) {
       if (scoped[i].session.pinnedAt.length > 0
-        && taskListCategory(scoped[i].session) === category) {
+        && taskListCategory(scoped[i].session) === category
+        && (category !== 'dialogues' || !this.isTeammateConversation(scoped[i]))) {
         out.push(scoped[i]);
       }
     }
@@ -2032,7 +2069,9 @@ struct TaskListPage {
     const out: TaskListEntry[] = [];
     const entries = this.regularEntries();
     for (let i = 0; i < entries.length; i++) {
-      if (taskListCategory(entries[i].session) === 'dialogues') out.push(entries[i]);
+      if (taskListCategory(entries[i].session) === 'dialogues' && !this.isTeammateConversation(entries[i])) {
+        out.push(entries[i]);
+      }
     }
     return out;
   }
@@ -2312,7 +2351,7 @@ struct TaskListPage {
         }
         .clip(false)
         .tabBar(this.taskListTabBarStyle(
-          '对话',
+          this.v12String('v138_communication'),
           $r('sys.symbol.ellipsis_message'),
         ))
 
@@ -2420,6 +2459,120 @@ struct TaskListPage {
     .visibility(this.listPaneShown() ? Visibility.Visible : Visibility.None)
   }
 
+  private clearRosterTimers(): void {
+    this.rosterTimers.forEach((timer: number): void => { clearTimeout(timer); });
+    this.rosterTimers.clear();
+    this.rosterReadInFlight.forEach((_queued: boolean, device: string) => this.rosterReadInFlight.set(device, false));
+  }
+
+  private refreshTeammates(): void {
+    for (const device of AppServices.instance.tasks.deviceList) {
+      if (device.online && device.remoteControlEnabled) this.scheduleTeammateRead(device.deviceId);
+    }
+  }
+
+  private scheduleTeammateRead(device: string): void {
+    if (!this.pageActive || this.activeListTab !== 'dialogues' || this.connectionStatus !== 'online'
+      || (this.selectedDeviceId && this.selectedDeviceId !== device) || !this.teammateDeviceOnline(device)) return;
+    if (this.rosterReadInFlight.has(device)) {
+      this.rosterReadInFlight.set(device, true);
+      return;
+    }
+    if (this.rosterTimers.has(device)) return;
+    // Merge bursts over 250ms and keep one follow-up if the host changes during the read.
+    const timer = setTimeout(() => {
+      this.rosterTimers.delete(device);
+      void this.readTeammates(device);
+    }, 250);
+    this.rosterTimers.set(device, timer);
+  }
+
+  private async readTeammates(device: string): Promise<void> {
+    if (!this.pageActive || this.activeListTab !== 'dialogues' || this.connectionStatus !== 'online'
+      || (this.selectedDeviceId && this.selectedDeviceId !== device) || !this.teammateDeviceOnline(device)) return;
+    const services = AppServices.instance;
+    const epoch = services.auth.sessionEpoch;
+    const lifecycle = this.pageLifecycleGeneration;
+    this.rosterReadInFlight.set(device, false);
+    try {
+      const rows = await services.teammateRoster.list(device);
+      if (!this.pageActive || this.activeListTab !== 'dialogues' || lifecycle !== this.pageLifecycleGeneration
+        || epoch !== services.auth.sessionEpoch || this.connectionStatus !== 'online'
+        || !this.teammateDeviceOnline(device)) return;
+      this.teammateRoster = this.teammateRoster.filter((row: TeammateRosterEntry) => row.deviceId !== device).concat(rows);
+    } catch (_error) {
+      // Keep verified rows when a request is interrupted. Old hosts may lack the collection.
+    } finally {
+      const queued = this.rosterReadInFlight.get(device) === true;
+      this.rosterReadInFlight.delete(device);
+      if (queued) this.scheduleTeammateRead(device);
+    }
+  }
+
+  private teammateDeviceOnline(device: string): boolean {
+    return AppServices.instance.tasks.deviceList.some((entry: PresenceSnapshot) =>
+      entry.deviceId === device && entry.online && entry.remoteControlEnabled);
+  }
+
+  private scopedTeammates(): TeammateRosterEntry[] {
+    return this.teammateRoster.filter((row: TeammateRosterEntry) =>
+      (!this.selectedDeviceId || row.deviceId === this.selectedDeviceId)
+      && this.devices.some((device: PresenceSnapshot) => device.deviceId === row.deviceId && device.remoteControlEnabled))
+      .sort((a: TeammateRosterEntry, b: TeammateRosterEntry) => b.timestamp - a.timestamp || a.name.localeCompare(b.name));
+  }
+
+  private isTeammateConversation(entry: TaskListEntry): boolean {
+    return this.teammateRoster.some((row: TeammateRosterEntry) =>
+      row.deviceId === entry.deviceId && row.session.id === entry.session.id);
+  }
+
+  private teammateDeviceLabel(row: TeammateRosterEntry): string {
+    const device = this.devices.find((item: PresenceSnapshot) => item.deviceId === row.deviceId);
+    return this.displayDeviceName(row.deviceId, device?.deviceName ?? '');
+  }
+
+  private teammateAvatarOnline(row: TeammateRosterEntry): boolean {
+    return this.connectionStatus === 'online' && this.devices.some((device: PresenceSnapshot) =>
+      device.deviceId === row.deviceId && device.online && device.remoteControlEnabled);
+  }
+
+  private teammateRunning(row: TeammateRosterEntry): boolean {
+    return row.running && this.teammateAvatarOnline(row);
+  }
+
+  private teammateKey(row: TeammateRosterEntry): string {
+    return JSON.stringify([row.deviceId, row.id, row.session.id, row.name, row.preview,
+      row.avatarKind, row.avatarValue, row.avatarFallback,
+      row.replyAt > Math.max(0, row.readAt), this.teammateDeviceLabel(row), this.teammateRunning(row), this.teammateAvatarOnline(row)]);
+  }
+
+  private openTeammate(row: TeammateRosterEntry): void {
+    if (this.bulkMode) return;
+    const entry = new TaskListEntry();
+    entry.deviceId = row.deviceId;
+    entry.session = row.session;
+    entry.key = row.deviceId + ':' + row.session.id;
+    const epoch = AppServices.instance.auth.sessionEpoch;
+    const generation = this.pageLifecycleGeneration;
+    const revision = ++this.teammateOpenRevision;
+    void AppServices.instance.tasks.loadSession(row.deviceId, row.session.id, 'bot').then((session: RemoteSession | undefined) => {
+      if (!this.pageActive || epoch !== AppServices.instance.auth.sessionEpoch || generation !== this.pageLifecycleGeneration
+        || revision !== this.teammateOpenRevision || this.bulkMode || this.activeListTab !== 'dialogues'
+        || !this.scopedTeammates().some((item: TeammateRosterEntry) =>
+          item.deviceId === row.deviceId && item.id === row.id && item.session.id === row.session.id)) return;
+      if (session !== undefined) entry.session = session;
+      else if (this.teammateDeviceOnline(row.deviceId)) {
+        promptAction.showToast({ message: this.v12String('v138_open_failed') });
+        return;
+      }
+      AppServices.instance.teammateRoster.expectVisible(row);
+      if (this.entrySelected(entry)) {
+        AppServices.instance.teammateRoster.noteVisible(row.deviceId, row.session.id);
+      }
+      this.openSession(entry);
+    });
+  }
+
   @Builder
   taskListTabPage(category: TaskListCategory) {
     Column() {
@@ -2431,7 +2584,7 @@ struct TaskListPage {
         } else {
           this.buildTaskSearchEntries(category)
         }
-      } else if (this.scopedEntries().length === 0) {
+      } else if (category !== 'dialogues' && this.scopedEntries().length === 0) {
         this.buildTaskListEmpty()
       } else {
         this.buildTaskListEntries(category)
@@ -2524,8 +2677,13 @@ struct TaskListPage {
       }
       ForEach(this.residentPanes, (pane: ResidentTaskPane) => {
         // 定位目标与版本号从父级 @State 读取：同 key 复用实例时，替换 pane 对象不会重新执行这里。
-        TaskPageContent({
+        OrcaTaskDetail({
+          registerBack: (handler: (() => boolean) | undefined): void => {
+            if (handler) this.residentBackHandlers.set(pane.key, handler);
+            else this.residentBackHandlers.delete(pane.key);
+          },
           paneDeviceId: pane.deviceId,
+          allowSideBySide: !this.safeWindowMultiWindow,
           paneSessionId: pane.sessionId,
           paneMessageClientId: this.paneSelected(pane) ? this.selectedMessageClientId : '',
           paneMessageRevision: this.paneSelected(pane) ? this.selectedMessageRevision : 0,
@@ -2590,17 +2748,9 @@ struct TaskListPage {
         this.openDeviceScopeMenu();
       })
 
-      this.headerSymbolButton(
-        $r('sys.symbol.slider_horizontal_2'),
-        () => this.openSortMenu(),
-        '排序',
-      )
+      this.headerSymbolButton($r('sys.symbol.slider_horizontal_2'), () => this.openSortMenu(), this.v12String('v138_sort'))
       this.refreshHeaderButton()
-      this.headerSymbolButton(
-        $r('sys.symbol.magnifyingglass'),
-        () => this.toggleSearch(),
-        '搜索',
-      )
+      this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch(), this.v12String('v138_search'))
       this.headerSymbolButton(
         $r('sys.symbol.gearshape'),
         () => this.openSettings(),
@@ -2777,10 +2927,76 @@ struct TaskListPage {
   }
 
   @Builder
+  communicationSectionTitle(title: string) {
+    Text(title)
+      .fontSize(13)
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('app.color.text_secondary'))
+      .width('100%')
+      .padding({ left: LIST_INSET + 14, right: LIST_INSET + 14, top: 14, bottom: 6 })
+  }
+
+  @Builder
+  teammateRow(row: TeammateRosterEntry) {
+    Row({ space: 10 }) {
+      TeammateAvatar({ teammate: row, online: this.teammateAvatarOnline(row), size: 44 })
+      Column({ space: 4 }) {
+        Text(row.name)
+          .fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.teammateDeviceLabel(row))
+          .fontSize(12).fontColor($r('app.color.text_secondary'))
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.teammateRunning(row)) {
+          Row({ space: 5 }) {
+            LoadingProgress().width(13).height(13).color($r('app.color.text_secondary'))
+            Text($r('app.string.teammate_activity_running')).fontSize(12).fontColor($r('app.color.text_secondary'))
+          }
+        } else if (row.preview.length > 0) {
+          Text(row.preview).fontSize(12).fontColor($r('app.color.text_secondary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      if (row.replyAt > Math.max(0, row.readAt)) {
+        Circle().width(8).height(8).fill($r('app.color.accent')).accessibilityText(this.v12String('v138_unread'))
+      }
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(12)
+        .fontColor([$r('app.color.text_tertiary')])
+    }
+    .constraintSize({ minHeight: 56 })
+    .padding({ left: 14, right: 14, top: 9, bottom: 9 })
+    .margin({ left: LIST_INSET, right: LIST_INSET, bottom: 2 })
+    .backgroundColor(this.selectedSessionDeviceId === row.deviceId && this.selectedSessionId === row.session.id
+      && this.splitLayoutEnabled() ? $r('app.color.bg_chip') : Color.Transparent)
+    .borderRadius(UI_RADIUS_CONTAINER)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .onClick(() => this.openTeammate(row))
+  }
+
+  @Builder
   buildTaskListEntries(category: TaskListCategory) {
     // 滑动只负责露出操作按钮；不要配置 actionAreaDistance / onAction，
     // 避免长距离滑动松手时直接置顶或归档，所有操作都必须由按钮点击触发。
     List({ scroller: this.scrollerForCategory(category) }) {
+      if (category === 'dialogues') {
+        ListItem() { this.communicationSectionTitle(this.v12String('v138_teammates')) }
+        if (this.scopedTeammates().length === 0) {
+          ListItem() {
+            Text(this.v12String('v138_no_teammates'))
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+              .padding({ left: LIST_INSET + 14, right: LIST_INSET + 14, top: 8, bottom: 12 })
+          }
+        }
+        ForEach(this.scopedTeammates(), (row: TeammateRosterEntry) => {
+          ListItem() { this.teammateRow(row) }
+        }, (row: TeammateRosterEntry) => this.teammateKey(row))
+        ListItem() { this.communicationSectionTitle(this.v12String('v138_chats')) }
+      }
       if (this.pinnedEntries(category).length > 0) {
         ListItem() {
           this.sectionHeader(

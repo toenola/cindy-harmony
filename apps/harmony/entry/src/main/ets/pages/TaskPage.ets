@@ -1,3 +1,8 @@
+import { TeammateAvatar } from '../components/TeammateAvatar';
+import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
+import { TeammateSettingsPanel } from '../components/TeammateSettingsPanel';
+import { OrcaWorker } from '../core/tasks/OrcaCollaboration';
+import { ORCA_DETAIL_MIN_WIDTH, orcaLeadPaneWidth } from './TaskSplitLayout';
 import { providerCatalogUnavailable } from '../core/ComposerCatalog';
 /**
  * 任务详情页：按渲染模型展示消息流 + Composer。
@@ -12,7 +17,7 @@ import { providerCatalogUnavailable } from '../core/ComposerCatalog';
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { KeyboardAvoidMode, LengthMetrics, router, promptAction, window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, LengthMetrics, router, promptAction, window, display } from '@kit.ArkUI';
 import { LevelMode } from '@kit.ArkUI';
 import {
   BlurStrategy,
@@ -546,6 +551,11 @@ export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
+  @Prop collabLabel: string = '';
+  @Prop collabRole: string = '';
+  @Prop standaloneDetail: boolean = false;
+  onCollab: () => void = (): void => {};
+  onDetailBack: (() => void) | undefined = undefined;
   @Prop @Watch('onPaneMessageChanged') paneMessageClientId: string = '';
   /** 父页面每次选择任务递增；同一条消息再次选择时也要重新定位。 */
   @Prop @Watch('onPaneMessageChanged') paneMessageRevision: number = 0;
@@ -566,6 +576,8 @@ export struct TaskPageContent {
    */
   @Prop paneKeyboardInset: number = 0;
   @State items: RenderItem[] = [];
+  @State private teammate: TeammateRosterEntry | undefined = undefined;
+  @State private teammateOnline: boolean = false;
   private messageDataSource: RenderItemDataSource = new RenderItemDataSource();
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
@@ -1177,8 +1189,18 @@ export struct TaskPageContent {
     this.sentMessageChipCache.clear();
     this.sentInlineTokenSeq = -1;
     this.syncMessagePresentationSources();
-    this.unsubs.push(AppServices.instance.onStatus(() => this.syncMessagePresentationSources()));
-    this.unsubs.push(AppServices.instance.auth.onChanged(() => this.syncMessagePresentationSources()));
+    this.syncTeammate();
+    this.unsubs.push(AppServices.instance.onStatus(() => {
+      this.syncMessagePresentationSources();
+      this.syncTeammate();
+    }));
+    this.unsubs.push(AppServices.instance.auth.onChanged(() => {
+      this.syncMessagePresentationSources();
+      this.syncTeammate();
+    }));
+    this.unsubs.push(AppServices.instance.teammateRoster.onSnapshotChanged((device: string) => {
+      if (device === this.deviceId) this.syncTeammate();
+    }));
 
     this.unsubs.push(AppServices.instance.messages.onChanged(() => {
       this.scheduleItemsRefresh();
@@ -1205,6 +1227,7 @@ export struct TaskPageContent {
 
     // 撤权检查：设备关闭远程控制时只读。
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
+      this.syncTeammate();
       this.syncMessagePresentationSources();
       this.deviceDisabled = this.checkDeviceDisabled();
       this.syncMessageCount();
@@ -1499,6 +1522,9 @@ export struct TaskPageContent {
       this.loadFailed = !loaded || AppServices.instance.messages.loadFailed(this.sessionId, this.deviceId);
       this.refreshItems();
       if (loaded) {
+        if (!this.loadFailed && this.paneActive && this.paneAccountEpoch === AppServices.instance.auth.sessionEpoch) {
+          AppServices.instance.teammateRoster.noteVisible(this.deviceId, this.sessionId);
+        }
         if (this.routeMessageClientId.length > 0) this.focusMessageTarget();
         else this.scrollToBottomOnce();
       }
@@ -1517,7 +1543,7 @@ export struct TaskPageContent {
   }
 
   private isEmbedded(): boolean {
-    return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
+    return !this.standaloneDetail && this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
   }
 
   private handleMessageAreaChange(_oldArea: Area, newArea: Area): void {
@@ -1535,13 +1561,8 @@ export struct TaskPageContent {
   }
 
   private session(): RemoteSession | undefined {
-    const sessions = AppServices.instance.tasks.getSessions(this.deviceId);
-    for (let i = 0; i < sessions.length; i++) {
-      if (sessions[i].id === this.sessionId) {
-        return sessions[i];
-      }
-    }
-    return undefined;
+    if (this.deviceId.length === 0) return undefined;
+    return AppServices.instance.tasks.findSessionById(this.sessionId, this.deviceId);
   }
 
   /** 把任务列表的服务端消息总数交给分页 Store，供首窗落地前乐观推断。 */
@@ -2310,7 +2331,7 @@ export struct TaskPageContent {
   }
 
   private isEmbeddedDetailPane(): boolean {
-    return this.paneDeviceId.length > 0 && this.paneSessionId.length > 0;
+    return this.isEmbedded();
   }
 
   private closeContextSheet(): void {
@@ -5392,6 +5413,7 @@ export struct TaskPageContent {
     if (!this.initialLoadResolved && this.showInitialSync) return '正在同步';
     if (this.loadFailed) return '同步失败';
     if (this.pendingInteractions.length > 0) return `待处理 ${this.pendingInteractions.length}`;
+    if (this.collabRole.length > 0) return this.collabRole;
     if (this.sessionStreaming) return '运行中';
     return '';
   }
@@ -5582,7 +5604,8 @@ export struct TaskPageContent {
     this.collapseComposerSurface();
     setTimeout(() => {
       if (lifecycleGeneration !== this.pageLifecycleGeneration || !this.leavingDetailPage) return;
-      router.back();
+      if (this.onDetailBack !== undefined) this.onDetailBack();
+      else router.back();
     }, 0);
   }
 
@@ -5855,6 +5878,18 @@ export struct TaskPageContent {
           .padding({ left: 16, right: 16, top: 4 })
       }
 
+      if (!this.shareSelectionActive && this.collabLabel.length > 0) {
+        Button(this.collabLabel + '  ›')
+          .type(ButtonType.Normal)
+          .height(44)
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_CONTAINER)
+          .width('100%')
+          .margin({ bottom: 4 })
+          .onClick(() => this.onCollab())
+      }
       if (this.shareSelectionActive) {
         this.shareSelectionBar()
       } else if (this.deviceDisabled) {
@@ -6244,6 +6279,16 @@ export struct TaskPageContent {
 
   @Builder
   sessionActionLayer() {
+    if (this.isTeammateConversation()) {
+      TeammateSettingsPanel({ deviceId: this.deviceId, sessionId: this.sessionId, deviceDisabled: this.deviceDisabled })
+        .width(this.isEmbedded() ? 360 : 320)
+    } else {
+      this.ordinarySessionActionLayer()
+    }
+  }
+
+  @Builder
+  ordinarySessionActionLayer() {
     Scroll() {
       Column({ space: 8 }) {
           Row({ space: 10 }) {
@@ -6647,7 +6692,7 @@ export struct TaskPageContent {
     .clickEffect(UI_ICON_CLICK_EFFECT)
     .enabled(!this.isCreationBlockingRemoteOps())
     .opacity(this.isCreationBlockingRemoteOps() ? 0.4 : 1)
-    .accessibilityText('任务操作')
+    .accessibilityText(this.isTeammateConversation() ? this.v12String('v138_settings') : this.v12String('v138_task_actions'))
     .onClick(() => this.showSessionActions())
     .bindPopup(this.sessionActionOpen, {
       builder: this.sessionActionLayer,
@@ -6677,38 +6722,48 @@ export struct TaskPageContent {
   taskHeader() {
     // 标题单独一层并居中；按钮层叠在上方，左右两组各自贴边（D-015）。
     Stack() {
-      Column({ space: 1 }) {
-        Text(this.sessionTitle())
-          .fontSize(uiFontSize(16))
-          .lineHeight(uiLineHeight(22))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .textAlign(TextAlign.Center)
-          .width('100%')
-        if (this.headerNotice().length > 0) {
-          Text(this.headerNotice())
-            .fontSize(uiFontSize(11))
-            .lineHeight(uiLineHeight(16))
-            .fontColor(this.sessionStreaming
-              ? $r('app.color.chat_status_accent')
-              : $r('app.color.chat_text_secondary'))
+      Row({ space: 8 }) {
+        if (this.teammate !== undefined) {
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 36 })
+        }
+        Column({ space: 1 }) {
+          Text(this.sessionTitle())
+            .fontSize(uiFontSize(16))
+            .lineHeight(uiLineHeight(22))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .textAlign(TextAlign.Center)
+            .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
             .width('100%')
+          if (this.headerNotice().length > 0) {
+            Text(this.headerNotice())
+              .fontSize(uiFontSize(11))
+              .lineHeight(uiLineHeight(16))
+              .fontColor(this.sessionStreaming
+                ? $r('app.color.chat_status_accent')
+                : $r('app.color.chat_text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
+              .width('100%')
+          }
         }
+        .layoutWeight(1)
       }
       .width('100%')
       .height('100%')
-      .justifyContent(FlexAlign.Center)
-      .alignItems(HorizontalAlign.Center)
+      .alignItems(VerticalAlign.Center)
       .padding(this.headerTitlePadding())
 
       Row() {
         Row() {
-          if (!this.isEmbedded()) {
+          if (this.onDetailBack !== undefined) {
+            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => {
+              this.collapseComposerSurface();
+              this.onDetailBack?.();
+            })
+          } else if (!this.isEmbedded()) {
             this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => this.leaveDetailPage())
           } else if (this.onTogglePaneList !== undefined) {
             this.paneListToggleButton()
@@ -7531,6 +7586,17 @@ export struct TaskPageContent {
           .width('calc(100% - 24vp)')
           .alignSelf(ItemAlign.Center)
       }
+      if (this.teammate !== undefined && this.sessionStreaming && this.pendingInteractions.length === 0
+        && !this.items.some((item: RenderItem) =>
+          item.type === 'work_group' && (item as RenderWorkGroupItem).isStreaming)) {
+        Row({ space: 8 }) {
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 28 })
+          LoadingProgress().width(12).height(12).color($r('app.color.text_tertiary'))
+          Text($r('app.string.v138_teammate_thinking'))
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.chat_text_secondary'))
+        }
+        .width('100%').padding({ left: 12, right: 12, top: 4, bottom: 4 })
+      }
       ConversationComposer({
         input: this.input,
         focused: this.composerFocused,
@@ -7564,7 +7630,7 @@ export struct TaskPageContent {
         agentPopupVisible: this.composerAgentPopupOpen,
         modelPopupVisible: this.composerModelPopupOpen,
         showAddButton: true,
-        showStreamingStatus: true,
+        showStreamingStatus: this.teammate === undefined,
         floatingGlass: true,
         maxContentWidth: CHAT_COMPOSER_MAX_WIDTH,
         compactToolbar: true,
@@ -9014,6 +9080,10 @@ export struct TaskPageContent {
   workGroupBlock(item: RenderWorkGroupItem) {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
+        if (this.teammate !== undefined) {
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 28 })
+        }
+
         if (item.isStreaming) {
           LoadingProgress()
             .width(14)
@@ -12367,13 +12437,26 @@ export struct TaskPageContent {
     });
   }
 
+  private syncTeammate(): void {
+    const services = AppServices.instance;
+    const current = this.paneAccountEpoch === services.auth.sessionEpoch;
+    this.teammate = current ? services.teammateRoster.findConversation(this.deviceId, this.sessionId) : undefined;
+    this.teammateOnline = current && services.client.getStatus() === 'online'
+      && services.tasks.deviceList.some((device: PresenceSnapshot) =>
+        device.deviceId === this.deviceId && device.online && device.remoteControlEnabled);
+  }
+
+  private isTeammateConversation(): boolean {
+    return this.teammate !== undefined;
+  }
+
   private showSessionActions(): void {
     if (this.isCreationBlockingRemoteOps()) return;
     this.sessionRenameDraft = this.sessionTitle();
     this.sessionActionInfoMode = false;
     this.sessionActionProjectMode = false;
     this.sessionRenameMode = false;
-    void this.loadAccountUsage();
+    if (!this.isTeammateConversation()) void this.loadAccountUsage();
     uiAnimateState(this.getUIContext(), () => {
       this.sessionActionOpen = true;
     });
@@ -13995,6 +14078,10 @@ export struct TaskPageContent {
 struct TaskPage {
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
+  @State routeDevice: string = '';
+  @State routeSession: string = '';
+  @State routeMessage: string = '';
+  private collabBack: (() => boolean) | undefined = undefined;
   @State safeWindowWidth: number = 0;
   @State safeWindowHeight: number = 0;
   /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
@@ -14025,6 +14112,10 @@ struct TaskPage {
 
   aboutToAppear(): void {
     this.pageActive = true;
+    const params = recordOrEmpty(router.getParams());
+    this.routeDevice = readStr(params, 'deviceId');
+    this.routeSession = readStr(params, 'sessionId');
+    this.routeMessage = readStr(params, 'message');
     this.splitNavigationPending = false;
     this.keyboardHeight = 0;
     // 单页详情显式缩小内容可用高度；不能依赖 HdsNavigation 内层对全局 OFFSET 的响应。
@@ -14135,19 +14226,421 @@ struct TaskPage {
     const deviceId = readStr(params, 'deviceId');
     const sessionId = readStr(params, 'sessionId');
     if (deviceId.length === 0 || sessionId.length === 0) return;
+    if (AppServices.instance.tasks.getSessions(deviceId).some((s: RemoteSession) =>
+      s.id === sessionId && s.orcaRole === 'lead')) return;
     this.splitNavigationPending = true;
     handoffTaskSplitRouteSelection(deviceId, sessionId, readStr(params, 'message'));
     router.back();
   }
 
+  onBackPress(): boolean {
+    return this.collabBack?.() ?? false;
+  }
+
   build() {
     Column() {
-      TaskPageContent({ paneKeyboardInset: this.keyboardHeight })
+      OrcaTaskDetail({
+        paneDeviceId: this.routeDevice, paneSessionId: this.routeSession, paneMessageClientId: this.routeMessage,
+        paneKeyboardInset: this.keyboardHeight, allowSideBySide: !this.safeWindowMultiWindow,
+        onBack: (): void => router.back(),
+        registerBack: (handler: (() => boolean) | undefined): void => { this.collabBack = handler; },
+      })
     }
     .width('100%')
     .height('100%')
     .onAreaChange((oldArea: Area, newArea: Area) => {
       this.handleAreaChange(oldArea, newArea);
+    })
+  }
+}
+
+/** Both layouts use the same task content and host-owned Worker identities. */
+@Component
+export struct OrcaTaskDetail {
+  @Prop paneDeviceId: string = '';
+  @Prop paneSessionId: string = '';
+  @Prop paneMessageClientId: string = '';
+  @Prop paneMessageRevision: number = 0;
+  @Prop @Watch('activationChanged') paneActive: boolean = true;
+  @Prop paneListCollapsed: boolean = false;
+  @Prop paneComposerBottomInset: number = 16;
+  @Prop paneKeyboardInset: number = 0;
+  @Prop allowSideBySide: boolean = false;
+  onTogglePaneList: (() => void) | undefined = undefined;
+  onBack: (() => void) | undefined = undefined;
+  registerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
+  @State role: string = '';
+  @State workers: OrcaWorker[] = [];
+  @State selected: OrcaWorker[] = [];
+  @State listOpen: boolean = false;
+  @State loadState: string = '';
+  @State widthVp: number = 0;
+  @State folded: boolean = false;
+  @State workerPaneCollapsed: boolean = false;
+  @State leadPaneFraction: number = 0.5;
+  private dividerStartX: number = 0;
+  private dividerStartWidth: number = 0;
+  private dividerDragging: boolean = false;
+  private foldListening: boolean = false;
+  private foldChanged: (state: display.FoldStatus) => void = (state: display.FoldStatus): void => {
+    this.folded = state === display.FoldStatus.FOLD_STATUS_FOLDED;
+  };
+  private mounted: boolean = false;
+  private epoch: number = -1;
+  private readGeneration: number = 0;
+  private workerReadActive: boolean = false;
+  private workerReadQueued: boolean = false;
+  @State private workersNeedingInteraction: string[] = [];
+  private detachTasks: (() => void) | undefined = undefined;
+  private detachWorkers: (() => void) | undefined = undefined;
+  private detachStatus: (() => void) | undefined = undefined;
+  private detachAuth: (() => void) | undefined = undefined;
+
+  aboutToAppear(): void {
+    this.mounted = true;
+    const services = AppServices.instance;
+    this.epoch = services.auth.sessionEpoch;
+    this.detachTasks = services.tasks.onChanged(() => {
+      this.updateRole();
+      this.syncWorkerActivity();
+    });
+    this.detachAuth = services.auth.onChanged(() => this.updateRole());
+    this.detachWorkers = services.orca.onChanged((device: string, lead: string): void => {
+      if (device === this.paneDeviceId && lead === this.paneSessionId) {
+        const selected = services.orca.selection(device, lead);
+        if (selected && this.selected[0] !== selected) {
+          this.selected = [selected];
+          this.workerPaneCollapsed = false;
+        }
+        void this.refreshWorkers();
+      }
+    });
+    this.detachStatus = services.onStatus((status: string): void => {
+      if (status === 'online') void this.refreshWorkers();
+      else if (status === 'stopped') this.updateRole();
+    });
+    if (display.isFoldable()) {
+      try {
+        this.foldChanged(display.getFoldStatus());
+        display.on('foldStatusChange', this.foldChanged);
+        this.foldListening = true;
+      } catch (_error) {
+        // Window width still controls the layout when fold status is unavailable.
+      }
+    }
+    this.registerBack?.((): boolean => this.returnToLead());
+    this.updateRole();
+  }
+
+  aboutToDisappear(): void {
+    this.mounted = false;
+    this.readGeneration += 1;
+    this.detachTasks?.();
+    this.detachWorkers?.();
+    this.detachStatus?.();
+    this.detachAuth?.();
+    if (this.foldListening) {
+      display.off('foldStatusChange', this.foldChanged);
+      this.foldListening = false;
+    }
+    this.registerBack?.(undefined);
+  }
+
+  private activationChanged(): void {
+    if (!this.mounted) return;
+    if (!this.paneActive) {
+      this.readGeneration += 1;
+      this.listOpen = false;
+    } else if (!this.updateRole()) {
+      void this.refreshWorkers();
+    }
+  }
+
+  private updateRole(): boolean {
+    const services = AppServices.instance;
+    const current = this.epoch === services.auth.sessionEpoch
+      ? services.tasks.getSessions(this.paneDeviceId).find((s: RemoteSession) => s.id === this.paneSessionId)
+      : undefined;
+    const nextRole = current?.orcaRole ?? '';
+    if (nextRole === this.role) return false;
+    this.role = nextRole;
+    this.workerPaneCollapsed = false;
+    this.readGeneration += 1;
+    this.workers = [];
+    this.loadState = '';
+    this.listOpen = false;
+    const worker = nextRole === 'lead' ? services.orca.selection(this.paneDeviceId, this.paneSessionId) : undefined;
+    this.selected = worker ? [worker] : [];
+    if (nextRole === 'lead') void this.refreshWorkers();
+    return true;
+  }
+
+  private async refreshWorkers(): Promise<void> {
+    if (!this.mounted || !this.paneActive || this.role !== 'lead') return;
+    if (this.workerReadActive) {
+      this.workerReadQueued = true;
+      return;
+    }
+    this.workerReadActive = true;
+    const generation = ++this.readGeneration;
+    this.loadState = 'loading';
+    const services = AppServices.instance;
+    try {
+      const workers = await services.orca.list(this.paneDeviceId, this.paneSessionId, this.epoch);
+      if (generation !== this.readGeneration || this.epoch !== services.auth.sessionEpoch) return;
+      this.workers = workers;
+      this.syncWorkerActivity();
+      this.loadState = 'ready';
+      if (this.selected.length > 0) {
+        const current = workers.find((w: OrcaWorker) => w.id === this.selected[0].id
+          || (w.deviceId === this.selected[0].deviceId && w.sessionId === this.selected[0].sessionId));
+        this.selected = current ? [current] : [];
+        services.orca.select(this.paneDeviceId, this.paneSessionId, current);
+      }
+    } catch (_error) {
+      if (generation === this.readGeneration && this.epoch === services.auth.sessionEpoch) this.loadState = 'error';
+    } finally {
+      this.workerReadActive = false;
+      if (this.workerReadQueued) {
+        this.workerReadQueued = false;
+        void this.refreshWorkers();
+      }
+    }
+  }
+
+  private supportsSideBySide(): boolean {
+    return this.role === 'lead' && !this.folded && this.allowSideBySide && this.widthVp >= ORCA_DETAIL_MIN_WIDTH;
+  }
+
+  private sideBySide(): boolean {
+    return this.supportsSideBySide() && !this.workerPaneCollapsed;
+  }
+
+  private workerVisible(): boolean {
+    return this.sideBySide() || (!this.workerPaneCollapsed && this.selected.length > 0);
+  }
+
+  private leadVisible(): boolean {
+    return this.sideBySide() || !this.workerVisible();
+  }
+
+  private leadPaneWidth(): number {
+    return orcaLeadPaneWidth(this.widthVp, this.leadPaneFraction);
+  }
+
+  private dragWorkerDivider(event: TouchEvent): void {
+    if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      this.dividerDragging = false;
+      return;
+    }
+    if (!this.sideBySide() || event.changedTouches.length === 0) return;
+    const x = event.changedTouches[0].displayX;
+    if (event.type === TouchType.Down) {
+      this.dividerStartX = x;
+      this.dividerStartWidth = this.leadPaneWidth();
+      this.dividerDragging = true;
+    } else if (event.type === TouchType.Move && this.dividerDragging) {
+      const width = orcaLeadPaneWidth(this.widthVp, (this.dividerStartWidth + x - this.dividerStartX) / this.widthVp);
+      this.leadPaneFraction = width / this.widthVp;
+    }
+  }
+
+  private collapseWorkerPane(): void {
+    this.getUIContext().getFocusController().clearFocus();
+    this.dividerDragging = false;
+    this.listOpen = false;
+    this.workerPaneCollapsed = true;
+  }
+
+  private returnToLead(): boolean {
+    if (!this.sideBySide() && this.listOpen) {
+      this.listOpen = false;
+      return true;
+    }
+    if (this.selected.length === 0) return false;
+    this.selected = [];
+    AppServices.instance.orca.select(this.paneDeviceId, this.paneSessionId, undefined);
+    return true;
+  }
+
+  private selectWorker(worker: OrcaWorker): void {
+    this.getUIContext().getFocusController().clearFocus();
+    this.workerPaneCollapsed = false;
+    this.selected = [worker];
+    AppServices.instance.orca.select(this.paneDeviceId, this.paneSessionId, worker);
+    if (!this.sideBySide()) this.listOpen = false;
+  }
+
+  private openWorkers(): void {
+    if (this.role !== 'lead') return;
+    this.getUIContext().getFocusController().clearFocus();
+    if (this.supportsSideBySide() && this.workerPaneCollapsed) {
+      this.workerPaneCollapsed = false;
+      return;
+    }
+    this.listOpen = !this.listOpen;
+    if (this.listOpen && this.loadState !== 'loading') void this.refreshWorkers();
+  }
+
+  @Builder
+  workerPaneButton(label: string, action: () => void) {
+    Button(label).type(ButtonType.Normal).height(44).fontSize(uiFontSize(13))
+      .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_PILL).onClick(action)
+  }
+
+  private label(name: string, ...args: Array<string | number>): string {
+    return harmonyV12String(this.getUIContext().getHostContext(), name, ...args);
+  }
+
+  private summary(): string {
+    if (this.loadState === 'loading' && this.workers.length === 0) return this.label('v138_workers_loading');
+    if (this.loadState === 'error' && this.workers.length === 0) return this.label('v138_workers_error');
+    const running = this.workers.filter((worker: OrcaWorker) => worker.status === 'running').length;
+    return this.label('v138_workers_summary', this.workers.length, running);
+  }
+
+  private syncWorkerActivity(): void {
+    const pending = this.workers.filter((worker: OrcaWorker) =>
+      AppServices.instance.tasks.getLiveActivity(worker.sessionId, worker.deviceId)?.phase === 'needs-interaction')
+      .map((worker: OrcaWorker) => worker.id);
+    if (pending.length !== this.workersNeedingInteraction.length
+      || pending.some((id: string, index: number) => id !== this.workersNeedingInteraction[index])) {
+      this.workersNeedingInteraction = pending;
+    }
+  }
+
+  private workerStatus(worker: OrcaWorker): string {
+    if (!worker.reachable) return this.label('v138_offline');
+    if (this.workersNeedingInteraction.includes(worker.id)) return this.label('v138_needs_interaction');
+    if (worker.status === 'running') return this.label('teammate_activity_running');
+    if (worker.status === 'done') return this.label('v138_done');
+    if (worker.status === 'error') return this.label('v138_error');
+    return this.label('v138_idle');
+  }
+
+  @Builder
+  workerList() {
+    Column({ space: 8 }) {
+      Text(this.summary()).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+      if (this.loadState === 'error') {
+        Button(this.label('v138_workers_retry')).height(44).fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_chip')).onClick(() => void this.refreshWorkers())
+      } else if (this.loadState === 'ready' && this.workers.length === 0) {
+        Text(this.label('v138_workers_empty')).fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
+      }
+      Scroll() {
+        Column({ space: 4 }) {
+          ForEach(this.workers, (worker: OrcaWorker) => {
+            Button() {
+              Row({ space: 8 }) {
+                Column({ space: 2 }) {
+                  Text(worker.name).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+                  if (worker.model.length > 0) {
+                    Text(worker.model).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+                  }
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                Text(this.workerStatus(worker)).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+                SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(13).fontColor([$r('app.color.text_secondary')])
+              }.width('100%')
+            }
+            .type(ButtonType.Normal)
+            .width('100%')
+            .constraintSize({ minHeight: 52 })
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+            .backgroundColor($r('app.color.bg_chip'))
+            .borderRadius(UI_RADIUS_CONTAINER)
+            .onClick(() => this.selectWorker(worker))
+          }, (worker: OrcaWorker) => JSON.stringify([worker.id, worker.deviceId, worker.sessionId, worker.name,
+            worker.model, this.workerStatus(worker)]))
+        }.width('100%')
+      }.layoutWeight(1).width('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(12)
+    .backgroundColor($r('app.color.bg_page'))
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.TopStart }) {
+    Row() {
+      TaskPageContent({
+        paneDeviceId: this.paneDeviceId, paneSessionId: this.paneSessionId,
+        paneMessageClientId: this.paneMessageClientId, paneMessageRevision: this.paneMessageRevision,
+        paneActive: this.paneActive && this.leadVisible(),
+        paneListCollapsed: this.paneListCollapsed, onTogglePaneList: this.onTogglePaneList,
+        standaloneDetail: this.onBack !== undefined && !this.sideBySide(),
+        onDetailBack: this.onBack,
+        paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
+        collabRole: this.role === 'lead' ? this.label('v138_lead') : (this.role === 'worker' ? this.label('v138_worker') : ''),
+        collabLabel: this.role === 'lead' ? (this.workerPaneCollapsed ? this.label('v138_expand') : this.summary()) : '',
+        onCollab: (): void => this.openWorkers(),
+      })
+        .width(this.sideBySide() ? this.leadPaneWidth() : '100%')
+        .height('100%')
+        .visibility(this.leadVisible() ? Visibility.Visible : Visibility.None)
+      if (this.sideBySide() || this.selected.length > 0) {
+        Column() {
+          if (this.sideBySide()) {
+            Row() {
+              Text(this.label('v138_collaboration')).fontSize(uiFontSize(14)).fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary')).layoutWeight(1)
+              this.workerPaneButton(this.label('v138_collapse'), () => this.collapseWorkerPane())
+            }.width('100%').padding({ left: 12, right: 12 })
+          }
+          if (this.sideBySide() && (this.listOpen || this.selected.length === 0)) {
+            Column() { this.workerList() }
+              .layoutWeight(this.selected.length > 0 ? 0.54 : 1)
+          }
+          ForEach(this.selected, (worker: OrcaWorker) => {
+            TaskPageContent({
+              paneDeviceId: worker.deviceId, paneSessionId: worker.sessionId,
+              paneActive: this.paneActive && this.workerVisible(),
+              standaloneDetail: !this.sideBySide(),
+              paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
+              collabRole: this.label('v138_worker'), collabLabel: this.label('v138_return_to_lead'),
+              onCollab: (): void => { this.returnToLead(); },
+              onDetailBack: (): void => { this.returnToLead(); },
+            }).width('100%').layoutWeight(1)
+          }, (worker: OrcaWorker) => JSON.stringify([worker.deviceId, worker.sessionId]))
+        }
+        .width(this.sideBySide() ? this.widthVp - this.leadPaneWidth() : '100%')
+        .height('100%')
+        .visibility(this.workerVisible() ? Visibility.Visible : Visibility.None)
+        .border({ width: { left: this.sideBySide() ? 1 : 0 }, color: $r('app.color.border') })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    if (this.sideBySide()) {
+      Column() {
+        Row() {
+          Row().width(2).height(24).backgroundColor($r('app.color.text_tertiary'))
+            .borderRadius(UI_RADIUS_PILL)
+        }.justifyContent(FlexAlign.Center).width(16).height(56)
+          .backgroundColor($r('app.color.bg_chip'))
+          .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_PILL)
+      }.width(24).height('100%').justifyContent(FlexAlign.Center)
+        .position({ x: this.leadPaneWidth() - 12, y: 0 })
+        .accessibilityText(this.label('v138_resize'))
+        .onTouch((event: TouchEvent) => this.dragWorkerDivider(event))
+    }
+    }
+    .width('100%').height('100%')
+    .onAreaChange((_old: Area, area: Area) => { this.widthVp = Number(area.width); })
+    .bindSheet(this.listOpen && !this.sideBySide(), this.workerList(), {
+      title: { title: this.label('v138_collaboration') },
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      preferType: SheetType.BOTTOM,
+      backgroundColor: $r('app.color.bg_card'),
+      maskColor: $r('app.color.overlay'),
+      onDisappear: (): void => {
+        if (!this.sideBySide()) this.listOpen = false;
+      },
     })
   }
 }

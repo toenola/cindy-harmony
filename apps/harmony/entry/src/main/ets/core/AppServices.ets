@@ -1,3 +1,6 @@
+import { presignGet } from './attachments/AttachmentUpload';
+import { OrcaCollaboration } from './tasks/OrcaCollaboration';
+import { TeammateRoster } from './tasks/TeammateRoster';
 import { LocalAttachmentPreviews } from './attachments/LocalAttachmentPreviews';
 /**
  * 应用服务组装（单例）。
@@ -100,6 +103,9 @@ export class AppServices {
   private backgroundReleaseHandlers: Array<() => void> = [];
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
+  readonly orca: OrcaCollaboration;
+  readonly teammateRoster: TeammateRoster;
+  private readonly teammateAvatarRequests: Map<string, Promise<string>> = new Map();
   private readonly http: HarmonyHttp = new HarmonyHttp();
   private readonly settingsStore: SecureStore = new SecureStore();
   private selfDeviceName: string = '';
@@ -133,6 +139,8 @@ export class AppServices {
     opts.createWs = () => new HarmonyWsAdapter();
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
+    this.orca = new OrcaCollaboration(this.client, (device: string): Promise<void> => this.openLink(device));
+    this.teammateRoster = new TeammateRoster(this.client, (device: string): Promise<void> => this.openLink(device));
     this.tasks.attach(this.client);
     this.taskSearch.attach(this.client, this.tasks, (deviceId: string) => this.openLink(deviceId));
     this.taskProjectOrder.attach(
@@ -165,6 +173,9 @@ export class AppServices {
       this.client.stop();
       // 这次是账号级清理；旧账号临时 topic 的补偿退订不能跨过
       // stop/新账号复用同一 deviceId，避免误伤新账号的同名会话。
+      this.orca.clear();
+      this.teammateRoster.clear();
+      this.teammateAvatarRequests.clear();
       this.newSessionCreations.clearAll(false);
       this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
@@ -251,6 +262,41 @@ export class AppServices {
     void run.finally((): void => {
       if (this.unarchiveRuns.get(key) === run) this.unarchiveRuns.delete(key);
     });
+  }
+
+  teammateAvatarSource(deviceId: string, value: string): Promise<string> {
+    if (!/^cindy-media:\/\/blobs\/[0-9a-f]{64}\.(?:png|jpe?g|webp)$/.test(value)) return Promise.resolve('');
+    const epoch = this.auth.sessionEpoch;
+    const key = JSON.stringify([epoch, deviceId, value]);
+    const existing = this.teammateAvatarRequests.get(key);
+    if (existing) return existing;
+    const request = this.readTeammateAvatar(deviceId, value, epoch);
+    this.teammateAvatarRequests.set(key, request);
+    void request.then((source: string) => {
+      if (this.teammateAvatarRequests.get(key) !== request) return;
+      if (!source.startsWith('data:') || source.length > 262144) this.teammateAvatarRequests.delete(key);
+      if (this.teammateAvatarRequests.size > 24) {
+        const oldest = this.teammateAvatarRequests.keys().next();
+        if (!oldest.done) this.teammateAvatarRequests.delete(oldest.value);
+      }
+    });
+    return request;
+  }
+
+  private async readTeammateAvatar(deviceId: string, value: string, epoch: number): Promise<string> {
+    try {
+      await this.openLink(deviceId);
+      if (epoch !== this.auth.sessionEpoch) return '';
+      const media = await this.messages.fetchRemoteMedia(deviceId, value, true);
+      if (epoch !== this.auth.sessionEpoch || !/^image\/(?:png|jpeg|webp)$/.test(media.mimeType)) return '';
+      if (media.inlineBase64) return 'data:' + media.mimeType + ';base64,' + media.inlineBase64;
+      const token = await this.auth.getAccessToken();
+      if (!token || epoch !== this.auth.sessionEpoch || !media.ossKey) return '';
+      const source = await presignGet(media.ossKey, token);
+      return epoch === this.auth.sessionEpoch ? source : '';
+    } catch (_error) {
+      return '';
+    }
   }
 
   async openLink(deviceId: string): Promise<void> {
@@ -526,6 +572,9 @@ export class AppServices {
         this.resetSessionSubscriptions();
         this.messages.invalidateLiveTailTrust();
         if (status === 'stopped') {
+          this.orca.clear();
+          this.teammateRoster.clear();
+          this.teammateAvatarRequests.clear();
           this.newSessionCreations.clearAll();
           this.localAttachmentPreviews.clear();
           this.inputQueue.clearAll();
@@ -723,6 +772,9 @@ export class AppServices {
     if (switchingAccount) {
       // hello-ack 发现账号变化时同样丢弃旧账号 topic lease；当前连接可能已
       // 属于新账号，不能把旧账号的 pending unsubscribe 发到新账号。
+      this.orca.clear();
+      this.teammateRoster.clear();
+      this.teammateAvatarRequests.clear();
       this.newSessionCreations.clearAll(false);
       this.localAttachmentPreviews.clear();
       this.inputQueue.clearAll();
@@ -762,6 +814,12 @@ export class AppServices {
     ownerStamp: Object | undefined = undefined,
   ): void {
     switch (channel) {
+      case 'maker:orca:worker-changed':
+        this.orca.changed(deviceId, payload);
+        break;
+      case 'maker:remote-resources:changed':
+        this.teammateRoster.changed(deviceId, payload);
+        break;
       case PROJECT_ALIASES_CHANGED:
         this.taskProjectAliases.refresh(deviceId);
         break;

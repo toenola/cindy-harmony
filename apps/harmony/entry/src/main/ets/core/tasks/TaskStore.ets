@@ -38,6 +38,8 @@ export class TaskStore {
   private sourceDeviceNames: Map<string, string> = new Map();
   messageSourceDirectoryLoaded: boolean = false;
   private sessionsByDevice: Map<string, RemoteSession[]> = new Map();
+  // 伙伴主对话由 sessions:get 读取，普通任务列表不会包含它。
+  private botSessionDetails: Map<string, Map<string, RemoteSession>> = new Map();
   private sessionLoadRevisions: Map<string, number> = new Map();
   /** 同一设备的列表恢复 single-flight；代次仍负责拒绝清理后的旧结果。 */
   private sessionLoadOperations: Map<string, Promise<boolean>> = new Map();
@@ -192,6 +194,7 @@ export class TaskStore {
       this.liveActivityBySession.delete(ownedActivityKeys[i]);
     }
     this.sessionsByDevice.delete(deviceId);
+    this.botSessionDetails.delete(deviceId);
     this.pendingActivityByDevice.delete(deviceId);
   }
 
@@ -210,7 +213,7 @@ export class TaskStore {
       for (let i = 0; i < scoped.length; i++) {
         if (scoped[i].id === sessionId) return scoped[i];
       }
-      return undefined;
+      return this.botSessionDetails.get(deviceId)?.get(sessionId);
     }
     let found: RemoteSession | undefined = undefined;
     this.sessionsByDevice.forEach((sessions: RemoteSession[]) => {
@@ -257,6 +260,7 @@ export class TaskStore {
     this.sourceDeviceNames.clear();
     this.messageSourceDirectoryLoaded = false;
     this.sessionsByDevice.clear();
+    this.botSessionDetails.clear();
     this.sessionLoadRevisions.clear();
     this.sessionLoadOperations.clear();
     this.activeRefreshOperations.clear();
@@ -369,8 +373,8 @@ export class TaskStore {
     }
   }
 
-  /** 从搜索结果打开缓存中尚不存在的历史任务；返回后写入当前设备快照。 */
-  async loadSession(deviceId: string, sessionId: string): Promise<RemoteSession | undefined> {
+  /** 读取通过搜索或伙伴名册定位的会话。 */
+  async loadSession(deviceId: string, sessionId: string, expectedSource: string = ''): Promise<RemoteSession | undefined> {
     const client = this.client;
     if (!client || sessionId.length === 0) return undefined;
     const stateGeneration = this.stateGeneration;
@@ -387,8 +391,25 @@ export class TaskStore {
       if (result === undefined || result === null || typeof result !== 'object'
         || Array.isArray(result)) return undefined;
       const session = parseSession(result as Record<string, Object>);
-      if (session.id !== sessionId || session.status === 'deleted') return undefined;
-      this.upsertSession(deviceId, session);
+      if (session.id !== sessionId) return undefined;
+      if (session.status === 'deleted') {
+        this.removeSession(deviceId, sessionId);
+        return undefined;
+      }
+      if (expectedSource && session.source !== expectedSource) return undefined;
+      if (session.source === 'bot') {
+        const details = this.botSessionDetails.get(deviceId) ?? new Map<string, RemoteSession>();
+        details.delete(sessionId);
+        details.set(sessionId, session);
+        if (details.size > 32) {
+          const oldest = details.keys().next();
+          if (!oldest.done) details.delete(oldest.value);
+        }
+        this.botSessionDetails.set(deviceId, details);
+        this.notify();
+      } else {
+        this.upsertSession(deviceId, session);
+      }
       return session;
     } catch (_error) {
       // 搜索结果仍可用摘要打开；详情页的消息 Store 会继续按 sessionId 拉历史。
@@ -560,19 +581,13 @@ export class TaskStore {
   }
 
   private removeSession(deviceId: string, sessionId: string): void {
-    const list = this.sessionsByDevice.get(deviceId);
-    if (list === undefined) {
-      this.clearLiveActivity(deviceId, sessionId);
-      return;
-    }
+    const removedDetail = this.botSessionDetails.get(deviceId)?.delete(sessionId) ?? false;
+    const list = this.getSessions(deviceId);
     const filtered = list.filter((item: RemoteSession) => item.id !== sessionId);
-    if (filtered.length === list.length) {
-      this.clearLiveActivity(deviceId, sessionId);
-      return;
-    }
-    this.sessionsByDevice.set(deviceId, filtered);
+    const removedListEntry = filtered.length !== list.length;
+    if (removedListEntry) this.sessionsByDevice.set(deviceId, filtered);
     this.clearLiveActivity(deviceId, sessionId);
-    this.notify();
+    if (removedListEntry || removedDetail) this.notify();
   }
 
   private clearLiveActivity(deviceId: string, sessionId: string): void {
@@ -634,34 +649,25 @@ export class TaskStore {
     const sessionId = readStr(p, 'sessionId');
     if (sessionId.length === 0) return;
     const patch = readObj(p, 'patch');
-    const list = this.sessionsByDevice.get(deviceId);
-    // push 可能在首次快照、重连快照或 created push 之前到达；active 行不能静默丢掉，
-    // 由桌面端权威列表补齐。Mobile 对未知 active 会话也走 reseed。
-    if (!list) {
-      if (readStr(patch, 'status') === 'active') void this.loadSessions(deviceId);
+    const status = readStr(patch, 'status');
+    if (status === 'deleted') {
+      this.removeSession(deviceId, sessionId);
       return;
     }
-    let changed = false;
-    for (let i = 0; i < list.length; i++) {
-      if (list[i].id === sessionId) {
-        list[i] = this.mergeSession(list[i], patch);
-        changed = true;
-        break;
-      }
-    }
-    if (!changed && readStr(patch, 'status') === 'active') {
-      void this.loadSessions(deviceId);
-      return;
-    }
-    if (changed) {
-      if (readStr(patch, 'status') === 'deleted') {
-        // deleted 是终态，不让它进入本地任务投影；列表与搜索都依赖这里
-        // 及时移除，避免只靠 UI 过滤留下旧任务缓存。
-        this.removeSession(deviceId, sessionId);
-        return;
-      }
+    const details = this.botSessionDetails.get(deviceId);
+    const detail = details?.get(sessionId);
+    if (detail !== undefined) details?.set(sessionId, this.mergeSession(detail, patch));
+    const list = this.getSessions(deviceId);
+    const index = list.findIndex((session: RemoteSession) => session.id === sessionId);
+    if (index >= 0) {
+      list[index] = this.mergeSession(list[index], patch);
       list.sort(sortSessionsByUpdatedAt);
+    }
+    if (index >= 0 || detail !== undefined) {
       this.notify();
+    } else if (status === 'active') {
+      // 首次列表快照或 created push 尚未到达，重读电脑端列表以接住未知 active 会话。
+      void this.loadSessions(deviceId);
     }
   }
 
