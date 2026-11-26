@@ -30,6 +30,7 @@ export class ComposerFileQueue {
   picking: boolean = false;
   onChanged: (files: ComposerFile[]) => void = () => {};
   onPickingChanged: (picking: boolean) => void = () => {};
+  targetDevice: () => string = () => '';
   isBusy: () => boolean = () => false;
   /** 图片与文件共用每条消息 20 个的上限。 */
   occupiedByOtherAttachments: () => number = () => 0;
@@ -188,7 +189,7 @@ export class ComposerFileQueue {
     AppServices.instance.auth.getAccessToken().then((token: string | null) => {
       if (!this.isCurrentUpload(file, revision)) throw new Error('stale file upload');
       if (token === null || token.length === 0) throw new Error('未登录');
-      return uploadDocument(file.uri, file.name, token);
+      return uploadDocument(file.uri, file.name, token, this.targetDevice());
     }).then((attachment: RemoteSerializedAttachment) => {
       if (!this.isCurrentUpload(file, revision)) {
         this.recycleAttachment(attachment);

@@ -45,7 +45,10 @@
               {
                 "scheme": "cindy",
                 "host": "session"
-              }
+              },
+              { "scheme": "cindy", "host": "relay" },
+              { "scheme": "cindycn", "host": "relay" },
+              { "scheme": "cindydev", "host": "relay" }
             ]
           }
         ]

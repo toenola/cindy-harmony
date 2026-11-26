@@ -21,7 +21,7 @@ struct Index {
       const restored = await AppServices.instance.auth.restoreSession();
       if (restored) {
         // 先画 last-known 列表，再连 relay 用远端权威快照对账。
-        AppServices.instance.restoreTaskListSnapshot();
+        await AppServices.instance.restoreTaskListSnapshot();
         AppServices.instance.client.start();
         router.replaceUrl({ url: 'pages/TaskListPage' });
       } else {

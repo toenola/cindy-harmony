@@ -1,3 +1,6 @@
+import { PromptRecommendationPanel } from '../components/PromptRecommendationPanel';
+import { PromptRecommendationInput } from '../core/messages/PromptRecommendation';
+import { RelayRoute } from '../core/device-link/RelayRoute';
 import { TeammateAvatar } from '../components/TeammateAvatar';
 import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 import { TeammateSettingsPanel } from '../components/TeammateSettingsPanel';
@@ -633,10 +636,15 @@ export struct TaskPageContent {
   @State showInitialSync: boolean = false;
   /** 会话仍在流式生成；驱动 Header、Composer 和消息尾部状态。 */
   @State sessionStreaming: boolean = false;
+  @State recommendationRevision: number = 0;
+  @State recommendationAgentKind: string = "";
   /** 真实消息区宽度；折叠双栏下不能拿整块屏幕宽度估算 Markdown 表格。 */
   @State messageAreaWidth: number = 0;
   /** 真实消息区高度；历史预加载阈值按可视区域计算，避免依赖顶层 item 数量。 */
   @State messageAreaHeight: number = 0;
+  @State private interactionViewportHeight: number = 600;
+  @State private askBodyHeights: Map<string, number> = new Map();
+  @State private askFooterHeights: Map<string, number> = new Map();
   private tableColumnWidthCache: Map<MdBlock, number[]> = new Map();
   /** 完成态 Markdown 数组身份稳定；缓存连续文本组，避免页面状态刷新时重复线性分组。 */
   private markdownSelectableGroupCache: Map<MdBlock[], MdSelectableBlockGroup[]> = new Map();
@@ -776,7 +784,7 @@ export struct TaskPageContent {
   @State pickingFiles: boolean = false;
   private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 发送开始后的输入变更不会被旧请求的成功回调清空。 */
-  private composerInputRevision: number = 0;
+  @State private composerInputRevision: number = 0;
   /** 正式消息回流对账会同步触发 queue notify；避免同一栈内递归刷新受控输入框。 */
   private reconcilingDeliveredClientIds: boolean = false;
   /** 同一事件栈内消息/队列可能连续 notify；页面只在下一轮任务重建一次消息投影。 */
@@ -1105,6 +1113,8 @@ export struct TaskPageContent {
     this.imageQueue.onPickingChanged = (picking: boolean): void => {
       this.pickingImages = picking;
     };
+    this.imageQueue.targetDevice = () => this.deviceId;
+    this.fileQueue.targetDevice = () => this.deviceId;
     this.imageQueue.isBusy = (): boolean => this.sending;
     this.imageQueue.occupiedByOtherAttachments = (): number => this.fileQueue.files.length;
     this.fileQueue.onChanged = (files: ComposerFile[]): void => {
@@ -1578,6 +1588,8 @@ export struct TaskPageContent {
   /** sessions:patched 回流计划模式后，保持 Sheet 与桌面端真相一致。 */
   private syncComposerContextState(): void {
     const session = this.session();
+    this.recommendationRevision = session?.lastTurnEndedAt ?? 0;
+    this.recommendationAgentKind = session !== undefined ? this.agentKindForCapability(session) : "";
     if (session === undefined) {
       return;
     }
@@ -3994,9 +4006,8 @@ export struct TaskPageContent {
       }
       if (item.type === 'work_group') {
         const group = item as RenderWorkGroupItem;
-        // workGroupChild 会把嵌套 work_group 直接展开，不再提供第二层折叠入口；
-        // 因此父组已展开时，嵌套 work_group 的 children 也属于当前可见投影。
-        if (insideExpandedWorkGroup || this.isIn(this.expandedWorkGroups, group.key)) {
+        // 每层工作过程独立展开；分享不能越过尚未展开的子组。
+        if (this.isIn(this.expandedWorkGroups, group.key)) {
           this.collectVisibleShareableMessages(group.children, output, true);
         }
         continue;
@@ -5093,15 +5104,16 @@ export struct TaskPageContent {
     return activeContent.length > 0 ? `${base} · ${activeContent}` : base;
   }
 
-  /** 思考卡标题（对齐 iOS：思考中 / 思考 Xs / 思考内容已隐藏）。 */
+  /** 工作过程的思考行以真实首行摘要为入口，避免只展示无信息量的时长。 */
   private thinkingTitle(item: RenderThinkingItem): string {
-    if (item.redacted) {
-      return '思考内容已隐藏';
-    }
-    if (item.durationMs > 0) {
-      return `思考 ${this.formatDuration(item.durationMs)}`;
-    }
-    return '思考过程';
+    if (item.redacted) return '思考内容已隐藏';
+    const first = item.body.trim().split(/\r?\n/)[0] ?? '';
+    return first.trim() || '思考过程';
+  }
+
+  private thinkingDetailBody(item: RenderThinkingItem): string {
+    const lines = item.body.trim().split(/\r?\n/);
+    return lines.length > 1 ? lines.slice(1).join('\n').trim() : item.body;
   }
 
   /** 工作过程标题（对齐 iOS：已工作 Xs / 工作过程）。 */
@@ -5839,6 +5851,23 @@ export struct TaskPageContent {
     }, 0);
   }
 
+  private promptRecommendationInput(): PromptRecommendationInput {
+    const state = new PromptRecommendationInput();
+    state.owner = JSON.stringify([AppServices.instance.auth.cacheAccountId, this.paneAccountEpoch]);
+    state.deviceId = this.deviceId; state.sessionId = this.sessionId;
+    state.agentKind = this.recommendationAgentKind;
+    state.revision = this.recommendationRevision; state.running = this.sessionStreaming;
+    state.available = this.paneActive && this.initialLoadResolved && !this.deviceDisabled
+      && !this.leavingForCreationEdit && !this.isCreationBlockingRemoteOps();
+    state.hasDraft = this.composerInputRevision >= 0 && composerDocumentHasContent(this.composerDocument);
+    state.terminalError = this.tailPresentation() !== null || this.queueProjectionError.length > 0;
+    state.displayBlocked = this.composerImages.length > 0 || this.composerFiles.length > 0
+      || this.composerDocument.nodes.some((node: ComposerNode): boolean => node.type === 'quote')
+      || this.pickingImages || this.pickingFiles || this.editingQueueClientId.length > 0
+      || this.editingMessageClientId.length > 0;
+    return state;
+  }
+
   @Builder
   taskPageBody() {
     Stack({ alignContent: Alignment.Bottom }) {
@@ -5855,16 +5884,21 @@ export struct TaskPageContent {
           if (this.pendingInteractions.length > 1) {
             this.pendingInteractionSwitcher()
           }
-          Scroll() {
-            if (this.activeInteractionIndex() >= 0) {
-              this.pendingInteractionCard(this.pendingInteractions[this.activeInteractionIndex()])
+          if (this.activeInteractionIndex() >= 0
+            && this.pendingInteractions[this.activeInteractionIndex()].kind === 'ask_user_question') {
+            this.askUserCard(this.pendingInteractions[this.activeInteractionIndex()])
+          } else {
+            Scroll() {
+              if (this.activeInteractionIndex() >= 0) {
+                this.pendingInteractionCard(this.pendingInteractions[this.activeInteractionIndex()])
+              }
             }
+            .width('100%')
+            .constraintSize({ maxHeight: 240 })
           }
-          .width('100%')
-          .constraintSize({ maxHeight: 240 })
         }
         .width('100%')
-        .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH, maxHeight: 286 })
+        .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH })
         .alignSelf(ItemAlign.Center)
         .padding({ left: 16, right: 16, top: 4, bottom: 4 })
       }
@@ -5878,6 +5912,20 @@ export struct TaskPageContent {
           .alignSelf(ItemAlign.Center)
           .padding({ left: 16, right: 16, top: 4 })
       }
+
+      PromptRecommendationPanel({
+        state: this.promptRecommendationInput(), draft: this.input,
+        composerActive: this.composerFocused || this.composerSurfaceVisible
+          || this.composerModelPopupOpen || this.composerPermissionPopupOpen || this.composerAgentPopupOpen,
+        show: this.paneActive && !this.shareSelectionActive && !this.deviceDisabled
+          && !this.composerHiddenByScroll && !this.sending && !this.queueBusy && !this.sessionStreaming
+          && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions)
+          && this.composerPaletteMode.length === 0,
+        onAccept: (prompt: string): void => {
+          this.applyComposerTextChange(this.input ? `${this.input}\n${prompt}` : prompt);
+          this.expandComposerForEditing(true);
+        },
+      })
 
       if (this.shareSelectionActive) {
         this.shareSelectionBar()
@@ -6087,6 +6135,10 @@ export struct TaskPageContent {
             }
             .width('100%')
             .height('100%')
+            .onAreaChange((_old: Area, area: Area) => {
+              const height = Number(area.height);
+              if (height > 0) this.interactionViewportHeight = height;
+            })
             .backgroundColor($r('app.color.bg_page'))
           }
           .titleBar({
@@ -8402,21 +8454,24 @@ export struct TaskPageContent {
   @Builder
   renderItem(item: RenderItem) {
     if (item.type === 'message') {
-      if ((item as RenderMessageItem).kind === 'ask_user') {
-        this.askHistoryBlock(item as RenderMessageItem)
-      } else if ((item as RenderMessageItem).orcaCard !== null) {
-        this.orcaCollabBlock(item as RenderMessageItem)
-      } else if ((item as RenderMessageItem).kind === 'system'
-        && (item as RenderMessageItem).message !== undefined
-        && (item as RenderMessageItem).message?.systemCardType === 'compact') {
-        this.compactBoundaryBlock(item as RenderMessageItem)
-      } else if ((item as RenderMessageItem).message !== undefined
-        && (item as RenderMessageItem).message?.systemCardType === 'auto-resume') {
-        this.autoResumeBlock(item as RenderMessageItem)
-      } else if ((item as RenderMessageItem).message?.systemCardType.length) {
-        this.systemCardBlock(item as RenderMessageItem)
-      } else {
-        this.messageBlock(item as RenderMessageItem)
+      if (!(item as RenderMessageItem).hidden) {
+        if ((item as RenderMessageItem).kind === 'ask_user') {
+          this.askHistoryBlock(item as RenderMessageItem)
+        } else if ((item as RenderMessageItem).orcaCard !== null) {
+          this.orcaCollabBlock(item as RenderMessageItem)
+        } else if ((item as RenderMessageItem).kind === 'system'
+          && (item as RenderMessageItem).message !== undefined
+          && (item as RenderMessageItem).message?.systemCardType === 'compact') {
+          this.compactBoundaryBlock(item as RenderMessageItem)
+        } else if ((item as RenderMessageItem).message !== undefined
+          && (item as RenderMessageItem).message?.systemCardType === 'auto-resume') {
+          this.autoResumeBlock(item as RenderMessageItem)
+        } else if ((item as RenderMessageItem).message?.systemCardType.length) {
+          this.systemCardBlock(item as RenderMessageItem)
+        } else {
+          this.messageBlock(item as RenderMessageItem)
+        }
+
       }
     } else if (item.type === 'thinking') {
       this.thinkingBlock(item as RenderThinkingItem)
@@ -9125,14 +9180,12 @@ export struct TaskPageContent {
       })
       .width('100%')
 
-      this.historyArtifactButtons(item)
-
       if (item.isStreaming
         && !this.isIn(this.expandedWorkGroups, item.key)
         && this.historyPreviewLines(item).length > 0) {
         Column({ space: 2 }) {
           ForEach(this.historyPreviewLines(item), (line: Record<string, Object>) => {
-            this.historyActivityLine(line)
+            this.historyActivityLine(line, item.key)
           }, (line: Record<string, Object>) => JSON.stringify(line))
         }
         .width('100%')
@@ -9155,9 +9208,7 @@ export struct TaskPageContent {
       if (this.isIn(this.expandedWorkGroups, item.key)) {
         Column({ space: 4 }) {
           ForEach(item.children, (child: RenderItem) => {
-            // shared/Desktop 的 outer work_group 展开后直接展示活动内容；Harmony
-            // 模型为保持时长边界可能保留一层 nested work_group，这里只展开它的
-            // chrome，不再给用户第二个“已工作”折叠入口。
+            // 与 Mobile 一致保留内层工作组自己的展开入口。
             this.workGroupChild(child)
           }, (child: RenderItem) => `${item.key}-${child.key}`)
         }
@@ -9209,24 +9260,32 @@ export struct TaskPageContent {
       }, (work: HistoryWorkPresentation) => work.messageId + work.revision)
       if (!child.key.startsWith('history-work:')) this.renderItem(child)
     } else if (child.type === 'work_group') {
-      ForEach((child as RenderWorkGroupItem).children, (nested: RenderItem) => {
-        this.workGroupChild(nested)
-      }, (nested: RenderItem) => this.renderItemNodeKey(nested, child.key))
+      this.workGroupBlock(child as RenderWorkGroupItem)
     } else {
       this.renderItem(child)
     }
   }
 
   @Builder
-  historyActivityLine(line: Record<string, Object>) {
-    Text(this.historyLineText(line))
-      .fontSize(uiFontSize(14))
-      .lineHeight(uiLineHeight(20))
-      .fontColor($r('app.color.chat_text_secondary'))
-      .maxLines(1)
-      .textOverflow({ overflow: TextOverflow.Ellipsis })
-      .width('100%')
-      .padding({ top: 4, bottom: 4 })
+  historyActivityLine(line: Record<string, Object>, groupKey: string = '') {
+    Row({ space: 6 }) {
+      SymbolGlyph(readStr(line, 'kind') === 'tool'
+        ? (line['hasError'] === true ? $r('sys.symbol.exclamationmark_circle') : $r('sys.symbol.checkmark'))
+        : $r('sys.symbol.wand_and_stars'))
+        .fontSize(uiFontSize(14)).fontColor([$r('app.color.text_tertiary')]).width(16)
+      Text() {
+        this.thinkingTextSpans(tokenizeThinkingText(this.historyLineText(line)))
+      }
+        .fontSize(uiFontSize(14))
+        .lineHeight(uiLineHeight(20))
+        .fontColor($r('app.color.chat_text_secondary'))
+        .fontStyle(readStr(line, 'kind') === 'tool' ? FontStyle.Normal : FontStyle.Italic)
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+      if (groupKey.length > 0) {
+        this.disclosureChevron(false, $r('app.color.text_tertiary'))
+      }
+    }.width('100%').constraintSize({ minHeight: 28 })
+      .onClick(() => { if (groupKey.length > 0) this.toggleWorkGroup(groupKey); })
   }
 
   @Builder
@@ -9842,10 +9901,12 @@ export struct TaskPageContent {
 
   /** 交互卡次要按钮（拒绝 / 跳过）：描边胶囊。 */
   @Builder
-  interactionSecondaryButton(label: string, danger: boolean, action: () => void, enabled: boolean = true) {
+  interactionSecondaryButton(label: string, danger: boolean, action: () => void, enabled: boolean = true, askFooter: boolean = false) {
     Button(label)
       .type(ButtonType.Normal)
-      .height(34)
+      .height(askFooter ? 44 : 34)
+      .constraintSize({ minWidth: askFooter ? 88 : 0 })
+      .margin(askFooter ? 4 : 0)
       .fontSize(uiFontSize(13))
       .fontWeight(FontWeight.Medium)
       .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
@@ -9880,19 +9941,22 @@ export struct TaskPageContent {
   /** Ask User 主按钮需在 Builder 内直接读取草稿，确保选项点击后 enabled 当帧刷新。 */
   @Builder
   askUserPrimaryButton(item: PendingInteraction) {
-    Button(this.askIsLast(item) ? (item.retainedDraft ? '发送回答' : '提交回答') : '下一题')
+    Button(this.askIsLast(item) ? (item.retainedDraft ? this.v12String('ask_send_label')
+      : this.v12String('ask_submit_label')) : this.v12String('ask_next_label'))
       .type(ButtonType.Normal)
-      .height(34)
+      .height(44)
+      .constraintSize({ minWidth: 88 })
+      .margin(4)
       .fontSize(uiFontSize(13))
       .fontWeight(FontWeight.Medium)
-      .fontColor($r('app.color.chat_cta_text'))
-      .backgroundColor($r('app.color.chat_cta'))
+      .fontColor(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
+        && this.askCurrentAnswer(item).trim().length > 0 ? $r('app.color.chat_cta_text') : $r('app.color.text_tertiary'))
+      .backgroundColor(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
+        && this.askCurrentAnswer(item).trim().length > 0 ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
       .borderRadius(UI_RADIUS_PILL)
       .padding({ left: 16, right: 16 })
       .enabled(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
         && this.askCurrentAnswer(item).trim().length > 0)
-      .opacity(!this.interactionBusy(item) && this.protectedAskBusyId !== item.requestId
-        && this.askCurrentAnswer(item).trim().length > 0 ? 1 : 0.55)
       .clickEffect(UI_CLICK_EFFECT)
       .onClick(() => this.submitAskQuestion(item))
   }
@@ -9979,147 +10043,170 @@ export struct TaskPageContent {
   }
 
   /** Ask User 卡：问题 + 选项（单选/多选）+ 自定义输入 + 提交。 */
+  private askUserPanelHeight(): number {
+    const available = Math.max(180, this.interactionViewportHeight - (this.pendingInteractions.length > 1 ? 40 : 0) - 16);
+    return Math.min(520, Math.max(180, available * 0.8));
+  }
+
+  private askUserBodyHeight(item: PendingInteraction): number {
+    const footer = this.askFooterHeights.get(item.requestId) ?? 60;
+    // Card padding, two content gaps and a one-line caption. Only the body may scroll.
+    const maximum = Math.max(16, this.askUserPanelHeight() - 32 - 24 - uiLineHeight(18) - footer);
+    return Math.min(this.askBodyHeights.get(item.requestId) ?? maximum, maximum);
+  }
+
+  private rememberAskHeight(requestId: string, height: number, footer: boolean): void {
+    if (!Number.isFinite(height) || height <= 0) return;
+    const previous = footer ? this.askFooterHeights : this.askBodyHeights;
+    const measured = Math.ceil(height);
+    if (previous.get(requestId) === measured) return;
+    const next = new Map(previous);
+    if (next.size >= 32 && !next.has(requestId)) next.clear();
+    next.set(requestId, measured);
+    if (footer) this.askFooterHeights = next;
+    else this.askBodyHeights = next;
+  }
+
+  private askUserSummary(item: PendingInteraction): string {
+    const parts: string[] = [];
+    const count = this.askOptionRows(item).length;
+    if (count > 0) {
+      parts.push(this.v12String('ask_option_count', count));
+      parts.push(this.v12String(this.askMultiSelect(item) ? 'ask_multi_choice' : 'ask_single_choice'));
+    }
+    if (!this.askRestrictedChoices(item)) parts.push(this.v12String('ask_other_supported'));
+    return parts.join(' · ');
+  }
+
+  @Builder
+  askUserOptionRow(item: PendingInteraction, opt: AskOptionPresentation) {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        if (this.isAskSelected(item, opt.label)) {
+          SymbolGlyph($r('sys.symbol.checkmark')).fontSize(uiFontSize(14))
+            .fontColor([$r('app.color.chat_cta_text')])
+        }
+      }.width(20).height(20).flexShrink(0)
+        .backgroundColor(this.isAskSelected(item, opt.label) ? $r('app.color.chat_cta') : Color.Transparent)
+        .border({ width: 1.5, color: this.isAskSelected(item, opt.label)
+          ? $r('app.color.chat_cta') : $r('app.color.text_tertiary') })
+        .borderRadius(this.askMultiSelect(item) ? UI_RADIUS_CONTROL : UI_RADIUS_PILL)
+      Column({ space: 4 }) {
+        Text(opt.label).fontSize(uiFontSize(14)).lineHeight(uiLineHeight(20))
+          .fontWeight(this.isAskSelected(item, opt.label) ? FontWeight.Medium : FontWeight.Regular)
+          .fontColor($r('app.color.text_primary')).width('100%')
+        if (opt.description.length > 0) {
+          Text(opt.description).fontSize(uiFontSize(12)).lineHeight(uiLineHeight(18))
+            .fontColor($r('app.color.text_secondary')).width('100%')
+        }
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+    }.width('100%').constraintSize({ minHeight: 46 })
+      .padding({ left: 14, right: 14, top: 10, bottom: 10 }).alignItems(VerticalAlign.Center)
+      .backgroundColor(this.isAskSelected(item, opt.label) ? $r('app.color.bg_chip') : Color.Transparent)
+      .enabled(!this.interactionBusy(item)).clickEffect(UI_CLICK_EFFECT)
+      .onClick(() => this.toggleAskSelection(item, opt.label))
+  }
+
   @Builder
   askUserCard(item: PendingInteraction) {
-    Column({ space: 10 }) {
-      this.interactionCardHeader($r('sys.symbol.ellipsis_message'), '请确认')
-      if (item.retainedDraft && this.requestStr(item, 'withdrawalReason').length > 0) {
-        Text('原问题已被撤回。发送前会确认原回答状态；只有确认取消后才会作为补充消息发送。')
-          .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
-      }
-      if (this.askQuestionCount(item) === 0) {
-        Text('问题内容暂不可用，可继续让电脑端处理。')
-          .fontSize(uiFontSize(13))
-          .lineHeight(uiLineHeight(19))
-          .fontColor($r('app.color.text_secondary'))
-          .width('100%')
-        Row() {
-          Row().layoutWeight(1)
-          this.interactionPrimaryButton('继续',
-            () => this.resolveInteraction(item, this.askEmptyDecision()),
-            !this.interactionBusy(item))
+    Column({ space: 12 }) {
+      Row() {
+        Text(item.retainedDraft ? $r('app.string.ask_withdrawn_label') : $r('app.string.ask_waiting_label'))
+          .fontSize(uiFontSize(12)).lineHeight(uiLineHeight(18)).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_secondary')).layoutWeight(1)
+        if (this.askQuestionCount(item) > 1) {
+          Text(this.v12String('ask_question_page', this.askCurrentIndex(item) + 1, this.askQuestionCount(item)))
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
         }
-        .width('100%')
-      } else {
-        Row({ space: 8 }) {
-          Text(`问题 ${this.askCurrentIndex(item) + 1} / ${this.askQuestionCount(item)}`)
-            .fontSize(uiFontSize(12))
-            .fontColor($r('app.color.text_tertiary'))
-          Text(this.askMultiSelect(item) ? '可多选' : '单选')
-            .fontSize(uiFontSize(12))
-            .fontColor($r('app.color.text_tertiary'))
-        }
-        .width('100%')
-
-        Text(this.askQuestion(item))
-          .fontSize(uiFontSize(14))
-          .lineHeight(uiLineHeight(20))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-
-        if (this.askOptionRows(item).length > 0) {
-          ForEach(this.askOptionRows(item), (opt: AskOptionPresentation) => {
-            Row({ space: 8 }) {
-              Stack({ alignContent: Alignment.Center }) {
-                if (this.isAskSelected(item, opt.label)) {
-                  SymbolGlyph($r('sys.symbol.checkmark'))
-                    .fontSize(uiFontSize(12))
-                    .fontColor([$r('app.color.chat_cta_text')])
-                }
+      }.width('100%').flexShrink(0)
+      Scroll() {
+        Column({ space: 12 }) {
+          if (item.retainedDraft && this.requestStr(item, 'withdrawalReason').length > 0) {
+            Text('原问题已被撤回。发送前会确认原回答状态；只有确认取消后才会作为补充消息发送。')
+              .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+          }
+          if (this.askQuestionCount(item) === 0) {
+            Text('问题内容暂不可用，可继续让电脑端处理。').fontSize(uiFontSize(13))
+              .lineHeight(uiLineHeight(19)).fontColor($r('app.color.text_secondary')).width('100%')
+          } else {
+            Column({ space: 6 }) {
+              Text(this.askQuestion(item)).fontSize(uiFontSize(15)).lineHeight(uiLineHeight(22))
+                .fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).width('100%')
+              if (this.askUserSummary(item).length > 0) {
+                Text(this.askUserSummary(item)).fontSize(uiFontSize(12)).lineHeight(uiLineHeight(18))
+                  .fontColor($r('app.color.text_secondary')).width('100%')
               }
-              .width(18)
-              .height(18)
-              .backgroundColor(this.isAskSelected(item, opt.label)
-                ? $r('app.color.chat_cta') : Color.Transparent)
-              .border({ width: 1, color: $r('app.color.border') })
-              .borderRadius(this.askMultiSelect(item) ? UI_RADIUS_CONTROL : UI_RADIUS_PILL)
-              Column({ space: 2 }) {
-                Text(opt.label)
-                  .fontSize(uiFontSize(13))
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.text_primary'))
-                  .width('100%')
-                if (opt.description.length > 0) {
-                  Text(opt.description)
-                    .fontSize(uiFontSize(12))
-                    .lineHeight(uiLineHeight(17))
-                    .fontColor($r('app.color.text_secondary'))
-                    .width('100%')
+            }.width('100%').alignItems(HorizontalAlign.Start)
+            if (this.askOptionRows(item).length > 0 || !this.askRestrictedChoices(item)) {
+              Column() {
+                ForEach(this.askOptionRows(item), (opt: AskOptionPresentation, index: number) => {
+                  this.askUserOptionRow(item, opt)
+                  if (index < this.askOptionRows(item).length - 1 || !this.askRestrictedChoices(item)) {
+                    Divider().strokeWidth(0.5).color($r('app.color.border'))
+                  }
+                }, (opt: AskOptionPresentation) => `${item.requestId}-${this.askCurrentIndex(item)}-${opt.label}`)
+                if (!this.askRestrictedChoices(item)) {
+                  TextInput({ placeholder: this.v12String('ask_other_placeholder'), text: this.askCustomInput(item) })
+                    .onChange((value: string) => this.updateAskCustomInput(item, value))
+                    .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+                    .placeholderColor($r('app.color.text_placeholder')).caretColor($r('app.color.chat_input_caret'))
+                    .height(46).padding({ left: 14, right: 14 }).borderRadius(0)
+                    .backgroundColor(Color.Transparent).enabled(!this.interactionBusy(item))
                 }
-              }
-              .layoutWeight(1)
-              .alignItems(HorizontalAlign.Start)
+              }.width('100%').border({ width: 0.5, color: $r('app.color.border') })
+                .borderRadius(UI_RADIUS_CONTAINER).clip(true)
             }
-            .width('100%')
-            .constraintSize({ minHeight: 40 })
-            .padding({ left: 10, right: 10 })
-            .backgroundColor(this.isAskSelected(item, opt.label)
-              ? $r('app.color.bg_chip') : Color.Transparent)
-            .border({ width: 1, color: $r('app.color.border') })
-            .borderRadius(UI_RADIUS_CONTROL)
-            .enabled(!this.interactionBusy(item))
-            .clickEffect(UI_CLICK_EFFECT)
-            .onClick(() => this.toggleAskSelection(item, opt.label))
-          }, (opt: AskOptionPresentation) =>
-            `${item.requestId}-${this.askCurrentIndex(item)}-${opt.label}`)
-        }
-
-        if (!this.askRestrictedChoices(item)) {
-          TextInput({ placeholder: '自定义回答…', text: this.askCustomInput(item) })
-            .onChange((v: string) => this.updateAskCustomInput(item, v))
-            .fontSize(uiFontSize(13))
-            .fontColor($r('app.color.text_primary'))
-            .placeholderColor($r('app.color.text_placeholder'))
-            .caretColor($r('app.color.chat_input_caret'))
-            .height(40)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor($r('app.color.bg_page'))
-            .border({ width: 1, color: $r('app.color.border') })
-            .borderRadius(UI_RADIUS_PILL)
-            .enabled(!this.interactionBusy(item))
-        }
-
-        if ((this.askValidationErrors.get(item.requestId) ?? '').length > 0) {
-          Text(this.askValidationErrors.get(item.requestId) ?? '')
-            .fontSize(uiFontSize(12))
-            .fontColor($r('app.color.danger'))
-            .width('100%')
-        }
-
-        if (this.interactionResolveError(item).length > 0) {
-          Text(this.interactionResolveError(item))
-            .fontSize(uiFontSize(12))
-            .fontColor($r('app.color.danger'))
-            .width('100%')
-        }
-
-        Row({ space: 8 }) {
+            if ((this.askValidationErrors.get(item.requestId) ?? '').length > 0) {
+              Text(this.askValidationErrors.get(item.requestId) ?? '').fontSize(uiFontSize(12))
+                .fontColor($r('app.color.danger')).width('100%')
+            }
+            if (this.interactionResolveError(item).length > 0) {
+              Text(this.interactionResolveError(item)).fontSize(uiFontSize(12))
+                .fontColor($r('app.color.danger')).width('100%')
+            }
+          }
+        }.width('100%').alignItems(HorizontalAlign.Start).justifyContent(FlexAlign.Start)
+          .onAreaChange((_old: Area, area: Area) => {
+            this.rememberAskHeight(item.requestId, Number(area.height), false);
+          })
+      }.width('100%').height(this.askUserBodyHeight(item)).flexShrink(0)
+        .align(Alignment.TopStart).scrollBar(BarState.Auto)
+      if (this.askQuestionCount(item) === 0) {
+        Row() {
+          Blank().layoutWeight(1)
+          this.interactionPrimaryButton('继续',
+            () => this.resolveInteraction(item, this.askEmptyDecision()), !this.interactionBusy(item))
+        }.width('100%').flexShrink(0)
+          .onAreaChange((_old: Area, area: Area) => {
+            this.rememberAskHeight(item.requestId, Number(area.height), true);
+          })
+      } else {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End, alignItems: ItemAlign.Center }) {
           if (this.askHasConstraints(item) && !item.retainedDraft) {
             // 服务端表单（如 MCP）可整体取消，对齐 Mobile interaction.permission.mcpCancel。
-            this.interactionSecondaryButton('取消', false,
-              () => this.resolveInteraction(item, this.askEmptyDecision()), !this.interactionBusy(item))
+            this.interactionSecondaryButton(this.v12String('ask_cancel_label'), false,
+              () => this.resolveInteraction(item, this.askEmptyDecision()), !this.interactionBusy(item), true)
           }
           if (this.askCurrentIndex(item) > 0) {
-            this.interactionSecondaryButton('上一题', false,
-              () => this.moveAskQuestion(item, -1), !this.interactionBusy(item))
+            this.interactionSecondaryButton(this.v12String('ask_previous_label'), false,
+              () => this.moveAskQuestion(item, -1), !this.interactionBusy(item), true)
           }
           if (!item.retainedDraft) {
-            this.interactionSecondaryButton('跳过', false,
-              () => this.skipAskQuestion(item), !this.interactionBusy(item))
+            this.interactionSecondaryButton(this.v12String('ask_skip_label'), false,
+              () => this.skipAskQuestion(item), !this.interactionBusy(item), true)
           }
-          Row().layoutWeight(1)
           this.askUserPrimaryButton(item)
         }
-        .width('100%')
+        .width('100%').flexShrink(0)
+          .onAreaChange((_old: Area, area: Area) => {
+            this.rememberAskHeight(item.requestId, Number(area.height), true);
+          })
       }
     }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-    .padding(14)
+    .width('100%').constraintSize({ maxHeight: this.askUserPanelHeight() })
+    .alignItems(HorizontalAlign.Start).padding(16)
     .backgroundColor($r('app.color.bg_card'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(UI_RADIUS_CONTAINER)
+    .border({ width: 0.5, color: $r('app.color.border') }).borderRadius(UI_RADIUS_CONTAINER)
     .transition(uiOverlayTransition())
   }
 
@@ -10521,8 +10608,8 @@ export struct TaskPageContent {
   }
 
   private hasMessageActions(item: RenderMessageItem): boolean {
-    return item.kind === 'user'
-      || (item.kind === 'assistant' && item.isTurnFinalAssistant);
+    return !item.hidden && (item.kind === 'user'
+      || (item.kind === 'assistant' && item.isTurnFinalAssistant));
   }
 
   private collapsedMessageLines(item: RenderMessageItem): number {
@@ -11128,14 +11215,16 @@ export struct TaskPageContent {
   thinkingBlock(item: RenderThinkingItem) {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
-        this.disclosureChevron(
-          this.isIn(this.expandedThinking, item.key),
-          $r('app.color.chat_text_secondary'),
-        )
-        Text(this.thinkingTitle(item))
+        SymbolGlyph($r('sys.symbol.wand_and_stars'))
+          .fontSize(uiFontSize(14)).fontColor([$r('app.color.text_tertiary')]).width(16)
+        Text() {
+          this.thinkingTextSpans(tokenizeThinkingText(this.thinkingTitle(item)))
+        }
           .fontSize(uiFontSize(14))
           .lineHeight(uiLineHeight(20))
           .fontColor($r('app.color.chat_text_secondary'))
+          .fontStyle(FontStyle.Italic).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+        this.disclosureChevron(this.isIn(this.expandedThinking, item.key), $r('app.color.text_tertiary'))
       }
       .width('100%')
       .constraintSize({ minHeight: 32 })
@@ -11154,7 +11243,7 @@ export struct TaskPageContent {
         } else if (item.body.trim().length > 0) {
           // Thinking 正文使用 12/18 斜体小字和 2vp rail，不继承普通消息 17/26 档。
           Text() {
-            this.thinkingTextSpans(tokenizeThinkingText(item.body))
+            this.thinkingTextSpans(tokenizeThinkingText(this.thinkingDetailBody(item)))
           }
             .fontSize(uiFontSize(12))
             .lineHeight(uiLineHeight(18))
@@ -11215,9 +11304,6 @@ export struct TaskPageContent {
         this.toolRow(t, action)
       },
       (action: ToolActionPresentation) => this.toolActionKey(t, action))
-    if (t.processMedia.length > 0) {
-      this.toolProcessMedia(t)
-    }
   }
 
   /** 对齐 Mobile ToolActionRow：原生过程媒体留在所属工具步骤里（明确交付媒体仍走媒体结果块）。 */
@@ -11228,9 +11314,8 @@ export struct TaskPageContent {
         List({ space: 8 }) {
           ForEach(this.processMediaImages(t), (ref: RemoteImageRef) => {
             ListItem() {
-              this.toolMediaImage(ref)
+              this.toolProcessImage(ref)
             }
-            .onAppear(() => this.ensureImageSource(ref.url, ref))
           }, (ref: RemoteImageRef) => `${t.toolUseId}-process-${ref.url}`)
         }
         .listDirection(Axis.Horizontal)
@@ -11244,6 +11329,48 @@ export struct TaskPageContent {
     .width('100%')
     .alignItems(HorizontalAlign.Start)
     .padding({ left: 30, right: 8, top: 2, bottom: 4 })
+  }
+
+  @Builder
+  toolProcessImage(ref: RemoteImageRef) {
+    if ((this.imageSources.get(ref.url) ?? '').length > 0 || this.imageStatus(ref.url) === 'error') {
+      this.toolMediaImage(ref)
+    } else {
+      Column({ space: 8 }) {
+        if (this.imageStatus(ref.url) === 'loading') {
+          LoadingProgress().width(20).height(20)
+        } else {
+          SymbolGlyph($r('sys.symbol.picture')).fontSize(24)
+            .fontColor([$r('app.color.text_tertiary')])
+        }
+        Text($r('app.string.v133_process_image'))
+          .fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
+        Text($r('app.string.v133_process_image_fetch'))
+          .fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
+          .textAlign(TextAlign.Center)
+      }
+      .width(220).height(165).padding(12)
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+      .accessibilityLevel('yes')
+      .accessibilityText($r('app.string.v133_process_image_fetch'))
+      .clickEffect(UI_CLICK_EFFECT)
+      .onClick(() => void this.fetchToolProcessImage(ref))
+    }
+  }
+
+  private async fetchToolProcessImage(ref: RemoteImageRef): Promise<void> {
+    const generation = this.pageLifecycleGeneration;
+    this.ensureImageSource(ref.url, ref);
+    const pending = this.imageResolutions.get(ref.url);
+    if (pending === undefined) return;
+    try {
+      const source = await pending;
+      if (!this.isCurrentPageLifecycle(generation) || source.length === 0) return;
+      this.previewImageUrl = source;
+    } catch (_error) {
+      // Existing media state owns the failure and exposes a manual retry on the card.
+    }
   }
 
   private processMediaImages(t: RenderToolItem): RemoteImageRef[] {
@@ -11362,6 +11489,10 @@ export struct TaskPageContent {
           this.toggleToolDetails(this.toolActionKey(t, action));
         }
       })
+
+      if (action.actionIndex === 0 && t.processMedia.length > 0) {
+        this.toolProcessMedia(t)
+      }
 
       if (this.toolHasDetails(t, action)
         && this.isIn(this.expandedTools, this.toolActionKey(t, action))) {
@@ -13318,7 +13449,14 @@ export struct TaskPageContent {
   }
 
   /** OSS key → 临时可加载地址，并在页面生命周期内复用。 */
+  private ossUrlRouteGeneration: number = -1;
   private resolveOssUrl(ossKey: string): Promise<string> {
+    const route = RelayRoute.instance;
+    const generation = route.generation;
+    if (generation !== this.ossUrlRouteGeneration) {
+      this.ossUrlCache.clear();
+      this.ossUrlRouteGeneration = generation;
+    }
     const cached = this.ossUrlCache.get(ossKey);
     if (cached !== undefined) {
       return Promise.resolve(cached);
@@ -13327,8 +13465,14 @@ export struct TaskPageContent {
       if (token === null || token.length === 0) {
         throw new Error('未登录');
       }
+      route.assertGeneration(generation);
       return presignGet(ossKey, token);
     }).then((getUrl: string) => {
+      route.assertGeneration(generation);
+      // Agent-Net URLs contain decrypted image bytes, so the former cheap URL cache needs a byte budget.
+      let size = getUrl.length;
+      this.ossUrlCache.forEach((value: string) => { size += value.length; });
+      if (size > 16 * 1024 * 1024 || this.ossUrlCache.size >= 24) this.ossUrlCache.clear();
       this.ossUrlCache.set(ossKey, getUrl);
       return getUrl;
     });

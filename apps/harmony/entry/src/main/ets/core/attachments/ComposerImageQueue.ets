@@ -41,6 +41,7 @@ export class ComposerImageQueue {
   /** 选图 busy 状态变化回调（Sheet/按钮禁用联动）。 */
   onPickingChanged: (picking: boolean) => void = () => {};
   /** 页面级忙碌判定（发送中/创建中），忙碌时禁止增删图片。 */
+  targetDevice: () => string = () => '';
   isBusy: () => boolean = () => false;
   occupiedByOtherAttachments: () => number = () => 0;
 
@@ -311,7 +312,7 @@ export class ComposerImageQueue {
       return AppServices.instance.auth.getAccessToken().then((token: string | null) => {
         if (!this.isCurrentUpload(image, revision)) throw new Error('stale image upload');
         if (token === null || token.length === 0) throw new Error('未登录');
-        return uploadImage(candidate, token);
+        return uploadImage(candidate, token, this.targetDevice());
       });
     }).then((ref: RemoteImageRef) => {
       if (!this.isCurrentUpload(image, revision)) {

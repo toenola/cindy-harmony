@@ -39,9 +39,11 @@
 | 历史加载 / 流式合并 / 去重 / push 应用 | `apps/mobile/src/session/remoteSessionStore.ts` | `core/messages/MessageStore.ets` |
 | 断线补齐（gap healing） | `apps/mobile/src/session/historyWindowGap.ts` | 切片 5 |
 | 消息滚动（分页触发 / 锚点 / 阅读位置） | `apps/mobile/src/session/messageScroll.ts` | 切片 2.4 |
+| 回复后的输入建议 | `apps/mobile/src/session/usePromptRecommendation.ts`、`promptRecommendationPreference.ts`、`usePromptRecommendationVisibility.ts`、`PromptRecommendation.tsx` | `core/messages/PromptRecommendation*.ets`、`components/PromptRecommendationPanel.ets` |
 | 输入投影（发送中 / 队列 / 失败重试 / 暂停） | `apps/mobile/src/session/inputProjection.ts` | 切片 3 |
 | 行内原子（quote / 粘贴段 / slash） | `apps/mobile/src/session/sentMessageAtoms.ts` | 后续增强 |
 | Composer 文档模型（手打 / 粘贴 / 引用恢复） | `apps/mobile/src/session/composerDocument.ts` | 切片 3 |
+| 用量概览（额度 / 30 天趋势 / 模型分组） | `apps/mobile/src/widgets/UsageDashboard.tsx`、`UsageQuotaColumns.tsx`、`usageWidgetSync.ts`；共享 `deviceLinkContract.ts` | `core/usage/UsageDashboard.ets`、`components/UsageDashboardPanel.ets` |
 | 图片 / 附件（选择 / 压缩 / 上传 / 恢复） | `apps/mobile/src/session/mobileImageAttachment.ts`、`mobileImagePreprocess.ts`、`mobileAttachmentUpload.ts`、`messageAttachments.ts` | 切片 3 |
 | 会话引用 / 历史窗口 | `apps/mobile/src/session/sessionReferences.ts` | 后续 |
 | 交互确认（Permission / Ask User / Plan Review） | 切片 4 开始时查 `apps/mobile/src` 对应实现 | 切片 4 |
@@ -60,3 +62,64 @@
   记录差异到 `decision-log.md` 再偏离；
 - 跨端协议层（Device Link / 认证）仍以 `packages/device-link-protocol` 与
   `packages/device-link` 为权威，本文件只管客户端行为表现。
+
+## 6. 鸿蒙首页用量入口
+
+按用户指定，底部为「项目 / 沟通 / 用量」；自动化对话归入沟通，包含置顶与搜索结果，
+旧自动化页签偏好迁移到沟通。用量页在展开屏占右侧详情区域，左侧保留此前的项目/沟通列表；合盖单栏时用量全屏展示。
+原任务详情节点和选择保留，点击左侧任务可返回会话。品牌额度图标使用与 iOS 同源的
+OpenAI / Anthropic provider path，不使用 CLI Agent mark；不展示底部 Cindy 余额行。
+
+用量复用 iOS 的 `device-link:usage-widget:snapshot:v1` 只读快照，额度和历史均由电脑端获取，
+不在手机直连模型厂商。全部电脑范围依次尝试在线可控制电脑（优先 macOS），选定电脑范围
+只读该电脑；快照里的 `usage.scope` 决定历史是本机还是全部电脑。打开、手动刷新或连接恢复
+时读取；在线候选电脑变化后可恢复读取，不对会话 push 重复拉取，也不增加网络定时轮询。
+
+图表和图例共用同一模型分组：模型数据结构完整时使用模型桶，缺失时整体回退到旧版 harness
+桶；超过四个非空分组保留前三个模型，其余合并。空快照或不支持与真实零用量分开呈现。
+跨账号、设备范围或中转代次清理旧快照，迟到结果不得回写；保留同范围失败前的快照和更新时间。
+
+真机统一验收项：Light / Dark、折叠 / 展开、底栏切换、自动化对话及搜索、真实额度与历史、
+手动刷新、离线恢复、电脑版本不支持、切换账号/设备/中转后的旧数据隔离。
+
+## 7. 回复后的输入建议
+
+设置里的「输入建议」仅保存在本手机，默认开启，可关闭或恢复默认。读取偏好失败时默认不开启，
+避免覆盖原先关闭的选择；写入失败仍保留当前进程选择并明确告知未保存。
+
+与 iOS 一致，复用电脑端 `maker:predict-prompt`：仅观察到正在运行→完成且完成版本推进时，
+允许在 500ms 防抖后发起一次非 cache-only 请求。历史进入只查缓存；缓存未就绪最多在
+1 / 3 / 5 秒后再读，不转成模型生成。请求失败等待连接恢复且只查缓存，普通重绘不得重复生成。
+失败的回合不推荐，跨账号/设备/任务及退出后迟到响应失效。开关关闭取消尚未发出的请求；
+已经发出的模型请求不重复发起，迟到结果不显示。
+
+输入框上方显示单行建议胶囊，点击只填入草稿并聚焦，不自动发送；横向滑动忽略本次完成版本，
+重进同一任务也不再次弹出。普通打字或聚焦只隐藏，不消费缓存；清空草稿或收起输入卡可恢复。
+附件、引用、编辑消息/队列、待确认交互、发送中与隐藏任务详情不展示。输入建议不参与模型提示词
+编写或工具协议修改，所有模型调用仍由电脑端完成。
+
+真机统一验收项追加：设置本机开关、关闭/恢复默认、回复结束后建议显示、点击填入不发送、
+横向滑动忽略、聚焦和输入/清空、附件和引用遮挡、历史不新生成、断线恢复、切任务/账号隔离。
+
+## 8. 用量图形和提问面板布局
+
+用量页品牌图标使用与 iOS 相同的 provider SVG 几何，分别提供 Light / Dark 原生图片资源，
+不依赖 ArkUI Shape 子路径继承主题色；24vp 图标与 16vp 账号文字按中心对齐。日均虚线用
+独立的短横条覆盖在走势图上，位置仍按同一平均值/峰值比例计算，不能被柱形或绘图裁剪吞掉。
+
+Ask User 提问面板根据扣除标题栏和键盘后的实际可用高度设置上限，按正文和底部操作的真实测量高度收缩。
+短内容不得用固定高度或 layoutWeight 撑开正文；仅长内容超过上限时滚动。标题仅显示文字，不加图标。问题、选项、自定义回答和错误
+提示在正文区域滚动，提交/下一题等操作固定在底部；底部主次按钮统一 44vp 点击高度、88vp 最小宽度和相同外边距，滚动正文显式顶部对齐，避免短问题被默认居中。不能把整张
+提问卡再次包进固定 240vp 的外层 Scroll，导致确认按钮出现在裁剪区域外。多问题切换与原有
+回答校验、取消和跳过语义不变。验收包括展开/合盖、长问题、多选项、键盘打开和底部确认按钮。
+
+会话列表的 Claude / Codex 图标按用户指定复用用量页的 provider SVG，使用 24vp 图片置于 28vp 图标槽中，Light / Dark 跟随同源主题资源。
+
+## 9. Ask User 的 iOS 分组样式
+
+卡内只保留弱提示「等待回答」、问题标题和选项数/单多选/其他回答说明。按用户最新要求，
+不显示方框外的队列说明行。选项与其他回答输入合成一个圆角分组，仅使用行间分隔线。
+选项最小高度 46vp、14vp 正文、20vp 指示器，问题标题 15vp，与对话中的文字协调；
+卡片内边距 16vp、区块间距 12vp。底部按钮统一 44vp 高度、88vp 最小宽度，禁用提交
+使用弱化语义色。正文高度按测量值收缩，长内容才滚动，不用固定高度或权重撑出留白。
+多题、约束选项、错误校验和回答提交仍走原有逻辑。

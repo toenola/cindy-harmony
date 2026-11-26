@@ -1,3 +1,4 @@
+import { RelayRoute } from '../device-link/RelayRoute';
 /**
  * 附件上传（ArkTS 移植 mobileAttachmentUpload.ts 语义）。
  *
@@ -7,7 +8,6 @@
  */
 
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
-import { AppConfig } from '../../AppConfig';
 import { HarmonyHttp } from '../../network/HarmonyHttp';
 import {
   AttachmentPresignResult, ImageAttachmentCandidate, RemoteImageRef,
@@ -61,9 +61,13 @@ export async function presignUpload(
   ext: string,
   token: string,
 ): Promise<AttachmentPresignResult> {
+  const route = RelayRoute.instance;
+  const generation = route.generation;
+  const baseUrl = route.apiBase;
+  const privateEndpoint = route.legacy !== undefined;
   const http = new HarmonyHttp();
   const headers: Record<string, string> = {};
-  headers['Authorization'] = `Bearer ${token}`;
+  headers['Authorization'] = RelayRoute.instance.authorization(token);
   const body = JSON.stringify({
     size: size,
     contentType: contentType,
@@ -72,12 +76,14 @@ export async function presignUpload(
   for (let attempt = 0; attempt < 2; attempt++) {
     let receivedResponse = false;
     try {
+      route.assertGeneration(generation);
       const res = await http.requestJson(
-        `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-put`,
+        `${baseUrl}/api/device-link/media/presign-put`,
         'POST',
         headers,
-        body,
+        body, 15000, privateEndpoint,
       );
+      route.assertGeneration(generation);
       receivedResponse = true;
       if (res.statusCode < 200 || res.statusCode >= 300) {
         if (attempt === 0 && isRetryablePresignStatus(res.statusCode)) continue;
@@ -103,6 +109,7 @@ export async function presignUpload(
       return out;
     } catch (e) {
       // 只有 transport rejection 自动重试；已收到的无效 2xx 不可重放。
+      route.assertGeneration(generation);
       if (!receivedResponse && attempt === 0) continue;
       if (e instanceof Error) throw e;
       throw new AttachmentUploadError('presign failed');
@@ -142,16 +149,26 @@ export async function putUpload(
 
 /** 获取 OSS 下载 URL（历史图片加载用；cindy-oss-attach 引用 → presign-get → OSS GET URL）。 */
 export async function presignGet(key: string, token: string): Promise<string> {
+  if (key.startsWith('agent-net-v3/')) {
+    const socket = RelayRoute.instance.socket;
+    if (!socket) throw new AttachmentUploadError('AGENT_NET_NOT_CONNECTED');
+    return socket.download(key);
+  }
+  const route = RelayRoute.instance;
+  const generation = route.generation;
+  const baseUrl = route.apiBase;
+  const privateEndpoint = route.legacy !== undefined;
   const http = new HarmonyHttp();
   const headers: Record<string, string> = {};
-  headers['Authorization'] = `Bearer ${token}`;
+  headers['Authorization'] = RelayRoute.instance.authorization(token);
   const body = JSON.stringify({ key: key });
   const res = await http.requestJson(
-    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media/presign-get`,
+    `${baseUrl}/api/device-link/media/presign-get`,
     'POST',
     headers,
-    body,
+    body, 15000, privateEndpoint,
   );
+  route.assertGeneration(generation);
   if (res.statusCode >= 300) {
     throw new AttachmentUploadError(`presign-get failed: ${res.statusCode}`);
   }
@@ -173,16 +190,26 @@ export async function deleteUpload(
   ossKey: string,
   token: string,
 ): Promise<void> {
+  if (ossKey.startsWith('agent-net-v3/')) {
+    const socket = RelayRoute.instance.socket;
+    if (!socket) throw new AttachmentUploadError('AGENT_NET_NOT_CONNECTED');
+    return socket.deleteMedia(ossKey);
+  }
+  const route = RelayRoute.instance;
+  const generation = route.generation;
+  const baseUrl = route.apiBase;
+  const privateEndpoint = route.legacy !== undefined;
   const http = new HarmonyHttp();
   const headers: Record<string, string> = {};
-  headers['Authorization'] = `Bearer ${token}`;
+  headers['Authorization'] = RelayRoute.instance.authorization(token);
   const body = JSON.stringify({ key: ossKey });
   const res = await http.requestJson(
-    `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/media`,
+    `${baseUrl}/api/device-link/media`,
     'DELETE',
     headers,
-    body,
+    body, 15000, privateEndpoint,
   );
+  route.assertGeneration(generation);
   if (res.statusCode >= 300) {
     throw new AttachmentUploadError(`delete failed: ${res.statusCode}`);
   }
@@ -205,7 +232,9 @@ export function uploadExtForName(name: string): string {
 export async function uploadImage(
   candidate: ImageAttachmentCandidate,
   token: string,
+  deviceId: string = '',
 ): Promise<RemoteImageRef> {
+  const generation = RelayRoute.instance.generation;
   if (candidate.size > MAX_ATTACHMENT_BYTES) {
     throw new AttachmentUploadError('图片超过大小限制');
   }
@@ -218,6 +247,20 @@ export async function uploadImage(
     candidate.height,
   );
   const sha = await sha256Hex(processed.bytes);
+  RelayRoute.instance.assertGeneration(generation);
+  if (RelayRoute.instance.agentNet) {
+    const socket = RelayRoute.instance.socket;
+    if (!socket || !deviceId) throw new AttachmentUploadError('AGENT_NET_MEDIA_PEER_REQUIRED');
+    const key = await socket.upload(deviceId, processed.bytes, processed.mimeType);
+    RelayRoute.instance.assertGeneration(generation);
+    const oss = new AttachmentOssRef();
+    oss.ossKey = key; oss.mimeType = processed.mimeType; oss.originalName = processed.name;
+    oss.size = processed.size; oss.sha256 = sha;
+    const ref = new RemoteImageRef();
+    ref.url = buildAttachmentOssRef(oss); ref.originalName = processed.name;
+    ref.mimeType = processed.mimeType; ref.size = processed.size; ref.sha256 = sha;
+    return ref;
+  }
   const presigned = await presignUpload(
     processed.size,
     processed.mimeType,
@@ -225,10 +268,12 @@ export async function uploadImage(
     token,
   );
   try {
+    RelayRoute.instance.assertGeneration(generation);
     await putUpload(presigned.putUrl, processed.bytes, processed.mimeType);
   } catch (e) {
     // 上传失败：回收中转对象（best-effort）。
     try {
+      RelayRoute.instance.assertGeneration(generation);
       await deleteUpload(presigned.key, token);
     } catch (e2) {
       // 忽略回收失败
@@ -238,6 +283,7 @@ export async function uploadImage(
     }
     throw new AttachmentUploadError('upload failed');
   }
+  RelayRoute.instance.assertGeneration(generation);
   const ref = new AttachmentOssRef();
   ref.ossKey = presigned.key;
   ref.mimeType = processed.mimeType;
@@ -294,7 +340,9 @@ export async function uploadDocument(
   uri: string,
   name: string,
   token: string,
+  deviceId: string = '',
 ): Promise<RemoteSerializedAttachment> {
+  const generation = RelayRoute.instance.generation;
   const category = attachmentCategoryForName(name);
   if (category.length === 0) throw new AttachmentUploadError('不支持这种文件类型');
   const bytes = await readFileBytes(uri);
@@ -302,14 +350,30 @@ export async function uploadDocument(
   if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new AttachmentUploadError('文件超过 30MB');
   const mimeType = attachmentMimeType(name, category);
   const sha = await sha256Hex(bytes);
+  RelayRoute.instance.assertGeneration(generation);
+  if (RelayRoute.instance.agentNet) {
+    const socket = RelayRoute.instance.socket;
+    if (!socket || !deviceId) throw new AttachmentUploadError('AGENT_NET_MEDIA_PEER_REQUIRED');
+    const key = await socket.upload(deviceId, bytes, mimeType);
+    RelayRoute.instance.assertGeneration(generation);
+    const oss = new AttachmentOssRef();
+    oss.ossKey = key; oss.mimeType = mimeType; oss.originalName = name; oss.size = bytes.byteLength; oss.sha256 = sha;
+    const attachment = new RemoteSerializedAttachment();
+    attachment.id = 'harmony-upload:' + key; attachment.name = name; attachment.originalName = name;
+    attachment.path = buildAttachmentOssRef(oss); attachment.ext = uploadExtForName(name);
+    attachment.size = bytes.byteLength; attachment.sha256 = sha; attachment.category = category; attachment.mimeType = mimeType;
+    return attachment;
+  }
   const presigned = await presignUpload(bytes.byteLength, mimeType, uploadExtForName(name), token);
   try {
+    RelayRoute.instance.assertGeneration(generation);
     await putUpload(presigned.putUrl, bytes, mimeType);
   } catch (e) {
-    try { await deleteUpload(presigned.key, token); } catch (e2) {}
+    try { RelayRoute.instance.assertGeneration(generation); await deleteUpload(presigned.key, token); } catch (e2) {}
     if (e instanceof Error) throw e;
     throw new AttachmentUploadError('upload failed');
   }
+  RelayRoute.instance.assertGeneration(generation);
   const oss = new AttachmentOssRef();
   oss.ossKey = presigned.key;
   oss.mimeType = mimeType;

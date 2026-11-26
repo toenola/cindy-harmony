@@ -1,3 +1,8 @@
+import { PromptRecommendationPreference } from './messages/PromptRecommendationPreference';
+import { parseRelayJoinLink } from './device-link/RelayJoinLink';
+import { AgentNetSocket } from './device-link/AgentNetSocket';
+import { RelayRoute } from './device-link/RelayRoute';
+import { LegacyRelaySocket } from './device-link/LegacyRelaySocket';
 import { presignGet } from './attachments/AttachmentUpload';
 import { OrcaCollaboration } from './tasks/OrcaCollaboration';
 import { TeammateRoster } from './tasks/TeammateRoster';
@@ -18,7 +23,7 @@ import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AppConfig } from '../AppConfig';
 import { HarmonyWsAdapter } from '../network/HarmonyWsAdapter';
-import { HarmonyHttp } from '../network/HarmonyHttp';
+import { HarmonyHttp, HttpResponseData } from '../network/HarmonyHttp';
 import { AuthStore } from './auth/AuthStore';
 import { DlClient, DlClientOptions, DlEvents, DlInvokeOptions, DlOpenLinkOptions } from './device-link/DlClient';
 import {
@@ -32,7 +37,7 @@ import { TaskAccountTransition } from './tasks/ResidentTaskPanes';
 import { PROJECT_ALIASES_CHANGED, TaskProjectAliasStore } from './tasks/TaskProjectAliasStore';
 import { RemoteAgentCatalogStore } from './tasks/RemoteAgentCatalogs';
 import { snapshotDevices, TaskListSnapshotStore } from './tasks/TaskListSnapshotStore';
-import { DeviceView, parseDeviceView, readStr, recordOrEmpty, safeErrorMessage } from './tasks/TaskModels';
+import { DeviceView, parseDeviceView, readStr, readObj, recordOrEmpty, safeErrorMessage } from './tasks/TaskModels';
 import { MessageStore } from './messages/MessageStore';
 import { InteractionStore } from './interactions/InteractionStore';
 import { GoalStore } from './goals/GoalStore';
@@ -82,6 +87,7 @@ export class AppServices {
   readonly richAnswerMemory: RichInteractionMemory = new RichInteractionMemory(this.richAnswerStorage);
   readonly richAnswerSubmissions: RichSubmissionController = new RichSubmissionController(this.richAnswerMemory);
   readonly taskListPreferences: TaskListPreferenceStore = new TaskListPreferenceStore();
+  readonly promptRecommendationPreference: PromptRecommendationPreference = new PromptRecommendationPreference();
   readonly newSessionPreferences: NewSessionPreferenceStore = new NewSessionPreferenceStore();
   readonly remoteModelPreferences: RemoteModelPreferenceStore = new RemoteModelPreferenceStore();
   readonly taskListSnapshot: TaskListSnapshotStore = new TaskListSnapshotStore();
@@ -131,12 +137,34 @@ export class AppServices {
   /** 账号切换后不能让新账号加入旧账号的设备快照请求。 */
   private deviceLoadInFlightEpoch: number = -1;
 
+  private encryptedSocket: AgentNetSocket | undefined;
+
   private constructor() {
     const opts = new DlClientOptions();
-    opts.getWsUrl = () => AppConfig.deviceLinkWsUrl;
-    opts.getToken = () => this.auth.getAccessToken();
+    opts.getWsUrl = () => RelayRoute.instance.wsUrl;
+    opts.getToken = async (): Promise<string | null> => {
+      await RelayRoute.instance.prepare(this.auth.cacheAccountId);
+      return RelayRoute.instance.custom ? 'relay' : this.auth.getAccessToken();
+    };
     opts.getHello = () => this.buildHello();
-    opts.createWs = () => new HarmonyWsAdapter();
+    opts.createWs = () => {
+      const route = RelayRoute.instance;
+      const membership = route.legacy;
+      const generation = route.generation;
+      const epoch = this.auth.sessionEpoch;
+      const guard = (): void => {
+        route.assertGeneration(generation);
+        if (epoch !== this.auth.sessionEpoch) throw new Error('RELAY_ACCOUNT_CHANGED');
+      };
+      const encrypted = route.agentNet;
+      if (encrypted) {
+        this.encryptedSocket = new AgentNetSocket(encrypted, guard);
+        route.socket = this.encryptedSocket;
+        return this.encryptedSocket;
+      }
+      this.encryptedSocket = undefined;
+      return membership ? new LegacyRelaySocket(membership, guard) : new HarmonyWsAdapter();
+    };
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
     this.orca = new OrcaCollaboration(this.client, (device: string): Promise<void> => this.openLink(device));
@@ -171,6 +199,8 @@ export class AppServices {
       // 自动 token 失效路径不会经过 SettingsPage 的 client.stop()；这里也必须
       // 断开旧账号链路并清掉队列、交互和新建任务，避免下一账号读取旧投影。
       this.client.stop();
+      RelayRoute.instance.reset();
+      this.pendingRelayLink = '';
       // 这次是账号级清理；旧账号临时 topic 的补偿退订不能跨过
       // stop/新账号复用同一 deviceId，避免误伤新账号的同名会话。
       this.orca.clear();
@@ -213,7 +243,20 @@ export class AppServices {
     );
   }
 
+  private pendingRelayLink: string = '';
+  hasPendingRelayLink(): boolean { return this.pendingRelayLink.length > 0; }
+  takePendingRelayLink(): string {
+    const link = this.pendingRelayLink;
+    this.pendingRelayLink = '';
+    return link;
+  }
+
   acceptDeepLinkUri(uri: string): boolean {
+    if (parseRelayJoinLink(uri)) {
+      this.pendingRelayLink = uri;
+      this.deepLinkListeners.forEach((listener: () => void) => listener());
+      return true;
+    }
     const intent = parseSessionDeepLink(uri);
     if (intent === null) return false;
     this.pendingDeepLink = intent;
@@ -353,6 +396,7 @@ export class AppServices {
       this.richAnswerStorage.init(context),
       this.taskListPreferences.init(context),
       this.newSessionPreferences.init(context),
+      this.promptRecommendationPreference.init(context),
       this.remoteModelPreferences.init(context),
       this.taskListSnapshot.init(context),
       this.taskCompletionPushPreference.init(context),
@@ -367,15 +411,49 @@ export class AppServices {
   }
 
   /** 登录态确认后、网络握手前恢复可丢弃的任务列表首屏快照。 */
-  restoreTaskListSnapshot(): void {
+  async restoreTaskListSnapshot(): Promise<void> {
+    const epoch = this.auth.sessionEpoch;
     const accountId = this.auth.cacheAccountId;
+    // A stored custom route that cannot be read must still allow Settings to open; never connect officially.
+    try { await RelayRoute.instance.prepare(accountId); } catch (_error) { return; }
+    if (epoch !== this.auth.sessionEpoch) return;
     void this.newSessionPreferences.setAccountScope(accountId);
     void this.remoteModelPreferences.setAccountScope(accountId);
-    this.taskListSnapshot.setAccountScope(accountId);
-    this.messages.setCacheAccountScope(accountId);
-    this.inputQueue.setAccountScope(accountId);
+    const routeScope = RelayRoute.instance.cacheScope(accountId);
+    this.taskListSnapshot.setAccountScope(routeScope);
+    this.messages.setCacheAccountScope(routeScope);
+    this.inputQueue.setAccountScope(routeScope);
     this.voiceDictionary.setAccountScope(accountId);
     this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
+  }
+
+  async activateRelay(expectCustom: boolean = false): Promise<void> {
+    const epoch = this.auth.sessionEpoch;
+    this.client.stop();
+    this.deviceLoadInFlight = undefined;
+    RelayRoute.instance.reset();
+    this.taskListSnapshot.setAccountScope('');
+    this.tasks.clearAll();
+    this.orca.clear();
+    this.teammateRoster.clear();
+    this.taskProjectOrder.clearAll();
+    this.taskProjectAliases.clearAll();
+    this.remoteAgentCatalogs.clearAll();
+    await this.messages.clearAllCachedSessions();
+    if (epoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn) return;
+    await RelayRoute.instance.prepare(this.auth.cacheAccountId);
+    if (epoch !== this.auth.sessionEpoch) return;
+    if (expectCustom && !RelayRoute.instance.custom) throw new Error('RELAY_ACTIVATION_FAILED');
+    const scope = RelayRoute.instance.cacheScope(this.auth.cacheAccountId);
+    this.taskListSnapshot.setAccountScope(scope);
+    this.messages.setCacheAccountScope(scope);
+    this.inputQueue.setAccountScope(scope);
+    this.client.start();
+  }
+
+  async useOfficialRelay(): Promise<void> {
+    await RelayRoute.instance.official(this.auth.cacheAccountId);
+    await this.activateRelay();
   }
 
   getSelfDeviceName(): string {
@@ -387,34 +465,55 @@ export class AppServices {
    * 避免网络失败时下次重连把未保存的草稿广播出去。
    */
   async renameSelfDevice(rawName: string): Promise<string> {
+    const route = RelayRoute.instance;
+    const generation = route.generation;
+    const epoch = this.auth.sessionEpoch;
+    const guard = (): void => {
+      route.assertGeneration(generation);
+      if (epoch !== this.auth.sessionEpoch) throw new Error('RELAY_ACCOUNT_CHANGED');
+    };
+    const baseUrl = route.apiBase;
+    const custom = route.custom;
     const name = rawName.trim();
     if (name.length > 64) throw new Error('设备名称不能超过 64 个字符');
     const deviceId = await this.auth.ensureDeviceId();
+    guard();
+    if (route.agentNet && this.encryptedSocket) {
+      await this.encryptedSocket.apiRequest('PATCH', '/devices/' + encodeURIComponent(deviceId), JSON.stringify({ name: name || null }));
+      guard();
+      this.selfDeviceName = name;
+      await this.settingsStore.set(KEY_SELF_DEVICE_NAME, name);
+      return name;
+    }
     const token = await this.auth.getAccessToken();
     if (token === null || token.length === 0) throw new Error('登录状态已失效');
+    guard();
     const headers: Record<string, string> = {};
-    headers['Authorization'] = `Bearer ${token}`;
+    headers['Authorization'] = RelayRoute.instance.authorization(token);
     const body = JSON.stringify({ name: name.length > 0 ? name : null });
     let responseBody = '';
     const res = await this.http.requestJson(
-      `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
+      `${baseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
       'PATCH',
       headers,
       body,
-      12000,
+      12000, RelayRoute.instance.legacy !== undefined,
     );
+    guard();
     responseBody = res.body;
-    if (res.statusCode === 401) {
+    if (res.statusCode === 401 && !custom) {
       const refreshed = await this.auth.forceRefreshToken();
+      guard();
       if (refreshed !== null && refreshed.length > 0) {
         headers['Authorization'] = `Bearer ${refreshed}`;
         const retry = await this.http.requestJson(
-          `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
+          `${baseUrl}/api/device-link/devices/${encodeURIComponent(deviceId)}`,
           'PATCH',
           headers,
           body,
           12000,
         );
+        guard();
         if (retry.statusCode < 200 || retry.statusCode >= 300) {
           throw new Error(`设备名称保存失败（HTTP ${retry.statusCode}）`);
         }
@@ -595,6 +694,12 @@ export class AppServices {
       }
     };
     events.onHelloAck = (ack: HelloAckPayload) => {
+      // Custom relays can use a relay-local subject. It is not an official login/account transition.
+      // Replacing the account here would orphan its encrypted membership and select the official route.
+      if (RelayRoute.instance.custom) {
+        this.tasks.setSelfDeviceId(ack.deviceId);
+        return;
+      }
       // setStatus('online') 已在同一 hello-ack 处理链中触发 loadDevices；这里只记录
       // 本机身份，避免冷启动对设备 REST 发出两份完全相同的并发请求。
       const previousAccountId = this.auth.cacheAccountId;
@@ -609,6 +714,7 @@ export class AppServices {
       this.tasks.setSelfDeviceId(ack.deviceId);
     };
     events.onAuthFailed = () => {
+      if (RelayRoute.instance.custom) return;
       // 握手被 401 拒：强制刷新 token 后立即重连。
       void this.recoverAuthAndReconnect();
     };
@@ -666,20 +772,46 @@ export class AppServices {
     const authEpoch = this.auth.sessionEpoch;
     let retried = false;
     try {
+      await RelayRoute.instance.prepare(this.auth.cacheAccountId);
+      const routeGeneration = RelayRoute.instance.generation;
       for (;;) {
-        const token = await this.auth.getAccessToken();
+        const token = RelayRoute.instance.custom ? 'relay' : await this.auth.getAccessToken();
+        RelayRoute.instance.assertGeneration(routeGeneration);
+        if (authEpoch !== this.auth.sessionEpoch) return false;
         if (token === null || token.length === 0) {
           return false;
         }
-        const headers: Record<string, string> = {};
-        headers['Authorization'] = `Bearer ${token}`;
-        const res = await this.http.requestJson(
-          `${AppConfig.deviceLinkApiBaseUrl}/api/device-link/devices`,
-          'GET',
-          headers,
-          undefined,
-        );
-        if (res.statusCode === 401 && !retried) {
+        let responseBody: string;
+        let responseStatus: number;
+        if (RelayRoute.instance.agentNet) {
+          if (!this.encryptedSocket) return false;
+          const directory = JSON.parse(await this.encryptedSocket.directory()) as Object[];
+          const devices: Record<string, Object>[] = [];
+          for (const item of directory) {
+            const view = recordOrEmpty(item);
+            const cert = readObj(view, 'certificate');
+            const projected: Record<string, Object> = {
+              'deviceId': readStr(cert, 'deviceId'), 'name': readStr(view, 'name'),
+              'platform': readStr(view, 'platform'), 'appVersion': readStr(view, 'appVersion'),
+              'online': view['online'] === true, 'busy': view['busy'] === true,
+              'remoteControlEnabled': view['remoteControlEnabled'] === true,
+              'isSelf': cert['deviceId'] === RelayRoute.instance.agentNet?.deviceId,
+            };
+            devices.push(projected);
+          }
+          responseBody = JSON.stringify(devices);
+          responseStatus = 200;
+        } else {
+          const headers: Record<string, string> = {};
+          headers['Authorization'] = RelayRoute.instance.authorization(token);
+          const response = await this.http.requestJson(RelayRoute.instance.apiBase + '/api/device-link/devices',
+            'GET', headers, undefined, 15000, RelayRoute.instance.custom);
+          responseBody = response.body;
+          responseStatus = response.statusCode;
+        }
+        const res: HttpResponseData = { statusCode: responseStatus, body: responseBody };
+        RelayRoute.instance.assertGeneration(routeGeneration);
+        if (res.statusCode === 401 && !retried && !RelayRoute.instance.custom) {
           // access token 过期：强制刷新后重试一次。
           retried = true;
           const refreshed = await this.auth.forceRefreshToken();
@@ -791,9 +923,10 @@ export class AppServices {
       if (switchingAccount) this.taskAccountTransition.complete(accountEpoch);
       return;
     }
-    this.taskListSnapshot.setAccountScope(accountId);
-    this.messages.setCacheAccountScope(accountId);
-    this.inputQueue.setAccountScope(accountId);
+    const routeScope = RelayRoute.instance.cacheScope(accountId);
+    this.taskListSnapshot.setAccountScope(routeScope);
+    this.messages.setCacheAccountScope(routeScope);
+    this.inputQueue.setAccountScope(routeScope);
     this.voiceDictionary.setAccountScope(accountId);
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);

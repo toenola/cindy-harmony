@@ -15,6 +15,9 @@ export class AppConfig {
   /** 认证 API base（验证码登录 / 刷新 / 账号）。 */
   static readonly authApiBaseUrl: string = 'https://auth.cindy.com.cn';
 
+  /** Official account-private relay directory, from config/endpoint.json. */
+  static readonly chatApiBaseUrl: string = 'https://chat.cindy.app';
+
   /** Device Link relay REST base（设备列表 / media presign）。 */
   static readonly deviceLinkApiBaseUrl: string = 'https://device-link.cindy.com.cn';
 

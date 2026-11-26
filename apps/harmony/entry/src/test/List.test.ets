@@ -1,3 +1,4 @@
+import promptRecommendationTests from './PromptRecommendation.test';
 import localUnitTest from './LocalUnit.test';
 import v131Tests from './V131.test';
 import v132DefaultsTests from './V132Defaults.test';
@@ -16,6 +17,7 @@ import v133PresentationTests from './V133Presentation.test';
 
 export default function testsuite() {
   localUnitTest();
+  promptRecommendationTests();
   v131Tests();
   v132DefaultsTests();
   v132InteractionTests();

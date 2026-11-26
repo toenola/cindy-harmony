@@ -1,3 +1,5 @@
+import { parseUsageSnapshot, usageSeries, usageSum, usageResetLabel, usageCandidates, UsageDay, UsageSeries } from '../main/ets/core/usage/UsageDashboard';
+import { PresenceSnapshot } from '../main/ets/core/device-link/DlProtocol';
 import { describe, expect, it } from '@ohos/hypium';
 import {
   buildRenderItems, RenderItem, RenderMessageItem, RenderSubagentGroupItem, RenderToolGroupItem, RenderToolItem,
@@ -67,6 +69,50 @@ function workChildIds(items: RenderItem[]): string[] {
 
 export default function v133PresentationTest(): void {
   describe('V133Presentation', () => {
+    // Unit tier, real dashboard projection: Mobile's legacy/model bucket contract was not
+    // covered by message rendering tests. Minimal inputs exercise zero vs unavailable,
+    // top-three/other consistency, and explicit device-scope/offline selection.
+    it('usage_snapshot_distinguishes_unavailable_from_zero_and_keeps_legacy_harnesses', 0, () => {
+      expect(parseUsageSnapshot(presentationRecord('{"version":2}')) === null).assertTrue();
+      const raw = presentationRecord('{"version":1,"sources":[],"usage":{"days":["2026-11-26"],"daily":[{"tokens":[10,20,0],"money":[1,2,0],"paid":0}]}}');
+      const snapshot = parseUsageSnapshot(raw);
+      expect(snapshot !== null).assertTrue();
+      if (snapshot === null) return;
+      expect(snapshot.days[0].paid).assertEqual(0);
+      const series = usageSeries(snapshot, 'Other');
+      expect(series[0].name).assertEqual('Codex');
+      expect(series[0].total).assertEqual(20);
+      expect(series[1].name).assertEqual('Claude Code');
+      expect(series[1].total).assertEqual(10);
+    });
+    it('usage_chart_and_legend_share_the_same_top_three_and_other_totals', 0, () => {
+      const raw = presentationRecord('{"version":1,"sources":[{"id":"a","kind":"subscription","fill":2,"value":"80","resetsAtMs":3600000,"when":"old"}],"strings":{"durationShort.hours":"{{h}}h","resetsIn":"Resets in {{duration}}"},"usage":{"days":["2026-11-26"],"models":[{"name":"A"},{"name":"B"},{"name":"C"},{"name":"D"}],"daily":[{"tokens":[100,50,0],"models":[0,0,0,0,0],"modelTokens":[50,40,30,20,10]}]}}');
+      const snapshot = parseUsageSnapshot(raw);
+      if (snapshot === null) { expect(false).assertTrue(); return; }
+      const series = usageSeries(snapshot, 'Other');
+      expect(series.length).assertEqual(4);
+      expect(series[3].name).assertEqual('Other');
+      expect(series[3].total).assertEqual(30);
+      expect(usageSum(series.map((s: UsageSeries): number => s.total))).assertEqual(usageSum(snapshot.days[0].tokens));
+      expect(snapshot.sources[0].fill).assertEqual(1);
+      expect(usageResetLabel(snapshot.sources[0], snapshot.strings, 0, 'Reset pending')).assertEqual('Resets in 1h');
+      expect(usageResetLabel(snapshot.sources[0], snapshot.strings, 3600000, 'Reset pending')).assertEqual('Reset pending');
+      // One missing daily bucket array must fall back for the entire period, like Mobile.
+      snapshot.days.push(new UsageDay());
+      expect(usageSeries(snapshot, 'Other')[0].name).assertEqual('Codex');
+      expect(usageSeries(snapshot, 'Other')[0].total).assertEqual(50);
+    });
+    it('usage_candidate_selection_respects_explicit_scope_and_excludes_offline_or_noncomputers', 0, () => {
+      const mac = new PresenceSnapshot(); mac.deviceId = 'mac'; mac.platform = 'darwin'; mac.online = true; mac.remoteControlEnabled = true;
+      const pc = new PresenceSnapshot(); pc.deviceId = 'pc'; pc.platform = 'win32'; pc.online = true; pc.remoteControlEnabled = true;
+      const phone = new PresenceSnapshot(); phone.deviceId = 'phone'; phone.platform = 'harmony'; phone.online = true; phone.remoteControlEnabled = true;
+      expect(usageCandidates([pc, phone, mac], '')[0].deviceId).assertEqual('mac');
+      expect(usageCandidates([pc, mac], 'pc').length).assertEqual(1);
+      expect(usageCandidates([pc, mac], 'pc')[0].deviceId).assertEqual('pc');
+      mac.online = false;
+      expect(usageCandidates([pc, mac], 'mac').length).assertEqual(0);
+    });
+
     it('failed_sampling_attempt_folds_into_work_and_never_completes_a_turn', 0, () => {
       const failed = presentationMessage('failed', 'assistant', 'Partial answer that was retried', 2,
         '{"failedSamplingAttempt":{"threadId":"t","turnId":"u","attempt":1,"itemId":"i"},"turnCompleted":true}');
@@ -102,6 +148,32 @@ export default function v133PresentationTest(): void {
       // 普通 JSON 工具输出保持原样；只剥掉我们的信封。
       expect(readToolProcessText('{"ok":true}')).assertEqual('{"ok":true}');
       expect(readToolProcessText('{"a":1,"cindy_process_media":[]}')).assertEqual('{\n  "a": 1\n}');
+    });
+
+    // Mobile process-media contract, unit tier: object-form history results must not lose
+    // the thumbnail to contentPreview's text shortcut. No network or native UI required.
+    it('object_tool_result_keeps_process_image_and_does_not_infer_command_paths', 0, () => {
+      const blob = `cindy-media://blobs/${'c'.repeat(64)}.png`;
+      const result = presentationToolResult('image-result', 'image-use', '', 2);
+      const envelope: Record<string, Object> = {};
+      envelope['text'] = 'Image inspected';
+      const media: Record<string, Object> = {};
+      media['kind'] = 'image';
+      media['url'] = blob;
+      envelope['cindy_process_media'] = [media];
+      result.content = envelope;
+      const tool = collectTools(buildRenderItems([
+        presentationMessage('image-user', 'user', 'Inspect', 0),
+        presentationToolUse('image-use', 1, 'view_image'), result,
+      ]), [])[0];
+      expect(tool.resultText).assertEqual('Image inspected');
+      expect(tool.processMedia.length).assertEqual(1);
+      expect(tool.processMedia[0].url).assertEqual(blob);
+      result.content = `Image inspected: ${blob}`;
+      const plain = collectTools(buildRenderItems([
+        presentationToolUse('image-use', 1, 'view_image'), result,
+      ]), [])[0];
+      expect(plain.processMedia.length).assertEqual(0);
     });
 
     it('only_host_issued_failed_image_records_enable_delivery_retry', 0, () => {

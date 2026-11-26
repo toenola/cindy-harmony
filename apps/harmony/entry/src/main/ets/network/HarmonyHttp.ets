@@ -30,6 +30,7 @@ export class HarmonyHttp {
     headers: Record<string, string>,
     body?: string,
     timeoutMs?: number,
+    privateEndpoint: boolean = false,
   ): Promise<HttpResponseData> {
     return new Promise<HttpResponseData>((resolve, reject) => {
       const req = http.createHttp();
@@ -50,9 +51,14 @@ export class HarmonyHttp {
         readTimeout: timeoutMs ?? 15000,
         expectDataType: http.HttpDataType.STRING,
       };
+      if (privateEndpoint) { options.maxRedirects = 0; options.usingCache = false; }
       req.request(url, options, (err: BusinessError, data: http.HttpResponse) => {
         req.destroy();
         if (err) {
+          if (privateEndpoint) {
+            reject(new Error('PRIVATE_ENDPOINT_UNREACHABLE'));
+            return;
+          }
           hilog.error(DOMAIN, TAG, '%{public}s %{public}s failed: %{public}s',
             method, url, safeErrorMessage(err));
           reject(new Error(`${method} ${url}: ${err.message}`));

@@ -530,6 +530,7 @@ export class DlClient {
     this.invalidatePeer(env.src);
     const p = this.payloadObj(env);
     const reason = this.readStr(p, 'reason');
+    hilog.warn(DOMAIN, TAG, 'peer closed link reason=%{public}s', /^[a-zA-Z0-9_-]{1,80}$/.test(reason) ? reason : 'unspecified');
     this.opts.events.onLinkClosed(env.src, reason);
   }
 

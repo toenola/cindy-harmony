@@ -155,6 +155,11 @@
     {
       "name": "chat_overlay_text",
       "value": "#FFFFFF"
-    }
+    },
+    {"name": "usage_chart_teal", "value": "#75bfb4"},
+    {"name": "usage_chart_pink", "value": "#e79fc1"},
+    {"name": "usage_chart_purple", "value": "#ab7bc6"},
+    {"name": "usage_chart_other", "value": "#969696"},
+    {"name": "usage_quota_plenty", "value": "#2DD4BF"}
   ]
 }

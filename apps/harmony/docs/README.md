@@ -19,6 +19,7 @@
 - [验证计划](./verification-plan.md)：协议、真机、断线、历史消息和交互验收
 - [决策记录](./decision-log.md)：重要技术选择及其原因
 - [版本开发资料](./version/README.md)：每个版本的开发计划、差异评估、技术设计和验收记录
+- [我的中转站开发计划](./self-hosted-relay-plan.md)：传统自建中转、仅 Agent-Net 中转与跨端验收
 
 ## 当前版本计划
 

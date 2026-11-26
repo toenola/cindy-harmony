@@ -322,6 +322,7 @@ export struct NewSessionPageContent {
     this.fileQueue.onPickingChanged = (picking: boolean): void => {
       this.pickingFiles = picking;
     };
+    this.fileQueue.targetDevice = () => this.selectedDeviceId;
     this.fileQueue.isBusy = (): boolean => this.creating || !this.pageActive || this.attachmentsDisposed;
     this.fileQueue.occupiedByOtherAttachments = (): number => this.composerImages.length;
     this.fileQueue.cancelPicking();
@@ -1065,7 +1066,7 @@ export struct NewSessionPageContent {
           throw new Error('stale image upload');
         }
         if (token === null || token.length === 0) throw new Error('未登录');
-        return uploadImage(candidate, token);
+        return uploadImage(candidate, token, this.selectedDeviceId);
       });
     }).then((ref: RemoteImageRef) => {
       if (!this.isCurrentComposerImageUpload(image, revision)) {

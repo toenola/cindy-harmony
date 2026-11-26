@@ -5,6 +5,7 @@
     "pages/TaskListPage",
     "pages/NewSessionPage",
     "pages/TaskPage",
-    "pages/SettingsPage"
+    "pages/SettingsPage",
+    "pages/RelayJoinPage"
   ]
 }

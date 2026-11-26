@@ -49,15 +49,16 @@ export function parseTaskListPreferences(raw: string): TaskListPreferences {
     out.selectedDeviceId = safeString(record, 'selectedDeviceId', 512);
     out.selectedDeviceName = safeString(record, 'selectedDeviceName', 256);
     const tab = safeString(record, 'activeListTab', 20);
-    if (tab === 'projects' || tab === 'dialogues' || tab === 'automations') out.activeListTab = tab;
+    if (tab === 'projects' || tab === 'dialogues' || tab === 'usage') out.activeListTab = tab;
+    if (tab === 'automations') out.activeListTab = 'dialogues';
     const sortMode = safeString(record, 'sortMode', 20);
     if (sortMode === 'default' || sortMode === 'recency' || sortMode === 'alphabetic') {
       out.sortMode = sortMode;
     }
     if (safeString(record, 'projectOrder', 20) === 'custom') out.projectOrder = 'custom';
     out.manualProjectOrder = safeKeys(record['manualProjectOrder']);
-    // 旧版把自动化放在状态筛选中；升级后迁移到新的一级分类。
-    if (safeString(record, 'statusFilter', 20) === 'automation') out.activeListTab = 'automations';
+    // 自动化对话现在统一归入沟通；旧页签和更早的筛选值都迁移到对话列表。
+    if (safeString(record, 'statusFilter', 20) === 'automation') out.activeListTab = 'dialogues';
     out.searchQuery = safeString(record, 'searchQuery', 256);
     out.openProjectKeys = safeKeys(record['openProjectKeys']);
     out.fullyExpandedProjectKeys = safeKeys(record['fullyExpandedProjectKeys']);

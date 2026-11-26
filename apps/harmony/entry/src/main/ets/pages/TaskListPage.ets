@@ -1,4 +1,4 @@
-import { CLAUDE_AGENT_PATH, CODEX_AGENT_FLOWER_PATH, CODEX_AGENT_PROMPT_PATH } from '../components/AgentMarkPaths';
+import { UsageDashboardPanel } from '../components/UsageDashboardPanel';
 import { TeammateAvatar } from '../components/TeammateAvatar';
 import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachineIdentity';
@@ -93,6 +93,7 @@ import {
   taskDisplayTitle,
   taskListEntryPresentationState,
   taskListCategory,
+  taskIsAutomation,
   taskListShouldShowFloatingBarAtBoundary,
   stableTaskKeys,
   TaskListCategory,
@@ -175,6 +176,7 @@ struct TaskListPage {
   @State scopeMenuOpen: boolean = false;
   @State sortMenuOpen: boolean = false;
   @State activeListTab: TaskListCategory = 'projects';
+  @State private usageSidebarCategory: TaskListCategory = 'projects';
   @State sortMode: TaskListSortMode = 'recency';
   /** 多设备范围使用本机账本；单设备范围优先使用被控端账本。 */
   @State projectOrderMode: TaskProjectOrderMode = 'activity';
@@ -286,7 +288,9 @@ struct TaskListPage {
   private listTabController: HdsTabsController = new HdsTabsController();
   private projectsScroller: Scroller = new Scroller();
   private dialoguesScroller: Scroller = new Scroller();
-  private automationsScroller: Scroller = new Scroller();
+  private usageScroller: Scroller = new Scroller();
+  private usageSidebarScroller: Scroller = new Scroller();
+  private usageSidebarOffset: number = 0;
   private listTabsAppeared: boolean = false;
   private floatingBarHidden: boolean = false;
   /** 正数表示向列表末尾浏览，负数表示回看上方；方向改变时重新累计。 */
@@ -320,7 +324,7 @@ struct TaskListPage {
     this.hydratePreferences();
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
-    if (this.activeListTab === 'dialogues') this.refreshTeammates();
+    if (this.sidebarCategory() === 'dialogues') this.refreshTeammates();
     // KeyboardAvoidMode 是 UIContext 级状态；从新建页等单栏页面返回时，
     // 必须按当前主从布局重新声明，不能沿用上一页的 OFFSET。
     this.updateKeyboardAvoidance();
@@ -330,7 +334,7 @@ struct TaskListPage {
       this.refreshProjection();
     }));
     this.unsubs.push(AppServices.instance.teammateRoster.onChanged((device: string): void => {
-      if (this.activeListTab === 'dialogues') this.scheduleTeammateRead(device);
+      if (this.sidebarCategory() === 'dialogues') this.scheduleTeammateRead(device);
     }));
     this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => this.refreshProjection()));
     this.unsubs.push(AppServices.instance.auth.onChanged(() => {
@@ -355,7 +359,7 @@ struct TaskListPage {
       this.connectionStatus = status;
       if (status === 'online') {
         if (this.selectedDeviceId.length > 0) void this.refreshProjectOrderForScope();
-        if (this.activeListTab === 'dialogues') this.refreshTeammates();
+        if (this.sidebarCategory() === 'dialogues') this.refreshTeammates();
       } else {
         // 连接代次变化时，旧主机快照不能继续作为当前正本；页面暂时使用本机投影。
         this.projectOrderScopeGeneration += 1;
@@ -577,6 +581,7 @@ struct TaskListPage {
   }
 
   private ensureWideSelection(): void {
+    if (this.activeListTab === 'usage') return;
     if (AppServices.instance.taskAccountTransition.active) return;
     if (!this.splitLayoutEnabled()) return;
     if (this.newSessionDraftOpen) return;
@@ -601,7 +606,7 @@ struct TaskListPage {
       this.setSelectedTask(results[0].deviceId, results[0].session.id, results[0].contentMessageClientId);
       return;
     }
-    if (this.activeListTab === 'dialogues' && this.scopedTeammates().some((row: TeammateRosterEntry) =>
+    if (this.sidebarCategory() === 'dialogues' && this.scopedTeammates().some((row: TeammateRosterEntry) =>
       row.deviceId === this.selectedSessionDeviceId && row.session.id === this.selectedSessionId)) {
       this.rememberSelectedTask();
       return;
@@ -894,12 +899,17 @@ struct TaskListPage {
   }
 
   private selectSession(entry: TaskListEntry): void {
+    if (this.activeListTab === 'usage') this.setActiveListTab(taskListCategory(entry.session));
     this.newSessionDraftOpen = false;
     this.updateKeyboardAvoidance();
     this.setSelectedTask(entry.deviceId, entry.session.id, '');
   }
 
   private tryOpenPendingDeepLink(): void {
+    if (AppServices.instance.hasPendingRelayLink()) {
+      void router.pushUrl({ url: 'pages/SettingsPage' });
+      return;
+    }
     if (AppServices.instance.taskAccountTransition.active) return;
     const intent = AppServices.instance.peekPendingDeepLink();
     if (intent === null) return;
@@ -934,7 +944,25 @@ struct TaskListPage {
     });
   }
 
+  private rememberUsageSidebar(next: TaskListCategory): void {
+    if (next !== 'usage' || this.activeListTab === 'usage') return;
+    this.usageSidebarCategory = this.activeListTab;
+    this.usageSidebarOffset = this.scrollerForCategory(this.activeListTab).currentOffset().yOffset;
+    if (this.splitLayoutEnabled()) {
+      setTimeout(() => {
+        if (this.pageActive && this.activeListTab === 'usage' && this.splitLayoutEnabled()) {
+          this.usageSidebarScroller.scrollTo({ xOffset: 0, yOffset: this.usageSidebarOffset, animation: false });
+        }
+      }, 0);
+    }
+  }
+
+  private sidebarCategory(): TaskListCategory {
+    return this.activeListTab === 'usage' ? this.usageSidebarCategory : this.activeListTab;
+  }
+
   private setActiveListTab(tab: TaskListCategory): void {
+    this.rememberUsageSidebar(tab);
     const index = this.listTabIndex(tab);
     if (this.activeListTab !== tab) {
       this.floatingBarScrolling = false;
@@ -951,23 +979,29 @@ struct TaskListPage {
 
   private listTabIndex(tab: TaskListCategory): number {
     if (tab === 'dialogues') return 1;
-    if (tab === 'automations') return 2;
+    if (tab === 'usage') return 2;
     return 0;
   }
 
   private listTabCategory(index: number): TaskListCategory {
     if (index === 1) return 'dialogues';
-    if (index === 2) return 'automations';
+    if (index === 2) return 'usage';
     return 'projects';
   }
 
   private handleListTabChange(index: number): void {
     const category = this.listTabCategory(index);
     if (category === this.activeListTab) return;
+    this.rememberUsageSidebar(category);
     this.activeListTab = category;
     this.floatingBarScrolling = false;
     this.floatingBarScrollIntent = 0;
     if (category === 'dialogues') this.refreshTeammates();
+    if (category === 'usage') {
+      this.showFloatingBar();
+      this.persistPreferences();
+      return;
+    }
     const visibleCount = this.taskSearchActive()
       ? this.taskSearchResultsForCategory(category).length
       : this.scopedEntries().length;
@@ -989,7 +1023,7 @@ struct TaskListPage {
 
   private scrollerForCategory(category: TaskListCategory): Scroller {
     if (category === 'dialogues') return this.dialoguesScroller;
-    if (category === 'automations') return this.automationsScroller;
+    if (category === 'usage') return this.splitLayoutEnabled() ? this.usageSidebarScroller : this.usageScroller;
     return this.projectsScroller;
   }
 
@@ -1426,7 +1460,7 @@ struct TaskListPage {
       this.scopeMenuOpen = false;
     });
     void this.refreshProjectOrderForScope();
-    if (this.activeListTab === 'dialogues') this.refreshTeammates();
+    if (this.sidebarCategory() === 'dialogues') this.refreshTeammates();
     this.ensureWideSelection();
     if (this.taskSearchActive()) this.scheduleTaskSearch();
     this.persistPreferences();
@@ -1773,7 +1807,7 @@ struct TaskListPage {
         this.resetDisplayOrder();
         this.refreshProjection();
       }
-      if (this.activeListTab === 'dialogues') this.refreshTeammates();
+      if (this.sidebarCategory() === 'dialogues') this.refreshTeammates();
       if (visible && !success) promptAction.showToast({ message: '部分任务刷新失败，请重试' });
       return success;
     } finally {
@@ -2084,18 +2118,8 @@ struct TaskListPage {
     return out;
   }
 
-  private automationEntries(): TaskListEntry[] {
-    const out: TaskListEntry[] = [];
-    const entries = this.regularEntries();
-    for (let i = 0; i < entries.length; i++) {
-      if (taskListCategory(entries[i].session) === 'automations') out.push(entries[i]);
-    }
-    return out;
-  }
-
   private flatCategoryEntries(category: TaskListCategory): TaskListEntry[] {
     if (category === 'dialogues') return this.dialogueEntries();
-    if (category === 'automations') return this.automationEntries();
     return [];
   }
 
@@ -2257,8 +2281,20 @@ struct TaskListPage {
       Row() {
         this.taskListPane()
         if (this.splitLayoutEnabled()) {
-          Column() {
-            this.detailPane()
+          Stack() {
+            Column() { this.detailPane() }
+              .width('100%').height('100%')
+              .visibility(this.activeListTab === 'usage' ? Visibility.None : Visibility.Visible)
+            Column() {
+              Row() {
+                Text($r('app.string.usage_title')).fontSize(18).fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+              }.width('100%').height(56).padding({ left: 20, right: 20 })
+              UsageDashboardPanel({ active: this.activeListTab === 'usage',
+                scopeDeviceId: this.selectedDeviceId, scroller: this.usageScroller })
+                .layoutWeight(1)
+            }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
+              .visibility(this.activeListTab === 'usage' ? Visibility.Visible : Visibility.None)
           }
           .width(this.detailPaneWidth())
           .height('100%')
@@ -2299,7 +2335,7 @@ struct TaskListPage {
           .transition(uiRevealTransition())
       }
 
-      if (this.splitLayoutEnabled() && this.listPaneShown()) {
+      if (this.splitLayoutEnabled() && (this.listPaneShown() || this.activeListTab === 'usage')) {
         this.splitDivider()
       }
 
@@ -2339,7 +2375,7 @@ struct TaskListPage {
       if (this.connectionStatus !== 'online') {
         this.connectionBanner()
       }
-      if (this.searchOpen) {
+      if (this.searchOpen && (this.activeListTab !== 'usage' || this.splitLayoutEnabled())) {
         this.taskSearchField()
       }
       HdsTabs({ controller: this.listTabController, index: this.initialListTabIndex }) {
@@ -2364,12 +2400,17 @@ struct TaskListPage {
         ))
 
         TabContent() {
-          this.taskListTabPage('automations')
+          if (this.splitLayoutEnabled()) {
+            this.taskListTabPage(this.usageSidebarCategory, 'usage')
+          } else {
+            UsageDashboardPanel({ active: this.activeListTab === 'usage',
+              scopeDeviceId: this.selectedDeviceId, scroller: this.usageScroller })
+          }
         }
         .clip(false)
         .tabBar(this.taskListTabBarStyle(
-          '自动化',
-          $r('sys.symbol.bolt'),
+          this.v12String('usage_tab'),
+          $r('sys.symbol.gauge_with_dots_needle_33percent'),
         ))
       }
       .barPosition(BarPosition.End)
@@ -2464,7 +2505,7 @@ struct TaskListPage {
     .height('100%')
     .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
     // 收起时只隐藏、不销毁，展开后列表滚动位置与 Tab 状态保持不变。
-    .visibility(this.listPaneShown() ? Visibility.Visible : Visibility.None)
+    .visibility(this.activeListTab === 'usage' || this.listPaneShown() ? Visibility.Visible : Visibility.None)
   }
 
   private clearRosterTimers(): void {
@@ -2480,7 +2521,7 @@ struct TaskListPage {
   }
 
   private scheduleTeammateRead(device: string): void {
-    if (!this.pageActive || this.activeListTab !== 'dialogues' || this.connectionStatus !== 'online'
+    if (!this.pageActive || this.sidebarCategory() !== 'dialogues' || this.connectionStatus !== 'online'
       || (this.selectedDeviceId && this.selectedDeviceId !== device) || !this.teammateDeviceOnline(device)) return;
     if (this.rosterReadInFlight.has(device)) {
       this.rosterReadInFlight.set(device, true);
@@ -2496,7 +2537,7 @@ struct TaskListPage {
   }
 
   private async readTeammates(device: string): Promise<void> {
-    if (!this.pageActive || this.activeListTab !== 'dialogues' || this.connectionStatus !== 'online'
+    if (!this.pageActive || this.sidebarCategory() !== 'dialogues' || this.connectionStatus !== 'online'
       || (this.selectedDeviceId && this.selectedDeviceId !== device) || !this.teammateDeviceOnline(device)) return;
     const services = AppServices.instance;
     const epoch = services.auth.sessionEpoch;
@@ -2504,7 +2545,7 @@ struct TaskListPage {
     this.rosterReadInFlight.set(device, false);
     try {
       const rows = await services.teammateRoster.list(device);
-      if (!this.pageActive || this.activeListTab !== 'dialogues' || lifecycle !== this.pageLifecycleGeneration
+      if (!this.pageActive || this.sidebarCategory() !== 'dialogues' || lifecycle !== this.pageLifecycleGeneration
         || epoch !== services.auth.sessionEpoch || this.connectionStatus !== 'online'
         || !this.teammateDeviceOnline(device)) return;
       this.teammateRoster = this.teammateRoster.filter((row: TeammateRosterEntry) => row.deviceId !== device).concat(rows);
@@ -2556,6 +2597,7 @@ struct TaskListPage {
 
   private openTeammate(row: TeammateRosterEntry): void {
     if (this.bulkMode) return;
+    if (this.activeListTab === 'usage') this.setActiveListTab('dialogues');
     const entry = new TaskListEntry();
     entry.deviceId = row.deviceId;
     entry.session = row.session;
@@ -2565,7 +2607,7 @@ struct TaskListPage {
     const revision = ++this.teammateOpenRevision;
     void AppServices.instance.tasks.loadSession(row.deviceId, row.session.id, 'bot').then((session: RemoteSession | undefined) => {
       if (!this.pageActive || epoch !== AppServices.instance.auth.sessionEpoch || generation !== this.pageLifecycleGeneration
-        || revision !== this.teammateOpenRevision || this.bulkMode || this.activeListTab !== 'dialogues'
+        || revision !== this.teammateOpenRevision || this.bulkMode || this.sidebarCategory() !== 'dialogues'
         || !this.scopedTeammates().some((item: TeammateRosterEntry) =>
           item.deviceId === row.deviceId && item.id === row.id && item.session.id === row.session.id)) return;
       if (session !== undefined) entry.session = session;
@@ -2582,7 +2624,7 @@ struct TaskListPage {
   }
 
   @Builder
-  taskListTabPage(category: TaskListCategory) {
+  taskListTabPage(category: TaskListCategory, scrollCategory: TaskListCategory = category) {
     Column() {
       if (this.taskSearchActive()) {
         if (this.taskSearchStatus === 'searching') {
@@ -2590,12 +2632,12 @@ struct TaskListPage {
         } else if (this.taskSearchResultsForCategory(category).length === 0) {
           this.activeTabEmptyState(category)
         } else {
-          this.buildTaskSearchEntries(category)
+          this.buildTaskSearchEntries(category, scrollCategory)
         }
       } else if (category !== 'dialogues' && this.scopedEntries().length === 0) {
         this.buildTaskListEmpty(category)
       } else {
-        this.buildTaskListEntries(category)
+        this.buildTaskListEntries(category, scrollCategory)
       }
     }
     .width('100%')
@@ -2695,7 +2737,7 @@ struct TaskListPage {
           paneSessionId: pane.sessionId,
           paneMessageClientId: this.paneSelected(pane) ? this.selectedMessageClientId : '',
           paneMessageRevision: this.paneSelected(pane) ? this.selectedMessageRevision : 0,
-          paneActive: this.paneSelected(pane),
+          paneActive: this.paneSelected(pane) && this.activeListTab !== 'usage',
           paneListCollapsed: !this.listPaneShown(),
           onTogglePaneList: (): void => this.toggleListPane(),
           paneComposerBottomInset: this.detailComposerBottomInset(),
@@ -2733,7 +2775,8 @@ struct TaskListPage {
     Row({ space: 8 }) {
       Button() {
         Row({ space: 6 }) {
-          Text(this.selectedDeviceLabel())
+          Text(this.activeListTab === 'usage' && !this.splitLayoutEnabled() && !this.selectedDeviceId
+            ? this.v12String('usage_all_devices') : this.selectedDeviceLabel())
             .fontSize(18)
             .lineHeight(24)
             .fontWeight(FontWeight.Medium)
@@ -2756,9 +2799,14 @@ struct TaskListPage {
         this.openDeviceScopeMenu();
       })
 
-      this.headerSymbolButton($r('sys.symbol.slider_horizontal_2'), () => this.openSortMenu(), this.v12String('v138_sort'))
-      this.refreshHeaderButton()
-      this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch(), this.v12String('v138_search'))
+      if (this.activeListTab === 'usage' && !this.splitLayoutEnabled()) {
+        Text($r('app.string.usage_title')).fontSize(18).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+      } else {
+        this.headerSymbolButton($r('sys.symbol.slider_horizontal_2'), () => this.openSortMenu(), this.v12String('v138_sort'))
+        this.refreshHeaderButton()
+        this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch(), this.v12String('v138_search'))
+      }
       this.headerSymbolButton(
         $r('sys.symbol.gearshape'),
         () => this.openSettings(),
@@ -2987,10 +3035,10 @@ struct TaskListPage {
   }
 
   @Builder
-  buildTaskListEntries(category: TaskListCategory) {
+  buildTaskListEntries(category: TaskListCategory, scrollCategory: TaskListCategory = category) {
     // 滑动只负责露出操作按钮；不要配置 actionAreaDistance / onAction，
     // 避免长距离滑动松手时直接置顶或归档，所有操作都必须由按钮点击触发。
-    List({ scroller: this.scrollerForCategory(category) }) {
+    List({ scroller: this.scrollerForCategory(scrollCategory) }) {
       if (category === 'dialogues') {
         ListItem() { this.communicationSectionTitle(this.v12String('v138_teammates')) }
         if (this.scopedTeammates().length === 0) {
@@ -3122,15 +3170,15 @@ struct TaskListPage {
     .scrollBar(BarState.Off)
     // Spring 无强度参数；Fade 保留触底反馈，但不会把整列内容明显拉离边界。
     .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
-    .onScrollStart(() => this.handleTaskListScrollStart(category))
+    .onScrollStart(() => this.handleTaskListScrollStart(scrollCategory))
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
-      this.handleTaskListScroll(category, scrollOffset, scrollState);
+      this.handleTaskListScroll(scrollCategory, scrollOffset, scrollState);
     })
-    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(category, velocity))
-    .onScrollStop(() => this.handleTaskListScrollStop(category))
+    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(scrollCategory, velocity))
+    .onScrollStop(() => this.handleTaskListScrollStop(scrollCategory))
     // 初次布局和短列表仍可恢复底栏，滚动途中则等待停稳。
-    .onReachStart(() => this.restoreFloatingBarAtBoundary(category))
-    .onReachEnd(() => this.restoreFloatingBarAtBoundary(category))
+    .onReachStart(() => this.restoreFloatingBarAtBoundary(scrollCategory))
+    .onReachEnd(() => this.restoreFloatingBarAtBoundary(scrollCategory))
   }
 
   @Builder
@@ -3151,8 +3199,8 @@ struct TaskListPage {
   }
 
   @Builder
-  buildTaskSearchEntries(category: TaskListCategory) {
-    List({ scroller: this.scrollerForCategory(category) }) {
+  buildTaskSearchEntries(category: TaskListCategory, scrollCategory: TaskListCategory = category) {
+    List({ scroller: this.scrollerForCategory(scrollCategory) }) {
       if (this.taskSearchCoverageLabel().length > 0) {
         ListItem() {
           this.taskSearchCoverageNotice()
@@ -3172,15 +3220,15 @@ struct TaskListPage {
     .cachedCount(3, true)
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
-    .onScrollStart(() => this.handleTaskListScrollStart(category))
+    .onScrollStart(() => this.handleTaskListScrollStart(scrollCategory))
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
-      this.handleTaskListScroll(category, scrollOffset, scrollState);
+      this.handleTaskListScroll(scrollCategory, scrollOffset, scrollState);
     })
-    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(category, velocity))
-    .onScrollStop(() => this.handleTaskListScrollStop(category))
+    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(scrollCategory, velocity))
+    .onScrollStop(() => this.handleTaskListScrollStop(scrollCategory))
     // 初次布局和短列表仍可恢复底栏，滚动途中则等待停稳。
-    .onReachStart(() => this.restoreFloatingBarAtBoundary(category))
-    .onReachEnd(() => this.restoreFloatingBarAtBoundary(category))
+    .onReachStart(() => this.restoreFloatingBarAtBoundary(scrollCategory))
+    .onReachEnd(() => this.restoreFloatingBarAtBoundary(scrollCategory))
   }
 
   @Builder
@@ -3255,7 +3303,7 @@ struct TaskListPage {
     const projectDir = sessionProjectDirectory(result.session);
     const project = result.session.workingDir.length > 0
       ? (this.projectAlias(result.deviceId, projectDir) || taskProjectName(projectDir))
-      : taskListCategory(result.session) === 'automations'
+      : taskIsAutomation(result.session)
         ? this.v12String('v12_automation') : this.v12String('v12_dialogue');
     return `${device} · ${project}`;
   }
@@ -3593,25 +3641,10 @@ struct TaskListPage {
   @Builder
   agentMark(agentKind: string) {
     Stack({ alignContent: Alignment.Center }) {
-      if (agentKind === 'codex') {
-        Shape() {
-          Path().commands(CODEX_AGENT_FLOWER_PATH)
-            .fill(Color.Transparent).stroke($r('app.color.text_secondary'))
-            .strokeWidth(1.6).strokeLineJoin(LineJoinStyle.Round)
-          Path().commands(CODEX_AGENT_PROMPT_PATH)
-            .fill($r('app.color.text_secondary')).stroke($r('app.color.text_secondary'))
-            .strokeWidth(0.5).strokeLineJoin(LineJoinStyle.Round)
-        }
-        .viewPort({ x: 0, y: 0, width: 24, height: 24 })
-        .width(24)
-        .height(24)
-      } else if (agentKind === 'cc' || agentKind === 'claude-code') {
-        Shape() {
-          Path().commands(CLAUDE_AGENT_PATH).fill($r('app.color.text_secondary'))
-        }
-        .viewPort({ x: 0, y: 0, width: 24, height: 24 })
-        .width(19)
-        .height(19)
+      if (agentKind === 'codex' || agentKind === 'cc' || agentKind === 'claude-code') {
+        Image(agentKind === 'codex' ? $r('app.media.usage_provider_openai')
+          : $r('app.media.usage_provider_anthropic'))
+          .width(24).height(24).objectFit(ImageFit.Contain)
       } else {
         Text(agentKind === 'pi' ? 'Pi' : 'AI')
           .fontSize(agentKind === 'pi' ? 12 : 9)
@@ -3619,8 +3652,8 @@ struct TaskListPage {
           .fontColor($r('app.color.text_secondary'))
       }
     }
-    .width(24)
-    .height(24)
+    .width(28)
+    .height(28)
     .backgroundColor(agentKind === 'cc' || agentKind === 'claude-code' || agentKind === 'codex'
       ? Color.Transparent : $r('app.color.bg_chip'))
     .borderRadius(UI_RADIUS_CONTROL)

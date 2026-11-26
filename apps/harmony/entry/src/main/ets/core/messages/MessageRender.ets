@@ -698,6 +698,9 @@ export function contentPreview(content: Object | undefined): string {
     const record = content as Record<string, Object>;
     const compacted = toolResultCompactionPreview(content);
     if (compacted.length > 0) return compacted;
+    // Object-form results carry the same explicit process-media envelope as JSON strings.
+    // Keep its fields until readToolResult extracts the media and unwraps the text.
+    if (Array.isArray(record['cindy_process_media'])) return sanitizeInternalOutput(JSON.stringify(content));
     const kind = readStr(record, 'kind');
     const type = readStr(record, 'type');
     if (kind === 'thinking' || type === 'thinking') {

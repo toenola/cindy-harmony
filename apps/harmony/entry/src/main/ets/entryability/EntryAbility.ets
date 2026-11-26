@@ -29,7 +29,9 @@ export default class EntryAbility extends UIAbility {
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     if (this.acceptDeepLinkWant(want)) {
-      router.replaceUrl({ url: 'pages/TaskListPage' });
+      router.replaceUrl({ url: AppServices.instance.auth.isLoggedIn
+        ? (AppServices.instance.hasPendingRelayLink() ? 'pages/SettingsPage' : 'pages/TaskListPage')
+        : 'pages/LoginPage' });
     }
   }
 

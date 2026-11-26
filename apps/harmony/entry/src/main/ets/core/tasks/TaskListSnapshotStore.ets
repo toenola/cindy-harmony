@@ -226,6 +226,13 @@ export class TaskListSnapshotStore {
   }
 
   setAccountScope(accountId: string): void {
+    if (this.accountId !== accountId) {
+      this.writeEpoch += 1;
+      if (this.timer >= 0) clearTimeout(this.timer);
+      this.timer = -1;
+      this.pendingCollect = undefined;
+      this.pendingRaw = null;
+    }
     this.accountId = accountId;
   }
 
