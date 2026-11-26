@@ -1,3 +1,4 @@
+import { CLAUDE_AGENT_PATH, CODEX_AGENT_FLOWER_PATH, CODEX_AGENT_PROMPT_PATH } from '../components/AgentMarkPaths';
 import { TeammateAvatar } from '../components/TeammateAvatar';
 import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 import { ProjectMachine, projectMachineLabel } from '../core/tasks/ProjectMachineIdentity';
@@ -3592,22 +3593,37 @@ struct TaskListPage {
   @Builder
   agentMark(agentKind: string) {
     Stack({ alignContent: Alignment.Center }) {
-      Text(this.agentMarkText(agentKind))
-        .fontSize(agentKind === 'pi' ? 12 : 9)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_secondary'))
+      if (agentKind === 'codex') {
+        Shape() {
+          Path().commands(CODEX_AGENT_FLOWER_PATH)
+            .fill(Color.Transparent).stroke($r('app.color.text_secondary'))
+            .strokeWidth(1.6).strokeLineJoin(LineJoinStyle.Round)
+          Path().commands(CODEX_AGENT_PROMPT_PATH)
+            .fill($r('app.color.text_secondary')).stroke($r('app.color.text_secondary'))
+            .strokeWidth(0.5).strokeLineJoin(LineJoinStyle.Round)
+        }
+        .viewPort({ x: 0, y: 0, width: 24, height: 24 })
+        .width(24)
+        .height(24)
+      } else if (agentKind === 'cc' || agentKind === 'claude-code') {
+        Shape() {
+          Path().commands(CLAUDE_AGENT_PATH).fill($r('app.color.text_secondary'))
+        }
+        .viewPort({ x: 0, y: 0, width: 24, height: 24 })
+        .width(19)
+        .height(19)
+      } else {
+        Text(agentKind === 'pi' ? 'Pi' : 'AI')
+          .fontSize(agentKind === 'pi' ? 12 : 9)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_secondary'))
+      }
     }
     .width(24)
     .height(24)
-    .backgroundColor($r('app.color.bg_chip'))
+    .backgroundColor(agentKind === 'cc' || agentKind === 'claude-code' || agentKind === 'codex'
+      ? Color.Transparent : $r('app.color.bg_chip'))
     .borderRadius(UI_RADIUS_CONTROL)
-  }
-
-  private agentMarkText(agentKind: string): string {
-    if (agentKind === 'cc') return 'CC';
-    if (agentKind === 'codex') return 'CX';
-    if (agentKind === 'pi') return 'Pi';
-    return 'AI';
   }
 
   @Builder
