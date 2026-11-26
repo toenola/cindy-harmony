@@ -290,6 +290,7 @@ struct TaskListPage {
   private floatingBarHidden: boolean = false;
   /** 正数表示向列表末尾浏览，负数表示回看上方；方向改变时重新累计。 */
   private floatingBarScrollIntent: number = 0;
+  private floatingBarScrolling: boolean = false;
   private initialListTabIndex: number = 0;
   private residentAccountEpoch: number = -1;
   private residentSessionStatuses: Map<string, string> = new Map();
@@ -934,6 +935,10 @@ struct TaskListPage {
 
   private setActiveListTab(tab: TaskListCategory): void {
     const index = this.listTabIndex(tab);
+    if (this.activeListTab !== tab) {
+      this.floatingBarScrolling = false;
+      this.floatingBarScrollIntent = 0;
+    }
     this.activeListTab = tab;
     if (tab === 'dialogues') this.refreshTeammates();
     if (!this.listTabsAppeared) {
@@ -959,6 +964,8 @@ struct TaskListPage {
     const category = this.listTabCategory(index);
     if (category === this.activeListTab) return;
     this.activeListTab = category;
+    this.floatingBarScrolling = false;
+    this.floatingBarScrollIntent = 0;
     if (category === 'dialogues') this.refreshTeammates();
     const visibleCount = this.taskSearchActive()
       ? this.taskSearchResultsForCategory(category).length
@@ -974,6 +981,7 @@ struct TaskListPage {
     this.listTabController.changeIndex(this.listTabIndex(this.activeListTab));
     // HdsTabsController 会保留上一次动画状态；每次进入页面都明确恢复默认显示态。
     this.floatingBarHidden = false;
+    this.floatingBarScrolling = false;
     this.floatingBarScrollIntent = 0;
     this.listTabController.applyShowAnimation(HdsAnimationMode.SCROLL_ANIMATION);
   }
@@ -984,16 +992,29 @@ struct TaskListPage {
     return this.projectsScroller;
   }
 
-  /**
-   * 顶部、底部和不足一屏都属于明确边界：底栏必须出现，方向阈值只作用于列表中段。
-   */
-  private restoreFloatingBarAtBoundary(category: TaskListCategory): boolean {
+  private isFloatingBarScrollSource(category: TaskListCategory): boolean {
+    return this.pageActive && this.activeListTab === category;
+  }
+
+  private restoreFloatingBarAtBoundary(category: TaskListCategory): void {
+    if (!this.isFloatingBarScrollSource(category) || this.floatingBarScrolling) return;
     const scroller = this.scrollerForCategory(category);
-    const yOffset = scroller.currentOffset().yOffset;
-    if (!taskListShouldShowFloatingBarAtBoundary(yOffset, scroller.isAtEnd())) return false;
+    if (taskListShouldShowFloatingBarAtBoundary(scroller.currentOffset().yOffset, scroller.isAtEnd())) {
+      this.showFloatingBar();
+    }
+  }
+
+  private handleTaskListScrollStart(category: TaskListCategory): void {
+    if (!this.isFloatingBarScrollSource(category)) return;
+    this.floatingBarScrolling = true;
     this.floatingBarScrollIntent = 0;
-    this.showFloatingBar();
-    return true;
+  }
+
+  private handleTaskListScrollStop(category: TaskListCategory): void {
+    if (!this.isFloatingBarScrollSource(category)) return;
+    this.floatingBarScrolling = false;
+    this.floatingBarScrollIntent = 0;
+    this.restoreFloatingBarAtBoundary(category);
   }
 
   private handleTaskListScroll(
@@ -1001,38 +1022,24 @@ struct TaskListPage {
     scrollOffset: number,
     scrollState: ScrollState,
   ): void {
-    // 惯性抵达边界也应立即恢复底栏；只有列表中段继续沿用手指方向判断。
-    if (this.restoreFloatingBarAtBoundary(category)) return;
-    // 只响应手指拖动；惯性与边缘反馈均为 Fling，不能反向改写用户刚表达的浏览意图。
-    if (scrollState !== ScrollState.Scroll) {
-      this.floatingBarScrollIntent = 0;
-      return;
-    }
-    if (Math.abs(scrollOffset) < FLOATING_BAR_SCROLL_NOISE) return;
+    if (!this.isFloatingBarScrollSource(category) || scrollState !== ScrollState.Scroll
+      || Math.abs(scrollOffset) < FLOATING_BAR_SCROLL_NOISE) return;
 
-    // 官方语义：内容向上（用户向列表末尾浏览）为正，内容向下（回看上方）为负。
-    if (scrollOffset > 0) {
-      if (this.floatingBarScrollIntent < 0) this.floatingBarScrollIntent = 0;
-      this.floatingBarScrollIntent += scrollOffset;
-      if (this.floatingBarScrollIntent >= FLOATING_BAR_HIDE_DISTANCE) {
-        this.hideFloatingBar();
-        this.floatingBarScrollIntent = 0;
-      }
-      return;
-    }
-
-    if (this.floatingBarScrollIntent > 0) this.floatingBarScrollIntent = 0;
+    // 内容向上为正，回看上方为负。惯性和布局回调不能改变底栏意图。
+    if (this.floatingBarScrollIntent * scrollOffset < 0) this.floatingBarScrollIntent = 0;
     this.floatingBarScrollIntent += scrollOffset;
-    if (this.floatingBarScrollIntent <= -FLOATING_BAR_SHOW_DISTANCE) {
+    if (this.floatingBarScrollIntent >= FLOATING_BAR_HIDE_DISTANCE) {
+      this.hideFloatingBar();
+      this.floatingBarScrollIntent = 0;
+    } else if (this.floatingBarScrollIntent <= -FLOATING_BAR_SHOW_DISTANCE) {
       this.showFloatingBar();
       this.floatingBarScrollIntent = 0;
     }
   }
 
   private handleTaskListDragRelease(category: TaskListCategory, velocity: number): void {
-    // 内容不足一屏时没有有效滚动位移，但松手仍能通过真实边界恢复底栏。
-    if (this.restoreFloatingBarAtBoundary(category)) return;
-    // 短距离快速甩动可能来不及累计位移，用较克制的速度门槛补齐同一方向语义。
+    if (!this.isFloatingBarScrollSource(category) || !this.floatingBarScrolling) return;
+    // 快速短甩来不及累计位移时保留方向。边界恢复统一等滚动结束。
     if (velocity >= FLOATING_BAR_FLING_VELOCITY) this.hideFloatingBar();
     else if (velocity <= -FLOATING_BAR_FLING_VELOCITY) this.showFloatingBar();
     this.floatingBarScrollIntent = 0;
@@ -2585,7 +2592,7 @@ struct TaskListPage {
           this.buildTaskSearchEntries(category)
         }
       } else if (category !== 'dialogues' && this.scopedEntries().length === 0) {
-        this.buildTaskListEmpty()
+        this.buildTaskListEmpty(category)
       } else {
         this.buildTaskListEntries(category)
       }
@@ -2907,7 +2914,7 @@ struct TaskListPage {
   }
 
   @Builder
-  buildTaskListEmpty() {
+  buildTaskListEmpty(category: TaskListCategory) {
     Column({ space: 8 }) {
       Text(this.emptyTitle())
         .fontSize(16)
@@ -2923,7 +2930,9 @@ struct TaskListPage {
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
     .padding({ left: 32, right: 32, bottom: 80 })
-    .onAppear(() => this.showFloatingBar())
+    .onAppear(() => {
+      if (this.isFloatingBarScrollSource(category)) this.showFloatingBar();
+    })
   }
 
   @Builder
@@ -2939,7 +2948,7 @@ struct TaskListPage {
   @Builder
   teammateRow(row: TeammateRosterEntry) {
     Row({ space: 10 }) {
-      TeammateAvatar({ teammate: row, online: this.teammateAvatarOnline(row), size: 44 })
+      TeammateAvatar({ teammate: row, online: this.teammateAvatarOnline(row), diameter: 44 })
       Column({ space: 4 }) {
         Text(row.name)
           .fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
@@ -3112,20 +3121,15 @@ struct TaskListPage {
     .scrollBar(BarState.Off)
     // Spring 无强度参数；Fade 保留触底反馈，但不会把整列内容明显拉离边界。
     .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
+    .onScrollStart(() => this.handleTaskListScrollStart(category))
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
       this.handleTaskListScroll(category, scrollOffset, scrollState);
     })
-    .onWillStopDragging((velocity: number) => {
-      this.handleTaskListDragRelease(category, velocity);
-    })
-    .onReachStart(() => {
-      this.restoreFloatingBarAtBoundary(category);
-    })
-    .onReachEnd(() => {
-      // 官方 onReachEnd 在短列表首次布局和内容变短时也会触发；再用 isAtEnd
-      // 精确复核，避免最后一行刚进入视口就过早显示底栏。
-      this.restoreFloatingBarAtBoundary(category);
-    })
+    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(category, velocity))
+    .onScrollStop(() => this.handleTaskListScrollStop(category))
+    // 初次布局和短列表仍可恢复底栏，滚动途中则等待停稳。
+    .onReachStart(() => this.restoreFloatingBarAtBoundary(category))
+    .onReachEnd(() => this.restoreFloatingBarAtBoundary(category))
   }
 
   @Builder
@@ -3167,9 +3171,13 @@ struct TaskListPage {
     .cachedCount(3, true)
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Fade, { alwaysEnabled: false, effectEdge: EffectEdge.END })
+    .onScrollStart(() => this.handleTaskListScrollStart(category))
     .onDidScroll((scrollOffset: number, scrollState: ScrollState) => {
       this.handleTaskListScroll(category, scrollOffset, scrollState);
     })
+    .onWillStopDragging((velocity: number) => this.handleTaskListDragRelease(category, velocity))
+    .onScrollStop(() => this.handleTaskListScrollStop(category))
+    // 初次布局和短列表仍可恢复底栏，滚动途中则等待停稳。
     .onReachStart(() => this.restoreFloatingBarAtBoundary(category))
     .onReachEnd(() => this.restoreFloatingBarAtBoundary(category))
   }

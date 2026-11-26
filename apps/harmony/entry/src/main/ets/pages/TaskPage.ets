@@ -552,6 +552,7 @@ export struct TaskPageContent {
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
   @Prop collabLabel: string = '';
+  @Prop collabReturnsToLead: boolean = false;
   @Prop collabRole: string = '';
   @Prop standaloneDetail: boolean = false;
   onCollab: () => void = (): void => {};
@@ -5878,18 +5879,6 @@ export struct TaskPageContent {
           .padding({ left: 16, right: 16, top: 4 })
       }
 
-      if (!this.shareSelectionActive && this.collabLabel.length > 0) {
-        Button(this.collabLabel + '  ›')
-          .type(ButtonType.Normal)
-          .height(44)
-          .fontSize(uiFontSize(13))
-          .fontColor($r('app.color.text_secondary'))
-          .backgroundColor($r('app.color.bg_chip'))
-          .borderRadius(UI_RADIUS_CONTAINER)
-          .width('100%')
-          .margin({ bottom: 4 })
-          .onClick(() => this.onCollab())
-      }
       if (this.shareSelectionActive) {
         this.shareSelectionBar()
       } else if (this.deviceDisabled) {
@@ -6724,7 +6713,7 @@ export struct TaskPageContent {
     Stack() {
       Row({ space: 8 }) {
         if (this.teammate !== undefined) {
-          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 36 })
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 36 })
         }
         Column({ space: 1 }) {
           Text(this.sessionTitle())
@@ -7420,37 +7409,54 @@ export struct TaskPageContent {
         })
       }
 
-      if ((this.items.length > 0 || this.queueBubbles.length > 0) && !this.followingLatest) {
-        Button() {
-          Stack({ alignContent: Alignment.Center }) {
-            SymbolGlyph($r('sys.symbol.chevron_down'))
-              .fontSize(uiFontSize(20))
+      Column({ space: 8 }) {
+        if (!this.shareSelectionActive && this.collabLabel.length > 0) {
+          Button() {
+            SymbolGlyph(this.collabReturnsToLead ? $r('sys.symbol.chevron_left') : $r('sys.symbol.person_2'))
+              .fontSize(uiFontSize(18))
               .fontColor([$r('app.color.chat_text_secondary')])
-            if (this.hasNewMessages) {
-              Circle()
-                .width(8)
-                .height(8)
-                .fill($r('app.color.chat_cta'))
-                .position({ x: 24, y: 3 })
+          }
+          .type(ButtonType.Circle)
+          .width(44)
+          .height(44)
+          .padding(0)
+          .backgroundColor($r('app.color.chat_fab_surface'))
+          .border({ width: 1, color: $r('app.color.chat_fab_border') })
+          .clickEffect(UI_ICON_CLICK_EFFECT)
+          .accessibilityText(this.collabLabel)
+          .onClick(() => this.onCollab())
+        }
+        if ((this.items.length > 0 || this.queueBubbles.length > 0) && !this.followingLatest) {
+          Button() {
+            Stack({ alignContent: Alignment.Center }) {
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(uiFontSize(20))
+                .fontColor([$r('app.color.chat_text_secondary')])
+              if (this.hasNewMessages) {
+                Circle()
+                  .width(8)
+                  .height(8)
+                  .fill($r('app.color.chat_cta'))
+                  .position({ x: 24, y: 3 })
+              }
             }
+            .width(36)
+            .height(36)
           }
           .width(36)
           .height(36)
+          .padding(0)
+          .borderRadius(UI_RADIUS_PILL)
+          .backgroundColor($r('app.color.chat_fab_surface'))
+          .border({ width: 1, color: $r('app.color.chat_fab_border') })
+          .clickEffect(UI_ICON_CLICK_EFFECT)
+          .transition(uiRevealTransition())
+          .onClick(() => this.jumpToLatest())
         }
-        .width(36)
-        .height(36)
-        .padding(0)
-        .borderRadius(UI_RADIUS_PILL)
-        .backgroundColor($r('app.color.chat_fab_surface'))
-        .border({ width: 1, color: $r('app.color.chat_fab_border') })
-        .margin({
-          right: 23,
-          bottom: 12,
-        })
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .transition(uiRevealTransition())
-        .onClick(() => this.jumpToLatest())
       }
+      .alignItems(HorizontalAlign.Center)
+      .width(44)
+      .margin({ right: 19, bottom: 12 })
     }
     .width('100%')
     .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH })
@@ -7590,7 +7596,7 @@ export struct TaskPageContent {
         && !this.items.some((item: RenderItem) =>
           item.type === 'work_group' && (item as RenderWorkGroupItem).isStreaming)) {
         Row({ space: 8 }) {
-          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 28 })
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 28 })
           LoadingProgress().width(12).height(12).color($r('app.color.text_tertiary'))
           Text($r('app.string.v138_teammate_thinking'))
             .fontSize(uiFontSize(12)).fontColor($r('app.color.chat_text_secondary'))
@@ -9081,7 +9087,7 @@ export struct TaskPageContent {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         if (this.teammate !== undefined) {
-          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, size: 28 })
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 28 })
         }
 
         if (item.isStreaming) {
@@ -12103,7 +12109,10 @@ export struct TaskPageContent {
             .alignItems(VerticalAlign.Top)
             .padding({ left: 10, right: 10, top: 7, bottom: 7 })
             .backgroundColor($r('app.color.bg_chip'))
-            .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
+            .border({
+              width: { left: hIndex === 0 ? 1 : 0, top: 1, right: 1, bottom: 1 },
+              color: $r('app.color.border'),
+            })
           }, (hIndex: number) => `${b.seq}-h-${hIndex}`)
         }
         .width(this.tableContentWidth(b))
@@ -12125,17 +12134,22 @@ export struct TaskPageContent {
               // 同行高度由最长内容决定；短单元格必须拉伸到整行，边框不能停在行中间。
               .alignItems(VerticalAlign.Top)
               .padding({ left: 10, right: 10, top: 7, bottom: 7 })
-              .border({ width: { right: 1, bottom: 1 }, color: $r('app.color.border') })
+              .border({
+                width: { left: cellIndex === 0 ? 1 : 0, right: 1, bottom: 1 },
+                color: $r('app.color.border'),
+              })
             }, (cellIndex: number) => `${b.seq}-${rowIndex ?? 0}-${cellIndex}`)
           }
           .width(this.tableContentWidth(b))
         }, (row: string[], rowIndex?: number) => `${b.seq}-r-${rowIndex ?? 0}`)
       }
       .width(this.tableContentWidth(b))
-      .border({ width: { left: 1, top: 1 }, color: $r('app.color.border') })
     }
     .width('100%')
     .scrollable(ScrollDirection.Horizontal)
+    .align(Alignment.TopStart)
+    // 表格可以宽于视口，但内容和边线都跟随单元格滚动并裁在表格视口内。
+    .clipContent(ContentClipMode.CONTENT_ONLY)
   }
 
   @Builder
@@ -14603,6 +14617,7 @@ export struct OrcaTaskDetail {
               standaloneDetail: !this.sideBySide(),
               paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
               collabRole: this.label('v138_worker'), collabLabel: this.label('v138_return_to_lead'),
+              collabReturnsToLead: true,
               onCollab: (): void => { this.returnToLead(); },
               onDetailBack: (): void => { this.returnToLead(); },
             }).width('100%').layoutWeight(1)

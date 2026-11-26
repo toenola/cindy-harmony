@@ -5,7 +5,7 @@ import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 export struct TeammateAvatar {
   @Prop @Watch('avatarChanged') teammate: TeammateRosterEntry = new TeammateRosterEntry();
   @Prop @Watch('avatarChanged') online: boolean = false;
-  @Prop size: number = 28;
+  @Prop diameter: number = 28;
   @State private accountCurrent: boolean = true;
   @State private source: string = '';
   private revision: number = 0;
@@ -65,10 +65,10 @@ export struct TeammateAvatar {
       } else if (this.accountCurrent) {
         Text(this.teammate.avatarKind === 'emoji' && this.teammate.avatarValue
           ? this.teammate.avatarValue : this.teammate.avatarFallback)
-          .fontSize(Math.round(this.size / 2)).maxLines(1).fontColor($r('app.color.text_primary'))
+          .fontSize(Math.round(this.diameter / 2)).maxLines(1).fontColor($r('app.color.text_primary'))
       }
     }
-    .width(this.size).height(this.size).borderRadius(this.size / 2).clip(true)
+    .width(this.diameter).height(this.diameter).borderRadius(this.diameter / 2).clip(true)
     .onVisibleAreaChange([0, 0.01], (visible: boolean, ratio: number) => {
       this.visible = visible && ratio > 0;
       this.avatarChanged();
