@@ -349,3 +349,37 @@ export function taskSplitPresentationFor(
   }
   return snapshot;
 }
+
+export type WorkerPaneIntentChange = 'inactive' | 'task' | 'role';
+
+export class WorkerPaneIntent {
+  open: boolean = false;
+  expanded: boolean = false;
+}
+
+/** Hiding a resident detail suspends it but doesn't discard the user's pane intent. */
+export function workerPaneIntentAfterChange(
+  change: WorkerPaneIntentChange, open: boolean, expanded: boolean,
+): WorkerPaneIntent {
+  const intent = new WorkerPaneIntent();
+  if (change === 'inactive') {
+    intent.open = open;
+    intent.expanded = expanded;
+  }
+  return intent;
+}
+
+/** Recheck both panes after every asynchronous flush, then commit without yielding again. */
+export async function flushStableSplitDrafts(
+  revision: () => string, flush: () => Promise<void>, current: () => boolean, commit: () => void,
+): Promise<void> {
+  while (current()) {
+    const before = revision();
+    await flush();
+    if (!current()) return;
+    if (revision() === before) {
+      commit();
+      return;
+    }
+  }
+}

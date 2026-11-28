@@ -423,6 +423,8 @@
     {"name": "home_task_split_narrow", "value": "タスクリストの幅を狭くする"},
     {"name": "home_task_split_widen", "value": "タスクリストの幅を広くする"},
     {"name": "home_list_more", "value": "その他の操作"},
-    {"name": "home_list_settings", "value": "設定"}
+    {"name": "home_list_settings", "value": "設定"},
+    {"name": "v140_collab_split_narrow", "value": "協同ペインを狭くする"},
+    {"name": "v140_collab_split_widen", "value": "協同ペインを広くする"}
   ]
 }

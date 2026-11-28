@@ -140,7 +140,9 @@ import {
   TaskListPreferences,
 } from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
+  cancelTaskSplitRouteSelection,
   consumeTaskSplitRouteSelection,
+  TASK_SPLIT_HANDOFF_TTL_MS,
   TaskSplitDetailPresentation,
   effectiveTaskSafeWindow,
   handoffTaskSplitRouteSelection,
@@ -329,6 +331,8 @@ import {
   COMPOSER_SCROLL_ACTION_SHOW,
   firstVisibleMessageRenderIndex,
   taskSplitPresentationFor,
+  workerPaneIntentAfterChange,
+  flushStableSplitDrafts,
   FOLLOW_LATEST_RETRY_DELAYS,
   HISTORY_PREFETCH_MIN_DISTANCE,
   HISTORY_PREFETCH_VIEWPORTS,
@@ -5081,20 +5085,71 @@ export default function localUnitTest() {
       expect(unmeasured.right).assertEqual(4);
     });
 
-    it('fallsBackToViewportOnlyWhenWindowMetricsAreUnavailable', 0, () => {
+    // Unit tier: a temporarily IME-compressed page cannot become the source of split eligibility.
+    it('retainsLastNonImeWindowSampleAndAppliesTheEnterExitHeightBand', 0, () => {
       const pending = effectiveTaskSafeWindow(939, 664, 0, 0, false);
       expect(isWideTaskLayout(939, pending.width, pending.height)).assertFalse();
       const unavailable = effectiveTaskSafeWindow(939, 664, 0, 0, true);
-      expect(isWideTaskLayout(939, unavailable.width, unavailable.height)).assertTrue();
+      expect(isWideTaskLayout(939, unavailable.width, unavailable.height)).assertFalse();
       const cutout = effectiveTaskSafeWindow(780, 664, 740, 600, false);
       expect(isWideTaskLayout(780, cutout.width, cutout.height)).assertFalse();
       // 输入法压缩页面高度时仍以窗口安全区高度为准，不在输入中收起双栏。
-      const typing = effectiveTaskSafeWindow(939, 300, 939, 600, false);
+      const typing = effectiveTaskSafeWindow(939, 300, 939, 492, true);
       expect(isWideTaskLayout(939, typing.width, typing.height)).assertTrue();
+      expect(isWideTaskLayout(939, 939, 491)).assertFalse();
+      expect(isWideTaskLayout(939, 939, 480, false, undefined, true)).assertTrue();
+      expect(isWideTaskLayout(939, 939, 479, false, undefined, true)).assertFalse();
     });
 
     // Unit tier: exercise the route's one-shot handoff and the actual restore gate. Changing just one
     // scope field must not carry a previous account's or task's Worker/focus into the visible pane.
+    // Unit, F02: the route identity test below doesn't cover a live resident hidden behind another
+    // pane. An open and expanded Worker must survive inactivity but not a task or role change.
+    it('preservesWorkerPaneIntentOnlyAcrossTemporaryInactivity', 0, () => {
+      const suspended = workerPaneIntentAfterChange('inactive', true, true);
+      expect(suspended.open && suspended.expanded).assertTrue();
+      const taskChanged = workerPaneIntentAfterChange('task', suspended.open, suspended.expanded);
+      const roleChanged = workerPaneIntentAfterChange('role', suspended.open, suspended.expanded);
+      expect(taskChanged.open || taskChanged.expanded).assertFalse();
+      expect(roleChanged.open || roleChanged.expanded).assertFalse();
+    });
+
+    // Unit, F03: snapshot identity tests don't cover asynchronous writes. One late edit while the
+    // other pane is flushing must reach the stable handoff, along with the final focus/selection.
+    it('onlyHandsOffAfterFlushingTheLatestDraftRevision', 0, async () => {
+      let leadRevision = 1;
+      const workerRevision = 3;
+      let persisted = '';
+      let handedOff = '';
+      let passes = 0;
+      await flushStableSplitDrafts(
+        (): string => `${leadRevision}:${workerRevision}`,
+        async (): Promise<void> => {
+          const flushing = `${leadRevision}:${workerRevision}`;
+          await Promise.resolve();
+          if (++passes === 1) leadRevision += 1;
+          persisted = flushing;
+        },
+        (): boolean => true,
+        (): void => { handedOff = persisted; },
+      );
+      expect(handedOff).assertEqual('2:3');
+      expect(passes).assertEqual(2);
+    });
+
+    // Unit, F03: an account/layout change during the wait must not commit the old route.
+    it('abandonsDraftHandoffIfTheSourceStopsBeingCurrentDuringFlush', 0, async () => {
+      let current = true;
+      let committed = false;
+      await flushStableSplitDrafts(
+        (): string => '1:3',
+        async (): Promise<void> => { await Promise.resolve(); current = false; },
+        (): boolean => current,
+        (): void => { committed = true; },
+      );
+      expect(committed).assertFalse();
+    });
+
     it('handsCurrentTaskBackToSplitLayoutOnlyOnceAndRestoresOnlyMatchingIdentity', 0, () => {
       const snapshot = new TaskSplitDetailPresentation();
       snapshot.accountEpoch = 7;
@@ -5137,6 +5192,22 @@ export default function localUnitTest() {
       expect(taskSplitPresentationFor(stale?.presentation, 8, 'device-1', 'session-1')).assertUndefined();
       const replay = consumeTaskSplitRouteSelection();
       expect(taskSplitPresentationFor(replay?.presentation, 7, 'device-1', 'session-1')).assertUndefined();
+    });
+
+    // Unit tier: a failed or timed-out route must not leak selection to a later visit.
+    it('revokesAndExpiresOnlyTheMatchingSplitRouteAttempt', 0, () => {
+      const startedAt = 1000;
+      const failed = handoffTaskSplitRouteSelection('device', 'old', '', undefined, true, startedAt);
+      cancelTaskSplitRouteSelection(failed);
+      expect(consumeTaskSplitRouteSelection(failed, startedAt)).assertNull();
+      const next = handoffTaskSplitRouteSelection('device', 'new', '', undefined, true, startedAt);
+      cancelTaskSplitRouteSelection(failed);
+      expect(consumeTaskSplitRouteSelection('', startedAt)).assertNull();
+      expect(consumeTaskSplitRouteSelection(failed, startedAt)).assertNull();
+      expect(consumeTaskSplitRouteSelection(next, startedAt)?.sessionId).assertEqual('new');
+      expect(consumeTaskSplitRouteSelection(next, startedAt)).assertNull();
+      const timedOut = handoffTaskSplitRouteSelection('device', 'late', '', undefined, true, startedAt);
+      expect(consumeTaskSplitRouteSelection(timedOut, startedAt + TASK_SPLIT_HANDOFF_TTL_MS)).assertNull();
     });
 
     it('projectsTaskListCopyAndRelativeTimeLikeMobile', 0, () => {

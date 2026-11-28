@@ -11,6 +11,9 @@ import { SPLIT_HANDLE_THRESHOLD_VP } from '../components/common/SplitHandleInter
 export const WIDE_TASK_LAYOUT_MIN_WIDTH = 600;
 export const WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH = 760;
 export const WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT = 480;
+export const WIDE_TASK_LAYOUT_ENTER_SAFE_HEIGHT = 492;
+export const TASK_SPLIT_HANDOFF_TTL_MS = 2500;
+export const TASK_SPLIT_HANDOFF_PARAM = 'splitHandoffToken';
 export const TASK_SPLIT_DIVIDER_WIDTH = 24;
 /** 容纳设备下拉、四个头部操作按钮和底部导航，不允许控件彼此覆盖。 */
 export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
@@ -60,24 +63,56 @@ export class TaskSplitRouteSelection {
 }
 
 let pendingTaskSplitRouteSelection: TaskSplitRouteSelection | null = null;
+let pendingHandoffToken: string = '';
+let pendingHandoffExpiresAt: number = 0;
+let pendingHandoffIsRouteBound: boolean = false;
+let pendingHandoffTimer: number = -1;
+let handoffGeneration: number = 0;
+
+/** Revokes only the originating attempt, never a newer handoff. */
+export function cancelTaskSplitRouteSelection(token: string): void {
+  if (token.length === 0 || token !== pendingHandoffToken) return;
+  pendingTaskSplitRouteSelection = null;
+  pendingHandoffToken = '';
+  pendingHandoffExpiresAt = 0;
+  pendingHandoffIsRouteBound = false;
+  if (pendingHandoffTimer >= 0) clearTimeout(pendingHandoffTimer);
+  pendingHandoffTimer = -1;
+}
 
 export function handoffTaskSplitRouteSelection(
   deviceId: string,
   sessionId: string,
   messageClientId: string = '',
   presentation?: TaskSplitDetailPresentation,
-): void {
+  routeBound: boolean = false,
+  now: number = Date.now(),
+): string {
+  cancelTaskSplitRouteSelection(pendingHandoffToken);
   const selection = new TaskSplitRouteSelection();
   selection.deviceId = deviceId;
   selection.sessionId = sessionId;
   selection.messageClientId = messageClientId;
   selection.presentation = presentation;
+  const token = String(++handoffGeneration);
+  pendingHandoffToken = token;
+  pendingHandoffExpiresAt = now + TASK_SPLIT_HANDOFF_TTL_MS;
+  pendingHandoffIsRouteBound = routeBound;
   pendingTaskSplitRouteSelection = selection;
+  pendingHandoffTimer = setTimeout((): void => cancelTaskSplitRouteSelection(token), TASK_SPLIT_HANDOFF_TTL_MS);
+  return token;
 }
 
-export function consumeTaskSplitRouteSelection(): TaskSplitRouteSelection | null {
+/** A void router.back is not an acknowledgement. Only the target carrying the token can claim it. */
+export function consumeTaskSplitRouteSelection(token: string = '', now: number = Date.now()): TaskSplitRouteSelection | null {
+  if (pendingTaskSplitRouteSelection === null) return null;
+  if (now >= pendingHandoffExpiresAt) {
+    cancelTaskSplitRouteSelection(pendingHandoffToken);
+    return null;
+  }
+  if ((pendingHandoffIsRouteBound || token.length > 0) && token !== pendingHandoffToken) return null;
   const selection = pendingTaskSplitRouteSelection;
-  pendingTaskSplitRouteSelection = null;
+  cancelTaskSplitRouteSelection(pendingHandoffToken);
   return selection;
 }
 
@@ -87,6 +122,7 @@ export function isWideTaskLayout(
   safeHeight: number,
   multiWindow: boolean = false,
   widthBreakpoint?: WidthBreakpoint,
+  wasWide: boolean = false,
 ): boolean {
   return !multiWindow
     && Number.isFinite(viewportWidth)
@@ -95,7 +131,7 @@ export function isWideTaskLayout(
     && (widthBreakpoint === undefined ? viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH
       : widthBreakpoint >= WidthBreakpoint.WIDTH_MD)
     && safeWidth >= WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH
-    && safeHeight >= WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT;
+    && safeHeight >= (wasWide ? WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT : WIDE_TASK_LAYOUT_ENTER_SAFE_HEIGHT);
 }
 
 export class TaskSafeWindowSize {
@@ -103,21 +139,17 @@ export class TaskSafeWindowSize {
   height: number = 0;
 }
 
-/**
- * 分栏判断使用的安全区尺寸。窗口避让区明确读不到时退回页面尺寸，不能让双栏永久不可用；
- * 仍在读取时保持 0，避免冷启动先进入双栏、拿到真实安全区后又退出并触发单栏跳转。
- * 高度不与页面高度取较小值：输入法会压缩页面高度，不能因此在输入时收起双栏。
- */
+/** Keep the last non-IME metrics. Until the first sample, stay in the single-pane layout. */
 export function effectiveTaskSafeWindow(
   viewportWidth: number,
-  viewportHeight: number,
+  _viewportHeight: number,
   safeWidth: number,
   safeHeight: number,
-  metricsUnavailable: boolean,
+  _metricsUnavailable: boolean,
 ): TaskSafeWindowSize {
   const size = new TaskSafeWindowSize();
-  size.width = metricsUnavailable ? viewportWidth : Math.min(viewportWidth, safeWidth);
-  size.height = metricsUnavailable ? viewportHeight : safeHeight;
+  size.width = Math.min(viewportWidth, safeWidth);
+  size.height = safeHeight;
   return size;
 }
 
@@ -185,7 +217,7 @@ export function taskDetailKeyboardInset(
   keyboardHeight: number,
   multiWindow: boolean = false,
 ): number {
-  if (!isWideTaskLayout(viewportWidth, safeWidth, safeHeight, multiWindow)) return 0;
+  if (!isWideTaskLayout(viewportWidth, safeWidth, safeHeight, multiWindow, undefined, true)) return 0;
   if (!Number.isFinite(keyboardHeight) || keyboardHeight <= 0) return 0;
   return keyboardHeight;
 }

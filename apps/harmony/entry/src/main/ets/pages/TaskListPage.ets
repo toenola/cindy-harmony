@@ -100,6 +100,7 @@ import {
   TaskSafeWindowSize,
   TaskSplitDetailPresentation,
   TASK_SPLIT_DIVIDER_WIDTH,
+  TASK_SPLIT_HANDOFF_PARAM,
   TASK_SPLIT_MAX_LIST_WIDTH,
   taskDetailKeyboardInset,
   taskDetailPaneWidth,
@@ -482,7 +483,8 @@ struct TaskListPage {
   }
 
   private adoptSplitRouteSelection(): void {
-    const selection = consumeTaskSplitRouteSelection();
+    const params = (router.getParams() ?? {}) as Record<string, Object>;
+    const selection = consumeTaskSplitRouteSelection(readStr(params, TASK_SPLIT_HANDOFF_PARAM));
     if (selection === null || AppServices.instance.taskAccountTransition.active) return;
     const epoch = AppServices.instance.auth.sessionEpoch;
     const presentation = taskSplitPresentationFor(selection.presentation, epoch, selection.deviceId, selection.sessionId);
@@ -792,9 +794,8 @@ struct TaskListPage {
 
   private handleSplitLayoutChange(wasSplit: boolean): void {
     const safe = this.safeWindowSize();
-    const allowance = wasSplit ? 0 : 12;
-    this.wideLayout = isWideTaskLayout(this.viewportWidth, safe.width, Math.max(0, safe.height - allowance),
-      this.safeWindowMultiWindow, this.windowWidthBreakpoint);
+    this.wideLayout = isWideTaskLayout(this.viewportWidth, safe.width, safe.height,
+      this.safeWindowMultiWindow, this.windowWidthBreakpoint, wasSplit);
     const splitEnabled = this.wideLayout;
     if (splitEnabled) this.ensureWideSelection();
     const wasListFullscreen = this.listPaneFullscreen;

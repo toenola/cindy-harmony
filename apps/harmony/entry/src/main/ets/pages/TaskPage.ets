@@ -2,7 +2,8 @@ import { UiEmptyState, UiInlineError } from '../components/common/UiStatus';
 import { UI_FONT_ACTION_SMALL, UI_FONT_BODY, UI_MOTION_BASE, getSystemFontSizeScale } from '../components/UiKit';
 import { UiCard, UiListGroup, UiListRow } from '../components/common/UiList';
 import { UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_RADIUS_CARD } from '../components/UiKit';
-import { UiIconButton } from '../components/common/UiActions';
+import { UiActionButton, UiActionKind, UiIconButton } from '../components/common/UiActions';
+import { uiAccessibleString } from '../components/common/UiAccessibility';
 import { UI_FONT_TITLE_S, UI_FONT_CAPTION, UI_TOUCH_TARGET_MIN } from '../components/UiKit';
 import { ModelPickerListRow } from '../components/ModelPickerListRow';
 import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
@@ -168,6 +169,9 @@ import {
 } from '../core/tasks/NewSessionCreationStore';
 import {
   handoffTaskSplitRouteSelection,
+  cancelTaskSplitRouteSelection,
+  TASK_SPLIT_HANDOFF_PARAM,
+  TASK_SPLIT_HANDOFF_TTL_MS,
   effectiveTaskSafeWindow,
   isWideTaskLayout,
   TaskSafeWindowSize,
@@ -296,6 +300,9 @@ import {
   ComposerScrollUpdate,
   firstVisibleMessageRenderIndex,
   taskSplitPresentationFor,
+  WorkerPaneIntentChange,
+  workerPaneIntentAfterChange,
+  flushStableSplitDrafts,
   FOLLOW_LATEST_RETRY_DELAYS,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   isNearHistoryStart,
@@ -4873,19 +4880,9 @@ export struct TaskPageContent {
   shareSelectionBar() {
     Column({ space: 6 }) {
       Row({ space: 8 }) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(uiFontSize(14))
-            .fontColor([$r('app.color.text_secondary')])
-        }
-        .type(ButtonType.Circle)
-        .width(36)
-        .height(36)
-        .padding(0)
-        .backgroundColor($r('app.color.bg_chip'))
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText($r('app.string.v12_cancel_selection'))
-        .onClick(() => this.exitShareSelection())
+        UiIconButton({ glyph: $r('sys.symbol.xmark'),
+          label: uiAccessibleString(this.getUIContext(), $r('app.string.v12_cancel_selection')),
+          onAction: () => this.exitShareSelection() })
 
         Text($r('app.string.v12_selected_messages', this.shareSelectionCount))
           .fontSize(uiFontSize(14))
@@ -6152,6 +6149,11 @@ export struct TaskPageContent {
     snapshot.focus = target;
     snapshot.selectionStart = this.splitSelectionStart;
     snapshot.selectionEnd = this.splitSelectionEnd;
+  }
+
+  splitDraftRevision(): string {
+    return JSON.stringify([this.deviceId, this.sessionId, this.pageLifecycleGeneration, this.composerInputRevision,
+      this.incomingDraftRestored, this.editingQueueClientId, this.editingMessageClientId]);
   }
 
   async flushDraftForSplit(epoch: number): Promise<void> {
@@ -9072,17 +9074,16 @@ export struct TaskPageContent {
         Column({ space: 14 }) {
           Column({ space: 6 }) {
             Text('目标')
-              .fontSize(uiFontSize(13))
+              .fontSize(UI_FONT_SECONDARY)
               .fontColor($r('app.color.text_secondary'))
               .width('100%')
             TextArea({ placeholder: '描述要持续推进的结果', text: this.goalObjective })
-              .fontSize(uiFontSize(15))
-              .placeholderFont({ size: uiFontSize(15) })
-              .lineHeight(uiLineHeight(22))
+              .fontSize(UI_FONT_BODY)
+              .placeholderFont({ size: UI_FONT_BODY })
               .fontColor($r('app.color.text_primary'))
               .placeholderColor($r('app.color.text_tertiary'))
               .caretColor($r('app.color.chat_input_caret'))
-              .height(108)
+              .constraintSize({ minHeight: 108 })
               .width('100%')
               .padding(10)
               .backgroundColor($r('app.color.composer_surface'))
@@ -9096,17 +9097,17 @@ export struct TaskPageContent {
           .alignItems(HorizontalAlign.Start)
 
           Text('可选限制')
-            .fontSize(uiFontSize(13))
+            .fontSize(UI_FONT_SECONDARY)
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           Row({ space: 8 }) {
             Column({ space: 5 }) {
-              Text('最大轮数').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('最大轮数').fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalMaxTurns })
                 .type(InputType.Number)
-                .height(40)
-                .fontSize(uiFontSize(14))
+                .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+                .fontSize(UI_FONT_BODY)
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(UI_RADIUS_CONTROL)
@@ -9118,11 +9119,11 @@ export struct TaskPageContent {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('token 预算').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('token 预算').fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '不限', text: this.goalBudgetTokens })
                 .type(InputType.Number)
-                .height(40)
-                .fontSize(uiFontSize(14))
+                .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+                .fontSize(UI_FONT_BODY)
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(UI_RADIUS_CONTROL)
@@ -9134,11 +9135,11 @@ export struct TaskPageContent {
             .alignItems(HorizontalAlign.Start)
 
             Column({ space: 5 }) {
-              Text('无进展轮数').fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary'))
+              Text('无进展轮数').fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
               TextInput({ placeholder: '3', text: this.goalNoProgressLimit })
                 .type(InputType.Number)
-                .height(40)
-                .fontSize(uiFontSize(14))
+                .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+                .fontSize(UI_FONT_BODY)
                 .backgroundColor($r('app.color.composer_surface'))
                 .border({ width: 1, color: $r('app.color.composer_border') })
                 .borderRadius(UI_RADIUS_CONTROL)
@@ -9154,7 +9155,7 @@ export struct TaskPageContent {
           Button(this.goalActionBusy ? '正在启动…' : '开始目标')
             .width('100%')
             .height(44)
-            .fontSize(uiFontSize(15))
+            .fontSize(UI_FONT_BODY)
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(UI_RADIUS_CONTROL)
@@ -9177,7 +9178,7 @@ export struct TaskPageContent {
                 ? $r('app.color.chat_status_accent')
                 : $r('app.color.text_tertiary'))
             Text(this.goalStatusText(this.goalState.status))
-              .fontSize(uiFontSize(14))
+              .fontSize(UI_FONT_BODY)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
           }
@@ -9191,14 +9192,14 @@ export struct TaskPageContent {
             .width('100%')
 
           Text(`${this.goalState.currentTurns} 轮 · ${this.goalState.cumulativeTokens} tokens`)
-            .fontSize(uiFontSize(13))
+            .fontSize(UI_FONT_SECONDARY)
             .lineHeight(uiLineHeight(20))
             .fontColor($r('app.color.text_secondary'))
             .width('100%')
 
           if (this.goalState.lastReason.length > 0) {
             Text(this.goalState.lastReason)
-              .fontSize(uiFontSize(13))
+              .fontSize(UI_FONT_SECONDARY)
               .lineHeight(uiLineHeight(20))
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
@@ -10659,10 +10660,9 @@ export struct TaskPageContent {
   interactionSecondaryButton(label: string, danger: boolean, action: () => void, enabled: boolean = true, askFooter: boolean = false) {
     Button(label)
       .type(ButtonType.Normal)
-      .height(askFooter ? 44 : 34)
-      .constraintSize({ minWidth: askFooter ? 88 : 0 })
+      .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN, minWidth: askFooter ? 88 : UI_TOUCH_TARGET_MIN })
       .margin(askFooter ? 4 : 0)
-      .fontSize(uiFontSize(13))
+      .fontSize(UI_FONT_ACTION_SMALL)
       .fontWeight(FontWeight.Medium)
       .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
       .backgroundColor($r('app.color.bg_card'))
@@ -10678,19 +10678,7 @@ export struct TaskPageContent {
   /** 交互卡主按钮（允许 / 提交 / 批准）：实心反色胶囊。 */
   @Builder
   interactionPrimaryButton(label: string, action: () => void, enabled: boolean = true) {
-    Button(label)
-      .type(ButtonType.Normal)
-      .height(34)
-      .fontSize(uiFontSize(13))
-      .fontWeight(FontWeight.Medium)
-      .fontColor($r('app.color.chat_cta_text'))
-      .backgroundColor($r('app.color.chat_cta'))
-      .borderRadius(UI_RADIUS_PILL)
-      .padding({ left: 16, right: 16 })
-      .enabled(enabled)
-      .opacity(enabled ? 1 : 0.55)
-      .clickEffect(UI_CLICK_EFFECT)
-      .onClick(action)
+    UiActionButton({ label, kind: UiActionKind.Primary, actionEnabled: enabled, onAction: action })
   }
 
   /** Ask User 主按钮需在 Builder 内直接读取草稿，确保选项点击后 enabled 当帧刷新。 */
@@ -15064,6 +15052,9 @@ struct TaskPage {
   /** 独立详情页的键盘高度；展开横屏转入 TaskListPage 后由右侧详情栏继续接管。 */
   @State keyboardHeight: number = 0;
   private splitNavigationPending: boolean = false;
+  private splitNavigationAttempt: number = 0;
+  private splitHandoffToken: string = '';
+  private splitHandoffTimer: number = -1;
   private pageActive: boolean = false;
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
@@ -15193,33 +15184,66 @@ struct TaskPage {
     if (!this.pageActive || this.splitNavigationPending || this.splitDetail === undefined ||
       !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) return;
     this.splitNavigationPending = true;
-    void this.returnToSplitHome(this.splitDetail);
+    void this.returnToSplitHome(this.splitDetail, ++this.splitNavigationAttempt);
   }
 
-  private async returnToSplitHome(detail: OrcaTaskDetail): Promise<void> {
+  private cancelSplitNavigation(attempt: number): void {
+    if (attempt !== this.splitNavigationAttempt) return;
+    this.splitNavigationAttempt += 1;
+    if (this.splitHandoffTimer >= 0) clearTimeout(this.splitHandoffTimer);
+    this.splitHandoffTimer = -1;
+    if (this.splitHandoffToken.length > 0) cancelTaskSplitRouteSelection(this.splitHandoffToken);
+    this.splitHandoffToken = '';
+    this.splitNavigationPending = false;
+  }
+
+  private async returnToSplitHome(detail: OrcaTaskDetail, attempt: number): Promise<void> {
     const epoch = AppServices.instance.auth.sessionEpoch;
     let navigationStarted = false;
-    try {
-      const snapshot = detail.captureSplitPresentation();
-      if (taskSplitPresentationFor(snapshot, epoch, this.routeDevice, this.routeSession) === undefined) return;
-      await detail.flushSplitDrafts(epoch);
+    let replacement: Promise<void> | undefined;
+    const current = (): boolean => {
       const safe = this.safeWindowSize();
-      if (!this.pageActive || this.splitDetail !== detail || epoch !== AppServices.instance.auth.sessionEpoch ||
-        !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) return;
-      handoffTaskSplitRouteSelection(this.routeDevice, this.routeSession, snapshot.leadMessageClientId, snapshot);
-      const home = 'pages/TaskListPage';
-      if (router.getStateByUrl(home).length > 0) router.back({ url: home });
-      else await router.replaceUrl({ url: home });
-      navigationStarted = true;
+      return this.pageActive && this.splitNavigationAttempt === attempt && this.splitDetail === detail &&
+        epoch === AppServices.instance.auth.sessionEpoch &&
+        isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow);
+    };
+    try {
+      if (taskSplitPresentationFor(detail.captureSplitPresentation(), epoch, this.routeDevice, this.routeSession) === undefined) return;
+      await flushStableSplitDrafts(
+        (): string => detail.splitDraftRevision(),
+        (): Promise<void> => detail.flushSplitDrafts(epoch),
+        current,
+        (): void => {
+          // Read the focus, selection and message anchor only once the actual drafts are stable.
+          const snapshot = detail.captureSplitPresentation();
+          if (taskSplitPresentationFor(snapshot, epoch, this.routeDevice, this.routeSession) === undefined) return;
+          const token = handoffTaskSplitRouteSelection(
+            this.routeDevice, this.routeSession, snapshot.leadMessageClientId, snapshot, true);
+          this.splitHandoffToken = token;
+          const params: Record<string, string> = {};
+          params[TASK_SPLIT_HANDOFF_PARAM] = token;
+          const home = 'pages/TaskListPage';
+          // Neither a void back nor a resolved replace acknowledges that Home claimed the token.
+          // Don't revoke in aboutToDisappear: Home may not yet have received the route params.
+          this.splitHandoffTimer = setTimeout(() => this.cancelSplitNavigation(attempt), TASK_SPLIT_HANDOFF_TTL_MS);
+          if (router.getStateByUrl(home).length > 0) router.back({ url: home, params });
+          else replacement = router.replaceUrl({ url: home, params });
+          navigationStarted = true;
+        },
+      );
+      await replacement;
     } catch (_error) {
       // Leave the existing detail and draft intact if persistence or navigation fails.
+      this.cancelSplitNavigation(attempt);
     } finally {
-      if (!navigationStarted) this.splitNavigationPending = false;
+      if (!navigationStarted) this.cancelSplitNavigation(attempt);
     }
   }
 
   onBackPress(): boolean {
-    return this.collabBack?.() ?? false;
+    if (this.collabBack?.()) return true;
+    this.cancelSplitNavigation(this.splitNavigationAttempt);
+    return false;
   }
 
   build() {
@@ -15227,7 +15251,10 @@ struct TaskPage {
       OrcaTaskDetail({
         paneDeviceId: this.routeDevice, paneSessionId: this.routeSession, paneMessageClientId: this.routeMessage,
         paneKeyboardInset: this.keyboardHeight, allowSideBySide: !this.safeWindowMultiWindow,
-        onBack: (): void => router.back(),
+        onBack: (): void => {
+          this.cancelSplitNavigation(this.splitNavigationAttempt);
+          router.back();
+        },
         registerBack: (handler: (() => boolean) | undefined): void => { this.collabBack = handler; },
         registerSplitDetail: (detail: OrcaTaskDetail | undefined): void => {
           this.splitDetail = detail;
@@ -15385,6 +15412,11 @@ export struct OrcaTaskDetail {
     return snapshot;
   }
 
+  splitDraftRevision(): string {
+    return JSON.stringify([this.leadContent?.splitDraftRevision(), this.selected[0]?.id,
+      this.workerContent?.splitDraftRevision()]);
+  }
+
   async flushSplitDrafts(epoch: number): Promise<void> {
     await Promise.all([this.leadContent?.flushDraftForSplit(epoch), this.workerContent?.flushDraftForSplit(epoch)]);
   }
@@ -15407,11 +15439,17 @@ export struct OrcaTaskDetail {
     }
   }
 
+  private applyWorkerPaneIntentChange(change: WorkerPaneIntentChange): void {
+    const intent = workerPaneIntentAfterChange(change, this.workerPaneOpen, this.workerExpanded);
+    this.workerPaneOpen = intent.open;
+    this.workerExpanded = intent.expanded;
+    this.resetWorkerDivider();
+  }
+
   private taskChanged(): void {
     this.restoredPresentation = undefined;
     this.pendingWorkerId = '';
-    this.workerPaneOpen = false;
-    this.workerExpanded = false;
+    this.applyWorkerPaneIntentChange('task');
     this.readGeneration += 1;
     this.workers = [];
     this.selected = [];
@@ -15423,9 +15461,7 @@ export struct OrcaTaskDetail {
     if (!this.mounted) return;
     if (!this.paneActive) {
       this.readGeneration += 1;
-      this.workerPaneOpen = false;
-      this.workerExpanded = false;
-      this.syncVisibleWorkerSelection();
+      this.applyWorkerPaneIntentChange('inactive');
     } else {
       if (!this.updateRole()) void this.refreshWorkers();
       this.restoreSplitPresentation();
@@ -15440,11 +15476,10 @@ export struct OrcaTaskDetail {
     const nextRole = current?.orcaRole ?? '';
     if (nextRole === this.role) return false;
     this.role = nextRole;
-    this.workerExpanded = false;
+    this.applyWorkerPaneIntentChange('role');
     this.readGeneration += 1;
     this.workers = [];
     this.loadState = '';
-    this.workerPaneOpen = false;
     this.selected = [];
     if (nextRole === 'lead') {
       this.restoreSplitPresentation();
@@ -15997,8 +16032,8 @@ export struct OrcaTaskDetail {
       Column() {
         UiSplitHandle({
           label: this.label('v138_resize'),
-          narrowLabel: $r('app.string.home_task_split_narrow'),
-          widenLabel: $r('app.string.home_task_split_widen'),
+          narrowLabel: $r('app.string.v140_collab_split_widen'),
+          widenLabel: $r('app.string.v140_collab_split_narrow'),
           paneStartActionLabel: this.label('v138_expand'),
           paneEndActionLabel: this.label('v138_return_to_lead'),
           leadingWidthVp: this.leadPaneWidth(),

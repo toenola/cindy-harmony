@@ -337,7 +337,7 @@ export struct UsageDashboardPanel {
 
   private quotaColumnCount(): number {
     const count = this.accounts().length;
-    if (count <= 3) return Math.max(1, count);
+    if (count <= 3) return Math.max(1, Math.min(count, Math.floor(this.quotaGridWidth / 64)));
     // Mobile balances rows based on the available width, up to six columns.
     const maxColumns = Math.max(1, Math.min(6, Math.floor(this.quotaGridWidth / 82)));
     return Math.ceil(count / Math.ceil(count / maxColumns));
@@ -425,7 +425,7 @@ export struct UsageDashboardPanel {
     Column({ space: compact ? 5 : 8 }) {
       Text((source.value || source.label || '—') + (source.reserve ? '' : source.unit))
         .fontSize(compact ? UI_FONT_LIST_TITLE : UI_FONT_TITLE_S).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%').textAlign(TextAlign.Center).wordBreak(WordBreak.BREAK_ALL)
       if (source.reserve && source.unit) Text(source.unit).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
       Stack({ alignContent: Alignment.Bottom }) {
         Column().width('100%').height(source.fill > 0 ? Math.max(3, (compact ? 58 : 68) * source.fill) : 0)
@@ -433,7 +433,7 @@ export struct UsageDashboardPanel {
       }.width(compact ? 26 : 30).height(compact ? 64 : 74).padding(3).clip(true).borderRadius(14)
         .border({ width: source.emphasized ? 1.25 : 1, color: $r('app.color.border') })
         .backgroundColor($r('app.color.bg_chip')).opacity(this.stale() || source.stale ? 0.45 : 1)
-      Row({ space: compact ? 2 : 8 }) {
+      Flex({ direction: compact ? FlexDirection.Column : FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Center }) {
         if (source.logo === 'codex' || source.logo === 'claude') {
           Image(source.logo === 'codex' ? $r('app.media.usage_provider_openai')
             : $r('app.media.usage_provider_anthropic'))
@@ -446,8 +446,9 @@ export struct UsageDashboardPanel {
             .border({ width: 1, color: $r('app.color.text_primary') }).borderRadius(4)
         }
         Text(source.name).fontSize(compact ? UI_FONT_CAPTION : UI_FONT_BODY).fontColor($r('app.color.text_primary'))
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
-      }.alignItems(VerticalAlign.Center).justifyContent(FlexAlign.Center).width('100%')
+          .wordBreak(WordBreak.BREAK_ALL).textAlign(TextAlign.Center).flexShrink(1)
+          .constraintSize({ maxWidth: compact ? '100%' : '72%' })
+      }.width('100%')
       Text(usageResetLabel(source, this.data().strings, this.now, this.text('usage_reset_pending')))
         .fontSize(compact ? UI_FONT_CAPTION_SMALL : UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
         .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Center)
@@ -515,7 +516,9 @@ export struct UsageDashboardPanel {
             this.historyChart()
             Row() {
               Text(this.data().days[0].date).layoutWeight(1).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
-              Text(this.today().date).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
+                .wordBreak(WordBreak.BREAK_ALL)
+              Text(this.today().date).layoutWeight(1).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
+                .textAlign(TextAlign.End).wordBreak(WordBreak.BREAK_ALL)
             }.width('100%').constraintSize({ minHeight: 30 })
               .onClick((): void => { if (this.pickedDay >= 0) { this.pickedDay = -1; this.rebuildUsage(); } })
           }.width('100%')
@@ -545,6 +548,11 @@ export struct UsageDashboardPanel {
       }.width('100%').alignItems(HorizontalAlign.Start)
     }
   }
+  private chartColumnGap(): number {
+    const count = this.data().days.length;
+    return count < 2 ? 0 : Math.max(0, Math.min(3, (this.chartWidth - count * 4) / (count - 1)));
+  }
+
   private averageDashes(): number[] {
     const indices: number[] = [];
     const count = Math.ceil(Math.max(0, this.chartWidth) / 8);
@@ -555,7 +563,7 @@ export struct UsageDashboardPanel {
   @Builder
   historyChart() {
     Stack({ alignContent: Alignment.TopStart }) {
-      Row({ space: 3 }) {
+      Row({ space: this.chartColumnGap() }) {
         ForEach(this.data().days, (_day: UsageDay, index: number) => {
           Column() {
             ForEach(this.chartSeries(), (series: UsageSeries) => {
@@ -579,6 +587,9 @@ export struct UsageDashboardPanel {
           .hitTestBehavior(HitTestMode.None)
       }
     }.width('100%').height(180)
-      .onAreaChange((_old: Area, area: Area) => { this.chartWidth = Number(area.width); })
+      .onAreaChange((_old: Area, area: Area) => {
+        const width = Number(area.width);
+        if (width > 0 && width !== this.chartWidth) this.chartWidth = width;
+      })
   }
 }

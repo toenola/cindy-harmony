@@ -423,6 +423,8 @@
     {"name": "home_task_split_narrow", "value": "縮窄任務清單"},
     {"name": "home_task_split_widen", "value": "加寬任務清單"},
     {"name": "home_list_more", "value": "更多操作"},
-    {"name": "home_list_settings", "value": "設定"}
+    {"name": "home_list_settings", "value": "設定"},
+    {"name": "v140_collab_split_narrow", "value": "縮窄協同欄"},
+    {"name": "v140_collab_split_widen", "value": "加寬協同欄"}
   ]
 }

@@ -1,4 +1,5 @@
 import { router } from '@kit.ArkUI';
+import { UiPanelHeading } from '../components/common/UiNavigation';
 import { RelaySettingsPanel } from '../components/RelaySettingsPanel';
 
 @Entry
@@ -15,7 +16,7 @@ struct RelayJoinPage {
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).fontColor([$r('app.color.text_primary')])
         }.width(44).height(44).backgroundColor($r('app.color.bg_card')).onClick(() => router.back())
-        Text($r('app.string.relay_join_title')).fontSize(20).layoutWeight(1).textAlign(TextAlign.Center)
+        Column() { UiPanelHeading({ heading: $r('app.string.relay_join_title') }) }.layoutWeight(1)
       }.width('100%').padding(16)
       Scroll() {
         Column() { RelaySettingsPanel({ joinOnly: true, offerJson: this.offer }) }

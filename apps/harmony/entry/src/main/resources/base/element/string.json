@@ -827,6 +827,8 @@
     {"name": "home_task_split_narrow", "value": "缩窄任务列表"},
     {"name": "home_task_split_widen", "value": "加宽任务列表"},
     {"name": "home_list_more", "value": "更多操作"},
-    {"name": "home_list_settings", "value": "设置"}
+    {"name": "home_list_settings", "value": "设置"},
+    {"name": "v140_collab_split_narrow", "value": "缩窄协同栏"},
+    {"name": "v140_collab_split_widen", "value": "加宽协同栏"}
   ]
 }

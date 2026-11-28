@@ -423,6 +423,8 @@
     {"name": "home_task_split_narrow", "value": "작업 목록 좁히기"},
     {"name": "home_task_split_widen", "value": "작업 목록 넓히기"},
     {"name": "home_list_more", "value": "추가 작업"},
-    {"name": "home_list_settings", "value": "설정"}
+    {"name": "home_list_settings", "value": "설정"},
+    {"name": "v140_collab_split_narrow", "value": "협업 창 좁히기"},
+    {"name": "v140_collab_split_widen", "value": "협업 창 넓히기"}
   ]
 }

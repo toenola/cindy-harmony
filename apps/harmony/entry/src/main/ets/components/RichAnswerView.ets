@@ -42,7 +42,9 @@ import {
 import {
   RichInteractionMemory, RichMessageSender, RichSubmissionController, RichSubmissionStatus,
 } from '../core/messages/RichInteractionMemory';
-import { UI_CLICK_EFFECT, UI_FONT_ACTION, UI_FONT_BODY, UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_FONT_TITLE_M, UI_RADIUS_PILL, UI_TOUCH_TARGET_MIN, uiFontSize } from './UiKit';
+import { UI_CLICK_EFFECT, UI_FONT_ACTION, UI_FONT_CAPTION, UI_FONT_BODY, UI_FONT_LIST_TITLE, UI_ICON_SIZE_COMPACT, UI_FONT_SECONDARY, UI_FONT_TITLE_M, UI_RADIUS_PILL, UI_TOUCH_TARGET_MIN, uiFontSize } from './UiKit';
+
+Environment.envProp<number>('fontScale', 1);
 
 const PHONE_LAYOUT_MAX_WIDTH = 600;
 const STACK_GAP = 16;
@@ -727,7 +729,7 @@ struct RichNodeView {
     } else if (this.node().kind === 'icon') {
       Row({ space: 12 }) {
         SymbolGlyph(richIcon(richString(this.node(), 'name')))
-          .fontSize(richNumber(this.node(), 'size', 20))
+          .fontSize(richNumber(this.node(), 'size', UI_ICON_SIZE_COMPACT))
           .fontColor([this.textColor(ROLE_TEXT)])
           .accessibilityLevel('no')
         Column({ space: 4 }) {
@@ -1017,6 +1019,7 @@ struct RichCanvasView {
   @Consume('cindyRichDoc') @Watch('redraw') richDoc: RichDocument;
   @Consume('cindyRichState') @Watch('redraw') richState: RichViewState;
   @StorageProp('cindyColorMode') @Watch('redraw') colorMode: number = -1;
+  @StorageProp('fontScale') @Watch('redraw') fontScale: number = 1;
   @State canvasWidth: number = 0;
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
@@ -1093,6 +1096,12 @@ struct RichCanvasView {
     else this.drawVector(palette);
   }
 
+  /** Canvas font accepts px/vp only; resolve the shared fp role using the current UI context. */
+  private canvasFontVp(token: string): number {
+    const context = this.getUIContext();
+    return context.px2vp(context.fp2px(parseFloat(token)));
+  }
+
   private drawChart(palette: CanvasPalette): void {
     const ctx = this.ctx;
     const node = this.node();
@@ -1102,7 +1111,9 @@ struct RichCanvasView {
     const color = roleColor !== undefined ? roleColor : palette.primary;
     ctx.save();
     ctx.scale(ratio, 1);
-    ctx.font = `${uiFontSize(13)}vp sans-serif`;
+    const labelSize = this.canvasFontVp(UI_FONT_CAPTION);
+    ctx.font = `${labelSize}vp sans-serif`;
+    ctx.textBaseline = 'middle';
     ctx.lineWidth = 1;
     plot.ticks.forEach((tick: RichPlotTick) => {
       if (node.props['showGrid'] !== false) {
@@ -1114,7 +1125,7 @@ struct RichCanvasView {
       }
       ctx.fillStyle = palette.secondary;
       ctx.textAlign = 'right';
-      ctx.fillText(tick.label, plot.left - 6, tick.y + 4);
+      ctx.fillText(tick.label, plot.left - 6, Math.max(labelSize / 2, tick.y), Math.max(1, plot.left - 8));
     });
     if (plot.points.length > 0) {
       ctx.strokeStyle = color;
@@ -1129,7 +1140,8 @@ struct RichCanvasView {
     }
     ctx.fillStyle = palette.secondary;
     ctx.textAlign = 'center';
-    plot.labels.forEach((label: RichPlotLabel) => ctx.fillText(label.label, label.x, plot.labelY));
+    ctx.textBaseline = 'bottom';
+    plot.labels.forEach((label: RichPlotLabel) => ctx.fillText(label.label, label.x, plot.height));
     plot.points.forEach((point: RichPlotPoint) => {
       if (node.props['showPoints'] !== false) {
         ctx.fillStyle = color;
@@ -1177,7 +1189,7 @@ struct RichCanvasView {
       const dash = shapeText(shape, 'strokeDasharray');
       ctx.setLineDash(dash.length > 0 ? parsePoints(dash) : []);
       if (shape.type === 'text') {
-        const size = shapeNumber(shape, 'fontSize', 16);
+        const size = shapeNumber(shape, 'fontSize', this.canvasFontVp(UI_FONT_BODY));
         const weight = shapeText(shape, 'fontWeight');
         ctx.font = `${weight.length > 0 ? weight : 'normal'} ${size}vp sans-serif`;
         const anchor = shapeText(shape, 'textAnchor');
