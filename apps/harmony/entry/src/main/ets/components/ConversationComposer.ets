@@ -769,6 +769,12 @@ export struct ConversationComposer {
     .alignItems(VerticalAlign.Center)
   }
 
+  inputController?: TextAreaController;
+  @Prop keyboardOnFocus: boolean = true;
+  onSelectionChange: (start: number, end: number) => void = (_start: number, _end: number) => {};
+  onInputReady: () => void = () => {};
+  onInputTouch: () => void = () => {};
+
   @Builder
   composerInputSurface() {
     Column({ space: 6 }) {
@@ -857,8 +863,16 @@ export struct ConversationComposer {
         if (this.expanded()) {
           Row({ space: 6 }) {
             Column() {
-              TextArea({ placeholder: this.placeholder, text: this.input })
+              TextArea({ placeholder: this.placeholder, text: this.input, controller: this.inputController })
                 .id(this.inputId)
+                .enableKeyboardOnFocus(this.keyboardOnFocus)
+                .onTextSelectionChange((start: number, end: number) => this.onSelectionChange(start, end))
+                .onAreaChange((_old: Area, area: Area) => {
+                  if (Number(area.height) > 0) this.onInputReady();
+                })
+                .onTouch((event: TouchEvent) => {
+                  if (event.type === TouchType.Down) this.onInputTouch();
+                })
                 .enabled(this.composerEnabled)
                 .fontSize(UI_FONT_BODY)
                 .placeholderFont({ size: UI_FONT_BODY })

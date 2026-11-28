@@ -141,6 +141,7 @@ import {
 } from '../main/ets/core/tasks/TaskListPreferenceStore';
 import {
   consumeTaskSplitRouteSelection,
+  TaskSplitDetailPresentation,
   effectiveTaskSafeWindow,
   handoffTaskSplitRouteSelection,
   isWideTaskLayout,
@@ -327,6 +328,7 @@ import {
   COMPOSER_SCROLL_ACTION_NONE,
   COMPOSER_SCROLL_ACTION_SHOW,
   firstVisibleMessageRenderIndex,
+  taskSplitPresentationFor,
   FOLLOW_LATEST_RETRY_DELAYS,
   HISTORY_PREFETCH_MIN_DISTANCE,
   HISTORY_PREFETCH_VIEWPORTS,
@@ -5091,13 +5093,50 @@ export default function localUnitTest() {
       expect(isWideTaskLayout(939, typing.width, typing.height)).assertTrue();
     });
 
-    it('handsCurrentTaskBackToSplitLayoutOnlyOnce', 0, () => {
-      handoffTaskSplitRouteSelection('device-1', 'session-1', 'message-1');
+    // Unit tier: exercise the route's one-shot handoff and the actual restore gate. Changing just one
+    // scope field must not carry a previous account's or task's Worker/focus into the visible pane.
+    it('handsCurrentTaskBackToSplitLayoutOnlyOnceAndRestoresOnlyMatchingIdentity', 0, () => {
+      const snapshot = new TaskSplitDetailPresentation();
+      snapshot.accountEpoch = 7;
+      snapshot.deviceId = 'device-1';
+      snapshot.sessionId = 'session-1';
+      snapshot.workerId = 'worker-2';
+      snapshot.workerPaneOpen = true;
+      snapshot.workerExpanded = true;
+      snapshot.leadPaneFraction = 0.6;
+      snapshot.focus = 'worker-composer';
+      snapshot.selectionStart = 2;
+      snapshot.selectionEnd = 5;
+      handoffTaskSplitRouteSelection('device-1', 'session-1', 'message-1', snapshot);
       const selection = consumeTaskSplitRouteSelection();
       expect(selection?.deviceId).assertEqual('device-1');
       expect(selection?.sessionId).assertEqual('session-1');
       expect(selection?.messageClientId).assertEqual('message-1');
+      const restored = taskSplitPresentationFor(selection?.presentation, 7, 'device-1', 'session-1');
+      expect(restored?.workerId).assertEqual('worker-2');
+      expect(restored?.workerPaneOpen && restored?.workerExpanded).assertTrue();
+      expect(restored?.leadPaneFraction).assertEqual(0.6);
+      expect(restored?.focus).assertEqual('worker-composer');
+      expect(restored?.selectionStart).assertEqual(2);
+      expect(restored?.selectionEnd).assertEqual(5);
+      expect(taskSplitPresentationFor(selection?.presentation, 8, 'device-1', 'session-1')).assertUndefined();
+      expect(taskSplitPresentationFor(selection?.presentation, 7, 'device-2', 'session-1')).assertUndefined();
+      expect(taskSplitPresentationFor(selection?.presentation, 7, 'device-1', 'session-2')).assertUndefined();
       expect(consumeTaskSplitRouteSelection()).assertNull();
+    });
+
+    // Unit tier: a snapshot queued by the previous login must not select that task
+    // when the home page resumes, even if the next login visits the same device/task.
+    it('discardsStaleSplitHandoffWithoutReplayingItForThePreviousAccount', 0, () => {
+      const presentation = new TaskSplitDetailPresentation();
+      presentation.accountEpoch = 7;
+      presentation.deviceId = 'device-1';
+      presentation.sessionId = 'session-1';
+      handoffTaskSplitRouteSelection('device-1', 'session-1', '', presentation);
+      const stale = consumeTaskSplitRouteSelection();
+      expect(taskSplitPresentationFor(stale?.presentation, 8, 'device-1', 'session-1')).assertUndefined();
+      const replay = consumeTaskSplitRouteSelection();
+      expect(taskSplitPresentationFor(replay?.presentation, 7, 'device-1', 'session-1')).assertUndefined();
     });
 
     it('projectsTaskListCopyAndRelativeTimeLikeMobile', 0, () => {

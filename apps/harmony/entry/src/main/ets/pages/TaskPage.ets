@@ -7,7 +7,7 @@ import { UI_FONT_TITLE_S, UI_FONT_CAPTION, UI_TOUCH_TARGET_MIN } from '../compon
 import { ModelPickerListRow } from '../components/ModelPickerListRow';
 import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
 import { pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption } from '../core/ComposerCatalog';
-import { SPLIT_HANDLE_HIT_WIDTH, SplitHandle } from '../components/common/SplitHandle';
+import { SPLIT_HANDLE_HIT_WIDTH, UiSplitHandle } from '../components/common/SplitHandle';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { WorkdirEntry, WorkdirRequest, workdirEntries, workdirName, workdirParent, workdirRelative } from '../core/files/WorkdirFiles';
@@ -171,6 +171,7 @@ import {
   effectiveTaskSafeWindow,
   isWideTaskLayout,
   TaskSafeWindowSize,
+  TaskSplitDetailPresentation,
 } from './TaskSplitLayout';
 import { readTaskWindowMetrics } from './TaskWindowMetrics';
 import {
@@ -294,6 +295,7 @@ import {
   canFollowLatest,
   ComposerScrollUpdate,
   firstVisibleMessageRenderIndex,
+  taskSplitPresentationFor,
   FOLLOW_LATEST_RETRY_DELAYS,
   INITIAL_HISTORY_AUTOFILL_PAGES,
   isNearHistoryStart,
@@ -598,6 +600,14 @@ export struct TaskPageContent {
   @BuilderParam collabHeader: () => void = emptyCollabHeader;
   onCollab: () => void = (): void => {};
   onDetailBack: (() => void) | undefined = undefined;
+  @Prop @Watch('tryRestoreSplitFocus') splitFocus?: TaskSplitDetailPresentation;
+  registerSplitContent: ((content: TaskPageContent | undefined) => void) | undefined = undefined;
+  private splitSelectionStart: number = 0;
+  private splitSelectionEnd: number = 0;
+  private restoredSplitFocus?: TaskSplitDetailPresentation;
+  @State private splitInputKeyboardOnFocus: boolean = true;
+  @State private splitInputReady: boolean = false;
+  private splitInputController: TextAreaController = new TextAreaController();
   registerComposerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
   @Prop @Watch('onPaneMessageChanged') paneMessageClientId: string = '';
   /** 父页面每次选择任务递增；同一条消息再次选择时也要重新定位。 */
@@ -1219,6 +1229,7 @@ export struct TaskPageContent {
       ? this.paneSessionId
       : readStr(params, 'sessionId');
     this.paneAccountEpoch = AppServices.instance.auth.sessionEpoch;
+    this.registerSplitContent?.(this);
     this.composerInputId = taskComposerInputId(this.paneAccountEpoch, this.deviceId, this.sessionId);
     this.detailMounted = true;
     if (this.isEmbeddedDetailPane()) {
@@ -1354,6 +1365,7 @@ export struct TaskPageContent {
     this.pickerFavoriteUnsubscribe?.();
     this.pickerFavoriteUnsubscribe = undefined;
     this.pickerRefreshRevision += 1;
+    this.registerSplitContent?.(undefined);
     this.registerComposerBack?.(undefined);
     this.detailMounted = false;
     if (AppServices.instance.isSharedTaskPeer(this.deviceId)) AppServices.instance.sharedTasks?.setTaskVisible(false);
@@ -5969,6 +5981,10 @@ export struct TaskPageContent {
 
   private handleComposerFocusChange(focused: boolean): void {
     this.composerFocused = focused;
+    if (!focused) {
+      this.splitInputReady = false;
+      this.splitInputKeyboardOnFocus = true;
+    }
     if (focused) {
       this.composerBlurGeneration += 1;
       this.composerSurfaceVisible = true;
@@ -6118,6 +6134,56 @@ export struct TaskPageContent {
     } finally { if (generation === this.pageLifecycleGeneration) this.incomingImportBusy = false; }
   }
 
+  splitReadingMessage(): string {
+    if (this.routeMessageClientId) return this.routeMessageClientId;
+    if (this.followingLatest) return '';
+    const index = firstVisibleMessageRenderIndex(this.hasOlderMessages, this.visibleStartIndex, this.items.length);
+    if (index < 0) return this.routeMessageClientId;
+    for (let i = index; i < this.items.length && i <= index + 8; i++) {
+      const row = this.items[i];
+      if (row.type === 'message') return (row as RenderMessageItem).message?.clientId ?? '';
+    }
+    return this.routeMessageClientId;
+  }
+
+  captureSplitFocus(snapshot: TaskSplitDetailPresentation, target: string): void {
+    if (this.paneAccountEpoch !== snapshot.accountEpoch || !this.paneActive || !this.composerFocused ||
+      this.editingQueueClientId || this.editingMessageClientId) return;
+    snapshot.focus = target;
+    snapshot.selectionStart = this.splitSelectionStart;
+    snapshot.selectionEnd = this.splitSelectionEnd;
+  }
+
+  async flushDraftForSplit(epoch: number): Promise<void> {
+    if (epoch !== this.paneAccountEpoch || epoch !== AppServices.instance.auth.sessionEpoch) return;
+    const drafts = AppServices.instance.composerDrafts;
+    if (!this.editingQueueClientId && !this.editingMessageClientId && this.incomingDraftRestored) {
+      drafts.save(this.sessionId, this.composerDocument, this.deviceId);
+    }
+    await drafts.flush(this.sessionId, this.deviceId);
+  }
+
+  private tryRestoreSplitFocus(): void {
+    const snapshot = this.splitFocus;
+    if (snapshot === undefined || snapshot === this.restoredSplitFocus || !this.paneActive || !this.incomingDraftRestored ||
+      snapshot.accountEpoch !== this.paneAccountEpoch || snapshot.accountEpoch !== AppServices.instance.auth.sessionEpoch ||
+      this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
+    this.splitInputKeyboardOnFocus = false;
+    this.expandComposerForEditing(false);
+    if (!this.splitInputReady) return;
+    this.restoredSplitFocus = snapshot;
+    const generation = this.pageLifecycleGeneration;
+    setTimeout(() => {
+      if (!this.isCurrentPageLifecycle(generation) || this.splitFocus !== snapshot || !this.paneActive ||
+        !focusControl.requestFocus(this.composerInputId)) {
+        this.splitInputKeyboardOnFocus = true;
+        return;
+      }
+      this.splitInputController.setTextSelection(Math.min(snapshot.selectionStart, this.input.length),
+        Math.min(snapshot.selectionEnd, this.input.length), { menuPolicy: MenuPolicy.HIDE });
+    }, 0);
+  }
+
   private restoreComposerDraft(): void {
     this.incomingDraftRestored = false; this.incomingDelivery = null; this.incomingBlocked = false;
     this.incomingHandoff = false; this.incomingImportBusy = false;
@@ -6139,7 +6205,7 @@ export struct TaskPageContent {
       this.setComposerDocument(document, false);
     }).then((): Promise<void> => {
       if (!this.isCurrentPageLifecycle(lifecycle)) return Promise.resolve();
-      this.incomingDraftRestored = true; return this.consumeIncomingShare();
+      this.incomingDraftRestored = true; this.tryRestoreSplitFocus(); return this.consumeIncomingShare();
     }).catch((): void => {
       if (this.isCurrentPageLifecycle(lifecycle)) { this.incomingBlocked = true; this.error = this.v12String('incoming_share_failed'); }
     });
@@ -8264,6 +8330,19 @@ export struct TaskPageContent {
         maxContentWidth: CHAT_COMPOSER_MAX_WIDTH,
         floatingBottomInset: this.paneComposerBottomInset,
         inputId: this.composerInputId,
+        inputController: this.splitInputController,
+        keyboardOnFocus: this.splitInputKeyboardOnFocus,
+        onSelectionChange: (start: number, end: number): void => {
+          this.splitSelectionStart = Math.max(0, start);
+          this.splitSelectionEnd = Math.max(this.splitSelectionStart, end);
+        },
+        onInputReady: (): void => {
+          if (this.splitFocus !== undefined && this.splitFocus !== this.restoredSplitFocus) {
+            this.splitInputReady = true;
+            this.tryRestoreSplitFocus();
+          }
+        },
+        onInputTouch: (): void => { this.splitInputKeyboardOnFocus = true; },
         onInputChange: (value: string): void => {
           if (this.leavingForCreationEdit) return;
           this.applyComposerTextChange(value);
@@ -14973,6 +15052,7 @@ struct TaskPage {
   @State routeDevice: string = '';
   @State routeSession: string = '';
   @State routeMessage: string = '';
+  private splitDetail?: OrcaTaskDetail;
   private collabBack: (() => boolean) | undefined = undefined;
   @State safeWindowWidth: number = 0;
   @State safeWindowHeight: number = 0;
@@ -15110,19 +15190,32 @@ struct TaskPage {
   /** 独立详情满足双栏尺寸时，回到承载主从双栏的任务列表页。 */
   private openSplitLayoutIfNeeded(): void {
     const safe = this.safeWindowSize();
-    if (this.splitNavigationPending
-      || !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) {
-      return;
-    }
-    const params = recordOrEmpty(router.getParams());
-    const deviceId = readStr(params, 'deviceId');
-    const sessionId = readStr(params, 'sessionId');
-    if (deviceId.length === 0 || sessionId.length === 0) return;
-    if (AppServices.instance.tasks.getSessions(deviceId).some((s: RemoteSession) =>
-      s.id === sessionId && s.orcaRole === 'lead')) return;
+    if (!this.pageActive || this.splitNavigationPending || this.splitDetail === undefined ||
+      !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) return;
     this.splitNavigationPending = true;
-    handoffTaskSplitRouteSelection(deviceId, sessionId, readStr(params, 'message'));
-    router.back();
+    void this.returnToSplitHome(this.splitDetail);
+  }
+
+  private async returnToSplitHome(detail: OrcaTaskDetail): Promise<void> {
+    const epoch = AppServices.instance.auth.sessionEpoch;
+    let navigationStarted = false;
+    try {
+      const snapshot = detail.captureSplitPresentation();
+      if (taskSplitPresentationFor(snapshot, epoch, this.routeDevice, this.routeSession) === undefined) return;
+      await detail.flushSplitDrafts(epoch);
+      const safe = this.safeWindowSize();
+      if (!this.pageActive || this.splitDetail !== detail || epoch !== AppServices.instance.auth.sessionEpoch ||
+        !isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow)) return;
+      handoffTaskSplitRouteSelection(this.routeDevice, this.routeSession, snapshot.leadMessageClientId, snapshot);
+      const home = 'pages/TaskListPage';
+      if (router.getStateByUrl(home).length > 0) router.back({ url: home });
+      else await router.replaceUrl({ url: home });
+      navigationStarted = true;
+    } catch (_error) {
+      // Leave the existing detail and draft intact if persistence or navigation fails.
+    } finally {
+      if (!navigationStarted) this.splitNavigationPending = false;
+    }
   }
 
   onBackPress(): boolean {
@@ -15136,6 +15229,10 @@ struct TaskPage {
         paneKeyboardInset: this.keyboardHeight, allowSideBySide: !this.safeWindowMultiWindow,
         onBack: (): void => router.back(),
         registerBack: (handler: (() => boolean) | undefined): void => { this.collabBack = handler; },
+        registerSplitDetail: (detail: OrcaTaskDetail | undefined): void => {
+          this.splitDetail = detail;
+          if (detail !== undefined) this.openSplitLayoutIfNeeded();
+        },
       })
     }
     .width('100%')
@@ -15173,6 +15270,13 @@ export struct OrcaTaskDetail {
   onTogglePaneList: (() => void) | undefined = undefined;
   onBack: (() => void) | undefined = undefined;
   registerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
+  @Prop @Watch('restoreSplitPresentation') initialPresentation?: TaskSplitDetailPresentation;
+  registerSplitDetail?: (detail: OrcaTaskDetail | undefined) => void;
+  private leadContent?: TaskPageContent;
+  private workerContent?: TaskPageContent;
+  private adoptedPresentation?: TaskSplitDetailPresentation;
+  private pendingWorkerId: string = '';
+  @State private restoredPresentation: TaskSplitDetailPresentation | undefined = undefined;
   private leadComposerBack: (() => boolean) | undefined = undefined;
   private workerComposerBack: (() => boolean) | undefined = undefined;
   @State role: string = '';
@@ -15193,7 +15297,7 @@ export struct OrcaTaskDetail {
   private workerWheelSlots: WorkerWheelSlot[] = [];
   private workerWheelNaturalWidths: number[] = [];
   @State leadPaneFraction: number = 0.5;
-  private dividerStartX: number = 0;
+  @State private dividerPreviewWidth: number = -1;
   private dividerStartWidth: number = 0;
   private dividerDragging: boolean = false;
   @State private dividerOverrun: number = 0;
@@ -15246,6 +15350,8 @@ export struct OrcaTaskDetail {
     }
     this.registerBack?.((): boolean => this.workerComposerBack?.() || this.leadComposerBack?.() || this.returnToLead());
     this.updateRole();
+    this.restoreSplitPresentation();
+    this.registerSplitDetail?.(this);
   }
 
   aboutToDisappear(): void {
@@ -15260,9 +15366,50 @@ export struct OrcaTaskDetail {
       this.foldListening = false;
     }
     this.registerBack?.(undefined);
+    this.registerSplitDetail?.(undefined);
+  }
+
+  captureSplitPresentation(): TaskSplitDetailPresentation {
+    const snapshot = new TaskSplitDetailPresentation();
+    snapshot.accountEpoch = this.epoch;
+    snapshot.deviceId = this.paneDeviceId;
+    snapshot.sessionId = this.paneSessionId;
+    snapshot.workerId = this.selected[0]?.id ?? '';
+    snapshot.workerPaneOpen = this.workerPaneOpen;
+    snapshot.workerExpanded = this.workerExpanded;
+    snapshot.leadPaneFraction = this.leadPaneFraction;
+    snapshot.leadMessageClientId = this.leadContent?.splitReadingMessage() ?? this.paneMessageClientId;
+    snapshot.workerMessageClientId = this.workerContent?.splitReadingMessage() ?? '';
+    if (this.leadVisible()) this.leadContent?.captureSplitFocus(snapshot, 'lead-composer');
+    if (this.workerVisible()) this.workerContent?.captureSplitFocus(snapshot, 'worker-composer');
+    return snapshot;
+  }
+
+  async flushSplitDrafts(epoch: number): Promise<void> {
+    await Promise.all([this.leadContent?.flushDraftForSplit(epoch), this.workerContent?.flushDraftForSplit(epoch)]);
+  }
+
+  private restoreSplitPresentation(): void {
+    const snapshot = taskSplitPresentationFor(this.initialPresentation, AppServices.instance.auth.sessionEpoch,
+      this.paneDeviceId, this.paneSessionId);
+    if (!this.mounted || !this.paneActive || snapshot === undefined || snapshot === this.adoptedPresentation ||
+      this.epoch !== snapshot.accountEpoch || this.widthVp <= 0) return;
+    if ((snapshot.workerPaneOpen || snapshot.workerId.length > 0) && this.role !== 'lead') return;
+    this.adoptedPresentation = snapshot;
+    this.restoredPresentation = snapshot;
+    this.leadPaneFraction = Number.isFinite(snapshot.leadPaneFraction)
+      ? Math.max(0, Math.min(1, snapshot.leadPaneFraction)) : 0.5;
+    if (this.role === 'lead') {
+      this.workerPaneOpen = snapshot.workerPaneOpen;
+      this.workerExpanded = snapshot.workerPaneOpen && snapshot.workerExpanded;
+      this.pendingWorkerId = snapshot.workerId;
+      if (this.loadState === 'ready') this.reconcileWorkerSelection(this.workers);
+    }
   }
 
   private taskChanged(): void {
+    this.restoredPresentation = undefined;
+    this.pendingWorkerId = '';
     this.workerPaneOpen = false;
     this.workerExpanded = false;
     this.readGeneration += 1;
@@ -15279,8 +15426,9 @@ export struct OrcaTaskDetail {
       this.workerPaneOpen = false;
       this.workerExpanded = false;
       this.syncVisibleWorkerSelection();
-    } else if (!this.updateRole()) {
-      void this.refreshWorkers();
+    } else {
+      if (!this.updateRole()) void this.refreshWorkers();
+      this.restoreSplitPresentation();
     }
   }
 
@@ -15298,7 +15446,10 @@ export struct OrcaTaskDetail {
     this.loadState = '';
     this.workerPaneOpen = false;
     this.selected = [];
-    if (nextRole === 'lead') void this.refreshWorkers();
+    if (nextRole === 'lead') {
+      this.restoreSplitPresentation();
+      void this.refreshWorkers();
+    }
     return true;
   }
 
@@ -15335,7 +15486,10 @@ export struct OrcaTaskDetail {
     const orca = AppServices.instance.orca;
     const current = this.selected[0];
     const remembered = orca.selection(this.paneDeviceId, this.paneSessionId);
-    const retained = workers.find((w: OrcaWorker) => w.id === current?.id)
+    const preferred = this.pendingWorkerId;
+    this.pendingWorkerId = '';
+    const retained = workers.find((w: OrcaWorker) => w.id === preferred)
+      ?? workers.find((w: OrcaWorker) => w.id === current?.id)
       ?? workers.find((w: OrcaWorker) => w.id === remembered?.id);
     // 预读不替尚未打开的面板选默认项。面板真正显示时才按最新列表选择。
     const worker = retained ?? (this.workerVisible()
@@ -15347,8 +15501,7 @@ export struct OrcaTaskDetail {
 
   private syncVisibleWorkerSelection(): void {
     if (!this.sideBySide()) {
-      this.dividerDragging = false;
-      this.dividerOverrun = 0;
+      this.resetWorkerDivider();
     }
     if (this.workerVisible() && this.selected.length === 0 && this.workers.length > 0) {
       this.reconcileWorkerSelection(this.workers);
@@ -15378,62 +15531,44 @@ export struct OrcaTaskDetail {
   private toggleExpanded(): void {
     if (!this.sideBySide()) return;
     this.getUIContext().getFocusController().clearFocus();
-    this.dividerDragging = false;
-    this.dividerOverrun = 0;
+    this.resetWorkerDivider();
     uiAnimateState(this.getUIContext(), () => { this.workerExpanded = !this.workerExpanded; });
   }
 
   private leadPaneWidth(): number {
-    return orcaLeadPaneWidth(this.widthVp, this.leadPaneFraction);
+    return this.dividerPreviewWidth >= 0 ? this.dividerPreviewWidth : orcaLeadPaneWidth(this.widthVp, this.leadPaneFraction);
   }
 
-  private dragWorkerDivider(event: TouchEvent): void {
-    if (event.type === TouchType.Cancel || !this.sideBySide() || this.workerExpanded) {
-      this.dividerDragging = false;
-      this.dividerOverrun = 0;
-      return;
-    }
-    if (event.changedTouches.length === 0) {
-      if (event.type === TouchType.Up) {
-        this.dividerDragging = false;
-        this.dividerOverrun = 0;
-      }
-      return;
-    }
-    const x = event.changedTouches[0].displayX;
-    if (event.type === TouchType.Down) {
-      this.dividerStartX = x;
-      this.dividerStartWidth = this.leadPaneWidth();
-      this.dividerDragging = true;
-      this.dividerOverrun = 0;
-      return;
-    }
-    if (!this.dividerDragging || (event.type !== TouchType.Move && event.type !== TouchType.Up)) return;
+  private resetWorkerDivider(): void {
+    this.dividerDragging = false;
+    this.dividerOverrun = 0;
+    this.dividerPreviewWidth = -1;
+  }
 
-    const requested = this.dividerStartWidth + x - this.dividerStartX;
+  private commitWorkerWidth(width: number): void {
+    if (!this.sideBySide() || this.workerExpanded || this.widthVp <= 0) return;
+    this.leadPaneFraction = orcaLeadPaneWidth(this.widthVp, width / this.widthVp) / this.widthVp;
+  }
+
+  private dragWorkerDivider(offset: number, ended: boolean): void {
+    if (!this.dividerDragging || !this.sideBySide() || this.workerExpanded) return;
+    const requested = this.dividerStartWidth + offset;
     const clamped = orcaLeadPaneWidth(this.widthVp, requested / this.widthVp);
     const overrun = requested - clamped;
-    if (event.type === TouchType.Move) {
-      this.leadPaneFraction = clamped / this.widthVp;
+    if (!ended) {
+      this.dividerPreviewWidth = clamped;
       this.dividerOverrun = overrun;
       return;
     }
-    this.dividerDragging = false;
-    this.dividerOverrun = 0;
-    if (Math.abs(overrun) > WORKER_DIVIDER_TRIGGER_VP) {
-      // 双栏恢复时保留手势开始前的宽度，不把拖到极限的比例作为新布局。
-      this.leadPaneFraction = this.dividerStartWidth / this.widthVp;
-      if (overrun < 0) this.toggleExpanded();
-      else this.returnToLead();
-    } else {
-      this.leadPaneFraction = clamped / this.widthVp;
-    }
+    this.resetWorkerDivider();
+    if (overrun < -WORKER_DIVIDER_TRIGGER_VP) this.toggleExpanded();
+    else if (overrun > WORKER_DIVIDER_TRIGGER_VP) this.returnToLead();
+    else this.commitWorkerWidth(clamped);
   }
 
   private collapseWorkerPane(): void {
     this.getUIContext().getFocusController().clearFocus();
-    this.dividerDragging = false;
-    this.dividerOverrun = 0;
+    this.resetWorkerDivider();
     this.workerPaneOpen = false;
     this.workerExpanded = false;
   }
@@ -15805,6 +15940,9 @@ export struct OrcaTaskDetail {
         standaloneDetail: this.onBack !== undefined && !this.sideBySide(),
         onDetailBack: this.onBack,
         registerComposerBack: (handler): void => { this.leadComposerBack = handler; },
+        registerSplitContent: (content: TaskPageContent | undefined): void => { this.leadContent = content; },
+        splitFocus: this.restoredPresentation?.focus === 'lead-composer' && this.leadVisible()
+          ? this.restoredPresentation : undefined,
         paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
         collabRole: this.role === 'lead' ? this.label('v138_collaboration_mode')
           : (this.role === 'worker' ? this.label('v138_worker') : ''),
@@ -15829,6 +15967,12 @@ export struct OrcaTaskDetail {
               standaloneDetail: !this.sideBySide(),
               collabEmbedded: true,
               registerComposerBack: (handler): void => { this.workerComposerBack = handler; },
+              registerSplitContent: (content: TaskPageContent | undefined): void => { this.workerContent = content; },
+              paneMessageClientId: this.restoredPresentation?.workerId === worker.id
+                ? this.restoredPresentation?.workerMessageClientId ?? '' : '',
+              splitFocus: this.restoredPresentation?.focus === 'worker-composer' &&
+                this.restoredPresentation?.workerId === worker.id && this.workerVisible()
+                ? this.restoredPresentation : undefined,
               collabHeader: (): void => {
                 this.collabBar();
               },
@@ -15851,16 +15995,41 @@ export struct OrcaTaskDetail {
     .height('100%')
     if (this.sideBySide() && !this.workerExpanded) {
       Column() {
-        SplitHandle({ overrun: this.dividerOverrun })
-      }.width(SPLIT_HANDLE_HIT_WIDTH).height('100%').justifyContent(FlexAlign.Center)
-        .position({ x: this.leadPaneWidth() - SPLIT_HANDLE_HIT_WIDTH / 2, y: 0 })
-        .accessibilityText(this.label('v138_resize'))
-        .onTouch((event: TouchEvent) => this.dragWorkerDivider(event))
+        UiSplitHandle({
+          label: this.label('v138_resize'),
+          narrowLabel: $r('app.string.home_task_split_narrow'),
+          widenLabel: $r('app.string.home_task_split_widen'),
+          paneStartActionLabel: this.label('v138_expand'),
+          paneEndActionLabel: this.label('v138_return_to_lead'),
+          leadingWidthVp: this.leadPaneWidth(),
+          minWidthVp: orcaLeadPaneWidth(this.widthVp, 0),
+          maxWidthVp: orcaLeadPaneWidth(this.widthVp, 1),
+          overrun: this.dividerOverrun,
+          onWidthChange: (width: number): void => this.commitWorkerWidth(width),
+          onPaneStartAction: (): void => this.toggleExpanded(),
+          onPaneEndAction: (): void => { this.returnToLead(); },
+        })
+      }.width(UI_TOUCH_TARGET_MIN).height('100%').justifyContent(FlexAlign.Center)
+        .responseRegion([
+          { x: (UI_TOUCH_TARGET_MIN - SPLIT_HANDLE_HIT_WIDTH) / 2, y: 0,
+            width: SPLIT_HANDLE_HIT_WIDTH, height: '100%' },
+          { x: 0, y: 'calc(50% - 22vp)', width: UI_TOUCH_TARGET_MIN, height: UI_TOUCH_TARGET_MIN },
+        ])
+        .position({ x: this.leadPaneWidth() - UI_TOUCH_TARGET_MIN / 2, y: 0 })
+        .priorityGesture(PanGesture({ direction: PanDirection.Horizontal, distance: 6 })
+          .onActionStart(() => {
+            this.dividerStartWidth = this.leadPaneWidth();
+            this.dividerDragging = true;
+          })
+          .onActionUpdate((event: GestureEvent) => this.dragWorkerDivider(event.offsetX, false))
+          .onActionEnd((event: GestureEvent) => this.dragWorkerDivider(event.offsetX, true))
+          .onActionCancel(() => this.resetWorkerDivider()))
     }
     }
     .width('100%').height('100%')
     .onAreaChange((_old: Area, area: Area) => {
       this.widthVp = Number(area.width);
+      this.restoreSplitPresentation();
       this.syncVisibleWorkerSelection();
     })
   }

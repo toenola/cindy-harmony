@@ -1,3 +1,4 @@
+import { TaskSplitDetailPresentation } from './TaskSplitLayout';
 /** TaskPage 消息列表索引与贴底重试的纯逻辑。 */
 
 import { deriveAgentTaskStatus, WorkflowProgressEntry } from '../core/messages/AgentTaskStore';
@@ -336,4 +337,15 @@ export function messageListItemPresentationState(item: RenderItem): string {
     ].join('|');
   }
   return '';
+}
+
+/** Capture and restore both reject stale presentations, even if only one identity component changed. */
+export function taskSplitPresentationFor(
+  snapshot: TaskSplitDetailPresentation | undefined, accountEpoch: number, deviceId: string, sessionId: string,
+): TaskSplitDetailPresentation | undefined {
+  if (snapshot === undefined || accountEpoch < 0 || !deviceId || !sessionId ||
+    snapshot.accountEpoch !== accountEpoch || snapshot.deviceId !== deviceId || snapshot.sessionId !== sessionId) {
+    return undefined;
+  }
+  return snapshot;
 }

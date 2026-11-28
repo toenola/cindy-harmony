@@ -36,10 +36,27 @@ export function taskWindowIsMultiWindow(status: number): boolean {
  * 独立详情页转入宽屏双栏时，先把当前任务交还给仍在路由栈中的列表页。
  * 这是一次性内存交接，不持久化，也不会覆盖用户之后在列表中的选择。
  */
+/** In-memory presentation only. Draft text and attachment data stay in ComposerDraftStore. */
+export class TaskSplitDetailPresentation {
+  accountEpoch: number = -1;
+  deviceId: string = '';
+  sessionId: string = '';
+  workerId: string = '';
+  workerPaneOpen: boolean = false;
+  workerExpanded: boolean = false;
+  leadPaneFraction: number = 0.5;
+  leadMessageClientId: string = '';
+  workerMessageClientId: string = '';
+  focus: string = '';
+  selectionStart: number = 0;
+  selectionEnd: number = 0;
+}
+
 export class TaskSplitRouteSelection {
   deviceId: string = '';
   sessionId: string = '';
   messageClientId: string = '';
+  presentation?: TaskSplitDetailPresentation;
 }
 
 let pendingTaskSplitRouteSelection: TaskSplitRouteSelection | null = null;
@@ -48,11 +65,13 @@ export function handoffTaskSplitRouteSelection(
   deviceId: string,
   sessionId: string,
   messageClientId: string = '',
+  presentation?: TaskSplitDetailPresentation,
 ): void {
   const selection = new TaskSplitRouteSelection();
   selection.deviceId = deviceId;
   selection.sessionId = sessionId;
   selection.messageClientId = messageClientId;
+  selection.presentation = presentation;
   pendingTaskSplitRouteSelection = selection;
 }
 

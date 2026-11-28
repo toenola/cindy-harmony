@@ -88,6 +88,7 @@ import {
 } from '../core/tasks/TaskListReconcilePolicy';
 import { OrcaTaskDetail } from './TaskPage';
 import { ORCA_DETAIL_MIN_WIDTH } from './TaskSplitLayout';
+import { taskSplitPresentationFor } from './TaskScrollState';
 import {
   ResidentTaskPane, rememberResidentTaskPane, residentPaneSurvives, residentTaskPaneKey,
 } from '../core/tasks/ResidentTaskPanes';
@@ -97,6 +98,7 @@ import {
   effectiveTaskSafeWindow,
   isWideTaskLayout,
   TaskSafeWindowSize,
+  TaskSplitDetailPresentation,
   TASK_SPLIT_DIVIDER_WIDTH,
   TASK_SPLIT_MAX_LIST_WIDTH,
   taskDetailKeyboardInset,
@@ -373,6 +375,7 @@ struct TaskListPage {
   private initialListTabIndex: number = 0;
   private residentAccountEpoch: number = -1;
   private routeSelectionKey: string = '';
+  @State private routePresentation: TaskSplitDetailPresentation | undefined = undefined;
   private residentSessionStatuses: Map<string, string> = new Map();
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
@@ -481,6 +484,11 @@ struct TaskListPage {
   private adoptSplitRouteSelection(): void {
     const selection = consumeTaskSplitRouteSelection();
     if (selection === null || AppServices.instance.taskAccountTransition.active) return;
+    const epoch = AppServices.instance.auth.sessionEpoch;
+    const presentation = taskSplitPresentationFor(selection.presentation, epoch, selection.deviceId, selection.sessionId);
+    // A stale or mismatched snapshot must reject the route selection too, not just its UI state.
+    if (selection.presentation !== undefined && presentation === undefined) return;
+    this.syncResidentAccount();
     const session = AppServices.instance.tasks.getSessions(selection.deviceId)
       .find((row: RemoteSession): boolean => row.id === selection.sessionId);
     this.selectedDeviceId = selection.deviceId;
@@ -491,6 +499,7 @@ struct TaskListPage {
     this.compactDetailOpen = !this.splitLayoutEnabled();
     this.setSelectedTask(selection.deviceId, selection.sessionId, selection.messageClientId);
     this.routeSelectionKey = this.selectedTaskKey();
+    this.routePresentation = presentation;
     if (this.splitLayoutEnabled() && session?.orcaRole === 'lead' && this.detailPaneWidth() < ORCA_DETAIL_MIN_WIDTH) {
       this.listPaneCollapsed = true;
     }
@@ -500,6 +509,7 @@ struct TaskListPage {
   aboutToDisappear(): void {
     this.pageLifecycleGeneration += 1;
     this.pageActive = false;
+    this.routePresentation = undefined;
     this.pluginIconTargets = '';
     this.pluginIconGeneration++;
     this.compactDetailOpen = false;
@@ -1122,6 +1132,7 @@ struct TaskListPage {
     if (epoch === this.residentAccountEpoch) return;
     this.residentAccountEpoch = epoch;
     this.routeSelectionKey = '';
+    this.routePresentation = undefined;
     this.closeUsage();
     this.moduleRequest = null;
     this.teammateRoster = [];
@@ -1148,6 +1159,7 @@ struct TaskListPage {
   private setSelectedTask(deviceId: string, sessionId: string, messageClientId: string): void {
     if (AppServices.instance.taskAccountTransition.active) return;
     this.routeSelectionKey = '';
+    this.routePresentation = undefined;
     this.listPaneFullscreen = false;
     this.closeUsage();
     this.moduleRequest = null;
@@ -3354,6 +3366,14 @@ struct TaskListPage {
     )
   }
 
+  private initialPresentationForPane(pane: ResidentTaskPane): TaskSplitDetailPresentation | undefined {
+    const services = AppServices.instance;
+    const epoch = services.auth.sessionEpoch;
+    if (services.taskAccountTransition.active || !this.paneSelected(pane)
+      || pane.key !== residentTaskPaneKey(epoch, pane.deviceId, pane.sessionId)) return undefined;
+    return taskSplitPresentationFor(this.routePresentation, epoch, pane.deviceId, pane.sessionId);
+  }
+
   @Builder
   detailPane() {
     Stack() {
@@ -3365,8 +3385,16 @@ struct TaskListPage {
         OrcaTaskDetail({
           registerBack: (handler: (() => boolean) | undefined): void => {
             if (handler) this.residentBackHandlers.set(pane.key, handler);
-            else this.residentBackHandlers.delete(pane.key);
+            else {
+              this.residentBackHandlers.delete(pane.key);
+              const presentation = this.routePresentation;
+              if (presentation !== undefined && pane.key === residentTaskPaneKey(
+                presentation.accountEpoch, presentation.deviceId, presentation.sessionId,
+              )) this.routePresentation = undefined;
+            }
           },
+          // Keep the same snapshot until the matching detail is ready; the detail applies it once.
+          initialPresentation: this.initialPresentationForPane(pane),
           paneDeviceId: pane.deviceId,
           allowSideBySide: this.splitLayoutEnabled() && !this.safeWindowMultiWindow,
           paneSessionId: pane.sessionId,
