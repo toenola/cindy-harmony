@@ -1,5 +1,6 @@
 {
   "string": [
+    {"name":"v139_model_pending_send","value":"On next send"},
     {"name": "image_viewer_previous", "value": "Previous"},
     {"name": "image_viewer_next", "value": "Next"},
     {"name": "turn_status_thinking", "value": "Thinking…"},

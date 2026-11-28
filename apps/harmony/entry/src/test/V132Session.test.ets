@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@ohos/hypium';
 import { RemoteSession, parseSession } from '../main/ets/core/tasks/TaskModels';
-import { agentLocationLabel, effectiveAgentDeviceId, parseSessionAgentSwitchIntent, runtimeRouteNeedsRemoteCatalog, sessionAgentSwitchIntentApplied, sessionSendNeedsModelReselection, supportsSessionAgentSwitch, supportsAgentRelocation, isOrcaAgentSession, sendSessionAgentIntent } from '../main/ets/core/tasks/SessionAgentSwitch';
+import { agentLocationLabel, effectiveAgentDeviceId, parseSessionAgentSwitchIntent, runtimeRouteNeedsRemoteCatalog, sessionAgentSwitchIntentApplied, sessionSendNeedsModelReselection, supportsSessionAgentSwitch, supportsAgentRelocation, isOrcaAgentSession, sendSessionAgentIntent, usesSessionModelIntent, pendingSessionModelLabel } from '../main/ets/core/tasks/SessionAgentSwitch';
 import {
   RemoteAgentCatalog, RemoteAgentDevice, remoteAgentLocationSupported, remoteAgentModelOptions, remoteAgentProviderList,
   resolveAgentLocationPick, selectRemoteAgentDevices,
@@ -287,6 +287,27 @@ export default function v132SessionTests() {
       await sendSessionAgentIntent(send, 'worker-host', 'worker', 'codex', 'model', 'provider', 'medium', false, null);
       expect(requests[0]).assertEqual('["lead-host","maker:switch-session-agent",["lead","claude-code","model","provider","high",false]]');
       expect(requests[1]).assertEqual('["worker-host","maker:switch-session-agent",["worker","codex","model","provider","medium",false,{"agentDeviceId":null}]]');
+    });
+    // Unit: same-engine ordinary selection uses the intent only when both host capabilities are present.
+    it('stages_ordinary_model_selection_on_supported_hosts_and_keeps_legacy_fallback', 0, () => {
+      const session = new RemoteSession();
+      session.agentKind = 'codex';
+      expect(usesSessionModelIntent(session, true, true, false)).assertTrue();
+      expect(usesSessionModelIntent(session, true, false, false)).assertFalse();
+      expect(usesSessionModelIntent(session, false, true, false)).assertFalse();
+      expect(usesSessionModelIntent(session, true, true, true)).assertFalse();
+      session.agentKind = 'pi'; session.agentDeviceId = 'peer';
+      expect(usesSessionModelIntent(session, true, true, false)).assertFalse();
+      session.agentKind = 'codex'; session.agentDeviceId = 'share:one';
+      expect(usesSessionModelIntent(session, true, true, false)).assertFalse();
+      session.orcaRole = 'lead'; session.agentDeviceId = 'peer';
+      expect(usesSessionModelIntent(session, true, false, false)).assertTrue();
+    });
+
+    it('labels_only_an_authoritative_pending_model_as_effective_on_next_send', 0, () => {
+      expect(pendingSessionModelLabel('Current', null, 'On next send')).assertEqual('Current');
+      const intent = parseSessionAgentSwitchIntent(wireRecord('{"targetAgentKind":"codex","model":"Next"}'));
+      expect(pendingSessionModelLabel('Current', intent, 'On next send')).assertEqual('On next send · Next');
     });
   });
 }

@@ -1,5 +1,6 @@
 {
   "string": [
+    {"name":"v139_model_pending_send","value":"下次发送生效"},
     {"name": "image_viewer_previous", "value": "上一张"},
     {"name": "image_viewer_next", "value": "下一张"},
     {"name": "turn_status_thinking", "value": "思考中…"},

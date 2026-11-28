@@ -92,6 +92,21 @@ export function isOrcaAgentSession(session: RemoteSession | undefined): boolean 
   return session !== undefined && (session.orcaRole.length > 0 || session.orcaRemoteLead);
 }
 
+/** Same-engine changes stage on hosts that can rebuild the model window. Older hosts retain set-model. */
+export function usesSessionModelIntent(session: RemoteSession, switchSupported: boolean,
+  rebuildSupported: boolean, scopedPeer: boolean): boolean {
+  if (!supportsSessionAgentSwitch(session, switchSupported) || scopedPeer) return false;
+  if (isOrcaAgentSession(session)) return true;
+  return rebuildSupported && !session.agentDeviceId.startsWith('share:')
+    && !(session.agentDeviceId && session.agentKind === 'pi');
+}
+
+/** Show the authoritative target separately from the current label without mutating the active model. */
+export function pendingSessionModelLabel(active: string, intent: SessionAgentSwitchIntent | null,
+  pendingLabel: string): string {
+  return intent === null ? active : pendingLabel + ' · ' + intent.model;
+}
+
 export function supportsAgentRelocation(session: RemoteSession | undefined, switchSupported: boolean,
   locationSupported: boolean, orcaRelocation: boolean, remoteWorkerRelocation: boolean): boolean {
   return session !== undefined && locationSupported && supportsSessionAgentSwitch(session, switchSupported)

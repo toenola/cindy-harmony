@@ -1,5 +1,6 @@
 {
   "string": [
+    {"name":"v139_model_pending_send","value":"다음 전송 시 적용"},
     {"name": "image_viewer_previous", "value": "이전 이미지"},
     {"name": "image_viewer_next", "value": "다음 이미지"},
     {"name": "turn_status_thinking", "value": "생각 중…"},

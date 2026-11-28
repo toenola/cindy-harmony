@@ -186,6 +186,8 @@ import {
   supportsAgentRelocation,
   isOrcaAgentSession,
   sendSessionAgentIntent,
+  usesSessionModelIntent,
+  pendingSessionModelLabel,
 } from '../core/tasks/SessionAgentSwitch';
 import {
   MessageEditRewindOptions,
@@ -932,6 +934,7 @@ export struct TaskPageContent {
   @State private orcaRelocationSupported: boolean = false;
   @State private remoteWorkerRelocationSupported: boolean = false;
   private modelCapabilityReads: Map<string, Promise<Object | undefined>> = new Map<string, Promise<Object | undefined>>();
+  @State private remoteModelWindowRebuildSupported: boolean = false;
   @State sessionAgentSwitchSupported: boolean = false;
   /** 被控端公开的 pending intent；仅用于提示，不提前改任务行的 agent/model。 */
   @State pendingAgentSwitchIntent: SessionAgentSwitchIntent | null = null;
@@ -1769,6 +1772,7 @@ export struct TaskPageContent {
   private async loadComposerCapabilities(): Promise<void> {
     const generation = ++this.composerCapabilitiesGeneration;
     this.modelCapabilityReads.clear();
+    this.remoteModelWindowRebuildSupported = false;
     this.orcaRelocationSupported = false;
     this.remoteWorkerRelocationSupported = false;
     this.composerToolbarReady = false;
@@ -1793,6 +1797,7 @@ export struct TaskPageContent {
       await this.loadProviderModelOptions(this.currentAgentTab(), generation);
       if (generation !== this.composerCapabilitiesGeneration) return;
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
+      this.remoteModelWindowRebuildSupported = readBool(capabilities, 'supportsRemoteModelWindowRebuild', false);
       this.orcaRelocationSupported = readBool(capabilities, 'supportsOrcaAgentRelocation', false);
       this.remoteWorkerRelocationSupported = readBool(capabilities, 'supportsOrcaRemoteWorkerAgentRelocation', false);
       this.modelAgentTab = this.currentAgentTab();
@@ -2931,7 +2936,8 @@ export struct TaskPageContent {
     this.contextRpcBusy = true;
     try {
       let result: Object | undefined;
-      const staged = isOrcaAgentSession(session);
+      const staged = usesSessionModelIntent(session, this.sessionAgentSwitchSupported,
+        this.remoteModelWindowRebuildSupported, AppServices.instance.isSharedTaskPeer(this.deviceId) || this.deviceId.length > 128);
       if (staged || targetAgent === 'acp' || targetAgent !== currentAgent || pick.relocates) {
         const writeGeneration = ++this.agentSwitchWriteGeneration;
         const taskHost = this.deviceId;
@@ -8285,8 +8291,9 @@ export struct TaskPageContent {
         permissionLabel: this.currentPermissionModeLabel(),
         planModeEnabled: this.planModeEnabled,
         agentLabel: modelAgentLabel(this.composerAgentKind()),
-        modelLabel: this.currentModelLabel(),
-        effortLabel: this.currentModelEffortLabel(),
+        modelLabel: pendingSessionModelLabel(this.currentModelLabel(), this.pendingAgentSwitchIntent,
+          this.v12String('v139_model_pending_send')),
+        effortLabel: this.pendingAgentSwitchIntent === null ? this.currentModelEffortLabel() : '',
         permissionPopupVisible: this.composerPermissionPopupOpen,
         agentPopupVisible: this.composerAgentPopupOpen,
         modelPopupVisible: this.composerModelPopupOpen,
