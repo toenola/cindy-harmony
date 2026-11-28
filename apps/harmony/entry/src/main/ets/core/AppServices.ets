@@ -466,7 +466,9 @@ export class AppServices {
   }
 
   teammateAvatarSource(deviceId: string, value: string): Promise<string> {
-    if (!/^cindy-media:\/\/blobs\/[0-9a-f]{64}\.(?:png|jpe?g|webp)$/.test(value)) return Promise.resolve('');
+    if (!/^cindy-media:\/\/blobs\/[0-9a-f]{64}\.(?:png|jpe?g|webp)$/.test(value)) {
+      return Promise.resolve(this.teammateAvatarFailure('unsupported_reference'));
+    }
     const epoch = this.auth.sessionEpoch;
     const key = JSON.stringify([epoch, deviceId, value]);
     const existing = this.teammateAvatarRequests.get(key);
@@ -484,19 +486,35 @@ export class AppServices {
     return request;
   }
 
+  invalidateTeammateAvatarSource(deviceId: string, value: string, request: Promise<string>): void {
+    const key = JSON.stringify([this.auth.sessionEpoch, deviceId, value]);
+    if (this.teammateAvatarRequests.get(key) === request) this.teammateAvatarRequests.delete(key);
+  }
+
+  private teammateAvatarFailure(reason: string): string {
+    hilog.debug(0, 'CindyCompanionPerf', 'avatar_failure reason=%{public}s', reason);
+    return '';
+  }
+
   private async readTeammateAvatar(deviceId: string, value: string, epoch: number): Promise<string> {
+    let stage = 'link_failed';
     try {
       await this.openLink(deviceId);
       if (epoch !== this.auth.sessionEpoch) return '';
+      stage = 'media_fetch_failed';
       const media = await this.messages.fetchRemoteMedia(deviceId, value, true);
-      if (epoch !== this.auth.sessionEpoch || !/^image\/(?:png|jpeg|webp)$/.test(media.mimeType)) return '';
+      if (epoch !== this.auth.sessionEpoch) return '';
+      if (!/^image\/(?:png|jpeg|webp)$/.test(media.mimeType)) return this.teammateAvatarFailure('unsupported_mime');
       if (media.inlineBase64) return 'data:' + media.mimeType + ';base64,' + media.inlineBase64;
+      stage = 'auth_failed';
       const token = await this.auth.getAccessToken();
-      if (!token || epoch !== this.auth.sessionEpoch || !media.ossKey) return '';
+      if (epoch !== this.auth.sessionEpoch) return '';
+      if (!token || !media.ossKey) return this.teammateAvatarFailure('missing_media_or_auth');
+      stage = 'presign_failed';
       const source = await presignGet(media.ossKey, token);
       return epoch === this.auth.sessionEpoch ? source : '';
     } catch (_error) {
-      return '';
+      return epoch === this.auth.sessionEpoch ? this.teammateAvatarFailure(stage) : '';
     }
   }
 

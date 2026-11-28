@@ -1,3 +1,4 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AppServices } from '../core/AppServices';
 import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
 
@@ -11,6 +12,12 @@ export struct TeammateAvatar {
   private revision: number = 0;
   private identity: string = '';
   private visible: boolean = false;
+  private inFlight: boolean = false;
+  private retries: number = 0;
+  private attempted: boolean = false;
+  private retryTimer: number = -1;
+  private wasOnline: boolean = false;
+  private request: Promise<string> | undefined = undefined;
   private ownerEpoch: number = -1;
   private unsubscribeAuth: (() => void) | undefined = undefined;
 
@@ -22,7 +29,24 @@ export struct TeammateAvatar {
 
   aboutToDisappear(): void {
     this.revision += 1;
+    this.visible = false;
+    this.clearRetry();
     this.unsubscribeAuth?.();
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer >= 0) clearTimeout(this.retryTimer);
+    this.retryTimer = -1;
+  }
+
+  private scheduleRetry(): void {
+    if (!this.accountCurrent || !this.visible || !this.online || this.retryTimer >= 0 || this.retries >= 1) return;
+    this.retries++;
+    const revision = this.revision;
+    this.retryTimer = setTimeout((): void => {
+      this.retryTimer = -1;
+      if (revision === this.revision) { this.attempted = false; this.avatarChanged(); }
+    }, 750);
   }
 
   private avatarChanged(): void {
@@ -33,13 +57,46 @@ export struct TeammateAvatar {
     const identity = JSON.stringify([epoch, row.deviceId, row.avatarKind, row.avatarValue]);
     if (this.identity !== identity) {
       this.identity = identity;
+      this.revision++;
+      this.inFlight = false;
+      this.request = undefined;
       this.source = '';
+      this.retries = 0;
+      this.attempted = false;
+      this.clearRetry();
     }
-    const revision = ++this.revision;
-    if (!this.accountCurrent || !this.visible || !this.online || this.source || row.avatarKind !== 'media') return;
-    void services.teammateAvatarSource(row.deviceId, row.avatarValue).then((source: string) => {
-      if (revision === this.revision && epoch === services.auth.sessionEpoch) this.source = source;
+    if (this.online && !this.wasOnline) { this.retries = 0; this.attempted = false; }
+    if (!this.online) this.clearRetry();
+    this.wasOnline = this.online;
+    if (!this.accountCurrent || !this.visible || !this.online || this.source || this.inFlight ||
+      this.retryTimer >= 0 || this.attempted || row.avatarKind !== 'media') return;
+    const revision = this.revision;
+    this.inFlight = true;
+    this.attempted = true;
+    const request = services.teammateAvatarSource(row.deviceId, row.avatarValue);
+    this.request = request;
+    void request.then((source: string): void => {
+      if (revision !== this.revision || epoch !== services.auth.sessionEpoch) return;
+      this.inFlight = false;
+      if (source) this.source = source;
+      else this.scheduleRetry();
+    }).catch((): void => {
+      if (revision !== this.revision || epoch !== services.auth.sessionEpoch) return;
+      this.inFlight = false;
+      hilog.debug(0, 'CindyCompanionPerf', 'avatar_failure reason=request_rejected');
+      this.scheduleRetry();
     });
+  }
+
+  private avatarImageFailed(): void {
+    if (!this.source || !this.accountCurrent) return;
+    hilog.debug(0, 'CindyCompanionPerf', 'avatar_failure reason=image_decode_or_download');
+    const request = this.request;
+    if (request !== undefined) {
+      AppServices.instance.invalidateTeammateAvatarSource(this.teammate.deviceId, this.teammate.avatarValue, request);
+    }
+    this.source = '';
+    this.scheduleRetry();
   }
 
   private preset(): Resource | undefined {
@@ -61,7 +118,7 @@ export struct TeammateAvatar {
       if (this.accountCurrent && this.imageSource()) {
         Image(this.imageSource())
           .width('100%').height('100%').objectFit(ImageFit.Cover)
-          .onError(() => { this.source = ''; })
+          .onError((): void => this.avatarImageFailed())
       } else if (this.accountCurrent) {
         Text(this.teammate.avatarKind === 'emoji' && this.teammate.avatarValue
           ? this.teammate.avatarValue : this.teammate.avatarFallback)
@@ -70,7 +127,11 @@ export struct TeammateAvatar {
     }
     .width(this.diameter).height(this.diameter).borderRadius(this.diameter / 2).clip(true)
     .onVisibleAreaChange([0, 0.01], (visible: boolean, ratio: number) => {
-      this.visible = visible && ratio > 0;
+      const next = visible && ratio > 0;
+      if (this.visible === next) return;
+      this.visible = next;
+      if (next) { this.retries = 0; this.attempted = false; }
+      else this.clearRetry();
       this.avatarChanged();
     })
     .backgroundColor($r('app.color.bg_chip')).accessibilityLevel('no')

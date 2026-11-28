@@ -8343,8 +8343,8 @@ export struct TaskPageContent {
         modelPanelScroller: this.modelPickerScroller,
         modelPickerTitle: this.pickerDetails?.label ?? '',
         onModelPickerBack: (): void => { this.pickerDetails = null; },
-        modelPopupContent: (enabled: boolean): void => {
-          this.modelContextView(enabled);
+        modelPopupContent: (enabled: boolean, bodyHeight: number): void => {
+          this.modelContextView(enabled, bodyHeight);
         },
         onPlanToggle: (): void => {
           void this.togglePlanMode();
@@ -8753,26 +8753,29 @@ export struct TaskPageContent {
   @Builder
   pickerPluginSections() {
     ForEach(this.filteredPickerPluginRows(), (engine: PluginEngine) => {
-      Column({ space: 4 }) {
-        Row({ space: 8 }) {
-          if (engine.iconDataUrl) {
-            Image(engine.iconDataUrl).width(22).height(22).objectFit(ImageFit.Contain)
-          }
-          Text(engine.name).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
-        }.width('100%').height(32)
+      Column({ space: 2 }) {
+        ComposerModelProviderHeader({ name: engine.name })
         if (engine.availability !== 'available') {
           Text(engine.availabilityMessage || '此电脑上的引擎不可用')
-            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).width('100%')
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Start)
+            .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('calc(100% - 36vp)').margin({ left: 18, right: 18, bottom: 4 })
         }
-        ForEach(pluginPickerModels(engine, this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''), (model: PluginEngineModel) => {
-          Button(model.label).width('100%').height(44).fontColor($r('app.color.text_primary'))
-            .backgroundColor(Color.Transparent)
-            .enabled(engine.availability === 'available' && this.canSwitchSessionAgent() && this.currentAgentDeviceId() === null)
-            .accessibilitySelected(model.id === (this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''))
-            .onClick(() => { void this.pickTaskPlugin(engine, model); })
-        }, (model: PluginEngineModel) => model.id)
-      }.width('100%').padding(10).backgroundColor($r('app.color.bg_page'))
-        .borderRadius(12).opacity(engine.availability === 'available' ? 1 : 0.6)
+        Column() {
+          ForEach(pluginPickerModels(engine, this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''), (model: PluginEngineModel, index: number) => {
+            if (index > 0) {
+              Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+            }
+            ModelPickerListRow({
+              modelName: model.label, providerName: engine.name, providerIconUrl: engine.iconDataUrl,
+              showConfigure: false, available: engine.availability === 'available' && this.canSwitchSessionAgent() && this.currentAgentDeviceId() === null,
+              selected: model.id === (this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''),
+              onPick: (): void => { void this.pickTaskPlugin(engine, model); },
+            })
+          }, (model: PluginEngineModel) => model.id)
+        }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+      }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
+        .opacity(engine.availability === 'available' ? 1 : 0.6)
     }, (engine: PluginEngine) => engine.providerId)
   }
 
@@ -8882,7 +8885,7 @@ export struct TaskPageContent {
   }
 
   @Builder
-  modelContextView(scrollEnabled: boolean = true) {
+  modelContextView(scrollEnabled: boolean = true, bodyHeight: number = 0) {
     Column() {
       if (this.pickerDetails === null) { this.pickerSearchHeader() }
       Scroll(this.modelPickerScroller) {
@@ -8981,9 +8984,10 @@ export struct TaskPageContent {
           }
         }
         .width('100%')
+        .padding({ bottom: this.composerModelPopupOpen ? 24 : 0 })
       }
       .width('100%')
-      .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
+      .layoutWeight(bodyHeight > 0 || !this.composerModelPopupOpen ? 1 : 0)
       .enableScrollInteraction(scrollEnabled)
       .scrollBar(BarState.Auto)
       .onTouch((event: TouchEvent) => {
@@ -8996,6 +9000,7 @@ export struct TaskPageContent {
       })
     }
     .width('100%')
+    .height(bodyHeight > 0 ? bodyHeight : undefined)
     .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
   }
 

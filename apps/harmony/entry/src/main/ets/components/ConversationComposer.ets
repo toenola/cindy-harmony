@@ -126,9 +126,9 @@ export struct ConversationComposer {
   }
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
-  @BuilderParam modelPopupContent: (enabled: boolean) => void = this.emptyModelPickerContent;
+  @BuilderParam modelPopupContent: (enabled: boolean, bodyHeight: number) => void = this.emptyModelPickerContent;
   @Builder
-  emptyModelPickerContent(_enabled: boolean) {}
+  emptyModelPickerContent(_enabled: boolean, _bodyHeight: number) {}
   @Prop modelPickerTitle: string = '';
   modelPanelScroller: Scroller = new Scroller();
   onModelPickerBack: () => void = () => {};
@@ -139,6 +139,7 @@ export struct ConversationComposer {
   private pickerMeasuredHeight: number = 0;
   private pickerDragAtTop: boolean = false;
   private pickerCanResize: boolean = false;
+  private pickerDragDirectionLocked: boolean = false;
   @State private editorDragHeight: number = 0;
   @Prop @Watch('syncPicker') externalPickerTitle: string = '';
   @BuilderParam externalPickerContent: (title: string) => void = this.emptyExternalPickerContent;
@@ -236,24 +237,38 @@ export struct ConversationComposer {
     if (this.editorDragHeight <= 52) this.editorDragHeight = 0;
   }
 
+  private pickerUsableHeight(): number {
+    return Math.max(160, this.pickerWindowHeight - (this.floatingGlass ? this.floatingBottomInset : 2));
+  }
+
+  private pickerBodyHeight(): number {
+    return Math.max(1, this.pickerHeightLimit() - 56);
+  }
+
   private pickerHeightLimit(): number {
-    const height = Math.max(160, this.pickerWindowHeight);
+    const height = this.pickerUsableHeight();
     return this.pickerDragHeight || (this.fullPicker ? height : height * 0.5);
   }
 
   private beginPickerDrag(): void {
     this.pickerStartHeight = this.pickerMeasuredHeight || this.pickerHeightLimit();
     this.pickerCanResize = true;
+    this.pickerDragDirectionLocked = false;
     const scroller = this.pickerPage === 'model' ? this.modelPanelScroller : this.commonPickerScroller;
     this.pickerDragAtTop = (scroller.currentOffset()?.yOffset ?? 0) <= 1;
   }
 
   private updatePickerDrag(delta: number): void {
-    if (!this.pickerCanResize || (this.fullPicker && (!this.pickerDragAtTop || delta < 0))) return;
-    this.pickerDragHeight = Math.min(this.pickerWindowHeight, Math.max(72, this.pickerStartHeight - delta));
+    if (!this.pickerDragDirectionLocked && Math.abs(delta) >= 4) {
+      this.pickerDragDirectionLocked = true;
+      this.pickerCanResize = !this.fullPicker || (this.pickerDragAtTop && delta > 0);
+    }
+    if (!this.pickerDragDirectionLocked || !this.pickerCanResize) return;
+    this.pickerDragHeight = Math.min(this.pickerUsableHeight(), Math.max(72, this.pickerStartHeight - delta));
   }
 
   private endPickerDrag(delta: number, cancelled: boolean): void {
+    if (this.pickerDragHeight === 0) return;
     this.getUIContext().animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, (): void => {
       if (!cancelled && this.pickerDragHeight > 0) {
         if (delta < -30) this.fullPicker = true;
@@ -577,10 +592,11 @@ export struct ConversationComposer {
       }.width('100%').height(44)
       if (this.pickerPage === 'model') {
         Column() {
-          this.modelPopupContent(this.fullPicker && this.pickerDragHeight === 0)
+          this.modelPopupContent(this.fullPicker && this.pickerDragHeight === 0,
+            this.fullPicker || this.pickerDragHeight > 0 ? this.pickerBodyHeight() : 0)
         }
         .width('100%')
-        .constraintSize({ maxHeight: Math.max(1, this.pickerHeightLimit() - 56) })
+        .constraintSize({ maxHeight: this.pickerBodyHeight() })
       } else {
         Scroll(this.commonPickerScroller) {
           Column() {
@@ -591,10 +607,11 @@ export struct ConversationComposer {
             } else {
               this.externalPickerContent(this.pickerPage)
             }
-          }.width('100%')
+          }.width('100%').padding({ bottom: this.fullPicker ? 24 : 0 })
         }
         .width('100%')
-        .constraintSize({ maxHeight: Math.max(1, this.pickerHeightLimit() - 56) })
+        .height(this.fullPicker || this.pickerDragHeight > 0 ? this.pickerBodyHeight() : undefined)
+        .constraintSize({ maxHeight: this.pickerBodyHeight() })
         .enableScrollInteraction(this.fullPicker && this.pickerDragHeight === 0)
         .scrollBar(BarState.Off)
       }

@@ -4,6 +4,8 @@ import { UI_ICON_CLICK_EFFECT, UI_LIST_CLICK_EFFECT, uiFontSize } from './UiKit'
 export struct ModelPickerListRow {
   @Prop modelName: string = '';
   @Prop providerName: string = '';
+  @Prop providerIconUrl: string = '';
+  @Prop showConfigure: boolean = true;
   @Prop providerKind: string = '';
   @Prop harness: string = '';
   @Prop effort: string = '';
@@ -18,7 +20,9 @@ export struct ModelPickerListRow {
     Row() {
       Button() {
         Row({ space: 8 }) {
-          if (this.providerKind === 'openai' || this.providerKind === 'claude') {
+          if (this.providerIconUrl) {
+            Image(this.providerIconUrl).width(22).height(22).objectFit(ImageFit.Contain)
+          } else if (this.providerKind === 'openai' || this.providerKind === 'claude') {
             Image(this.providerKind === 'openai' ? $r('app.media.usage_provider_openai')
               : $r('app.media.usage_provider_anthropic'))
               .width(22).height(22).objectFit(ImageFit.Contain).fillColor($r('app.color.text_secondary'))
@@ -33,8 +37,10 @@ export struct ModelPickerListRow {
               if (this.effort) {
                 Text(this.effort).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
               }
+              if (this.harness) {
               Text(this.harness === 'codex' ? '✣' : this.harness === 'pi' ? 'π' : '♟')
                 .fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
+              }
             }.width('100%')
             if (this.quota) {
               Text(this.quota).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
@@ -50,11 +56,13 @@ export struct ModelPickerListRow {
         .clickEffect(UI_LIST_CLICK_EFFECT).enabled(this.available)
         .accessibilityText([this.modelName, this.providerName, this.harness, this.effort, this.quota].join(' · '))
         .accessibilitySelected(this.selected).onClick(() => this.onPick())
+      if (this.showConfigure) {
       Button() {
         SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(17).fontColor([$r('app.color.text_secondary')])
       }.type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor(Color.Transparent)
         .clickEffect(UI_ICON_CLICK_EFFECT).accessibilityText(this.modelName + ' 模型设置')
         .enabled(this.canConfigure).onClick(() => this.onConfigure())
+      }
     }.width('100%').padding({ right: 4 })
   }
 }
