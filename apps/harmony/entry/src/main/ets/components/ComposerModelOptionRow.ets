@@ -1,8 +1,9 @@
+import { LengthMetrics } from '@kit.ArkUI';
+import { UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_FONT_CAPTION, UI_ICON_SIZE_COMPACT, UI_TOUCH_TARGET_MIN, uiScaledMaxWidth } from './UiKit';
 import {
   UI_RADIUS_CONTROL,
   UI_RADIUS_PILL,
   uiFontSize,
-  uiLineHeight,
 } from './UiKit';
 
 /** 新建任务与任务详情共用的模型选项行；页面只负责业务状态与回调。 */
@@ -65,7 +66,7 @@ export struct ComposerModelOptionRow {
         .textAlign(TextAlign.Center)
     } else {
       Text(this.providerInitial)
-        .fontSize(uiFontSize(11))
+        .fontSize(UI_FONT_CAPTION)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_secondary'))
         .width(20)
@@ -85,8 +86,7 @@ export struct ComposerModelOptionRow {
         .onClick(() => this.onSelect())
 
         Text(this.label)
-          .fontSize(uiFontSize(14))
-          .lineHeight(uiLineHeight(20))
+          .fontSize(UI_FONT_LIST_TITLE)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
@@ -98,14 +98,14 @@ export struct ComposerModelOptionRow {
           Button() {
             Row({ space: 3 }) {
               Text(this.effortLabel(this.selectedEffort))
-                .fontSize(uiFontSize(12))
+                .fontSize(UI_FONT_SECONDARY)
                 .fontColor($r('app.color.text_secondary'))
               SymbolGlyph($r('sys.symbol.chevron_down'))
                 .fontSize(uiFontSize(9))
                 .fontColor([$r('app.color.text_tertiary')])
             }
           }
-          .height(28)
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN, minWidth: UI_TOUCH_TARGET_MIN, maxWidth: uiScaledMaxWidth(86, 106) })
           .padding({ left: 5, right: 5 })
           .backgroundColor(Color.Transparent)
           .enabled(!this.disabled && (!this.paymentRequired || this.selected))
@@ -117,14 +117,14 @@ export struct ComposerModelOptionRow {
           Button() {
             Row({ space: 3 }) {
               Text(this.speedLabel(this.fastSpeed))
-                .fontSize(uiFontSize(12))
+                .fontSize(UI_FONT_SECONDARY)
                 .fontColor($r('app.color.text_secondary'))
               SymbolGlyph($r('sys.symbol.chevron_down'))
                 .fontSize(uiFontSize(9))
                 .fontColor([$r('app.color.text_tertiary')])
             }
           }
-          .height(28)
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN, minWidth: UI_TOUCH_TARGET_MIN, maxWidth: uiScaledMaxWidth(86, 106) })
           .padding({ left: 5, right: 5 })
           .backgroundColor(Color.Transparent)
           .enabled(!this.disabled && (!this.paymentRequired || this.selected))
@@ -142,34 +142,33 @@ export struct ComposerModelOptionRow {
         Stack({ alignContent: Alignment.Center }) {
           if (this.selected) {
             SymbolGlyph($r('sys.symbol.checkmark'))
-              .fontSize(uiFontSize(17))
-              .fontColor([$r('app.color.text_primary')])
+              .fontSize(UI_ICON_SIZE_COMPACT)
+              .fontColor([$r('app.color.accent')])
               .onClick(() => this.onSelect())
           } else if (this.paymentRequired) {
             Text('需付费')
-              .fontSize(uiFontSize(10))
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.text_tertiary'))
               .backgroundColor($r('app.color.bg_chip'))
               .borderRadius(UI_RADIUS_CONTROL)
               .padding({ left: 5, right: 5, top: 2, bottom: 2 })
           } else if (this.subscription) {
             Text('订阅')
-              .fontSize(uiFontSize(10))
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.bg_chip'))
               .borderRadius(UI_RADIUS_CONTROL)
               .padding({ left: 6, right: 6, top: 2, bottom: 2 })
           }
         }
-        .width(32)
-        .height(28)
+        .constraintSize({ minWidth: 24, maxWidth: uiScaledMaxWidth(44, 64) })
       }
       .width('100%')
       .constraintSize({ minHeight: 38 })
 
       if (this.quotaLine.length > 0) {
         Text(this.quotaLine)
-          .fontSize(uiFontSize(11))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -178,11 +177,11 @@ export struct ComposerModelOptionRow {
       }
 
       if (this.effortPickerOpen) {
-        Row({ space: 4 }) {
+        Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(4), cross: LengthMetrics.vp(4) } }) {
           ForEach(this.effortIds, (effort: string) => {
             Button(this.effortLabel(effort))
-              .height(26)
-              .fontSize(uiFontSize(11))
+              .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+              .fontSize(UI_FONT_CAPTION)
               .fontColor(effort === this.selectedEffort
                 ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
               .padding({ left: 9, right: 9 })
@@ -197,11 +196,11 @@ export struct ComposerModelOptionRow {
       }
 
       if (this.speedPickerOpen && this.fastModeVisible && this.ultrafastAvailable) {
-        Row({ space: 4 }) {
+        Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(4), cross: LengthMetrics.vp(4) } }) {
           ForEach(['standard', 'fast', 'ultrafast'], (speed: string) => {
             Button(this.speedLabel(speed))
-              .height(26)
-              .fontSize(uiFontSize(11))
+              .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+              .fontSize(UI_FONT_CAPTION)
               .fontColor(speed === this.fastSpeed
                 ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
               .padding({ left: 9, right: 9 })
@@ -240,7 +239,7 @@ export struct ComposerModelProviderHeader {
   build() {
     Row() {
       Text(this.name)
-        .fontSize(uiFontSize(12))
+        .fontSize(UI_FONT_SECONDARY)
         .fontWeight(FontWeight.Normal)
         .fontColor($r('app.color.text_tertiary'))
         .maxLines(1)

@@ -1,3 +1,5 @@
+import { UiCard, UiListGroup, UiListRow } from '../components/common/UiList';
+import { UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_RADIUS_CARD } from '../components/UiKit';
 import { ModelPickerListRow } from '../components/ModelPickerListRow';
 import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
 import { ComposerModelOption, pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption, pickerConfiguredOption } from '../core/ComposerCatalog';
@@ -105,7 +107,6 @@ import { deriveOptimisticSessionTitle } from './TaskListPresentation';
 import { ComposerImage, ConversationComposer, composerPermissionSymbol, composerPermissionTint } from '../components/ConversationComposer';
 import {
   ComposerModelOptionRow,
-  ComposerModelProviderHeader,
 } from '../components/ComposerModelOptionRow';
 import {
   ComposerDocument,
@@ -2809,6 +2810,10 @@ export struct NewSessionPageContent {
     Stack() {
       HdsNavigation() {
         Column() {
+          if (this.creating) {
+            LoadingProgress().width(20).height(20).color($r('app.color.text_secondary'))
+              .alignSelf(ItemAlign.End).margin({ top: 8, right: 16 })
+          }
           // 尚未发送时没有远端消息，也不制造“正在同步”或空态卡片。
           Blank()
             .width('100%')
@@ -2843,11 +2848,14 @@ export struct NewSessionPageContent {
           },
         },
         content: {
-          title: { mainTitle: '' },
-          stackBuilder: (): void => this.newSessionHeader(),
+          title: { mainTitle: '新任务' },
+          backIcon: {
+            label: '返回任务列表',
+            action: (): void => { if (!this.dismissActiveComposerPicker()) this.onClose(); },
+          },
         },
       })
-      .hideBackButton(true)
+      .hideBackButton(this.embedded)
       .hideToolBar(true)
       .mode(NavigationMode.Stack)
       .titleMode(HdsNavigationTitleMode.MINI)
@@ -2921,49 +2929,6 @@ export struct NewSessionPageContent {
       maskColor: $r('app.color.overlay'),
       onDisappear: (): void => this.restoreComposerFocusAfterSheetDisappear(),
     })
-  }
-
-  @Builder
-  newSessionHeader() {
-    Row({ space: 4 }) {
-      if (!this.embedded) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(44)
-        .height(44)
-        .padding(0)
-        .backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText('返回任务列表')
-        .onClick(() => { if (!this.dismissActiveComposerPicker()) this.onClose(); })
-      }
-
-      Text('新任务')
-        .fontSize(uiFontSize(16))
-        .lineHeight(uiLineHeight(22))
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
-
-
-      Blank()
-        .layoutWeight(1)
-
-      if (this.creating) {
-        LoadingProgress()
-          .width(16)
-          .height(16)
-          .color($r('app.color.text_secondary'))
-      }
-    }
-    .width('100%')
-    .constraintSize({ minHeight: 50 })
-    .padding({ left: this.embedded ? 12 : 8, right: 12, top: 4, bottom: 4 })
-    .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -3047,13 +3012,13 @@ export struct NewSessionPageContent {
     Button() {
       Row({ space: 8 }) {
         SymbolGlyph(icon).width(24).fontSize(17).fontColor([$r('app.color.text_secondary')])
-        Text(label).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary')).layoutWeight(1)
+        Text(label).fontSize(UI_FONT_LIST_TITLE).fontColor($r('app.color.text_primary')).layoutWeight(1)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Start)
         if (selected) {
-          SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.text_primary')])
+          SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.accent')])
         }
       }.width('100%')
-    }.type(ButtonType.Normal).height(44).width('100%').padding({ left: 12, right: 12 })
+    }.type(ButtonType.Normal).constraintSize({ minHeight: 44 }).width('100%').padding({ left: 12, right: 12, top: 6, bottom: 6 })
       .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
       .borderRadius(UI_RADIUS_CONTROL).accessibilitySelected(selected)
       .clickEffect(UI_CLICK_EFFECT).onClick(action)
@@ -3430,6 +3395,7 @@ export struct NewSessionPageContent {
   @Builder
   permissionContextView() {
     Column() {
+    UiCard({ inset: 0 }) {
       ForEach(this.permissionOptions, (option: RuntimeChoiceOption) => {
         Row({ space: 8 }) {
           SymbolGlyph(composerPermissionSymbol(option.id))
@@ -3438,14 +3404,13 @@ export struct NewSessionPageContent {
             .width(24)
           Column({ space: 1 }) {
             Text(option.label)
-              .fontSize(uiFontSize(14))
+              .fontSize(UI_FONT_LIST_TITLE)
               .fontWeight(option.id === this.permissionMode
                 ? FontWeight.Medium : FontWeight.Normal)
               .fontColor($r('app.color.text_primary'))
             if (option.description.length > 0) {
               Text(option.description)
-                .fontSize(uiFontSize(11))
-                .lineHeight(uiLineHeight(14))
+                .fontSize(UI_FONT_SECONDARY)
                 .fontColor($r('app.color.text_tertiary'))
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3455,7 +3420,7 @@ export struct NewSessionPageContent {
           if (option.id === this.permissionMode) {
             SymbolGlyph($r('sys.symbol.checkmark'))
               .fontSize(uiFontSize(18))
-              .fontColor([$r('app.color.chat_cta')])
+              .fontColor([$r('app.color.accent')])
           }
         }
         .width('100%')
@@ -3466,8 +3431,12 @@ export struct NewSessionPageContent {
         .borderRadius(UI_RADIUS_CONTROL)
         .opacity(this.creating ? 0.55 : 1)
         .clickEffect(UI_LIST_CLICK_EFFECT)
+        .focusable(true)
+        .accessibilityGroup(true)
+        .accessibilitySelected(option.id === this.permissionMode)
         .onClick(() => this.selectContextPermission(option))
       }, (option: RuntimeChoiceOption) => option.id)
+    }
     }
     .width('100%')
     .padding({ left: 10, right: 10, top: 2, bottom: 8 })
@@ -3510,10 +3479,8 @@ export struct NewSessionPageContent {
 
   @Builder
   modelProviderGroup(group: ComposerModelGroup) {
-    Column({ space: 2 }) {
-      ComposerModelProviderHeader({ name: group.name })
-
-      Column() {
+    Column() {
+    UiListGroup({ heading: group.name }) {
       ForEach(group.options, (option: RuntimeModelOption, index: number) => {
         if (index > 0) {
           Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
@@ -3540,7 +3507,7 @@ export struct NewSessionPageContent {
         })
       }, (option: RuntimeModelOption) => this.modelOptionKey(option) + ':' + option.pickerHarness + ':' + option.pickerConfigurationId)
 
-      }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+    }
     }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
   }
 
@@ -3571,15 +3538,14 @@ export struct NewSessionPageContent {
   @Builder
   pickerPluginSections() {
     ForEach(this.filteredPickerPluginRows(), (engine: PluginEngine) => {
-      Column({ space: 2 }) {
-        ComposerModelProviderHeader({ name: engine.name })
+      Column() {
+      UiListGroup({ heading: engine.name }) {
         if (engine.availability !== 'available') {
           Text(engine.availabilityMessage || '此电脑上的引擎不可用')
-            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Start)
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Start)
             .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('calc(100% - 36vp)').margin({ left: 18, right: 18, bottom: 4 })
         }
-        Column() {
           ForEach(pluginPickerModels(engine, this.selectedPickerPlugin()?.providerId === engine.providerId ? this.pickerPluginModel : ''), (model: PluginEngineModel, index: number) => {
             if (index > 0) {
               Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
@@ -3591,7 +3557,7 @@ export struct NewSessionPageContent {
               onPick: (): void => { this.pickDraftPlugin(engine, model); },
             })
           }, (model: PluginEngineModel) => model.id)
-        }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+      }
       }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
         .opacity(engine.availability === 'available' ? 1 : 0.6)
     }, (engine: PluginEngine) => engine.providerId)
@@ -3617,86 +3583,66 @@ export struct NewSessionPageContent {
 
   @Builder
   pickerDetailsView(option: ComposerModelOption) {
-    Column({ space: 8 }) {
-      Text([option.label, option.providerName, option.agentDeviceName, option.contextWindow > 0
-        ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
-        .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-        .width('100%').padding(12).backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+    Column({ space: 12 }) {
       Column() {
-      Row({ space: 8 }) {
-        Text('✣').width(24).fontColor($r('app.color.text_secondary'))
-        Column({ space: 3 }) {
-          Text('Harness').fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
-          Text(agentLabel(this.selectedAgentKind)).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-        }.alignItems(HorizontalAlign.Start)
-      }.height(44).width('100%')
-      ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
-        Button('切换到 ' + agentLabel(compatible.pickerHarness as NewAgentKind))
-          .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-          .onClick(() => { void this.pickOtherHarnessModel(compatible); })
-      }, (compatible: ComposerModelOption) => compatible.pickerHarness)
-        Divider().color($r('app.color.border'))
-        Button() {
-          Row({ space: 6 }) {
-            Text('推理强度').layoutWeight(1).textAlign(TextAlign.Start).fontSize(uiFontSize(14))
-              .fontColor($r('app.color.text_primary'))
-            Text(this.modelEffortLabel(option, this.modelEffortForRow(option))).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-            SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(12).fontColor([$r('app.color.text_secondary')])
-          }.width('100%')
-        }.type(ButtonType.Normal).padding(0).height(44).width('100%')
-          .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
-          .enabled(option.efforts.length > 0)
-          .onClick(() => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : this.modelOptionKey(option); })
-        if (this.modelEffortPickerKey === this.modelOptionKey(option)) {
-          ForEach(option.efforts, (level: string) => {
-            Button(this.modelEffortLabel(option, level)).height(44).width('100%').fontColor($r('app.color.text_primary'))
-              .backgroundColor(Color.Transparent).accessibilitySelected(level === this.modelEffortForRow(option))
-              .onClick(() => {
-                this.selectModelRowEffort(option, level)
-                this.modelEffortPickerKey = '';
-              })
-          }, (level: string) => level)
+        UiCard() {
+          Text([option.label, option.providerName, option.agentDeviceName, option.contextWindow > 0
+            ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
         }
-        if (option.supportsFastMode) {
-          Divider().color($r('app.color.border'))
-          Row() {
-            SymbolGlyph($r('sys.symbol.bolt')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
-            Text('快速模式').layoutWeight(1).fontColor($r('app.color.text_primary'))
-            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-              .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-          }.height(44).width('100%')
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
+      Column() {
+        UiCard({ inset: 0 }) {
+          UiListRow({ label: 'Harness', detail: agentLabel(this.selectedAgentKind) })
+          ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
+            Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+            UiListRow({ label: '切换到 ' + agentLabel(compatible.pickerHarness as NewAgentKind), showChevron: true,
+              onRowClick: () => { void this.pickOtherHarnessModel(compatible); } })
+          }, (compatible: ComposerModelOption) => compatible.pickerHarness)
+          Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+          UiListRow({ label: '推理强度', value: this.modelEffortLabel(option, this.modelEffortForRow(option)), showChevron: option.efforts.length > 0,
+            rowEnabled: option.efforts.length > 0,
+            onRowClick: () => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : this.modelOptionKey(option); } })
+          if (this.modelEffortPickerKey === this.modelOptionKey(option)) {
+            ForEach(option.efforts, (level: string) => {
+              UiListRow({ label: this.modelEffortLabel(option, level),
+                onRowClick: () => { this.selectModelRowEffort(option, level); this.modelEffortPickerKey = ''; } })
+                .accessibilitySelected(level === this.modelEffortForRow(option))
+            }, (level: string) => level)
+          }
+          if (option.supportsFastMode) {
+            Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.bolt')).fontSize(20).fontColor([$r('app.color.text_secondary')])
+              Text('快速模式').layoutWeight(1).fontSize(UI_FONT_LIST_TITLE).fontColor($r('app.color.text_primary'))
+              Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+                .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+            }.width('100%').constraintSize({ minHeight: 44 }).padding({ left: 16, right: 16, top: 4, bottom: 4 })
+          }
         }
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
       Column() {
-      Button('使用推荐设定').height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-        .onClick(() => {
-          void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option)));
-        })
-      Divider().color($r('app.color.border')).margin({ top: 4, bottom: 8 })
-      Text('恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。').fontSize(uiFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
-      Text('目前设定').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-      Column() {
-      Row({ space: 8 }) {
-      SymbolGlyph($r('sys.symbol.star')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
-      Column() {
-      Button(modelFavoriteMutation(option, this.selectedAgentKind, this.modelEffortForRow(option), this.modelFastForRow(option),
-        this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定')
-        .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-        .enabled(this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId)
-        .onClick(() => { void this.togglePickerFavorite(option); })
-      Text(agentLabel(this.selectedAgentKind) + ' · ' + this.modelEffortLabel(option, this.modelEffortForRow(option)) + (this.modelFastForRow(option) ? ' · Fast' : ''))
-        .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-      }.alignItems(HorizontalAlign.Start)
-      }.width('100%')
-      Divider().color($r('app.color.border')).margin({ top: 8, bottom: 8 })
-      Text('储存这组参数，方便下次从收藏清单直接使用。').fontSize(uiFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+        UiCard({ inset: 0 }) {
+          UiListRow({ label: '使用推荐设定',
+            detail: '恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。',
+            onRowClick: () => { void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option))); } })
+        }
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
+      UiListGroup({ heading: '目前设定' }) {
+        Row() {
+          SymbolGlyph($r('sys.symbol.star')).fontSize(20).fontColor([$r('app.color.text_secondary')])
+          UiListRow({
+            label: modelFavoriteMutation(option, this.selectedAgentKind, this.modelEffortForRow(option), this.modelFastForRow(option),
+              this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定',
+            detail: agentLabel(this.selectedAgentKind) + ' · ' + this.modelEffortLabel(option, this.modelEffortForRow(option)) + (this.modelFastForRow(option) ? ' · Fast' : ''),
+            rowEnabled: this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId,
+            onRowClick: () => { void this.togglePickerFavorite(option); }
+          }).layoutWeight(1)
+        }.width('100%').padding({ left: 16 })
+        Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+        Text('储存这组参数，方便下次从收藏清单直接使用。')
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).padding(16)
+      }
     }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
   }
 

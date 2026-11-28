@@ -160,6 +160,8 @@
     {"name": "usage_chart_pink", "value": "#df83b0"},
     {"name": "usage_chart_purple", "value": "#ab7bc6"},
     {"name": "usage_chart_other", "value": "#969696"},
-    {"name": "usage_quota_plenty", "value": "#14B8A6"}
+    {"name": "usage_quota_plenty", "value": "#14B8A6"},
+    {"name": "usage_chart_blue", "value": "#3568BA"},
+    {"name": "usage_chart_amber", "value": "#986018"}
   ]
 }

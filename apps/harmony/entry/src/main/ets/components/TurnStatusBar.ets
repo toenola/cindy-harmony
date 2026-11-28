@@ -4,7 +4,7 @@ import {
   sessionActivityDuration,
   sessionActivityElapsedMs,
 } from '../core/messages/SessionActivityPresentation';
-import { UI_RADIUS_PILL, uiFontSize } from './UiKit';
+import { UI_FONT_ACTION_SMALL, UI_FONT_CAPTION, UI_RADIUS_CAPSULE, UI_SPACE_TIGHT, UI_SPACE_INLINE, UI_SPACE_PAGE, UI_TOUCH_TARGET_MIN } from './UiKit';
 
 @Component
 export struct TurnStatusBar {
@@ -94,57 +94,57 @@ export struct TurnStatusBar {
   }
 
   build() {
-    Row({ space: 6 }) {
+    Row({ space: UI_SPACE_INLINE }) {
       if (this.visible) {
-        Row({ space: 4 }) {
+        Row({ space: UI_SPACE_TIGHT }) {
           Text('✧')
-            .fontSize(uiFontSize(14))
+            .fontSize(UI_FONT_ACTION_SMALL)
             .fontColor($r('app.color.chat_status_accent'))
             .accessibilityLevel('no')
           Text(this.phaseLabel())
-            .fontSize(uiFontSize(12))
+            .fontSize(UI_FONT_CAPTION)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.chat_status_accent'))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+            .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
             .flexShrink(1)
           if (this.retryProgress.length > 0) {
             Text(this.retryProgress)
-              .fontSize(uiFontSize(11)).fontFamily('monospace')
-              .fontColor($r('app.color.chat_status_accent'))
+              .fontSize(UI_FONT_CAPTION).fontFamily('monospace')
+              .fontColor($r('app.color.chat_status_accent')).flexShrink(1)
           }
         }
-        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .padding({ left: UI_SPACE_INLINE, right: UI_SPACE_INLINE, top: UI_SPACE_TIGHT, bottom: UI_SPACE_TIGHT })
         .backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_PILL)
+        .borderRadius(UI_RADIUS_CAPSULE)
         .flexShrink(1)
 
         Row().layoutWeight(1)
 
-        Row({ space: 4 }) {
+        Row({ space: UI_SPACE_TIGHT }) {
           Text(this.elapsedLabel())
-            .fontSize(uiFontSize(11)).fontFamily('monospace')
+            .fontSize(UI_FONT_CAPTION).fontFamily('monospace')
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
           if (!this.sideTaskRunning && this.retryPhase.length === 0
             && formatSessionActivityTokens(this.tokenUsage).length > 0) {
             Text('· ↓')
-              .fontSize(uiFontSize(11))
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.text_secondary'))
               .accessibilityLevel('no')
             Text($r('app.string.turn_status_tokens', formatSessionActivityTokens(this.tokenUsage)))
-              .fontSize(uiFontSize(11)).fontFamily('monospace')
+              .fontSize(UI_FONT_CAPTION).fontFamily('monospace')
               .fontColor($r('app.color.text_secondary'))
               .maxLines(1)
           }
         }
-        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .padding({ left: UI_SPACE_INLINE, right: UI_SPACE_INLINE, top: UI_SPACE_TIGHT, bottom: UI_SPACE_TIGHT })
         .backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_PILL)
+        .borderRadius(UI_RADIUS_CAPSULE)
       }
     }
     .width('100%')
-    .constraintSize({ minHeight: 44 })
-    .padding({ left: 16, right: 16 })
+    .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+    .padding({ left: UI_SPACE_PAGE, right: UI_SPACE_PAGE })
     .hitTestBehavior(HitTestMode.None)
   }
 }

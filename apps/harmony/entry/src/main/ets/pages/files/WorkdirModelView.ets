@@ -1,3 +1,5 @@
+import { UiInlineError } from '../../components/common/UiStatus';
+import { UI_FONT_SECONDARY } from '../../components/UiKit';
 import { Camera, Scene } from '@ohos.graphics.scene';
 import { WorkdirModelLease } from '../../core/files/WorkdirModel';
 
@@ -80,7 +82,8 @@ export struct WorkdirModelView {
             })
           ))
       } else {
-        Text(this.error || '正在载入 3D 模型…').fontColor($r('app.color.text_secondary'))
+        if (this.error) { UiInlineError({ message: this.error }) }
+        else { Text('正在载入 3D 模型…').fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')) }
       }
     }.width('100%').height('100%')
   }

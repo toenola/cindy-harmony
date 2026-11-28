@@ -1,3 +1,7 @@
+import { UiListRow } from './common/UiList';
+import { UiActionButton, UiActionKind, UiIconButton } from './common/UiActions';
+import { UiInlineError } from './common/UiStatus';
+import { UI_FONT_SECONDARY, UI_FONT_TITLE_S, UI_SPACE_PAGE } from './UiKit';
 import { uiConfirm, uiConfirmCopy, uiSheetOptions, UiSheetExtras } from './common/UiOverlay';
 import { ChatHomePanel } from './chat/ChatHomePanel';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -213,25 +217,30 @@ export struct HomeModulePanel {
   @Builder
   private directoryPicker() {
     Column({ space: 12 }) {
-      Text(this.directoryPath).fontSize(14).fontColor($r('app.color.text_primary')).maxLines(2).width('100%')
+      Text(this.directoryPath).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_primary')).maxLines(2).width('100%')
       if (this.directoryLoading) { LoadingProgress().width(28).height(28) }
       if (this.directoryParent) {
-        Button('..').height(44).onClick((): void => { void this.loadDirectory(this.directoryParent); })
+        UiActionButton({ label: '..', onAction: (): void => { void this.loadDirectory(this.directoryParent); } })
       }
       Scroll() {
         Column() {
           ForEach(this.directoryEntries, (path: string) => {
-            Button(path.slice(path.lastIndexOf('/') + 1) || path).height(44).width('100%')
-              .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
-              .onClick((): void => { void this.loadDirectory(path); })
+            UiListRow({
+              label: path.slice(path.lastIndexOf('/') + 1) || path,
+              showChevron: true,
+              onRowClick: (): void => { void this.loadDirectory(path); },
+            })
           }, (path: string): string => path)
         }.width('100%')
       }.width('100%').constraintSize({ maxHeight: 360 })
-      if (this.error) { Text(this.error).fontColor($r('app.color.text_secondary')).fontSize(13) }
-      Row({ space: 12 }) {
-        Button(this.copy('cancel')).height(44).layoutWeight(1).onClick((): void => this.finishDirectory(''))
-        Button(this.copy('confirm')).height(44).layoutWeight(1).enabled(!this.directoryLoading && !!this.directoryPath)
-          .onClick((): void => this.finishDirectory(this.directoryPath))
+      if (this.error) { UiInlineError({ message: this.error }) }
+      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End }) {
+        UiActionButton({ label: this.copy('cancel'), onAction: (): void => this.finishDirectory('') }).margin({ right: 8 })
+        UiActionButton({
+          label: this.copy('confirm'), kind: UiActionKind.Primary,
+          actionEnabled: !this.directoryLoading && this.directoryPath.length > 0,
+          onAction: (): void => this.finishDirectory(this.directoryPath),
+        })
       }.width('100%')
     }.width('100%').padding({ left: 20, right: 20, top: 8, bottom: 20 })
   }
@@ -312,7 +321,7 @@ export struct HomeModulePanel {
         if (link.kind === 'session') this.onOpenTask(this.request.deviceId, link.sessionId);
       } })
     } else {
-      Text(this.copy('loading')).fontColor($r('app.color.text_secondary')).padding(20)
+      Text(this.copy('loading')).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).padding(20)
     }
   }
   build() {
@@ -323,30 +332,35 @@ export struct HomeModulePanel {
         if (this.request.kind !== 'project' &&
           !(this.request.kind === 'chat' && this.chatReady && !this.choosingDirectory)) {
           Row({ space: 4 }) {
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).fontColor([$r('app.color.text_primary')])
-            }.width(44).height(44).padding(0).backgroundColor(Color.Transparent)
-              .accessibilityText(this.copy('back')).onClick(this.onClose)
-            Text(this.request.title || this.copy(this.request.kind)).fontSize(17).fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary')).layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          }.height(56).width('100%').padding({ left: 4, right: 16 }).alignItems(VerticalAlign.Center)
+            UiIconButton({
+              glyph: $r('sys.symbol.chevron_left'),
+              label: this.copy('back'),
+              onAction: this.onClose,
+            })
+            Text(this.request.title || this.copy(this.request.kind)).fontSize(UI_FONT_TITLE_S).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary')).layoutWeight(1).maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(TextAlign.Start)
+          }.constraintSize({ minHeight: 56 }).width('100%').padding({ left: 4, right: UI_SPACE_PAGE })
+            .alignItems(VerticalAlign.Center)
         }
         if (this.error) {
-          Row({ space: 8 }) {
-            Text(this.error).fontSize(13).fontColor($r('app.color.danger')).layoutWeight(1)
-            if (this.request.kind === 'chat') {
-              Button(this.copy('refresh'), { type: ButtonType.Normal }).height(44).padding({ left: 8, right: 8 })
-                .fontSize(14).fontColor($r('app.color.accent')).backgroundColor(Color.Transparent)
-                .onClick((): void => { void this.prepareChat(); })
-            }
-          }.width('100%').padding({ left: 16, right: 8 }).alignItems(VerticalAlign.Center)
+          if (this.request.kind === 'chat') {
+            UiInlineError({
+              message: this.error,
+              actionLabel: this.copy('refresh'),
+              onAction: (): void => { void this.prepareChat(); },
+            })
+          } else {
+            UiInlineError({ message: this.error })
+          }
         }
         Column() { if (this.revision >= 0) this.content() }.width('100%').layoutWeight(1)
       }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
       if (this.mediaUrl && this.mediaImage && this.mediaOwner && this.mediaOwner === this.mediaScope()) {
         Stack({ alignContent: Alignment.TopEnd }) {
           Image(this.mediaUrl).width('100%').height('100%').objectFit(ImageFit.Contain)
-          Button(this.copy('back')).height(44).margin(16).onClick((): void => { this.mediaUrl = ''; })
+          UiActionButton({ label: this.copy('back'), onAction: (): void => { this.mediaUrl = ''; } }).margin(UI_SPACE_PAGE)
         }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
       }
     }.width('100%').height('100%')

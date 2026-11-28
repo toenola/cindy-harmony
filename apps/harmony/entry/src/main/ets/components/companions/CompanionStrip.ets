@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { TeammateRosterEntry } from '../../core/tasks/TeammateRoster';
 import { TeammateAvatar } from '../TeammateAvatar';
-import { UI_RADIUS_CONTROL, UI_LIST_CLICK_EFFECT } from '../UiKit';
+import { UI_FONT_CAPTION, UI_RADIUS_CONTROL, UI_LIST_CLICK_EFFECT } from '../UiKit';
 
 let modeWrites: Promise<void> = Promise.resolve();
 
@@ -68,11 +68,12 @@ export struct CompanionStrip {
             .stroke($r('app.color.bg_page')).strokeWidth(1.5)
         }
       }.width(COMPANION_TILE_SIZE).height(COMPANION_TILE_SIZE)
-      Text(row.name).fontSize(12).fontColor($r('app.color.text_primary'))
-        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%').height(16).textAlign(TextAlign.Center)
+      Text(row.name).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_primary'))
+        .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%').constraintSize({ minHeight: 32 }).textAlign(TextAlign.Center)
     }
     .width(COMPANION_TILE_SIZE).flexShrink(0).padding({ top: 4, bottom: 4 })
     .borderRadius(UI_RADIUS_CONTROL).clickEffect(UI_LIST_CLICK_EFFECT)
+    .focusable(true)
     .accessibilityText(row.name + this.statusLabel(row))
     .onClick((): void => this.open(row))
   }
@@ -91,7 +92,7 @@ export struct CompanionStrip {
               .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
             this.addMenu()
           }.width(COMPANION_TILE_SIZE).height(COMPANION_TILE_SIZE)
-          Blank().height(16)
+          Blank().height(32)
         }.width(COMPANION_TILE_SIZE).flexShrink(0).padding({ top: 4, bottom: 4 })
       }.justifyContent(FlexAlign.Start).alignItems(VerticalAlign.Top).padding({ left: 16, right: 16 })
     }.width('100%').align(Alignment.Start).scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off)

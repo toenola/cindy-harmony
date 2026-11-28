@@ -1,3 +1,9 @@
+import { UiEmptyState, UiInlineError } from '../components/common/UiStatus';
+import { UI_FONT_ACTION_SMALL, UI_FONT_BODY, UI_MOTION_BASE, getSystemFontSizeScale } from '../components/UiKit';
+import { UiCard, UiListGroup, UiListRow } from '../components/common/UiList';
+import { UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_RADIUS_CARD } from '../components/UiKit';
+import { UiIconButton } from '../components/common/UiActions';
+import { UI_FONT_TITLE_S, UI_FONT_CAPTION, UI_TOUCH_TARGET_MIN } from '../components/UiKit';
 import { ModelPickerListRow } from '../components/ModelPickerListRow';
 import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
 import { pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption } from '../core/ComposerCatalog';
@@ -117,7 +123,6 @@ import { GoalStartOptions } from '../core/goals/GoalStore';
 import { ComposerImage, ConversationComposer, composerPermissionSymbol, composerPermissionTint } from '../components/ConversationComposer';
 import {
   ComposerModelOptionRow,
-  ComposerModelProviderHeader,
 } from '../components/ComposerModelOptionRow';
 import {
   UI_CLICK_EFFECT,
@@ -603,6 +608,7 @@ export struct TaskPageContent {
   /** 双栏父页面提供；存在时标题栏最左侧显示收起 / 展开任务列表按钮（D-015）。 */
   onTogglePaneList: (() => void) | undefined = undefined;
   @State private compactHeaderCollab: boolean = true;
+  @State private narrowTaskHeader: boolean = false;
   @State paneActivationRevision: number = 0;
   /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
@@ -6856,6 +6862,10 @@ export struct TaskPageContent {
   @Builder
   sessionActionLayer() {
     Column() {
+      if (this.headerFolderInMenu() && this.headerFolderVisible()) {
+        UiSheetActionRow({ label: '项目文件夹', symbol: $r('sys.symbol.folder'),
+          onAction: (): void => this.openHeaderFolderFromMenu() })
+      }
       TeammateSettingsPanel({ deviceId: this.deviceId, sessionId: this.sessionId, deviceDisabled: this.deviceDisabled })
     }
     .width('100%')
@@ -6869,6 +6879,12 @@ export struct TaskPageContent {
   @Builder
   ordinarySessionActionMenu() {
     Menu() {
+      if (this.headerFolderInMenu() && this.headerFolderVisible()) {
+        MenuItemGroup() {
+          this.sessionMenuItem('项目文件夹', $r('sys.symbol.folder'), false, () => this.openHeaderFolderFromMenu())
+        }
+      }
+
       MenuItemGroup({ header: this.sessionMenuHeader() }) {
         this.sessionMenuItem('重命名', $r('sys.symbol.doc_text'), false,
           () => { this.sessionActionOpen = false; this.sessionRenameMode = true; })
@@ -7301,52 +7317,42 @@ export struct TaskPageContent {
     .onClick(action)
   }
 
-  /** Header 与搜索栏共用的圆形图标按钮，统一触控反馈和选中态。 */
   @Builder
-  taskIconButton(symbol: Resource, size: number, selected: boolean, enabled: boolean, action: () => void) {
-    Button() {
-      SymbolGlyph(symbol)
-        .fontSize(uiFontSize(20))
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(size)
-    .height(size)
-    .padding(0)
-    .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(enabled)
-    .opacity(enabled ? 1 : 0.4)
-    .onClick(action)
+  taskIconButton(symbol: Resource, label: string, enabled: boolean, action: () => void) {
+    UiIconButton({ glyph: symbol, label, actionEnabled: enabled, onAction: action })
   }
 
   private headerFolderVisible(): boolean {
     return !AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0;
   }
 
+  private headerFolderInMenu(): boolean {
+    return this.narrowTaskHeader || getSystemFontSizeScale() >= 1.3;
+  }
+
+  private openHeaderFolderFromMenu(): void {
+    this.closeSessionActions();
+    // Let the existing menu or settings sheet release its overlay before opening the file sheet.
+    const deviceId = this.deviceId;
+    const sessionId = this.sessionId;
+    setTimeout((): void => {
+      if (this.paneActive && this.deviceId === deviceId && this.sessionId === sessionId) this.showProjectActions();
+    }, UI_MOTION_BASE);
+  }
+
   /** 主控使用同款标签外观，但用 44vp 按钮承载点击热区。 */
   @Builder
   collabRoleBadge() {
-    if (this.collabModeEntry) {
-      Button() {
-        if (this.compactHeaderCollab) {
-          SymbolGlyph($r('sys.symbol.person_2')).fontSize(uiFontSize(18))
-            .fontColor([$r('app.color.text_secondary')])
-        } else {
-          this.collabBadgeText()
-        }
-      }
-      .type(ButtonType.Normal)
-      .width(this.compactHeaderCollab ? 44 : 76)
-      .height(44)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .borderRadius(UI_RADIUS_PILL)
-      .flexShrink(0)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .accessibilityText(this.collabRole)
-      .enabled(!this.shareSelectionActive)
-      .onClick(() => this.onCollab())
+    if (this.collabModeEntry && this.compactHeaderCollab) {
+      UiIconButton({ glyph: $r('sys.symbol.person_2'), label: this.collabRole,
+        actionEnabled: !this.shareSelectionActive, onAction: () => this.onCollab() })
+    } else if (this.collabModeEntry) {
+      Button() { this.collabBadgeText() }
+        .type(ButtonType.Normal).buttonStyle(ButtonStyleMode.TEXTUAL)
+        .constraintSize({ minWidth: UI_TOUCH_TARGET_MIN, maxWidth: 88, minHeight: UI_TOUCH_TARGET_MIN })
+        .padding(0).backgroundColor(Color.Transparent).flexShrink(0)
+        .accessibilityText(this.collabRole).enabled(!this.shareSelectionActive)
+        .onClick(() => this.onCollab())
     } else {
       this.collabBadgeText()
     }
@@ -7355,13 +7361,12 @@ export struct TaskPageContent {
   @Builder
   collabBadgeText() {
     Text(this.collabRole)
-      .fontSize(uiFontSize(12))
+      .fontSize(UI_FONT_CAPTION)
       .fontColor($r('app.color.text_secondary'))
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
       .constraintSize({ maxWidth: 76 })
-      .height(24)
-      .padding({ left: 8, right: 8 })
+      .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .border({ width: 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_PILL)
       .flexShrink(0)
@@ -7372,21 +7377,12 @@ export struct TaskPageContent {
   /** 会话菜单直接锚定标题栏按钮；系统 Menu（bindMenu）自己处理避让和材质。 */
   @Builder
   sessionActionButton() {
-    Button() {
-      SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-        .fontSize(uiFontSize(20))
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(!this.isCreationBlockingRemoteOps())
-    .opacity(this.isCreationBlockingRemoteOps() ? 0.4 : 1)
-    .accessibilityText(this.isTeammateConversation() ? this.v12String('v138_settings') : this.v12String('v138_task_actions'))
-    .onClick(() => this.showSessionActions())
+    UiIconButton({
+      glyph: $r('sys.symbol.ellipsis_circle'),
+      label: this.isTeammateConversation() ? this.v12String('v138_settings') : this.v12String('v138_task_actions'),
+      actionEnabled: !this.isCreationBlockingRemoteOps(),
+      onAction: () => this.showSessionActions()
+    })
     .bindMenu(this.sessionActionOpen && !this.isTeammateConversation(), this.ordinarySessionActionMenu, this.sessionMenuOptions())
     .bindSheet(this.sessionActionOpen && this.isTeammateConversation(), this.sessionActionLayer,
       uiSheetOptions(this.v12String('v138_settings'), (): void => { this.sessionActionOpen = false; }))
@@ -7413,110 +7409,75 @@ export struct TaskPageContent {
 
   @Builder
   taskHeader() {
-    // 标题按整栏中心对齐，左右对称预留按钮空间，不等待按钮测量回流。
-    Stack({ alignContent: Alignment.Center }) {
-      Column() {
-        Row({ space: 8 }) {
-          if (this.teammate !== undefined) {
-            TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 36 })
-          }
-          Column({ space: 1 }) {
-            Text(this.sessionTitle())
-              .fontSize(uiFontSize(16))
-              .lineHeight(uiLineHeight(22))
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
+    // HDS 负责现有导航与材质，嵌入标题只占用可用宽度，不给动作预留对称空列。
+    Row({ space: 4 }) {
+      if (this.onDetailBack !== undefined) {
+        this.taskIconButton($r('sys.symbol.chevron_left'), '返回任务列表', true, () => {
+          if (this.dismissActiveComposerPicker()) return;
+          this.collapseComposerSurface();
+          this.onDetailBack?.();
+        })
+      } else if (!this.isEmbedded()) {
+        this.taskIconButton($r('sys.symbol.chevron_left'), '返回任务列表', true,
+          () => { if (!this.dismissActiveComposerPicker()) this.leaveDetailPage(); })
+      } else if (this.onTogglePaneList !== undefined) {
+        this.paneListToggleButton()
+      }
+      Row({ space: 8 }) {
+        if (this.teammate !== undefined) {
+          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: this.headerFolderInMenu() ? 24 : 32 })
+        }
+        Column() {
+          Text(this.sessionTitle())
+            .fontSize(UI_FONT_TITLE_S)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (!this.headerFolderInMenu() && this.headerNotice().length > 0) {
+            Text(this.headerNotice())
+              .fontSize(UI_FONT_CAPTION)
+              .fontColor(this.sessionStreaming ? $r('app.color.chat_status_accent') : $r('app.color.chat_text_secondary'))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
-            if (this.headerNotice().length > 0) {
-              Text(this.headerNotice())
-                .fontSize(uiFontSize(11))
-                .lineHeight(uiLineHeight(16))
-                .fontColor(this.sessionStreaming
-                  ? $r('app.color.chat_status_accent')
-                  : $r('app.color.chat_text_secondary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
-            }
           }
-          .flexShrink(1)
-          .alignItems(this.teammate === undefined ? HorizontalAlign.Center : HorizontalAlign.Start)
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      }.layoutWeight(1).constraintSize({ minWidth: 80 }).alignItems(VerticalAlign.Center)
+
+      Row({ space: 4 }) {
+        if (this.collabRole.length > 0) {
+          this.collabRoleBadge()
         }
-        .constraintSize({ maxWidth: '100%' })
-        .alignItems(VerticalAlign.Center)
+        if (!this.headerFolderInMenu() && this.headerFolderVisible()) {
+          this.taskIconButton($r('sys.symbol.folder'), '项目文件夹',
+            !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
+        }
+        this.sessionActionButton()
       }
-      .width('100%').height('100%').justifyContent(FlexAlign.Center)
-      .padding({ left: this.headerTitleInset(), right: this.headerTitleInset() })
-
-      Row() {
-        Row({ space: 4 }) {
-          if (this.onDetailBack !== undefined) {
-            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => {
-              if (this.dismissActiveComposerPicker()) return;
-              this.collapseComposerSurface();
-              this.onDetailBack?.();
-            })
-          } else if (!this.isEmbedded()) {
-            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => { if (!this.dismissActiveComposerPicker()) this.leaveDetailPage(); })
-          } else if (this.onTogglePaneList !== undefined) {
-            this.paneListToggleButton()
-          }
-        }
-
-        Blank()
-
-        Row({ space: 4 }) {
-          if (this.collabRole.length > 0) {
-            this.collabRoleBadge()
-          }
-          if (this.headerFolderVisible()) {
-            this.taskIconButton($r('sys.symbol.folder'), 40, false,
-              !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
-          }
-
-          this.sessionActionButton()
-        }
-        .bindSheet($$this.workdirBrowserOpen, this.workdirBrowserSheet(),
-          workdirBrowserSheetOptions((): void => { this.workdirBrowserOpen = false; }))
-      }
-      .width('100%')
-      .height('100%')
+      .flexShrink(0)
+      .bindSheet($$this.workdirBrowserOpen, this.workdirBrowserSheet(),
+        workdirBrowserSheetOptions((): void => { this.workdirBrowserOpen = false; }))
     }
     .width('100%')
-    .height(44)
-    .padding({ left: 8, right: 8, top: this.collabModeEntry ? 0 : 2, bottom: this.collabModeEntry ? 0 : 2 })
-    .backgroundColor(Color.Transparent)
+    .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+    .padding({ left: 8, right: 8 })
     .onAreaChange((_old: Area, area: Area) => {
-      const compact = Number(area.width) < 408;
+      const width = Number(area.width);
+      const narrow = width < 360;
+      if (narrow !== this.narrowTaskHeader) this.narrowTaskHeader = narrow;
+      const compact = width < 408 || getSystemFontSizeScale() >= 1.3;
       if (compact !== this.compactHeaderCollab) this.compactHeaderCollab = compact;
     })
   }
 
-  /** 双栏时收起 / 展开左侧任务列表；图标表示点击后的动作。 */
   @Builder
   paneListToggleButton() {
-    Button() {
-      SymbolGlyph(this.paneListCollapsed ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
-        : $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
-        .fontSize(uiFontSize(20))
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(44)
-    .height(44)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .accessibilityText(this.v12String(this.paneListCollapsed ? 'v134_pane_list_expand' : 'v134_pane_list_collapse'))
-    .onClick(() => this.onTogglePaneList?.())
-  }
-
-  private headerTitleInset(): number {
-    // Folder + menu, their spacing, and a gap. Reserve the folder slot even before its data arrives.
-    if (this.collabRole.length === 0) return 88;
-    return this.collabModeEntry && this.compactHeaderCollab ? 136 : 168;
+    UiIconButton({
+      glyph: this.paneListCollapsed ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
+        : $r('sys.symbol.arrow_up_left_and_arrow_down_right'),
+      label: this.v12String(this.paneListCollapsed ? 'v134_pane_list_expand' : 'v134_pane_list_collapse'),
+      onAction: () => this.onTogglePaneList?.()
+    })
   }
 
   @Builder
@@ -7539,20 +7500,20 @@ export struct TaskPageContent {
             .constraintSize({ minWidth: 32 })
             .textAlign(TextAlign.Center)
         }
-        this.taskIconButton($r('sys.symbol.chevron_up'), 36, false,
+        this.taskIconButton($r('sys.symbol.chevron_up'), '上一条搜索结果',
           this.searchHits().length > 0, () => this.moveSearch(-1))
-        this.taskIconButton($r('sys.symbol.chevron_down'), 36, false,
+        this.taskIconButton($r('sys.symbol.chevron_down'), '下一条搜索结果',
           this.searchHits().length > 0, () => this.moveSearch(1))
-        this.taskIconButton($r('sys.symbol.xmark'), 36, false, true, () => this.closeSearch())
+        this.taskIconButton($r('sys.symbol.xmark'), '关闭搜索', true, () => this.closeSearch())
       }
       .width('100%')
       .padding({ left: 12, right: 8, top: 6, bottom: 6 })
       if (this.searchPaging().visible) {
         Button(this.searchPaging().label)
-          .fontSize(uiFontSize(12))
+          .fontSize(UI_FONT_ACTION_SMALL)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_secondary'))
-          .height(30)
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
           .padding({ left: 12, right: 12 })
           .borderRadius(UI_RADIUS_PILL)
           .backgroundColor(Color.Transparent)
@@ -8095,31 +8056,20 @@ export struct TaskPageContent {
 
       Column({ space: 8 }) {
         if ((this.items.length > 0 || this.queueBubbles.length > 0) && !this.followingLatest) {
-          Button() {
-            Stack({ alignContent: Alignment.Center }) {
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(uiFontSize(20))
-                .fontColor([$r('app.color.chat_text_secondary')])
-              if (this.hasNewMessages) {
-                Circle()
-                  .width(8)
-                  .height(8)
-                  .fill($r('app.color.chat_cta'))
-                  .position({ x: 24, y: 3 })
-              }
+          Stack() {
+            UiIconButton({ glyph: $r('sys.symbol.chevron_down'),
+              label: this.hasNewMessages ? '有新消息，跳到最新' : '跳到最新',
+              onAction: () => this.jumpToLatest() })
+            if (this.hasNewMessages) {
+              Circle().width(8).height(8).fill($r('app.color.accent'))
+                .position({ x: 31, y: 4 }).hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
             }
-            .width(36)
-            .height(36)
           }
-          .width(36)
-          .height(36)
-          .padding(0)
+          .width(UI_TOUCH_TARGET_MIN).height(UI_TOUCH_TARGET_MIN)
           .borderRadius(UI_RADIUS_PILL)
           .backgroundColor($r('app.color.chat_fab_surface'))
           .border({ width: 1, color: $r('app.color.chat_fab_border') })
-          .clickEffect(UI_ICON_CLICK_EFFECT)
           .transition(uiRevealTransition())
-          .onClick(() => this.jumpToLatest())
         }
       }
       .alignItems(HorizontalAlign.Center)
@@ -8376,7 +8326,7 @@ export struct TaskPageContent {
     Column() {
       Row() {
         if (this.contextSheetPage !== 'main') {
-          this.taskIconButton($r('sys.symbol.chevron_left'), 36, false, true, () => {
+          this.taskIconButton($r('sys.symbol.chevron_left'), '返回', true, () => {
             if (this.contextSheetPage === 'goal') {
               uiAnimateState(this.getUIContext(), () => {
                 this.contextSheetPage = 'main';
@@ -8524,6 +8474,7 @@ export struct TaskPageContent {
   @Builder
   permissionContextView() {
     Column() {
+    UiCard({ inset: 0 }) {
       ForEach(this.permissionOptions, (option: ComposerChoiceOption) => {
         Row({ space: 8 }) {
           SymbolGlyph(composerPermissionSymbol(option.id))
@@ -8532,15 +8483,13 @@ export struct TaskPageContent {
             .width(24)
           Column({ space: 1 }) {
             Text(option.label)
-              .fontSize(uiFontSize(14))
-              .lineHeight(uiLineHeight(18))
+              .fontSize(UI_FONT_LIST_TITLE)
               .fontWeight(option.id === this.effectivePermissionMode()
                 ? FontWeight.Medium : FontWeight.Normal)
               .fontColor($r('app.color.text_primary'))
             if (option.description.length > 0) {
               Text(option.description)
-                .fontSize(uiFontSize(11))
-                .lineHeight(uiLineHeight(14))
+                .fontSize(UI_FONT_SECONDARY)
                 .fontColor($r('app.color.text_tertiary'))
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -8551,7 +8500,7 @@ export struct TaskPageContent {
           if (option.id === this.effectivePermissionMode()) {
             SymbolGlyph($r('sys.symbol.checkmark'))
               .fontSize(uiFontSize(18))
-              .fontColor([$r('app.color.chat_cta')])
+              .fontColor([$r('app.color.accent')])
           }
         }
         .width('100%')
@@ -8562,8 +8511,12 @@ export struct TaskPageContent {
         .borderRadius(UI_RADIUS_CONTROL)
         .opacity(this.contextRpcBusy ? 0.55 : 1)
         .clickEffect(UI_LIST_CLICK_EFFECT)
+        .focusable(true)
+        .accessibilityGroup(true)
+        .accessibilitySelected(option.id === this.effectivePermissionMode())
         .onClick(() => this.requestPermissionMode(option))
       }, (option: ComposerChoiceOption) => option.id)
+    }
     }
     .width('100%')
     .padding({ left: 10, right: 10, top: 2, bottom: 8 })
@@ -8656,10 +8609,8 @@ export struct TaskPageContent {
 
   @Builder
   modelProviderGroup(group: ComposerModelGroup) {
-    Column({ space: 2 }) {
-      ComposerModelProviderHeader({ name: group.name })
-
-      Column() {
+    Column() {
+    UiListGroup({ heading: group.name }) {
       ForEach(group.options, (option: ComposerModelOption, index: number) => {
         if (index > 0) {
           Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
@@ -8686,7 +8637,7 @@ export struct TaskPageContent {
         })
       }, (option: ComposerModelOption) => composerModelKey(option) + ':' + option.pickerHarness + ':' + option.pickerConfigurationId)
 
-      }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+    }
     }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
   }
 
@@ -8754,15 +8705,14 @@ export struct TaskPageContent {
   @Builder
   pickerPluginSections() {
     ForEach(this.filteredPickerPluginRows(), (engine: PluginEngine) => {
-      Column({ space: 2 }) {
-        ComposerModelProviderHeader({ name: engine.name })
+      Column() {
+      UiListGroup({ heading: engine.name }) {
         if (engine.availability !== 'available') {
           Text(engine.availabilityMessage || '此电脑上的引擎不可用')
-            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Start)
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Start)
             .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('calc(100% - 36vp)').margin({ left: 18, right: 18, bottom: 4 })
         }
-        Column() {
           ForEach(pluginPickerModels(engine, this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''), (model: PluginEngineModel, index: number) => {
             if (index > 0) {
               Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
@@ -8774,7 +8724,7 @@ export struct TaskPageContent {
               onPick: (): void => { void this.pickTaskPlugin(engine, model); },
             })
           }, (model: PluginEngineModel) => model.id)
-        }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+      }
       }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
         .opacity(engine.availability === 'available' ? 1 : 0.6)
     }, (engine: PluginEngine) => engine.providerId)
@@ -8801,87 +8751,66 @@ export struct TaskPageContent {
 
   @Builder
   pickerDetailsView(option: ComposerModelOption) {
-    Column({ space: 8 }) {
-      Text([option.label, option.providerName, option.agentDeviceName, option.contextWindow > 0
-        ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
-        .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-        .width('100%').padding(12).backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+    Column({ space: 12 }) {
       Column() {
-      Row({ space: 8 }) {
-        Text('✣').width(24).fontColor($r('app.color.text_secondary'))
-        Column({ space: 3 }) {
-          Text('Harness').fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
-          Text(modelAgentLabel(this.composerAgentKind())).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-        }.alignItems(HorizontalAlign.Start)
-      }.height(44).width('100%')
-      ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
-        Button('切换到 ' + modelAgentLabel(compatible.pickerHarness))
-          .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-          .onClick(() => { void this.pickOtherHarnessModel(compatible); })
-      }, (compatible: ComposerModelOption) => compatible.pickerHarness)
-        Divider().color($r('app.color.border'))
-        Button() {
-          Row({ space: 6 }) {
-            Text('推理强度').layoutWeight(1).textAlign(TextAlign.Start).fontSize(uiFontSize(14))
-              .fontColor($r('app.color.text_primary'))
-            Text(this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option))).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-            SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(12).fontColor([$r('app.color.text_secondary')])
-          }.width('100%')
-        }.type(ButtonType.Normal).padding(0).height(44).width('100%')
-          .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
-          .enabled(option.efforts.length > 0)
-          .onClick(() => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : composerModelKey(option); })
-        if (this.modelEffortPickerKey === composerModelKey(option)) {
-          ForEach(option.efforts, (level: string) => {
-            Button(this.effortOptionLabel(level, level)).height(44).width('100%').fontColor($r('app.color.text_primary'))
-              .backgroundColor(Color.Transparent).accessibilitySelected(level === this.modelEffortForRow(option))
-              .onClick(() => {
-                this.setModelRowEffortById(option, level)
-                this.modelEffortPickerKey = '';
-              })
-          }, (level: string) => level)
+        UiCard() {
+          Text([option.label, option.providerName, option.agentDeviceName, option.contextWindow > 0
+            ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
         }
-        if (option.supportsFastMode) {
-          Divider().color($r('app.color.border'))
-          Row() {
-            SymbolGlyph($r('sys.symbol.bolt')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
-            Text('快速模式').layoutWeight(1).fontColor($r('app.color.text_primary'))
-            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
-              .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
-          }.height(44).width('100%')
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
+      Column() {
+        UiCard({ inset: 0 }) {
+          UiListRow({ label: 'Harness', detail: modelAgentLabel(this.composerAgentKind()) })
+          ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
+            Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+            UiListRow({ label: '切换到 ' + modelAgentLabel(compatible.pickerHarness), showChevron: true,
+              onRowClick: () => { void this.pickOtherHarnessModel(compatible); } })
+          }, (compatible: ComposerModelOption) => compatible.pickerHarness)
+          Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+          UiListRow({ label: '推理强度', value: this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option)), showChevron: option.efforts.length > 0,
+            rowEnabled: option.efforts.length > 0,
+            onRowClick: () => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : composerModelKey(option); } })
+          if (this.modelEffortPickerKey === composerModelKey(option)) {
+            ForEach(option.efforts, (level: string) => {
+              UiListRow({ label: this.effortOptionLabel(level, level),
+                onRowClick: () => { this.setModelRowEffortById(option, level); this.modelEffortPickerKey = ''; } })
+                .accessibilitySelected(level === this.modelEffortForRow(option))
+            }, (level: string) => level)
+          }
+          if (option.supportsFastMode) {
+            Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.bolt')).fontSize(20).fontColor([$r('app.color.text_secondary')])
+              Text('快速模式').layoutWeight(1).fontSize(UI_FONT_LIST_TITLE).fontColor($r('app.color.text_primary'))
+              Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+                .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+            }.width('100%').constraintSize({ minHeight: 44 }).padding({ left: 16, right: 16, top: 4, bottom: 4 })
+          }
         }
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
       Column() {
-      Button('使用推荐设定').height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-        .onClick(() => {
-          void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option),
-            this.currentAgentTab()));
-        })
-      Divider().color($r('app.color.border')).margin({ top: 4, bottom: 8 })
-      Text('恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。').fontSize(uiFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
-      Text('目前设定').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-      Column() {
-      Row({ space: 8 }) {
-      SymbolGlyph($r('sys.symbol.star')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
-      Column() {
-      Button(modelFavoriteMutation(option, this.composerAgentKind(), this.modelEffortForRow(option), this.modelFastForRow(option),
-        this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定')
-        .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-        .enabled(this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId)
-        .onClick(() => { void this.togglePickerFavorite(option); })
-      Text(modelAgentLabel(this.composerAgentKind()) + ' · ' + this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option)) + (this.modelFastForRow(option) ? ' · Fast' : ''))
-        .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-      }.alignItems(HorizontalAlign.Start)
-      }.width('100%')
-      Divider().color($r('app.color.border')).margin({ top: 8, bottom: 8 })
-      Text('储存这组参数，方便下次从收藏清单直接使用。').fontSize(uiFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
-      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+        UiCard({ inset: 0 }) {
+          UiListRow({ label: '使用推荐设定',
+            detail: '恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。',
+            onRowClick: () => { void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option), this.currentAgentTab())); } })
+        }
+      }.width('100%').borderRadius(UI_RADIUS_CARD).border({ width: 1, color: $r('app.color.border') })
+      UiListGroup({ heading: '目前设定' }) {
+        Row() {
+          SymbolGlyph($r('sys.symbol.star')).fontSize(20).fontColor([$r('app.color.text_secondary')])
+          UiListRow({
+            label: modelFavoriteMutation(option, this.composerAgentKind(), this.modelEffortForRow(option), this.modelFastForRow(option),
+              this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定',
+            detail: modelAgentLabel(this.composerAgentKind()) + ' · ' + this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option)) + (this.modelFastForRow(option) ? ' · Fast' : ''),
+            rowEnabled: this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId,
+            onRowClick: () => { void this.togglePickerFavorite(option); }
+          }).layoutWeight(1)
+        }.width('100%').padding({ left: 16 })
+        Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+        Text('储存这组参数，方便下次从收藏清单直接使用。')
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).padding(16)
+      }
     }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
   }
 
@@ -11439,15 +11368,13 @@ export struct TaskPageContent {
   @Builder
   collapsedPlainUserMessage(item: RenderMessageItem) {
     Text(item.body)
-      .fontSize(uiFontSize(17))
-      .lineHeight(uiLineHeight(26))
+      .fontSize(UI_FONT_BODY)
       .copyOption(CopyOptions.LocalDevice)
       .maxLines(this.collapsedMessageLines(item))
       .textOverflow({ overflow: TextOverflow.Ellipsis })
       .width('100%')
     Text('展开全文')
-      .fontSize(uiFontSize(12))
-      .lineHeight(uiLineHeight(18))
+      .fontSize(UI_FONT_ACTION_SMALL)
       .fontColor($r('app.color.accent'))
       .padding({ top: 4, bottom: 4 })
       .clickEffect(UI_CLICK_EFFECT)
@@ -11458,19 +11385,8 @@ export struct TaskPageContent {
   }
 
   @Builder
-  messageActionButton(symbol: Resource, action: () => void) {
-    Button() {
-      SymbolGlyph(symbol)
-        .fontSize(uiFontSize(14))
-        .fontColor([$r('app.color.chat_text_secondary')])
-    }
-    .type(ButtonType.Circle)
-    .width(32)
-    .height(32)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .onClick(action)
+  messageActionButton(symbol: Resource, label: string, action: () => void) {
+    UiIconButton({ glyph: symbol, label, onAction: action })
   }
 
   private findPresentationMessage(items: RenderItem[], key: string): RenderMessageItem | null {
@@ -11624,7 +11540,7 @@ export struct TaskPageContent {
         Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
           .fontSize(uiFontSize(12))
           .fontColor($r('app.color.chat_text_secondary'))
-        this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), () => this.copyMessage(item))
+        this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), '复制消息', () => this.copyMessage(item))
       }
     }
     .width('100%')
@@ -11832,38 +11748,38 @@ export struct TaskPageContent {
 
       // iOS 操作栏顺序：user 为时间→复制→分叉→更多，assistant 为复制→分叉→更多→时间→用量。
       if (!reserveSelectionSpace && this.hasMessageActions(item)) {
-        Row({ space: 2 }) {
+        Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center,
+          justifyContent: item.kind === 'user' ? FlexAlign.End : FlexAlign.Start,
+          space: { main: LengthMetrics.vp(2), cross: LengthMetrics.vp(2) } }) {
           if (item.kind === 'user') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(uiFontSize(12))
-              .lineHeight(uiLineHeight(24))
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ right: 2 })
           }
-          this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), () => this.copyMessage(item))
+          this.messageActionButton($r('sys.symbol.rectangle_on_rectangle'), '复制消息', () => this.copyMessage(item))
           if (this.canFork(item)) {
-            this.messageActionButton($r('sys.symbol.split'), () => this.confirmFork(item))
+            this.messageActionButton($r('sys.symbol.split'), '从此消息分支', () => this.confirmFork(item))
           }
           // 运行中编辑入口收进「…」菜单（点编辑不中断，发送时才中断）。
           if (!this.sessionStreaming && this.canEditMessage(item)) {
-            this.messageActionButton($r('sys.symbol.square_and_pencil'), () => this.beginMessageEdit(item))
+            this.messageActionButton($r('sys.symbol.square_and_pencil'), '编辑消息', () => this.beginMessageEdit(item))
           }
-          this.messageActionButton($r('sys.symbol.ellipsis_circle'), () => this.showMessageActions(item))
+          this.messageActionButton($r('sys.symbol.ellipsis_circle'), '更多消息操作', () => this.showMessageActions(item))
           if (item.kind === 'assistant') {
             Text(this.timeLabel(item.message !== undefined ? item.message.createdAt : ''))
-              .fontSize(uiFontSize(12))
-              .lineHeight(uiLineHeight(24))
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.chat_text_secondary'))
               .margin({ left: 2 })
             if (this.turnTokensLabel(item).length > 0) {
               Text(this.turnTokensLabel(item))
-                .fontSize(uiFontSize(12))
-                .lineHeight(uiLineHeight(24))
+                .fontSize(UI_FONT_CAPTION)
                 .fontColor($r('app.color.chat_text_secondary'))
             }
           }
         }
-        .height(32)
+        .width('100%')
+        .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
         .alignSelf(item.kind === 'user' ? ItemAlign.End : ItemAlign.Start)
       }
     }
@@ -12519,7 +12435,7 @@ export struct TaskPageContent {
 
   @Builder
   mdInlineContent(
-    tokens: InlineToken[], fontSize: number, lineHeight: number,
+    tokens: InlineToken[], fontSize: string,
     heading: boolean, secondary: boolean, constrainToParent: boolean = true,
   ) {
     Column({ space: 4 }) {
@@ -12528,7 +12444,7 @@ export struct TaskPageContent {
           this.mdInlineImage(group.image)
         } else {
           this.inlineTokensText(
-            group.tokens, fontSize, lineHeight, heading, secondary, constrainToParent)
+            group.tokens, fontSize, heading, secondary, constrainToParent)
         }
       }, (group: InlineTokenGroup) => `${group.key}`)
     }
@@ -12559,7 +12475,7 @@ export struct TaskPageContent {
           .width(14)
           .height(14)
         Text(token.value.length > 0 ? token.value : '图片')
-          .fontSize(uiFontSize(12))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -12668,8 +12584,7 @@ export struct TaskPageContent {
         this.selectableMarkdownTextBlock(block, index ?? 0)
       }, (block: MdSelectableTextBlock) => block.key)
     }
-    .fontSize(uiFontSize(17))
-    .lineHeight(uiLineHeight(26))
+    .fontSize(UI_FONT_BODY)
     .copyOption(selectable ? CopyOptions.LocalDevice : CopyOptions.None)
     .fontWeight(FontWeight.Regular)
     .fontColor($r('app.color.text_primary'))
@@ -12683,63 +12598,60 @@ export struct TaskPageContent {
   @Builder
   selectableMarkdownTextBlock(block: MdSelectableTextBlock, index: number) {
     if (index > 0) {
-      // 两个换行保留 Markdown 块间距，但把空白行压到 4vp，避免合并后正文突然变松。
+      // 两个换行保留 Markdown 块间距，但把空白行压到 4fp，避免合并后正文突然变松。
       Span('\n\n')
-        .fontSize(uiFontSize(4))
-        .lineHeight(uiLineHeight(4))
+        .fontSize('4fp').lineHeight('4fp')
     }
     if (block.type === 'list_item') {
       Span(block.checked >= 0
         ? (block.checked === 1 ? '☑ ' : '☐ ')
         : (block.ordered ? `${block.marker} ` : '• '))
-        .fontSize(uiFontSize(17))
-        .lineHeight(uiLineHeight(26))
+        .fontSize(UI_FONT_BODY)
         .fontWeight(FontWeight.Regular)
         .fontColor($r('app.color.text_secondary'))
     }
     this.selectableInlineTokenSpans(
       block.inlineTokens,
-      block.type === 'heading' ? (block.level <= 1 ? 20 : (block.level === 2 ? 18 : 17)) : 17,
-      block.type === 'heading' ? (block.level <= 2 ? 28 : 26) : 26,
+      block.type === 'heading' ? (block.level <= 1 ? UI_FONT_TITLE_S : UI_FONT_LIST_TITLE) : UI_FONT_BODY,
       block.type === 'heading',
     )
   }
 
   @Builder
   selectableInlineTokenSpans(
-    tokens: InlineToken[], fontSize: number, lineHeight: number, heading: boolean,
+    tokens: InlineToken[], fontSize: string, heading: boolean,
   ) {
     ForEach(this.sentInlineTokens(tokens), (t: InlineToken) => {
       if (t.kind === 'code') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontFamily('monospace').fontColor($r('app.color.code_text'))
           .textBackgroundStyle({ color: $r('app.color.bg_chip') })
       } else if (t.kind === 'strong') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
       } else if (t.kind === 'emphasis') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontStyle(FontStyle.Italic).fontColor($r('app.color.text_primary'))
       } else if (t.kind === 'strikethrough') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontColor($r('app.color.text_primary'))
           .decoration({ type: TextDecorationType.LineThrough })
       } else if (t.kind === 'math') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontFamily('serif').fontStyle(FontStyle.Italic)
           .fontColor($r('app.color.code_text'))
       } else if (t.kind === 'link' && parseSessionDeepLink(this.normalizedSessionLink(t.url)) !== null) {
         Span(this.sentInlineLinkLabel(t))
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontColor($r('app.color.text_primary'))
           .textBackgroundStyle({ color: $r('app.color.bg_chip') })
@@ -12747,7 +12659,7 @@ export struct TaskPageContent {
           .onClick(() => this.openUrl(this.normalizedSessionLink(t.url)))
       } else if (t.kind === 'link' && this.isLocalReference(t.url)) {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontFamily('monospace').fontColor($r('app.color.code_text'))
           .textBackgroundStyle({ color: $r('app.color.bg_chip') })
@@ -12760,14 +12672,14 @@ export struct TaskPageContent {
             uiMenuOptions((): void => { if (this.workdirChipMenu === t.seq) this.workdirChipMenu = -1; }))
       } else if (t.kind === 'link') {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontColor($r('app.color.text_primary'))
           .decoration({ type: TextDecorationType.Underline })
           .onClick(() => this.openUrl(t.url))
       } else {
         Span(t.value)
-          .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
+          .fontSize(fontSize)
           .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
           .fontColor($r('app.color.text_primary'))
       }
@@ -12779,18 +12691,17 @@ export struct TaskPageContent {
     if (b.type === 'heading') {
       this.mdInlineContent(
         b.inlineTokens,
-        b.level <= 1 ? 20 : (b.level === 2 ? 18 : 17),
-        b.level <= 2 ? 28 : 26,
+        b.level <= 1 ? UI_FONT_TITLE_S : UI_FONT_LIST_TITLE,
         true,
         false,
         constrainToParent,
       )
     } else if (b.type === 'paragraph') {
       if (this.hasImageToken(b.inlineTokens)) {
-        this.mdInlineContent(b.inlineTokens, 17, 26, false, false, constrainToParent)
+        this.mdInlineContent(b.inlineTokens, UI_FONT_BODY, false, false, constrainToParent)
       } else {
         // MessageRender 已预解析行内 token；流式刷新时不在 ArkUI Builder 内重复分词。
-        this.inlineTokensText(b.inlineTokens, 17, 26, false, false, constrainToParent)
+        this.inlineTokensText(b.inlineTokens, UI_FONT_BODY, false, false, constrainToParent)
       }
     } else if (b.type === 'list') {
       Column({ space: 2 }) {
@@ -12799,10 +12710,10 @@ export struct TaskPageContent {
             this.markdownListMarker(b, idx ?? 0)
             Column() {
               if (this.hasImageToken(b.itemTokens[idx ?? 0] ?? [])) {
-                this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false)
+                this.mdInlineContent(b.itemTokens[idx ?? 0] ?? [], UI_FONT_BODY, false, false)
               } else {
                 this.inlineTokensText(
-                  b.itemTokens[idx ?? 0] ?? [], 17, 26, false, false, true)
+                  b.itemTokens[idx ?? 0] ?? [], UI_FONT_BODY, false, false, true)
               }
             }
             // 正文只能占项目符号之后的剩余宽度；内部 Text 的 100% 以此为基准，
@@ -12820,14 +12731,14 @@ export struct TaskPageContent {
     } else if (b.type === 'quote') {
       if (this.hasImageToken(b.inlineTokens)) {
         Row() {
-          this.mdInlineContent(b.inlineTokens, 14, 22, false, true)
+          this.mdInlineContent(b.inlineTokens, UI_FONT_SECONDARY, false, true)
         }
         .width('100%')
         .padding({ left: 10 })
         .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
       } else {
         Row() {
-          this.inlineTokensText(b.inlineTokens, 14, 22, false, true, true)
+          this.inlineTokensText(b.inlineTokens, UI_FONT_SECONDARY, false, true, true)
         }
           .padding({ left: 10 })
           .border({ width: { left: 3 }, color: { left: $r('app.color.border') } })
@@ -12850,11 +12761,10 @@ export struct TaskPageContent {
     } else if (b.type === 'code') {
       Column({ space: 4 }) {
         Text(b.code)
-          .fontSize(uiFontSize(12))
+          .fontSize(UI_FONT_SECONDARY)
           .fontFamily('monospace')
           .copyOption(CopyOptions.LocalDevice)
           .fontColor($r('app.color.code_text'))
-          .lineHeight(uiLineHeight(18))
           .padding(10)
           .backgroundColor($r('app.color.bg_code'))
           .border({ width: 1, color: $r('app.color.border') })
@@ -12893,8 +12803,7 @@ export struct TaskPageContent {
     } else {
       Text(b.itemOrdered[index] === true
         ? (b.itemMarkers[index] ?? `${index + 1}.`) : '•')
-        .fontSize(uiFontSize(17))
-        .lineHeight(uiLineHeight(26))
+        .fontSize(UI_FONT_BODY)
         .fontColor($r('app.color.text_secondary'))
     }
   }
@@ -12906,7 +12815,7 @@ export struct TaskPageContent {
       Row({ space: 6 }) {
         SymbolGlyph($r('sys.symbol.doc_text'))
           .fontSize(uiFontSize(13)).fontColor([$r('app.color.text_secondary')])
-        Text(this.v12String('v135_mermaid_title')).fontSize(uiFontSize(12)).fontWeight(FontWeight.Medium)
+        Text(this.v12String('v135_mermaid_title')).fontSize(UI_FONT_CAPTION).fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary')).layoutWeight(1)
       }.width('100%')
       Stack() {
@@ -12969,16 +12878,16 @@ export struct TaskPageContent {
       Row({ space: 6 }) {
         SymbolGlyph($r('sys.symbol.doc_text'))
           .fontSize(uiFontSize(13)).fontColor([$r('app.color.text_secondary')])
-        Text(title).fontSize(uiFontSize(12)).fontWeight(FontWeight.Medium)
+        Text(title).fontSize(UI_FONT_CAPTION).fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary')).layoutWeight(1)
         Text(kind === 'html' ? '静态安全模式' : '源码')
           .fontSize(uiFontSize(10)).fontColor($r('app.color.text_tertiary'))
       }.width('100%')
       Text(source)
-        .fontSize(uiFontSize(kind === 'math' || kind === 'latex' || kind === 'tex' ? 14 : 12))
+        .fontSize(UI_FONT_SECONDARY)
         .fontFamily(kind === 'math' || kind === 'latex' || kind === 'tex' ? 'serif' : 'monospace')
         .copyOption(CopyOptions.LocalDevice)
-        .fontColor($r('app.color.code_text')).lineHeight(uiLineHeight(19))
+        .fontColor($r('app.color.code_text'))
         .maxLines(24).textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%').padding(10).backgroundColor($r('app.color.bg_code'))
         .borderRadius(UI_RADIUS_CONTROL)
@@ -13030,10 +12939,10 @@ export struct TaskPageContent {
           ForEach(this.tableColumnIndexes(b), (hIndex: number) => {
             Row() {
               if (this.hasImageToken(this.tableHeaderTokens(b, hIndex))) {
-                this.mdInlineContent(this.tableHeaderTokens(b, hIndex), 17, 26, false, false)
+                this.mdInlineContent(this.tableHeaderTokens(b, hIndex), UI_FONT_BODY, false, false)
               } else {
                 this.inlineTokensText(
-                  this.tableHeaderTokens(b, hIndex), 17, 26, false, false, true)
+                  this.tableHeaderTokens(b, hIndex), UI_FONT_BODY, false, false, true)
               }
             }
             .width(this.tableColumnWidths(b)[hIndex])
@@ -13054,11 +12963,11 @@ export struct TaskPageContent {
               Row() {
                 if (this.hasImageToken(this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex))) {
                   this.mdInlineContent(
-                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), 17, 26, false, false)
+                    this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex), UI_FONT_BODY, false, false)
                 } else {
                   this.inlineTokensText(
                     this.tableRowCellTokens(b, rowIndex ?? 0, cellIndex),
-                    17, 26, false, false, true)
+                    UI_FONT_BODY, false, false, true)
                 }
               }
               .width(this.tableColumnWidths(b)[cellIndex])
@@ -13101,7 +13010,7 @@ export struct TaskPageContent {
 
   @Builder
   inlineTokensText(
-    tokens: InlineToken[], fontSize: number, lineHeight: number,
+    tokens: InlineToken[], fontSize: string,
     heading: boolean, secondary: boolean, constrainToParent: boolean = false,
   ) {
     Text() {
@@ -13155,8 +13064,7 @@ export struct TaskPageContent {
         }
       }, (t: InlineToken) => `${t.seq}`)
     }
-    .fontSize(uiFontSize(fontSize))
-    .lineHeight(uiLineHeight(lineHeight))
+    .fontSize(fontSize)
     .copyOption(CopyOptions.LocalDevice)
     .fontWeight(heading ? FontWeight.Medium : FontWeight.Regular)
     .fontColor(secondary ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
@@ -15756,6 +15664,10 @@ export struct OrcaTaskDetail {
     }, (): void => { this.workerWheelPosition = index; });
   }
 
+  private workerTabHeight(): number {
+    return Math.max(44, Math.ceil(22 * getSystemFontSizeScale() + 12));
+  }
+
   @Builder
   workerTabButton(worker: OrcaWorker, index: number, slot: WorkerWheelSlot, active: boolean) {
     Stack() {
@@ -15767,13 +15679,13 @@ export struct OrcaTaskDetail {
           .layoutWeight(1)
           .margin({ left: 6 * slot.focus, right: 4 * slot.focus })
           .opacity(Math.min(1, slot.focus * 4))
-          .fontSize(uiFontSize(13))
+          .fontSize(UI_FONT_SECONDARY)
           .fontWeight(FontWeight.Medium)
           .fontColor(active ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
       }
       .padding({ left: 4, right: 4 })
       .width('100%')
-      .height(32)
+      .constraintSize({ minHeight: 32, maxHeight: this.workerTabHeight() })
       .backgroundColor(active ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
       .border({ width: active ? 0 : 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_PILL)
@@ -15782,7 +15694,7 @@ export struct OrcaTaskDetail {
       .opacity(active ? 1 : (0.5 + 0.5 * slot.focus) * (worker.reachable ? 1 : 0.5))
     }
     .width(slot.chipWidth)
-    .height(44)
+    .height(this.workerTabHeight())
     .position({ x: slot.centerX - slot.chipWidth / 2, y: 0 })
     .clickEffect(UI_CLICK_EFFECT)
     .hitTestBehavior(slot.centerX + slot.chipWidth / 2 <= 0 || slot.centerX - slot.chipWidth / 2 >= this.workerTabsWidth
@@ -15805,7 +15717,7 @@ export struct OrcaTaskDetail {
       }
     }
     .layoutWeight(1)
-    .height(44)
+    .height(this.workerTabHeight())
     .clip(true)
     .onAreaChange((_old: Area, area: Area) => {
       const width = Number(area.width);
@@ -15844,32 +15756,15 @@ export struct OrcaTaskDetail {
   collabBar() {
     Row({ space: 4 }) {
       if (!this.sideBySide()) {
-        Button({ type: ButtonType.Circle, stateEffect: true }) {
-          SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .width(44)
-        .height(44)
-        .backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText(this.label('v138_return_to_lead'))
-        .onClick(() => { this.returnToLead(); })
+        UiIconButton({ glyph: $r('sys.symbol.chevron_left'), label: this.label('v138_return_to_lead'),
+          onAction: () => this.returnToLead() })
       } else {
-        Button() {
-          SymbolGlyph(this.workerExpanded ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
-            : $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
-            .fontSize(uiFontSize(20))
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(44)
-        .height(44)
-        .padding(0)
-        .backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText(this.label(this.workerExpanded ? 'v138_collapse' : 'v138_expand'))
-        .onClick(() => this.toggleExpanded())
+        UiIconButton({
+          glyph: this.workerExpanded ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
+            : $r('sys.symbol.arrow_up_left_and_arrow_down_right'),
+          label: this.label(this.workerExpanded ? 'v138_collapse' : 'v138_expand'),
+          onAction: () => this.toggleExpanded()
+        })
       }
       // 标签填充按钮之后的剩余宽度，由标签自身的 onAreaChange 实测。
       if (this.workers.length > 0) {
@@ -15879,24 +15774,24 @@ export struct OrcaTaskDetail {
       }
     }
     .width('100%')
-    .height(44)
+    .height(this.workerTabHeight())
     .padding({ left: this.sideBySide() ? 8 : 4, right: 4 })
   }
 
   @Builder
   workerPaneEmpty() {
-    Column({ space: 8 }) {
-      Text(this.loadState === 'ready' ? this.label('v138_workers_empty') : this.summary())
-        .fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
-        .textAlign(TextAlign.Center)
-      if (this.loadState === 'error') {
-        this.workerPaneButton(this.label('v138_workers_retry'), () => void this.refreshWorkers())
+    Column() {
+      if (this.loadState === 'ready') {
+        UiEmptyState({ heading: this.label('v138_workers_empty'), actionLabel: this.label('v138_return_to_lead'),
+          onAction: (): void => { this.returnToLead(); } })
+      } else if (this.loadState === 'error') {
+        UiInlineError({ message: this.summary(), actionLabel: this.label('v138_workers_retry'),
+          onAction: (): void => { void this.refreshWorkers(); } })
+      } else {
+        Text(this.summary()).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
+          .textAlign(TextAlign.Center)
       }
-    }
-    .width('100%')
-    .layoutWeight(1)
-    .justifyContent(FlexAlign.Center)
-    .padding(12)
+    }.width('100%').layoutWeight(1).justifyContent(FlexAlign.Center)
   }
 
   build() {

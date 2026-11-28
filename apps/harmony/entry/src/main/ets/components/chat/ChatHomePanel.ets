@@ -1,3 +1,6 @@
+import { UiPanelHeading } from '../common/UiNavigation';
+import { UiListRow } from '../common/UiList';
+import { UiInlineError } from '../common/UiStatus';
 import { uiToast } from '../common/UiOverlay';
 import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { ChatHomeAuthIdentity, captureChatHomeAccount } from '../../core/chat/ChatHomeAccount';
@@ -255,9 +258,9 @@ export struct ChatHomePanel {
   headerBar(title:string,onBack:()=>void,backEnabled:boolean,showCreate:boolean){
     Row(){
       ChatIconButton({symbol:$r('sys.symbol.chevron_left'),label:chatStrings(this.locale).back,enable:backEnabled,onTap:onBack})
-      Text(title).fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
+      Column() { UiPanelHeading({ heading: title }) }.layoutWeight(1)
       if(showCreate){ChatIconButton({symbol:$r('sys.symbol.plus'),label:homeLabels(this.locale).create,enable:!!this.selectedDevice&&this.resourceInvoke!==null,onTap:():void=>{this.showCreate();}})}
-    }.width('100%').height(56).padding({left:4,right:8}).alignItems(VerticalAlign.Center)
+    }.width('100%').padding({left:4,right:8}).alignItems(VerticalAlign.Center)
   }
   /** Cloud / computer switch; handed to ChatWorkspace so it shares one row with refresh and join. */
   @Builder
@@ -298,7 +301,7 @@ export struct ChatHomePanel {
           ChatIconButton({symbol:$r('sys.symbol.arrow_clockwise'),label:chatStrings(this.locale).refresh,onTap:():void=>{if(!this.directory){this.hostSource='';this.sourceChanged();}this.directory?.refresh();}})
         }.width('100%').alignItems(VerticalAlign.Center).padding({left:16,right:8})
       }
-      if(this.error){Text(chatErrorText(this.locale,this.error)).fontSize(13).fontColor($r('app.color.danger')).width('100%').padding({left:16,right:16,top:4,bottom:4})}
+      if(this.error){UiInlineError({ message: chatErrorText(this.locale,this.error) })}
       if(!this.ready){LoadingProgress().width(32).height(32)}
       else if(this.mode==='invite'){
         ChatInvitePanel({store:this.services?.invitation??null,initialInput:this.initialInvitation,locale:this.locale,
@@ -311,10 +314,10 @@ export struct ChatHomePanel {
         ChatGroupCreatePanel({adapter:this.adapter,actors:this.cloudStore?.actors??[],locale:this.locale,onCreated:(id:string,_device:string):void=>{this.openHost(id);},onReviewUnknown:():void=>{this.showHostList();}}).layoutWeight(1)
       }else if(this.mode==='host-list'){
         if(this.version>=0&&this.directory?.loading){LoadingProgress().width(32).height(32)}
-        if(this.version>=0&&this.directory?.error){Text(chatErrorText(this.locale,this.directory.error)).fontSize(13).fontColor($r('app.color.danger')).width('100%').padding({left:16,right:16,top:4,bottom:4})}
+        if(this.version>=0&&this.directory?.error){UiInlineError({ message: chatErrorText(this.locale,this.directory.error) })}
         Refresh({ refreshing: this.pullRefreshing }) {
         List(){
-          ForEach(this.version>=0?this.directory?.items??[]:[],(item:ResourceItem)=>{ListItem(){Column({space:2}){Text(item.title).fontSize(16).lineHeight(22).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis});Text(item.preview||item.subtitle).fontSize(13).lineHeight(18).fontColor($r('app.color.text_secondary')).maxLines(2).textOverflow({overflow:TextOverflow.Ellipsis})}.width('100%').alignItems(HorizontalAlign.Start).padding({left:16,right:16,top:10,bottom:10}).constraintSize({minHeight:68}).justifyContent(FlexAlign.Center).onClick(():void=>{this.openHost(item.ref.id);})}},(item:ResourceItem):string=>item.ref.id)
+          ForEach(this.version>=0?this.directory?.items??[]:[],(item:ResourceItem)=>{ListItem(){UiListRow({ label: item.title, detail: item.preview || item.subtitle, showChevron: true, onRowClick: (): void => { void this.openHost(item.ref.id); } })}},(item:ResourceItem):string=>item.ref.id)
           if(this.directory?.nextCursor){ListItem(){Row(){ChatTextButton({label:chatStrings(this.locale).older,onTap:():void=>{this.directory?.refresh(true);}})}.width('100%').justifyContent(FlexAlign.Center)}}
         }.width('100%').layoutWeight(1).scrollBar(BarState.Off).divider({strokeWidth:0.5,color:$r('app.color.border'),startMargin:16,endMargin:16})
         }

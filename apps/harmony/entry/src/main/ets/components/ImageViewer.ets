@@ -1,4 +1,7 @@
-import { UI_ICON_CLICK_EFFECT, UI_RADIUS_PILL, uiAnimateFastState, uiFontSize } from './UiKit';
+import { LengthMetrics } from '@kit.ArkUI';
+import { UiIconButton } from './common/UiActions';
+import { uiAccessibleString } from './common/UiAccessibility';
+import { UI_FONT_ACTION_SMALL, UI_RADIUS_CAPSULE, UI_SPACE_GROUP, UI_SPACE_INLINE, UI_SPACE_PAGE, UI_TOUCH_TARGET_MIN, getSystemFontSizeScale, uiAnimateFastState } from './UiKit';
 
 const MAX_ZOOM: number = 4;
 const DOUBLE_TAP_ZOOM: number = 2.5;
@@ -173,14 +176,24 @@ export struct ImageViewer {
 
   @Builder
   galleryButton(previous: boolean) {
-    Button(previous ? $r('app.string.image_viewer_previous') : $r('app.string.image_viewer_next'))
-      .fontSize(uiFontSize(14))
-      .fontColor($r('app.color.chat_overlay_text'))
-      .backgroundColor($r('app.color.chat_overlay_surface'))
-      .height(44)
-      .padding({ left: 14, right: 14 })
-      .borderRadius(UI_RADIUS_PILL)
-      .onClick((): void => this.onStep(previous ? -1 : 1))
+    if (getSystemFontSizeScale() >= 1.3) {
+      UiIconButton({
+        glyph: previous ? $r('sys.symbol.chevron_left') : $r('sys.symbol.chevron_right'),
+        label: uiAccessibleString(this.getUIContext(),
+          previous ? $r('app.string.image_viewer_previous') : $r('app.string.image_viewer_next')),
+        iconRole: 'onMedia',
+        onAction: () => this.onStep(previous ? -1 : 1),
+      }).backgroundColor($r('app.color.chat_overlay_surface')).borderRadius(UI_RADIUS_CAPSULE)
+    } else {
+      Button(previous ? $r('app.string.image_viewer_previous') : $r('app.string.image_viewer_next'))
+        .fontSize(UI_FONT_ACTION_SMALL)
+        .fontColor($r('app.color.chat_overlay_text'))
+        .backgroundColor($r('app.color.chat_overlay_surface'))
+        .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN, minWidth: UI_TOUCH_TARGET_MIN })
+        .padding({ left: UI_SPACE_GROUP, right: UI_SPACE_GROUP })
+        .borderRadius(UI_RADIUS_CAPSULE)
+        .onClick((): void => this.onStep(previous ? -1 : 1))
+    }
   }
 
   build() {
@@ -191,38 +204,32 @@ export struct ImageViewer {
         .hitTestBehavior(HitTestMode.None)
       this.imageCanvas()
       if (this.chromeVisible) {
-        Button() {
-          Stack() {
-            Circle().width(40).height(40).fill($r('app.color.chat_overlay_surface'))
-            SymbolGlyph($r('sys.symbol.xmark'))
-              .fontSize(uiFontSize(20))
-              .fontColor([$r('app.color.chat_overlay_text')])
-          }
-          .width(44).height(44)
-        }
-        .type(ButtonType.Circle)
-        .width(44).height(44).padding(0)
-        .backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText($r('app.string.v131_close'))
-        .position({ left: 12, top: 12 })
-        .onClick((): void => this.onClose())
+        UiIconButton({
+          glyph: $r('sys.symbol.xmark'),
+          label: uiAccessibleString(this.getUIContext(), $r('app.string.v131_close')),
+          iconRole: 'onMedia',
+          onAction: () => this.onClose(),
+        })
+          .backgroundColor($r('app.color.chat_overlay_surface'))
+          .borderRadius(UI_RADIUS_CAPSULE)
+          .position({ left: UI_SPACE_GROUP, top: UI_SPACE_GROUP })
 
         if (this.imageCount > 1) {
-          Row({ space: 8 }) {
+          Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center, alignItems: ItemAlign.Center,
+            space: { main: LengthMetrics.vp(UI_SPACE_INLINE), cross: LengthMetrics.vp(UI_SPACE_INLINE) } }) {
             this.galleryButton(true)
             Text(`${this.imageIndex + 1} / ${this.imageCount}`)
-              .fontSize(uiFontSize(14)).fontFamily('monospace')
+              .fontSize(UI_FONT_ACTION_SMALL).fontFamily('monospace')
               .fontColor($r('app.color.chat_overlay_text'))
               .backgroundColor($r('app.color.chat_overlay_surface'))
-              .height(40).padding({ left: 12, right: 12 })
-              .borderRadius(UI_RADIUS_PILL)
+              .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN }).padding({ left: UI_SPACE_GROUP, right: UI_SPACE_GROUP })
+              .borderRadius(UI_RADIUS_CAPSULE).textAlign(TextAlign.Center)
             this.galleryButton(false)
           }
           .width('100%')
-          .justifyContent(FlexAlign.Center)
+          .padding({ left: UI_SPACE_INLINE, right: UI_SPACE_INLINE })
           .hitTestBehavior(HitTestMode.Transparent)
-          .position({ left: 0, bottom: 16 })
+          .position({ left: 0, bottom: UI_SPACE_PAGE })
         }
       }
     }

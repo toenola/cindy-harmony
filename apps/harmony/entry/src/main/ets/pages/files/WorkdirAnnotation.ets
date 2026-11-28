@@ -1,3 +1,5 @@
+import { UiActionButton, UiActionKind } from '../../components/common/UiActions';
+import { UiInlineError } from '../../components/common/UiStatus';
 import { LengthMetricsUnit } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 
@@ -112,17 +114,17 @@ export struct WorkdirAnnotation {
           })
           .onTouch((event: TouchEvent): void => this.touch(event))
       }.width('100%').layoutWeight(1)
-      if (this.error) { Text(this.error).fontColor($r('app.color.text_secondary')) }
-      Row({ space: 8 }) {
-        Button('取消').height(44).onClick((): void => this.cancel())
-        Button('撤销').height(44).enabled(!this.busy && this.hasInk).onClick((): void => {
+      if (this.error) { UiInlineError({ message: this.error }) }
+      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center }) {
+        UiActionButton({ label: '取消', onAction: () => this.cancel() })
+        UiActionButton({ label: '撤销', actionEnabled: !this.busy && this.hasInk, onAction: (): void => {
           this.strokes.pop();
           this.hasInk = this.strokes.length > 0;
           this.redraw();
-        })
-        Button(this.busy ? '正在合成…' : '添加到任务').height(44).enabled(!this.busy && this.hasInk)
-          .onClick((): void => { void this.finish(); })
-      }.width('100%').justifyContent(FlexAlign.Center)
+        } })
+        UiActionButton({ label: this.busy ? '正在合成…' : '添加到任务', kind: UiActionKind.Primary,
+          actionEnabled: !this.busy && this.hasInk, onAction: () => void this.finish() })
+      }.width('100%')
     }.width('100%').height('100%')
   }
 }

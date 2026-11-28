@@ -1,5 +1,7 @@
-import { ComposeListItem, ContentItem, OperationType, OperateItem, SubHeader } from '@kit.ArkUI';
-import { UI_FONT_CAPTION, UI_RADIUS_CARD, UI_SPACE_INLINE, UI_SPACE_PAGE } from '../UiKit';
+import { OperationType, SubHeader } from '@kit.ArkUI';
+import { UI_FONT_CAPTION, UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_ICON_SIZE_COMPACT, UI_RADIUS_CARD,
+  UI_RADIUS_CONTROL, UI_SPACE_INLINE, UI_SPACE_PAGE, UI_SPACE_TIGHT, UI_TOUCH_TARGET_MIN } from '../UiKit';
+import { uiAccessibleString } from './UiAccessibility';
 
 @Component
 export struct UiCard {
@@ -21,7 +23,7 @@ export struct UiCard {
   }
 }
 
-/** Native row content. Put it in ListItem at a List/ListItemGroup call site, or in a settings card. */
+/** A single native Button owns an actionable row; its content slots never receive separate focus. */
 @Component
 export struct UiListRow {
   @Require @Prop label: ResourceStr = '';
@@ -29,27 +31,79 @@ export struct UiListRow {
   @Prop detail?: ResourceStr;
   @Prop showChevron: boolean = false;
   @Prop rowEnabled: boolean = true;
+  /** Optional localized status and specific action hint. The Button supplies the generic activation hint. */
+  @Prop status?: ResourceStr;
+  @Prop actionHint?: ResourceStr;
   onRowClick?: () => void;
 
-  private nativeContent(): ContentItem {
-    return { primaryText: this.label, secondaryText: this.detail };
+  private spokenLabel(): string {
+    const context = this.getUIContext();
+    return [this.label, this.value, this.detail, this.status]
+      .map((entry: ResourceStr | undefined): string => uiAccessibleString(context, entry))
+      .filter((entry: string): boolean => entry.length > 0)
+      .join(' · ');
   }
 
-  private nativeOperation(): OperateItem {
-    return {
-      text: this.value,
-      arrow: this.showChevron ? { value: $r('sys.media.ohos_ic_public_arrow_right') } : undefined,
-    };
+  @Builder
+  private rowContent() {
+    Row({ space: UI_SPACE_INLINE }) {
+      Column({ space: UI_SPACE_TIGHT }) {
+        Text(this.label)
+          .fontSize(UI_FONT_LIST_TITLE).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.detail !== undefined) {
+          Text(this.detail)
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
+            .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      if (this.value !== undefined) {
+        Text(this.value)
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
+          .constraintSize({ maxWidth: '45%' })
+          .textAlign(TextAlign.End).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      if (this.showChevron) {
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(UI_ICON_SIZE_COMPACT).fontColor([$r('app.color.text_secondary')])
+          .flexShrink(0)
+      }
+    }
+    .width('100%')
+    .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+    .padding({ left: UI_SPACE_PAGE, right: UI_SPACE_PAGE, top: UI_SPACE_INLINE, bottom: UI_SPACE_INLINE })
+    .focusable(false)
+    .accessibilityLevel('no-hide-descendants')
   }
 
   build() {
     if (this.onRowClick !== undefined) {
-      ComposeListItem({ contentItem: this.nativeContent(), operateItem: this.nativeOperation() })
-        .enabled(this.rowEnabled)
-        .focusable(true)
-        .onClick(() => this.onRowClick?.())
+      Button() {
+        this.rowContent()
+      }
+      .type(ButtonType.Normal)
+      .buttonStyle(ButtonStyleMode.TEXTUAL)
+      .backgroundColor(Color.Transparent)
+      .borderRadius(UI_RADIUS_CONTROL)
+      .width('100%')
+      .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+      .padding(0)
+      .enabled(this.rowEnabled)
+      .accessibilityLevel('yes')
+      .accessibilityText(this.spokenLabel())
+      .accessibilityDescription(uiAccessibleString(this.getUIContext(), this.actionHint))
+      .onClick(() => { if (this.rowEnabled) this.onRowClick?.(); })
     } else {
-      ComposeListItem({ contentItem: this.nativeContent(), operateItem: this.nativeOperation() })
+      Column() {
+        this.rowContent()
+      }
+      .width('100%')
+      .focusable(false)
+      .accessibilityLevel('yes')
+      .accessibilityText(this.spokenLabel())
     }
   }
 }

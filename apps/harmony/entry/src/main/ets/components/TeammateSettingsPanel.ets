@@ -1,8 +1,12 @@
+import { UiCard, UiListRow } from './common/UiList';
+import { UiActionButton, UiActionKind, UiIconButton } from './common/UiActions';
+import { UiPanelHeading } from './common/UiNavigation';
+import { UiInlineError } from './common/UiStatus';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { AppServices } from '../core/AppServices';
 import { TeammateSettingForm } from '../core/tasks/TeammateRoster';
 import { readStr } from '../core/tasks/TaskModels';
-import { UI_LIST_CLICK_EFFECT, UI_RADIUS_CONTAINER, UI_RADIUS_CONTROL, UI_RADIUS_PILL, uiFontSize } from './UiKit';
+import { UI_RADIUS_CONTAINER, UI_RADIUS_CONTROL, uiFontSize } from './UiKit';
 
 @Component
 export struct TeammateSettingsPanel {
@@ -133,48 +137,32 @@ export struct TeammateSettingsPanel {
   }
 
   @Builder
-  menuItem(id: string, title: string, icon: Resource, value: string) {
-    Button() {
-      Row({ space: 10 }) {
-        SymbolGlyph(icon).width(24).fontSize(uiFontSize(17)).fontColor([$r('app.color.text_secondary')])
-        Text(title).fontSize(uiFontSize(15)).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          .textAlign(TextAlign.Start)
-        if (value.length > 0) {
-          Text(value).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-            .constraintSize({ maxWidth: '50%' }).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-        SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(12).fontColor([$r('app.color.text_secondary')])
-      }.width('100%')
-    }
-    .type(ButtonType.Normal).constraintSize({ minHeight: 48 }).width('100%')
-    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-    .backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_LIST_CLICK_EFFECT)
-    .enabled(!this.busy && !this.deviceDisabled && !this.error)
-    .onClick(() => { this.saved = false; this.selectPage(id); })
+  menuItem(id: string, title: string, value: string) {
+    UiListRow({ label: title, value: value || undefined, showChevron: true,
+      rowEnabled: !this.busy && !this.deviceDisabled && !this.error,
+      onRowClick: () => { this.saved = false; this.selectPage(id); } })
   }
 
   @Builder
   settingsList() {
-    Column() {
+    UiCard({ inset: 0 }) {
       if (this.forms.has('profile')) {
-        this.menuItem('profile', this.label('v138_profile'), $r('sys.symbol.person_head_on_circle'),
+        this.menuItem('profile', this.label('v138_profile'),
           readStr(this.forms.get('profile')?.values, 'name'))
       }
       if (this.forms.has('memory')) {
         if (this.forms.has('profile')) {
           this.divider(46)
         }
-        this.menuItem('memory', this.label('v138_memory'), $r('sys.symbol.AI_memory'), '')
+        this.menuItem('memory', this.label('v138_memory'), '')
       }
       if (this.forms.has('models')) {
         if (this.forms.has('profile') || this.forms.has('memory')) {
           this.divider(46)
         }
-        this.menuItem('models', this.label('v138_models'), $r('sys.symbol.slider_horizontal_2'), this.modelPreview())
+        this.menuItem('models', this.label('v138_models'), this.modelPreview())
       }
     }
-    .width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTAINER).clip(true)
   }
 
   @Builder
@@ -206,14 +194,13 @@ export struct TeammateSettingsPanel {
 
   @Builder
   pageHeader() {
-    Row({ space: 8 }) {
-      Button() {
-        SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(16).fontColor([$r('app.color.text_primary')])
-      }.type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor($r('app.color.bg_page'))
-        .accessibilityText(this.label('v138_settings_back')).enabled(!this.busy)
-        .onClick(() => { this.saved = false; this.selectPage(''); })
-      Text(this.label(this.page === 'profile' ? 'v138_profile' : this.page === 'models' ? 'v138_models' : 'v138_memory'))
-        .fontSize(uiFontSize(16)).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+    Row({ space: 4 }) {
+      UiIconButton({ glyph: $r('sys.symbol.chevron_left'), label: this.label('v138_settings_back'),
+        actionEnabled: !this.busy, onAction: () => { this.saved = false; this.selectPage(''); } })
+      Column() {
+        UiPanelHeading({ heading: this.label(this.page === 'profile' ? 'v138_profile'
+          : this.page === 'models' ? 'v138_models' : 'v138_memory') })
+      }.layoutWeight(1)
     }.width('100%')
   }
 
@@ -250,14 +237,13 @@ export struct TeammateSettingsPanel {
         if (this.busy) {
           LoadingProgress().width(24).height(24).color($r('app.color.accent')).accessibilityText(this.label('v138_sync_settings'))
         } else if (this.error) {
-          Text(this.error).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-          Button(this.label('v138_refresh_settings')).height(44)
-            .backgroundColor($r('app.color.bg_chip')).fontColor($r('app.color.text_primary'))
-            .enabled(!this.deviceDisabled).onClick(() => void this.load())
+          UiInlineError({ message: this.error })
+          UiActionButton({ label: this.label('v138_refresh_settings'),
+            actionEnabled: !this.deviceDisabled, onAction: () => void this.load() })
         } else if (this.page) {
-          Button(this.saved ? this.label('v138_saved') : this.label('v138_save')).width('100%').height(50)
-            .borderRadius(UI_RADIUS_PILL).backgroundColor($r('app.color.chat_cta')).fontColor($r('app.color.chat_cta_text'))
-            .opacity(this.canSave() ? 1 : 0.45).enabled(this.canSave()).onClick(() => void this.save())
+          UiActionButton({ label: this.saved ? this.label('v138_saved') : this.label('v138_save'),
+            kind: UiActionKind.Primary, actionEnabled: this.canSave(),
+            onAction: () => void this.save() }).width('100%')
         }
       }.width('100%').alignItems(HorizontalAlign.Start)
     }

@@ -822,6 +822,11 @@
     {"name": "home_companion_compact", "value": "收起为紧凑模式"},
     {"name": "home_companion_show_all", "value": "显示全部 %d"},
     {"name": "home_companion_show_less", "value": "收起列表"},
-    {"name": "composer_picker_permission", "value": "权限"}
+    {"name": "composer_picker_permission", "value": "权限"},
+    {"name": "home_task_split_resize", "value": "调整任务列表宽度"},
+    {"name": "home_task_split_narrow", "value": "缩窄任务列表"},
+    {"name": "home_task_split_widen", "value": "加宽任务列表"},
+    {"name": "home_list_more", "value": "更多操作"},
+    {"name": "home_list_settings", "value": "设置"}
   ]
 }

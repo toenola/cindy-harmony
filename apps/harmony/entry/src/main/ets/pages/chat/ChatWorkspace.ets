@@ -1,3 +1,5 @@
+import { UiPanelHeading } from '../../components/common/UiNavigation';
+import { UiInlineError } from '../../components/common/UiStatus';
 import { uiToast } from '../../components/common/UiOverlay';
 import { ChatInvitationStore } from '../../core/chat/ChatInvitationStore';
 import { ChatInvitePanel } from '../../components/chat/ChatInvitePanel';
@@ -136,17 +138,22 @@ export struct ChatWorkspace {
         // Conversation header: one row, icon actions on the right.
         Row() {
           ChatIconButton({ symbol: $r('sys.symbol.chevron_left'), label: chatStrings(this.locale).back, onTap: this.onBack })
-          Text(this.store.page.snapshot.room.name).fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+          Column() { UiPanelHeading({ heading: this.store.page.snapshot.room.name }) }.layoutWeight(1)
           ChatIconButton({ symbol: $r('sys.symbol.arrow_clockwise'), label: chatStrings(this.locale).refresh, onTap: (): void => { this.refreshNow(); } })
           if (this.store.page.snapshot.room.kind === 'group') {
             ChatIconButton({ symbol: $r('sys.symbol.gearshape'), label: chatStrings(this.locale).settings, onTap: (): void => { if (this.store) this.onSettings(this.store); } })
+
+          }
+        }.width('100%').alignItems(VerticalAlign.Center)
+        if (this.store.page.snapshot.room.kind === 'group') {
+          Flex({ wrap: FlexWrap.Wrap }) {
             ChatTextButton({ label: chatActionStrings(this.locale).topics, onTap: (): void => { this.menu = this.menu === 'topics' ? '' : 'topics'; this.run(async (): Promise<void> => { await this.store?.loadTopics(); }); } })
             if (this.store.capability('personalMentionHistory') && this.store.capability('personalMask')) {
               ChatTextButton({ label: chatActionStrings(this.locale).mentions, onTap: (): void => { this.menu = 'mentions'; this.run(async (): Promise<void> => { await this.store?.loadMentions(); }); } })
             }
-          }
-        }.width('100%').alignItems(VerticalAlign.Center)
+          }.width('100%').padding({ left: 16, right: 16 })
+        }
+
       } else {
         // Conversation list header: the parent supplies the leading switch; refresh / join stay as quiet icon actions.
         Row() {
@@ -157,7 +164,7 @@ export struct ChatWorkspace {
           }
         }.width('100%').alignItems(VerticalAlign.Center).padding({ left: 16, right: 8 })
       }
-      if (this.error || this.store?.error) { Text(chatErrorText(this.locale, this.error || this.store?.error || '')).fontColor($r('app.color.danger')).fontSize(13).width('100%').padding({ left: 16, right: 16 }) }
+      if (this.error || this.store?.error) { UiInlineError({ message: chatErrorText(this.locale, this.error || this.store?.error || '') }) }
       if (this.version >= 0 && this.store?.loading) { LoadingProgress().width(32).height(32) }
       if (this.version >= 0 && this.store?.page) {
         if (this.store.page.verified === false) { Text(chatActionStrings(this.locale).offline).fontColor($r('app.color.warn')) }
@@ -243,7 +250,7 @@ export struct ChatWorkspace {
             uncertainLabel:chatStrings(this.locale).unknown,onJoined:(id:string):void=>{this.run(async():Promise<void>=>{await this.store?.loadConversations();await this.store?.open(id);this.menu='';});}})
         }
         Refresh({ refreshing: this.pullRefreshing }) {
-        ChatConversationList({ localCompanions: this.localCompanions, onLocalCompanion: this.onLocalCompanion, deviceName: this.deviceName, summaries: this.store?.summaries ?? [],
+        ChatConversationList({ showEmpty: this.store !== null && !this.store?.loading && !this.error && !this.store?.error, localCompanions: this.localCompanions, onLocalCompanion: this.onLocalCompanion, deviceName: this.deviceName, summaries: this.store?.summaries ?? [],
           onVisibleGroups: (ids: string[]): void => { this.run(async (): Promise<void> => { await this.store?.loadSummaries(ids); }); }, rooms: (this.store?.rooms ?? []).slice(), actors: this.store?.me?.capabilities?.['companionHome'] === true ? this.store.actors : [], labels: chatStrings(this.locale),
           onOpenCompanion: (actor: ChatActor): void => { if (this.onCompanion) this.onCompanion(actor); else this.run(async (): Promise<void> => { await this.store?.openCompanion(actor); }); },
           onOpenGroup: (id: string): void => { this.run(async (): Promise<void> => { await this.store?.open(id); }); },

@@ -418,6 +418,11 @@
     {"name": "home_companion_compact", "value": "收合為緊湊模式"},
     {"name": "home_companion_show_all", "value": "顯示全部 %d"},
     {"name": "home_companion_show_less", "value": "收合清單"},
-    {"name": "composer_picker_permission", "value": "權限"}
+    {"name": "composer_picker_permission", "value": "權限"},
+    {"name": "home_task_split_resize", "value": "調整任務清單寬度"},
+    {"name": "home_task_split_narrow", "value": "縮窄任務清單"},
+    {"name": "home_task_split_widen", "value": "加寬任務清單"},
+    {"name": "home_list_more", "value": "更多操作"},
+    {"name": "home_list_settings", "value": "設定"}
   ]
 }

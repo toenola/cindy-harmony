@@ -1,6 +1,9 @@
+import { UI_FONT_BODY } from '../components/UiKit';
+import { UiListGroup, UiListRow } from '../components/common/UiList';
+import { UiActionButton, UiActionKind, UiIconButton } from '../components/common/UiActions';
+import { UiPanelHeading } from '../components/common/UiNavigation';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { PromptRecommendationSettings } from '../components/PromptRecommendationPanel';
-import { HarmonySettingsGroup, HarmonySettingsRow } from '../components/SettingsRows';
 import { RelaySettingsPanel } from '../components/RelaySettingsPanel';
 /**
  * 设置页：按 Mobile 的信息架构呈现账号、版本、通知、设备、调试与法律信息。
@@ -515,30 +518,12 @@ struct SettingsPage {
 
   @Builder
   private pageHeader(title: string, onBack: () => void) {
-    Row({ space: 8 }) {
-      Button() {
-        Text('‹')
-          .fontSize(uiFontSize(24))
-          .fontColor($r('app.color.text_primary'))
-      }
-      .type(ButtonType.Circle)
-      .width(40)
-      .height(40)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .stateStyles({
-        pressed: { opacity: 0.6 },
-      })
-      .onClick(onBack)
-      Text(title)
-        .fontSize(uiFontSize(20))
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .layoutWeight(1)
+    Row({ space: 4 }) {
+      UiIconButton({ glyph: $r('sys.symbol.chevron_left'), label: '返回', onAction: onBack })
+      Column() { UiPanelHeading({ heading: title }) }.layoutWeight(1)
     }
     .width('100%')
-    .height(56)
-    .padding({ left: 12, right: 16 })
+    .padding({ left: 8, right: 16 })
   }
 
   @Builder
@@ -607,8 +592,8 @@ struct SettingsPage {
 
             PromptRecommendationSettings()
 
-            HarmonySettingsGroup({ title: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared') }) {
-              HarmonySettingsRow({ label: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared'),
+            UiListGroup({ heading: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared') }) {
+              UiListRow({ label: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared'),
                 showChevron: true, onRowClick: (): void => {
                   AppServices.instance.openSharedManagement();
                   try { router.back({ url: 'pages/TaskListPage' }); }
@@ -616,19 +601,19 @@ struct SettingsPage {
                 } })
             }
 
-            HarmonySettingsGroup({ title: '版本' }) {
-              HarmonySettingsRow({ label: '当前版本', value: `整包版本 ${AppConfig.appVersion}` })
+            UiListGroup({ heading: '版本' }) {
+              UiListRow({ label: '当前版本', value: `整包版本 ${AppConfig.appVersion}` })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: '运行来源',
                 value: '随整包',
                 detail: '鸿蒙版本通过应用安装包更新；当前不使用 Mobile 的 OTA 热更新。',
               })
               this.settingsDivider()
-              HarmonySettingsRow({ label: 'Beta 测试渠道', value: '当前版本不支持' })
+              UiListRow({ label: 'Beta 测试渠道', value: '当前版本不支持' })
             }
 
-            HarmonySettingsGroup({ title: '通知' }) {
+            UiListGroup({ heading: '通知' }) {
               HarmonySettingsSwitchRow({
                 label: '任务完成通知',
                 detail: '电脑上的任务完成、出错或需要你回复时，推送到这台手机。',
@@ -687,8 +672,8 @@ struct SettingsPage {
               }
             }
 
-            HarmonySettingsGroup({ title: '语音词典', footer: this.voiceStatus() }) {
-              HarmonySettingsRow({
+            UiListGroup({ heading: '语音词典', footer: this.voiceStatus() }) {
+              UiListRow({
                 label: '查看词典',
                 value: `${this.voiceEntries().length} 个词条`,
                 showChevron: true,
@@ -696,8 +681,8 @@ struct SettingsPage {
               })
             }
 
-            HarmonySettingsGroup({ title: '语言', footer: '仅影响应用界面。Agent 回复语言由 Agent 自身决定。' }) {
-              HarmonySettingsRow({
+            UiListGroup({ heading: '语言', footer: '仅影响应用界面。Agent 回复语言由 Agent 自身决定。' }) {
+              UiListRow({
                 label: '语言',
                 value: '简体中文',
                 showChevron: true,
@@ -705,8 +690,8 @@ struct SettingsPage {
               })
             }
 
-            HarmonySettingsGroup({ title: '关于这台手机' }) {
-              HarmonySettingsRow({
+            UiListGroup({ heading: '关于这台手机' }) {
+              UiListRow({
                 label: '设备名称',
                 value: this.deviceName(),
                 detail: '电脑端授权列表会显示这个名称。',
@@ -714,66 +699,66 @@ struct SettingsPage {
                 onRowClick: () => this.openRename(),
               })
               this.settingsDivider()
-              HarmonySettingsRow({ label: '平台', value: 'HarmonyOS' })
+              UiListRow({ label: '平台', value: 'HarmonyOS' })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: '被控权限',
                 value: '电脑端管理',
                 detail: '手机只作为控制端。允许被控、撤销和恢复权限仍在电脑端设置里完成。',
               })
             }
 
-            HarmonySettingsGroup({
-              title: '调试 / 开发者',
-              collapsible: true,
+            UiListGroup({
+              heading: '调试 / 开发者',
+              toggleLabel: this.debugExpanded ? '收起' : '展开',
               expanded: this.debugExpanded,
               onToggle: () => this.debugExpanded = !this.debugExpanded,
             }) {
-              HarmonySettingsRow({
+              UiListRow({
                 label: '用户 ID',
                 value: this.accountUserId(),
                 showChevron: false,
                 onRowClick: () => this.copyText(this.accountUserId()),
               })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: '设备 ID',
                 value: this.deviceId.length > 0 ? this.deviceId : '初始化中',
                 showChevron: false,
                 onRowClick: () => this.copyText(this.deviceId),
               })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: 'Auth Server',
                 value: AppConfig.authApiBaseUrl,
                 showChevron: false,
                 onRowClick: () => this.copyText(AppConfig.authApiBaseUrl),
               })
               this.settingsDivider()
-              HarmonySettingsRow({ label: '登录区域', value: AppConfig.region === 'global' ? 'Global' : 'CN' })
+              UiListRow({ label: '登录区域', value: AppConfig.region === 'global' ? 'Global' : 'CN' })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: 'Device Link',
                 value: this.relayLabel(),
                 detail: this.relayDetail(),
               })
             }
 
-            HarmonySettingsGroup({ title: '备案信息' }) {
-              HarmonySettingsRow({
+            UiListGroup({ heading: '备案信息' }) {
+              UiListRow({
                 label: '使用统计',
                 value: '当前未启用',
                 detail: '鸿蒙版当前未接入统计 SDK，不会上报使用统计。',
               })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: '隐私政策',
                 value: '查看',
                 showChevron: true,
                 onRowClick: () => this.openExternal(this.privacyPolicyUrl()),
               })
               this.settingsDivider()
-              HarmonySettingsRow({
+              UiListRow({
                 label: '用户协议',
                 value: '查看',
                 showChevron: true,
@@ -781,11 +766,11 @@ struct SettingsPage {
               })
               if (AppConfig.region !== 'global') {
                 this.settingsDivider()
-                HarmonySettingsRow({ label: 'App 备案号', value: '沪ICP备11033765号-89A' })
+                UiListRow({ label: 'App 备案号', value: '沪ICP备11033765号-89A' })
               }
               if (this.deletionAvailable) {
                 this.settingsDivider()
-                HarmonySettingsRow({
+                UiListRow({
                   label: '注销账号',
                   value: '继续',
                   showChevron: true,
@@ -801,14 +786,7 @@ struct SettingsPage {
                 .fontColor($r('app.color.text_secondary'))
                 .width('100%')
                 .padding({ left: 12, right: 12 })
-              Button(this.loggingOut ? '退出中' : '退出登录')
-                .width('100%')
-                .height(48)
-                .fontSize(uiFontSize(15))
-                .fontColor($r('app.color.chat_cta_text'))
-                .backgroundColor($r('app.color.danger'))
-                .enabled(!this.loggingOut)
-                .onClick(() => this.logout())
+              UiActionButton({ label: this.loggingOut ? '退出中' : '退出登录', kind: UiActionKind.Danger, actionEnabled: !this.loggingOut, onAction: () => this.logout() }).width('100%')
             }
           }
           .width('100%')
@@ -831,12 +809,12 @@ struct SettingsPage {
   @Builder
   private languageSheet() {
     Column() {
-      HarmonySettingsRow({
+      UiListRow({
         label: '跟随系统',
         value: '当前不支持',
         onRowClick: () => this.selectLanguage('system'),
       })
-      HarmonySettingsRow({ label: '简体中文', value: '已选择' })
+      UiListRow({ label: '简体中文', value: '已选择' })
     }
     .width('100%')
     .padding({ bottom: 16 })
@@ -999,7 +977,7 @@ struct SettingsPage {
               .fontColor($r('app.color.text_secondary'))
               .padding(16)
           } else if (!this.deletionAvailable) {
-            HarmonySettingsGroup({ title: '当前无法进行此操作' }) {
+            UiListGroup({ heading: '当前无法进行此操作' }) {
               Text('请返回设置页稍后重试。')
                 .fontSize(uiFontSize(13))
                 .fontColor($r('app.color.text_secondary'))
@@ -1007,7 +985,7 @@ struct SettingsPage {
                 .padding(16)
             }
           } else if (this.deletionChallenge !== null) {
-            HarmonySettingsGroup({ title: '验证账号所有权' }) {
+            UiListGroup({ heading: '验证账号所有权' }) {
               Text(`验证码已发送至 ${this.deletionChallenge.maskedTarget}，10 分钟内有效。`)
                 .fontSize(uiFontSize(13))
                 .fontColor($r('app.color.text_secondary'))
@@ -1046,26 +1024,10 @@ struct SettingsPage {
             .width('100%')
             .padding({ left: 16, right: 16 })
             .onClick(() => this.deletionAcknowledged = !this.deletionAcknowledged)
-            Button(this.deletionBusy ? '确认中' : '确认注销账号')
-              .width('calc(100% - 32vp)')
-              .height(48)
-              .margin({ left: 16, right: 16, top: 12 })
-              .fontSize(uiFontSize(15))
-              .fontColor($r('app.color.chat_cta_text'))
-              .backgroundColor($r('app.color.danger'))
-              .enabled(!this.deletionBusy && this.deletionCode.length === 6 && this.deletionAcknowledged)
-              .onClick(() => void this.confirmDeletion())
-            Button('重新发送验证码')
-              .width('calc(100% - 32vp)')
-              .height(40)
-              .margin({ left: 16, right: 16 })
-              .fontSize(uiFontSize(13))
-              .fontColor($r('app.color.text_primary'))
-              .backgroundColor($r('app.color.bg_chip'))
-              .enabled(!this.deletionBusy)
-              .onClick(() => void this.requestDeletionChallenge())
+            UiActionButton({ label: this.deletionBusy ? '确认中' : '确认注销账号', kind: UiActionKind.Danger, actionEnabled: !this.deletionBusy && this.deletionCode.length === 6 && this.deletionAcknowledged, onAction: () => void this.confirmDeletion() }).margin({ left: 16, top: 12 })
+            UiActionButton({ label: '重新发送验证码', actionEnabled: !this.deletionBusy, onAction: () => void this.requestDeletionChallenge() }).margin({ left: 16 })
           } else {
-            HarmonySettingsGroup({ title: '注销前请确认' }) {
+            UiListGroup({ heading: '注销前请确认' }) {
               Text('确认后，这台手机立即退出；其他客户端会在登录状态失效后退出。')
                 .fontSize(uiFontSize(13))
                 .fontColor($r('app.color.text_secondary'))
@@ -1095,15 +1057,7 @@ struct SettingsPage {
               .fontColor($r('app.color.text_tertiary'))
               .width('100%')
               .padding({ left: 16, right: 16 })
-            Button(this.deletionBusy ? '发送中' : '发送验证码')
-              .width('calc(100% - 32vp)')
-              .height(48)
-              .margin({ left: 16, right: 16 })
-              .fontSize(uiFontSize(15))
-              .fontColor($r('app.color.chat_cta_text'))
-              .backgroundColor($r('app.color.danger'))
-              .enabled(!this.deletionBusy)
-              .onClick(() => void this.requestDeletionChallenge())
+            UiActionButton({ label: this.deletionBusy ? '发送中' : '发送验证码', kind: UiActionKind.Primary, actionEnabled: !this.deletionBusy, onAction: () => void this.requestDeletionChallenge() }).margin({ left: 16 })
           }
           if (this.deletionError.length > 0) {
             Text(this.deletionError)
@@ -1155,19 +1109,9 @@ struct HarmonySettingsSwitchRow {
       Column({ space: 3 }) {
         Row({ space: 4 }) {
           Text(this.label)
-            .fontSize(uiFontSize(14))
-            .fontColor($r('app.color.text_secondary'))
-          Button() {
-            SymbolGlyph($r('sys.symbol.info_circle'))
-              .fontSize(uiFontSize(15))
-              .fontColor([$r('app.color.text_secondary')])
-          }
-          .type(ButtonType.Circle)
-          .width(28)
-          .height(28)
-          .padding(0)
-          .backgroundColor(Color.Transparent)
-          .onClick(() => this.onInfo())
+            .fontSize(UI_FONT_BODY).layoutWeight(1)
+            .fontColor($r('app.color.text_primary'))
+          UiIconButton({ glyph: $r('sys.symbol.info_circle'), label: this.label, onAction: this.onInfo })
         }
         if (this.detail.length > 0) {
           Text(this.detail)
@@ -1186,7 +1130,7 @@ struct HarmonySettingsSwitchRow {
         .onChange((enabled: boolean) => this.onChange(enabled))
     }
     .width('100%')
-    .height(this.detail.length > 0 ? 68 : 52)
+    .constraintSize({ minHeight: 52 })
     .padding({ left: 16, right: 12, top: 10, bottom: 10 })
   }
 }

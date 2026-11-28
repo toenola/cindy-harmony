@@ -1,3 +1,5 @@
+import { SPLIT_HANDLE_THRESHOLD_VP } from '../components/common/SplitHandleInteraction';
+
 /**
  * 任务页宽屏双栏布局的纯计算。
  *
@@ -65,12 +67,14 @@ export function isWideTaskLayout(
   safeWidth: number,
   safeHeight: number,
   multiWindow: boolean = false,
+  widthBreakpoint?: WidthBreakpoint,
 ): boolean {
   return !multiWindow
     && Number.isFinite(viewportWidth)
     && Number.isFinite(safeWidth)
     && Number.isFinite(safeHeight)
-    && viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH
+    && (widthBreakpoint === undefined ? viewportWidth >= WIDE_TASK_LAYOUT_MIN_WIDTH
+      : widthBreakpoint >= WidthBreakpoint.WIDTH_MD)
     && safeWidth >= WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH
     && safeHeight >= WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT;
 }
@@ -130,7 +134,6 @@ export function taskSplitWidthForDrag(
 }
 
 export type TaskSplitDragTarget = 'none' | 'detail' | 'list';
-const TASK_SPLIT_EDGE_THRESHOLD = 44;
 
 export class TaskSplitDrag {
   width: number = 0;
@@ -147,8 +150,8 @@ export function taskSplitDrag(viewportWidth: number, startWidth: number, deltaX:
   const maximum = taskListPaneWidth(viewportWidth, TASK_SPLIT_MAX_LIST_WIDTH);
   const overshoot = raw < minimum ? raw - minimum : (raw > maximum ? raw - maximum : 0);
   result.overrun = overshoot;
-  if (overshoot <= -TASK_SPLIT_EDGE_THRESHOLD) result.target = 'detail';
-  if (overshoot >= TASK_SPLIT_EDGE_THRESHOLD) result.target = 'list';
+  if (overshoot <= -SPLIT_HANDLE_THRESHOLD_VP) result.target = 'detail';
+  if (overshoot >= SPLIT_HANDLE_THRESHOLD_VP) result.target = 'list';
   return result;
 }
 

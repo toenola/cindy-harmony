@@ -1,5 +1,8 @@
 import { CompanionStrip, readCompanionCompact, writeCompanionCompact } from '../components/companions/CompanionStrip';
-import { SplitHandle } from '../components/common/SplitHandle';
+import { UiSplitHandle } from '../components/common/SplitHandle';
+import { UiActionButton, UiActionKind, UiIconButton } from '../components/common/UiActions';
+import { UiPanelHeading } from '../components/common/UiNavigation';
+import { UiEmptyState } from '../components/common/UiStatus';
 import { requestProjectSettingsClose } from '../components/projects/ProjectSettingsPanel';
 import { WorkdirBrowser, workdirBrowserSheetOptions } from './files/WorkdirBrowser';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -29,6 +32,7 @@ import { deviceDisplayName } from '../core/tasks/DeviceDisplayName';
  */
 
 import {
+  display,
   KeyboardAvoidMode,
   LengthMetrics,
   router,
@@ -94,12 +98,13 @@ import {
   isWideTaskLayout,
   TaskSafeWindowSize,
   TASK_SPLIT_DIVIDER_WIDTH,
+  TASK_SPLIT_MAX_LIST_WIDTH,
   taskDetailKeyboardInset,
   taskDetailPaneWidth,
   taskListPaneWidth,
   taskSplitDrag,
 } from './TaskSplitLayout';
-import { readTaskWindowMetrics } from './TaskWindowMetrics';
+import { readTaskWindowMetrics, TaskWindowMetrics } from './TaskWindowMetrics';
 import {
   compareTaskListLabels,
   compareTaskSessionsForList,
@@ -120,7 +125,12 @@ import {
   taskVisibleInTaskList,
 } from './TaskListPresentation';
 import {
-  UI_ICON_CLICK_EFFECT,
+  UI_FONT_ACTION_SMALL,
+  UI_FONT_CAPTION,
+  UI_FONT_LIST_TITLE,
+  UI_FONT_SECONDARY,
+  UI_FONT_TITLE_S,
+  UI_TOUCH_TARGET_MIN,
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_FAST,
@@ -223,6 +233,7 @@ struct TaskListPage {
   @State taskSearchProjectKeys: string[] = [];
   @State refreshing: boolean = false;
   @State sessionActionBusy: boolean = false;
+  @State private bulkMoreOpen: boolean = false;
   @State bulkMode: boolean = false;
   @State selectedEntryKeys: string[] = [];
   // 置顶和单个项目组每次打开应用默认收起；手动展开状态只在本页面存活期间保留。
@@ -265,6 +276,10 @@ struct TaskListPage {
   @State now: number = Date.now();
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
+  @State private viewportOriginX: number = 0;
+  @State private viewportOriginY: number = 0;
+  @State private windowWidthBreakpoint: WidthBreakpoint = WidthBreakpoint.WIDTH_XS;
+  @State private windowMetrics: TaskWindowMetrics = new TaskWindowMetrics();
   @State safeWindowWidth: number = 0;
   @State safeWindowHeight: number = 0;
   /** 窗口避让区读取失败；为 true 时分栏退回按页面尺寸判断。 */
@@ -278,9 +293,13 @@ struct TaskListPage {
    * 退出双栏即恢复展开；与列表宽度一样不写入偏好（D-015）。
    */
   @State private listPaneFullscreen: boolean = false;
+  @State private compactDetailOpen: boolean = false;
+  private splitHandleFocused: boolean = false;
+  @State private dividerPreviewWidth: number = 0;
   @State private dividerOverrun: number = 0;
   @State listPaneCollapsed: boolean = false;
   @State keyboardHeight: number = 0;
+  @State private listSearchFocused: boolean = false;
 
   private routeParamsInitialized: boolean = false;
   private unsubs: Array<() => void> = [];
@@ -299,10 +318,9 @@ struct TaskListPage {
   private projectDragStartIndex: number = -1;
   private projectDragStartOrder: string[] = [];
   private projectDragMoved: boolean = false;
-  private dividerTouchId: number = -1;
-  private dividerTouchStartX: number = 0;
+  @State private wideLayout: boolean = false;
+  private dividerDragging: boolean = false;
   private dividerTouchStartWidth: number = 0;
-  private singlePaneNavigationPending: boolean = false;
   private pageActive: boolean = false;
   /** 页面重进后，旧的刷新/任务操作 Promise 不能再改写新页面状态。 */
   private pageLifecycleGeneration: number = 0;
@@ -313,6 +331,14 @@ struct TaskListPage {
   private keyboardWindow: window.Window | null = null;
   private keyboardHeightListening: boolean = false;
   private avoidAreaListening: boolean = false;
+  private foldStatusListening: boolean = false;
+  private foldStatusListener: (status: display.FoldStatus) => void =
+    (_status: display.FoldStatus): void => {
+      const wasSplit = this.splitLayoutEnabled();
+      this.resetDividerTouch();
+      this.refreshSafeWindowMetrics();
+      this.handleSplitLayoutChange(wasSplit);
+    };
   private avoidAreaListener: (options: window.AvoidAreaOptions) => void =
     (options: window.AvoidAreaOptions): void => {
       if (options.type === window.AvoidAreaType.TYPE_KEYBOARD) return;
@@ -346,12 +372,12 @@ struct TaskListPage {
   private floatingBarScrolling: boolean = false;
   private initialListTabIndex: number = 0;
   private residentAccountEpoch: number = -1;
+  private routeSelectionKey: string = '';
   private residentSessionStatuses: Map<string, string> = new Map();
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
     this.resetDisplayOrder();
     this.pageActive = true;
-    this.singlePaneNavigationPending = false;
     this.taskListReconcileGeneration += 1;
     this.residentAccountEpoch = AppServices.instance.auth.sessionEpoch;
     if (!this.routeParamsInitialized) {
@@ -361,14 +387,7 @@ struct TaskListPage {
       this.selectedSessionId = readStr(params, 'sessionId');
       this.routeParamsInitialized = true;
     }
-    const splitRouteSelection = consumeTaskSplitRouteSelection();
-    if (splitRouteSelection !== null) {
-      this.selectedDeviceId = splitRouteSelection.deviceId;
-      this.selectedSessionDeviceId = splitRouteSelection.deviceId;
-      this.selectedSessionId = splitRouteSelection.sessionId;
-      this.selectedMessageClientId = splitRouteSelection.messageClientId;
-      this.selectedMessageRevision += 1;
-    }
+    this.adoptSplitRouteSelection();
     this.hydratePreferences();
     this.initialListTabIndex = this.listTabIndex(this.activeListTab);
     this.connectionStatus = AppServices.instance.client.getStatus();
@@ -455,11 +474,35 @@ struct TaskListPage {
     }, TASK_LIST_RECONCILE_INTERVAL_MS);
   }
 
+  onPageShow(): void {
+    this.adoptSplitRouteSelection();
+  }
+
+  private adoptSplitRouteSelection(): void {
+    const selection = consumeTaskSplitRouteSelection();
+    if (selection === null || AppServices.instance.taskAccountTransition.active) return;
+    const session = AppServices.instance.tasks.getSessions(selection.deviceId)
+      .find((row: RemoteSession): boolean => row.id === selection.sessionId);
+    this.selectedDeviceId = selection.deviceId;
+    this.newSessionDraftOpen = false;
+    if (session !== undefined) this.setActiveListTab(taskListCategory(session));
+    // Window metrics can arrive after the returning route. Show the same resident
+    // task in the foreground until the window qualifies for a split.
+    this.compactDetailOpen = !this.splitLayoutEnabled();
+    this.setSelectedTask(selection.deviceId, selection.sessionId, selection.messageClientId);
+    this.routeSelectionKey = this.selectedTaskKey();
+    if (this.splitLayoutEnabled() && session?.orcaRole === 'lead' && this.detailPaneWidth() < ORCA_DETAIL_MIN_WIDTH) {
+      this.listPaneCollapsed = true;
+    }
+    this.updateKeyboardAvoidance();
+  }
+
   aboutToDisappear(): void {
     this.pageLifecycleGeneration += 1;
     this.pageActive = false;
     this.pluginIconTargets = '';
     this.pluginIconGeneration++;
+    this.compactDetailOpen = false;
     this.residentPanes = [];
     this.taskListReconcileGeneration += 1;
     this.cancelTaskSearch();
@@ -495,6 +538,7 @@ struct TaskListPage {
   }
 
   onBackPress(): boolean {
+    if (this.bulkMoreOpen) { this.bulkMoreOpen = false; return true; }
     if (this.moduleRequest !== null) {
       if (this.moduleRequest.kind === 'project' && requestProjectSettingsClose(this.closeHomeModule)) return true;
       this.closeHomeModule();
@@ -524,9 +568,10 @@ struct TaskListPage {
       this.toggleListPane();
       return true;
     }
-    if (this.splitLayoutEnabled()) {
+    if (this.splitLayoutEnabled() || this.compactDetailOpen) {
       const key = residentTaskPaneKey(this.residentAccountEpoch, this.selectedSessionDeviceId, this.selectedSessionId);
-      return this.residentBackHandlers.get(key)?.() ?? false;
+      if (this.residentBackHandlers.get(key)?.()) return true;
+      if (this.compactDetailOpen || this.listPaneCollapsed) { this.toggleListPane(); return true; }
     }
     return false;
   }
@@ -668,6 +713,10 @@ struct TaskListPage {
     if (AppServices.instance.taskAccountTransition.active) return;
     if (!this.splitLayoutEnabled()) return;
     if (this.newSessionDraftOpen) return;
+    if (this.routeSelectionKey.length > 0 && this.routeSelectionKey === this.selectedTaskKey()) {
+      this.rememberSelectedTask();
+      return;
+    }
     if (AppServices.instance.client.hasScopedPeer(this.selectedSessionDeviceId)) return;
     if (this.teammateSessionKeys.has(this.selectedTaskKey())) {
       this.rememberSelectedTask();
@@ -717,86 +766,64 @@ struct TaskListPage {
     const width = typeof widthValue === 'number' ? widthValue : 0;
     const height = typeof heightValue === 'number' ? heightValue : 0;
     if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
-    if (width === this.viewportWidth && height === this.viewportHeight) return;
+    const x = typeof newArea.globalPosition.x === 'number' ? newArea.globalPosition.x : 0;
+    const y = typeof newArea.globalPosition.y === 'number' ? newArea.globalPosition.y : 0;
+    if (width === this.viewportWidth && height === this.viewportHeight
+      && x === this.viewportOriginX && y === this.viewportOriginY) return;
+    if (width !== this.viewportWidth) this.resetDividerTouch();
     const wasSplit = this.splitLayoutEnabled();
     this.viewportWidth = width;
     this.viewportHeight = height;
+    this.viewportOriginX = x;
+    this.viewportOriginY = y;
     this.refreshSafeWindowMetrics();
     this.handleSplitLayoutChange(wasSplit);
   }
 
   private handleSplitLayoutChange(wasSplit: boolean): void {
-    const splitEnabled = this.splitLayoutEnabled();
+    const safe = this.safeWindowSize();
+    const allowance = wasSplit ? 0 : 12;
+    this.wideLayout = isWideTaskLayout(this.viewportWidth, safe.width, Math.max(0, safe.height - allowance),
+      this.safeWindowMultiWindow, this.windowWidthBreakpoint);
+    const splitEnabled = this.wideLayout;
     if (splitEnabled) this.ensureWideSelection();
     const wasListFullscreen = this.listPaneFullscreen;
+    const searchHadFocus = this.listSearchFocused;
     if (wasSplit && !splitEnabled) {
-      this.residentPanes = [];
-      this.listPaneCollapsed = false;
-      this.listPaneFullscreen = false;
+      // Keep the same detail instance across split/stack. No new route and no loss of
+      // per-task drafts, reader position, or in-memory collaboration state.
+      this.compactDetailOpen = !wasListFullscreen && this.selectedTaskKey().length > 0;
       this.resetDividerTouch();
-    }
-    if (wasSplit && !splitEnabled && !this.newSessionDraftOpen && !wasListFullscreen && !this.usageOpen) {
-      void this.openSelectedTaskAfterSplitExit();
+      if (this.splitHandleFocused || (searchHadFocus && this.compactDetailOpen)) this.restoreFocusAfterDivider();
+    } else if (splitEnabled && this.compactDetailOpen) {
+      this.compactDetailOpen = false;
     }
     this.updateKeyboardAvoidance();
   }
 
-  /** 折叠或横转竖退出双栏时，保持用户正在查看的任务详情，而不是退回列表。 */
-  private async openSelectedTaskAfterSplitExit(): Promise<void> {
-    if (this.singlePaneNavigationPending || this.newSessionDraftOpen) return;
-    const lifecycleGeneration = this.pageLifecycleGeneration;
-    if (!this.pageActive) return;
-    const deviceId = this.selectedSessionDeviceId;
-    const sessionId = this.selectedSessionId;
-    const messageClientId = this.selectedMessageClientId;
-    this.singlePaneNavigationPending = true;
-    try {
-      if (deviceId.length === 0 || sessionId.length === 0) return;
-      if (messageClientId.length > 0) {
-        await router.pushUrl({
-          url: 'pages/TaskPage',
-          params: {
-            deviceId: deviceId,
-            sessionId: sessionId,
-            message: messageClientId,
-          },
-        });
-      } else {
-        await router.pushUrl({
-          url: 'pages/TaskPage',
-          params: {
-            deviceId: deviceId,
-            sessionId: sessionId,
-          },
-        });
-      }
-    } finally {
-      if (lifecycleGeneration === this.pageLifecycleGeneration) {
-        this.singlePaneNavigationPending = false;
-      }
-    }
-  }
-
   private splitLayoutEnabled(): boolean {
-    const safe = this.safeWindowSize();
-    return isWideTaskLayout(this.viewportWidth, safe.width, safe.height, this.safeWindowMultiWindow);
+    return this.wideLayout;
   }
 
   private refreshSafeWindowMetrics(): void {
+    this.windowWidthBreakpoint = this.getUIContext().getWindowWidthBreakpoint();
     if (this.keyboardWindow === null) return;
     try {
       const metrics = readTaskWindowMetrics(this.keyboardWindow, (value: number): number =>
         this.getUIContext().px2vp(value));
+      this.windowMetrics = metrics;
       this.safeWindowWidth = metrics.safeWidth;
       this.safeWindowHeight = metrics.safeHeight;
       this.safeWindowMultiWindow = metrics.multiWindow;
       this.safeWindowMetricsUnavailable = false;
     } catch (_error) {
+      // Never substitute the ArkUI viewport height: OFFSET/IME can shrink it.
+      // With no valid sample, stay single-column until the window reports one.
       this.safeWindowMetricsUnavailable = true;
     }
   }
 
-  /** 读取窗口失败时退回页面尺寸判断分栏；状态翻转需按普通布局变化处理。 */
+  /** No valid window sample: stay single-column, independently of IME-driven viewport changes. */
   private markSafeWindowMetricsUnavailable(): void {
     if (this.safeWindowMetricsUnavailable) return;
     const wasSplit = this.splitLayoutEnabled();
@@ -805,8 +832,110 @@ struct TaskListPage {
   }
 
   private safeWindowSize(): TaskSafeWindowSize {
-    return effectiveTaskSafeWindow(this.viewportWidth, this.viewportHeight,
-      this.safeWindowWidth, this.safeWindowHeight, this.safeWindowMetricsUnavailable);
+    const availableWidth = this.naturalDivider()
+      ? this.viewportWidth - this.foregroundLeftInset() - this.foregroundRightInset()
+        - (this.windowMetrics.creaseRight - this.windowMetrics.creaseLeft)
+      : this.foregroundWidth();
+    const safe = effectiveTaskSafeWindow(availableWidth, this.viewportHeight,
+      this.safeWindowWidth, this.safeWindowHeight, false);
+    if (this.horizontalFoldRegionUsable()) {
+      const m = this.windowMetrics;
+      safe.height = Math.min(safe.height,
+        Math.max(0, m.creaseTop - m.topInset, m.windowHeight - m.bottomInset - m.creaseBottom));
+    }
+    return safe;
+  }
+
+  // Apply only the portion not already excluded by the ArkUI root.
+  private foregroundLeftInset(): number {
+    return Math.max(0, this.windowMetrics.leftInset - this.viewportOriginX);
+  }
+
+  private foregroundRightInset(): number {
+    if (this.windowMetrics.windowWidth <= 0) return 0;
+    const end = this.viewportOriginX + this.viewportWidth;
+    return Math.max(0, end - (this.windowMetrics.windowWidth - this.windowMetrics.rightInset));
+  }
+
+  private foregroundX(): number {
+    const left = this.foregroundLeftInset();
+    const right = this.viewportWidth - this.foregroundRightInset();
+    const m = this.windowMetrics;
+    if (m.creaseRight <= 0 || this.usesFoldGap()) return left;
+    if (this.naturalDivider() && this.splitLayoutEnabled()) {
+      return this.listPaneFullscreen ? left : Math.max(left, m.creaseRight - this.foregroundCoordinateOffsetX());
+    }
+    const creaseLeft = m.creaseLeft - this.foregroundCoordinateOffsetX();
+    const creaseRight = m.creaseRight - this.foregroundCoordinateOffsetX();
+    return creaseLeft - left >= right - creaseRight ? left : Math.max(left, creaseRight);
+  }
+
+  private foregroundWidth(): number {
+    const right = this.viewportWidth - this.foregroundRightInset();
+    const left = this.foregroundLeftInset();
+    const m = this.windowMetrics;
+    if (this.viewportWidth <= 0 || m.creaseRight <= 0 || this.usesFoldGap()) {
+      return Math.max(0, right - left);
+    }
+    const offset = this.foregroundCoordinateOffsetX();
+    const leading = Math.max(0, m.creaseLeft - offset - left);
+    const trailing = Math.max(0, right - m.creaseRight + offset);
+    if (this.naturalDivider() && this.splitLayoutEnabled()) return this.listPaneFullscreen ? leading : trailing;
+    return Math.max(leading, trailing);
+  }
+
+  private naturalDivider(): boolean {
+    const m = this.windowMetrics;
+    if (m.creaseRight <= 0 || m.creaseBottom > 0 || m.multiWindow
+      || this.windowWidthBreakpoint < WidthBreakpoint.WIDTH_MD) return false;
+    const offset = this.foregroundCoordinateOffsetX();
+    const leading = m.creaseLeft - offset - this.foregroundLeftInset();
+    const trailing = this.viewportWidth - this.foregroundRightInset() - m.creaseRight + offset;
+    return leading >= 300 && trailing >= 400 && leading + trailing >= 760 && m.safeHeight >= 480;
+  }
+
+  private foregroundCoordinateOffsetX(): number {
+    return this.viewportOriginX;
+  }
+
+  private usesFoldGap(): boolean {
+    return this.splitLayoutEnabled() && this.naturalDivider() && !this.listPaneFullscreen
+      && (!this.listPaneCollapsed || this.selectedTaskKey().length === 0
+        || this.usageOpen || this.newSessionDraftOpen || this.moduleRequest !== null);
+  }
+
+  private foldGapWidth(): number {
+    return this.usesFoldGap() && this.splitLayoutEnabled()
+      ? this.windowMetrics.creaseRight - this.windowMetrics.creaseLeft : 0;
+  }
+
+  private horizontalFoldRegionUsable(): boolean {
+    const m = this.windowMetrics;
+    return m.horizontalHover && m.creaseBottom > 0
+      && Math.max(m.creaseTop - m.topInset, m.windowHeight - m.bottomInset - m.creaseBottom) >= 280;
+  }
+
+  private hasForegroundCrease(): boolean {
+    return this.windowMetrics.creaseRight > 0 || this.horizontalFoldRegionUsable();
+  }
+
+  private foldUsesLowerRegion(): boolean {
+    const m = this.windowMetrics;
+    return m.windowHeight - m.bottomInset - m.creaseBottom > m.creaseTop - m.topInset;
+  }
+
+  private foregroundY(): number {
+    return this.horizontalFoldRegionUsable() && this.foldUsesLowerRegion()
+      ? Math.max(0, this.windowMetrics.creaseBottom - this.viewportOriginY) : 0;
+  }
+
+  private foregroundHeight(): number {
+    const m = this.windowMetrics;
+    if (!this.horizontalFoldRegionUsable()) return this.viewportHeight;
+    // Without a dedicated upper/lower interaction split, use one uninterrupted region.
+    const bottom = this.foldUsesLowerRegion() ? m.windowHeight - m.bottomInset : m.creaseTop;
+    return Math.max(0, Math.min(this.viewportHeight - this.foregroundY(),
+      bottom - this.viewportOriginY - this.foregroundY()));
   }
 
   private updateKeyboardAvoidance(): void {
@@ -844,6 +973,12 @@ struct TaskListPage {
       } catch (_error) {
         this.windowStatusListening = false;
       }
+      try {
+        display.on('foldStatusChange', this.foldStatusListener);
+        this.foldStatusListening = true;
+      } catch (_error) {
+        this.foldStatusListening = false;
+      }
       const wasSplit = this.splitLayoutEnabled();
       this.refreshSafeWindowMetrics();
       this.handleSplitLayoutChange(wasSplit);
@@ -865,6 +1000,10 @@ struct TaskListPage {
     } catch (_err) {
       // 页面退出时监听已被系统清理，不影响后续路由恢复默认避让。
     }
+    if (this.foldStatusListening) {
+      try { display.off('foldStatusChange', this.foldStatusListener); } catch (_error) {}
+      this.foldStatusListening = false;
+    }
     this.keyboardWindow = null;
     this.keyboardHeightListening = false;
     this.avoidAreaListening = false;
@@ -885,25 +1024,47 @@ struct TaskListPage {
   }
 
   private detailKeyboardInset(): number {
+    return this.isListSearchInputActive() ? 0 : this.splitKeyboardInset();
+  }
+
+  private isListSearchInputActive(): boolean {
+    return this.listSearchFocused && this.searchOpen && this.listPaneShown()
+      && !this.newSessionDraftOpen && this.moduleRequest === null && !this.usageOpen;
+  }
+
+  private listPaneHeight(): Length {
+    const inset = this.isListSearchInputActive() ? this.splitKeyboardInset() : 0;
+    return inset > 0 ? `calc(100% - ${inset}vp)` : '100%';
+  }
+
+  private splitKeyboardInset(): number {
     const safe = this.safeWindowSize();
-    return taskDetailKeyboardInset(this.viewportWidth, safe.width, safe.height, this.keyboardHeight,
+    return taskDetailKeyboardInset(this.viewportWidth, safe.width, safe.height, this.foregroundKeyboardInset(),
       this.safeWindowMultiWindow);
   }
 
+  private foregroundKeyboardInset(): number {
+    if (!this.horizontalFoldRegionUsable()) return this.keyboardHeight;
+    const foregroundEnd = this.viewportOriginY + this.foregroundY() + this.foregroundHeight();
+    return Math.max(0, this.keyboardHeight - Math.max(0, this.windowMetrics.windowHeight - foregroundEnd));
+  }
+
   private newSessionKeyboardInset(): number {
-    // 宽屏继续只抬右栏；窄屏草稿覆盖整页时直接消费实际键盘高度，
-    // 确保正文、工具栏和发送按钮作为完整 Composer 一起停在键盘上方。
-    return this.splitLayoutEnabled() ? this.detailKeyboardInset() : this.keyboardHeight;
+    return this.foregroundKeyboardInset();
   }
 
   private listPaneWidth(): number {
-    if (this.listPaneFullscreen && !this.newSessionDraftOpen) return this.viewportWidth;
-    return taskListPaneWidth(this.viewportWidth, this.requestedListPaneWidth);
+    if (this.listPaneFullscreen && !this.newSessionDraftOpen) return this.foregroundWidth();
+    if (this.usesFoldGap()) return this.windowMetrics.creaseLeft
+      - this.foregroundCoordinateOffsetX() - this.foregroundLeftInset();
+    return taskListPaneWidth(this.foregroundWidth(), this.dividerPreviewWidth || this.requestedListPaneWidth);
   }
 
   private detailPaneWidth(): number {
-    if (!this.listPaneShown() && !this.usageOpen) return this.viewportWidth;
-    return taskDetailPaneWidth(this.viewportWidth, this.requestedListPaneWidth);
+    if (!this.splitLayoutEnabled()) return this.foregroundWidth();
+    if (this.usesFoldGap()) return this.foregroundWidth() - this.listPaneWidth() - this.foldGapWidth();
+    if (!this.listPaneShown() && !this.usageOpen) return this.foregroundWidth();
+    return taskDetailPaneWidth(this.foregroundWidth(), this.dividerPreviewWidth || this.requestedListPaneWidth);
   }
 
   /**
@@ -911,12 +1072,19 @@ struct TaskListPage {
    * 用户会被困在没有任务列表的界面里。
    */
   private listPaneShown(): boolean {
-    return !this.splitLayoutEnabled() || !this.listPaneCollapsed
-      || this.selectedTaskKey().length === 0 || this.newSessionDraftOpen;
+    return !this.compactDetailOpen && (!this.splitLayoutEnabled() || !this.listPaneCollapsed
+      || this.selectedTaskKey().length === 0 || this.newSessionDraftOpen
+      || (this.naturalDivider() && this.moduleRequest !== null));
   }
 
   private toggleListPane(): void {
+    if (this.compactDetailOpen) {
+      this.compactDetailOpen = false;
+      this.restoreFocusAfterDivider();
+      return;
+    }
     if (!this.splitLayoutEnabled()) return;
+    const searchHadFocus = this.listSearchFocused;
     uiAnimateState(this.getUIContext(), () => {
       if (this.listPaneFullscreen) {
         this.listPaneFullscreen = false;
@@ -925,6 +1093,7 @@ struct TaskListPage {
         this.listPaneCollapsed = !this.listPaneCollapsed;
       }
     });
+    if (searchHadFocus && !this.listPaneShown()) this.restoreFocusAfterDivider();
   }
 
   private selectedTaskKey(): string {
@@ -933,7 +1102,7 @@ struct TaskListPage {
   }
 
   private rememberSelectedTask(): void {
-    if (AppServices.instance.taskAccountTransition.active || !this.splitLayoutEnabled()) return;
+    if (AppServices.instance.taskAccountTransition.active || (!this.splitLayoutEnabled() && !this.compactDetailOpen)) return;
     const key = residentTaskPaneKey(this.residentAccountEpoch, this.selectedSessionDeviceId, this.selectedSessionId);
     const last = this.residentPanes[this.residentPanes.length - 1];
     if (last !== undefined && last.key === key && last.messageClientId === this.selectedMessageClientId) return;
@@ -952,12 +1121,14 @@ struct TaskListPage {
     const epoch = AppServices.instance.auth.sessionEpoch;
     if (epoch === this.residentAccountEpoch) return;
     this.residentAccountEpoch = epoch;
+    this.routeSelectionKey = '';
     this.closeUsage();
     this.moduleRequest = null;
     this.teammateRoster = [];
     this.updateTeammateProjection(true);
     this.clearRosterTimers();
     if (this.pageActive) this.restoreTeammateView();
+    this.compactDetailOpen = false;
     this.residentPanes = [];
     this.residentSessionStatuses.clear();
     this.selectedSessionDeviceId = '';
@@ -976,6 +1147,7 @@ struct TaskListPage {
 
   private setSelectedTask(deviceId: string, sessionId: string, messageClientId: string): void {
     if (AppServices.instance.taskAccountTransition.active) return;
+    this.routeSelectionKey = '';
     this.listPaneFullscreen = false;
     this.closeUsage();
     this.moduleRequest = null;
@@ -1027,7 +1199,7 @@ struct TaskListPage {
     if (shared !== null) {
       this.moduleRequest = null; this.newSessionDraftOpen = false;
       this.setSelectedTask(shared.peer, shared.sessionId, '');
-      if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage', params: { deviceId: shared.peer, sessionId: shared.sessionId } });
+      this.showSelectedTask();
       return;
     }
     const invitation = AppServices.instance.consumeModuleInvitation();
@@ -1215,48 +1387,52 @@ struct TaskListPage {
   }
 
   private resetDividerTouch(): void {
-    this.dividerTouchId = -1;
+    this.dividerDragging = false;
     this.dividerOverrun = 0;
+    this.dividerPreviewWidth = 0;
   }
 
   private canDragTaskDivider(): boolean {
-    return this.splitLayoutEnabled() && !this.listPaneFullscreen && !this.newSessionDraftOpen &&
+    return this.splitLayoutEnabled() && !this.naturalDivider() && !this.listPaneFullscreen && !this.newSessionDraftOpen &&
       this.moduleRequest === null && (this.listPaneShown() || this.usageOpen);
   }
 
-  private handleDividerTouch(event: TouchEvent): void {
-    if (event.type === TouchType.Cancel || !this.canDragTaskDivider()) {
-      this.resetDividerTouch();
+  private handleDividerPan(deltaX: number, finished: boolean): void {
+    if (!this.dividerDragging) return;
+    if (!this.canDragTaskDivider()) { this.resetDividerTouch(); return; }
+    const drag = taskSplitDrag(this.foregroundWidth(), this.dividerTouchStartWidth, deltaX);
+    const canFocusDetail = this.selectedTaskKey().length > 0 && !this.usageOpen && !this.listPaneCollapsed;
+    const permitted = !this.usageOpen && (drag.overrun > 0 || canFocusDetail);
+    if (!finished) {
+      this.dividerPreviewWidth = drag.width;
+      this.dividerOverrun = permitted ? drag.overrun : 0;
       return;
     }
-    if (event.type === TouchType.Down && this.dividerTouchId < 0) {
-      const point = event.changedTouches[0];
-      if (!point) return;
-      this.dividerTouchId = point.id;
-      this.dividerTouchStartX = point.displayX;
-      this.dividerTouchStartWidth = this.listPaneWidth();
-      return;
-    }
-    const point = event.changedTouches.find((touch: TouchObject): boolean => touch.id === this.dividerTouchId);
-    if (!point || (event.type !== TouchType.Move && event.type !== TouchType.Up)) return;
-    const drag = taskSplitDrag(this.viewportWidth, this.dividerTouchStartWidth, point.displayX - this.dividerTouchStartX);
-    this.requestedListPaneWidth = drag.width;
-    const canFocusDetail = this.selectedTaskKey().length > 0 && !this.usageOpen
-      && !this.listPaneCollapsed;
-    const target = this.usageOpen || (drag.target === 'detail' && !canFocusDetail) ? 'none' : drag.target;
-    if (event.type === TouchType.Move) {
-      this.dividerOverrun = !this.usageOpen && (canFocusDetail || drag.overrun > 0) ?
-        drag.overrun : 0;
-      return;
+    if (drag.target === 'none' && (drag.overrun === 0 || permitted)) {
+      this.requestedListPaneWidth = drag.width;
     }
     this.resetDividerTouch();
-    if (target === 'detail') this.toggleListPane();
-    if (target === 'list') {
-      uiAnimateState(this.getUIContext(), () => {
-        this.listPaneFullscreen = true;
-        this.listPaneCollapsed = false;
-      });
-    }
+    if (!permitted) return;
+    if (drag.target === 'detail') this.toggleListPane();
+    if (drag.target === 'list') this.focusListPane();
+  }
+
+  private restoreFocusAfterDivider(): void {
+    setTimeout((): void => {
+      if (this.pageActive && !this.newSessionDraftOpen && this.moduleRequest === null && !this.usageOpen) {
+        this.getUIContext().getFocusController().requestFocus(
+          this.listPaneShown() ? 'home-task-scope' : 'home-task-detail');
+      }
+    }, 0);
+  }
+
+  private focusListPane(): void {
+    if (!this.canDragTaskDivider() || this.usageOpen) return;
+    uiAnimateState(this.getUIContext(), () => {
+      this.listPaneFullscreen = true;
+      this.listPaneCollapsed = false;
+    });
+    if (this.splitHandleFocused) this.restoreFocusAfterDivider();
   }
 
   private deviceCanOpen(device: PresenceSnapshot): boolean {
@@ -1269,16 +1445,25 @@ struct TaskListPage {
       return;
     }
     this.selectSession(entry);
+    this.showSelectedTask(entry.session.orcaRole === 'lead');
+  }
+
+  private showSelectedTask(isLead: boolean = false): void {
+    if (AppServices.instance.taskAccountTransition.active || this.selectedTaskKey().length === 0) return;
     if (this.splitLayoutEnabled()) {
-      if (entry.session.orcaRole === 'lead' && this.detailPaneWidth() < ORCA_DETAIL_MIN_WIDTH) {
-        this.listPaneCollapsed = true;
-      }
+      if (isLead && this.detailPaneWidth() < ORCA_DETAIL_MIN_WIDTH) this.listPaneCollapsed = true;
       return;
     }
-    router.pushUrl({
-      url: 'pages/TaskPage',
-      params: { deviceId: entry.deviceId, sessionId: entry.session.id },
-    });
+    if (this.hasForegroundCrease() || this.compactDetailOpen) {
+      this.compactDetailOpen = true;
+      this.rememberSelectedTask();
+      return;
+    }
+    void router.pushUrl({ url: 'pages/TaskPage', params: {
+      deviceId: this.selectedSessionDeviceId,
+      sessionId: this.selectedSessionId,
+      message: this.selectedMessageClientId,
+    } });
   }
 
   /** 搜索结果先种入摘要，再异步用 sessions:get 对账；这样旧任务也能立即进入详情。 */
@@ -1305,12 +1490,7 @@ struct TaskListPage {
     this.setSelectedTask(result.deviceId, session.id, result.contentMessageClientId);
     this.setActiveListTab(taskListCategory(session));
     this.persistPreferences();
-    if (this.splitLayoutEnabled()) return;
-    const params: Record<string, Object> = {};
-    params['deviceId'] = result.deviceId;
-    params['sessionId'] = session.id;
-    if (result.contentMessageClientId.length > 0) params['message'] = result.contentMessageClientId;
-    void router.pushUrl({ url: 'pages/TaskPage', params });
+    this.showSelectedTask(session.orcaRole === 'lead');
   }
 
   private openSettings(): void {
@@ -1691,6 +1871,7 @@ struct TaskListPage {
   }
 
   private selectDevice(deviceId: string): void {
+    this.routeSelectionKey = '';
     this.animateMenu(() => {
       this.selectedDeviceId = deviceId;
       if (this.moduleRequest?.kind === 'chat') {
@@ -2149,6 +2330,7 @@ struct TaskListPage {
   }
 
   private cancelBulkSelection(): void {
+    this.bulkMoreOpen = false;
     this.bulkMode = false;
     this.selectedEntryKeys = [];
   }
@@ -2509,137 +2691,140 @@ struct TaskListPage {
   }
 
   build() {
-    Stack() {
-      // Keep the project folder sheet mounted independently of search and list filters.
-      Column() {}
-        .width(0)
-        .height(0)
-        .bindSheet($$this.projectFolderOpen, this.projectFolderSheet(),
-          workdirBrowserSheetOptions((): void => { this.projectFolderOpen = false; }))
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column()
+        .width('100%').height('100%')
+        .backgroundColor($r('app.color.bg_page'))
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.None)
+      Stack() {
+        // Keep the project folder sheet mounted independently of search and list filters.
+        Column() {}
+          .width(0)
+          .height(0)
+          .bindSheet($$this.projectFolderOpen, this.projectFolderSheet(),
+            workdirBrowserSheetOptions((): void => { this.projectFolderOpen = false; }))
 
-      Row() {
-        this.taskListPane()
-        if (this.splitLayoutEnabled()) {
-          Stack() {
-            Column() { this.detailPane() }
-              .width('100%').height('100%')
-              .visibility(this.usageOpen || this.listPaneFullscreen ? Visibility.None : Visibility.Visible)
-            if (this.usageOpen) { this.usageDestination() }
+        Row() {
+          this.taskListPane()
+          if (this.foldGapWidth() > 0) { Blank().width(this.foldGapWidth()) }
+          if (this.splitLayoutEnabled() || this.compactDetailOpen || this.residentPanes.length > 0) {
+            Stack() {
+              Column() { this.detailPane() }
+                .width('100%').height('100%')
+                .visibility(this.usageOpen || this.listPaneFullscreen ? Visibility.None : Visibility.Visible)
+              if (this.usageOpen && this.splitLayoutEnabled()) { this.usageDestination() }
+            }
+            .width(this.detailPaneWidth())
+            .height('100%')
+            .visibility((this.splitLayoutEnabled()
+              ? !this.listPaneFullscreen || this.newSessionDraftOpen : this.compactDetailOpen)
+              ? Visibility.Visible : Visibility.None)
+            .accessibilityLevel((this.splitLayoutEnabled() ? !this.listPaneFullscreen : this.compactDetailOpen)
+              ? 'auto' : 'no-hide-descendants')
           }
-          .width(this.detailPaneWidth())
-          .height('100%')
-          .visibility(this.listPaneFullscreen && !this.newSessionDraftOpen ? Visibility.None : Visibility.Visible)
         }
-      }
-      .width('100%')
-      .height('100%')
+        .alignItems(VerticalAlign.Top)
+        .width('100%')
+        .height('100%')
 
-      if (this.usageOpen && !this.splitLayoutEnabled()) {
-        this.usageDestination()
-      }
+        if (this.usageOpen && !this.splitLayoutEnabled()) {
+          this.usageDestination()
+        }
 
-      if (this.moduleRequest !== null) {
-        HomeModulePanel({ request: this.moduleRequest, localCompanions: this.scopedTeammates(),
-          onClose: this.closeHomeModule,
-          onLocalCompanion: (entry: TeammateRosterEntry): void => this.openTeammate(entry),
-          onChooseComputer: (): void => this.openDeviceScopeMenu(),
-          onOpenTask: (device: string, session: string, message?: string): void => {
-            this.setSelectedTask(device, session, message ?? '');
-            if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage', params: { deviceId: device, sessionId: session, messageClientId: message ?? '' } });
-          },
-          onProjectSaved: (device: string, key: string): void => {
-            const created = this.moduleRequest?.create === true;
-            const fromDraft = this.newSessionDraftOpen;
-            this.moduleRequest = null;
-            AppServices.instance.taskProjectAliases.refresh(device);
-            if (created && key.startsWith('local:')) {
-              AppServices.instance.newSessionPreferences.save(device, 'project', key.slice(6));
-              if (fromDraft) {
-                // 从新建任务页发起：回到同一个草稿并选中新项目，不改首页电脑筛选。
-                this.draftCreatedProject = device + '\n' + key.slice(6) + '\n' + (++this.draftCreatedProjectToken);
-                return;
+        if (this.moduleRequest !== null) {
+          HomeModulePanel({ request: this.moduleRequest, localCompanions: this.scopedTeammates(),
+            onClose: this.closeHomeModule,
+            onLocalCompanion: (entry: TeammateRosterEntry): void => this.openTeammate(entry),
+            onChooseComputer: (): void => this.openDeviceScopeMenu(),
+            onOpenTask: (device: string, session: string, message?: string): void => {
+              this.setSelectedTask(device, session, message ?? '');
+              this.showSelectedTask();
+            },
+            onProjectSaved: (device: string, key: string): void => {
+              const created = this.moduleRequest?.create === true;
+              const fromDraft = this.newSessionDraftOpen;
+              this.moduleRequest = null;
+              AppServices.instance.taskProjectAliases.refresh(device);
+              if (created && key.startsWith('local:')) {
+                AppServices.instance.newSessionPreferences.save(device, 'project', key.slice(6));
+                if (fromDraft) {
+                  // 从新建任务页发起：回到同一个草稿并选中新项目，不改首页电脑筛选。
+                  this.draftCreatedProject = device + '\n' + key.slice(6) + '\n' + (++this.draftCreatedProjectToken);
+                  return;
+                }
+                this.selectedDeviceId = device;
+                this.openNewSession();
               }
-              this.selectedDeviceId = device;
-              this.openNewSession();
-            }
-          },
-        }).width(this.splitLayoutEnabled() ? this.detailPaneWidth() : '100%').height('100%')
-          .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() : 0, y: 0 })
-          // 从新建任务页打开新建项目时，面板盖在草稿上方；其余入口打开前都会先关闭草稿。
-          .zIndex(this.newSessionDraftOpen ? 1 : 0)
-      }
-
-      // 新任务草稿始终由同一个节点持有：窄屏覆盖整页，宽屏只覆盖详情栏。
-      // 旋转或折叠只更新尺寸，避免组件重建时释放尚未发送的附件。
-      if (this.newSessionDraftOpen) {
-        NewSessionPageContent({
-          registerComposerBack: (handler: (() => boolean) | undefined): void => { this.draftComposerBack = handler; },
-          paneDeviceId: this.newSessionDraftDeviceId,
-          paneKeyboardInset: this.newSessionKeyboardInset(),
-          paneComposerBottomInset: this.detailComposerBottomInset(),
-          embedded: this.splitLayoutEnabled(),
-          createdProject: this.draftCreatedProject,
-          onCreateProject: (deviceId: string): void => this.openProjectCreateFromDraft(deviceId),
-          onClose: (): void => {
-            this.newSessionDraftOpen = false;
-            this.updateKeyboardAvoidance();
-            this.ensureWideSelection();
-          },
-          onSessionStarted: (deviceId: string, sessionId: string): void => {
-            this.newSessionDraftOpen = false;
-            this.updateKeyboardAvoidance();
-            this.setSelectedTask(deviceId, sessionId, '');
-            if (!this.splitLayoutEnabled()) {
-              void router.pushUrl({
-                url: 'pages/TaskPage',
-                params: { deviceId: deviceId, sessionId: sessionId },
-              });
-            }
-          },
-        })
-          .width(this.splitLayoutEnabled()
-            ? this.detailPaneWidth() : '100%')
-          .height('100%')
-          .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() : 0, y: 0 })
-          .transition(uiRevealTransition())
-      }
-
-      if (this.canDragTaskDivider()) {
-        this.splitDivider()
-      }
-
-      IncomingShareSurface({
-        activeDeviceId: this.newSessionDraftOpen ? this.newSessionDraftDeviceId
-          : this.splitLayoutEnabled() && this.moduleRequest === null && !this.usageOpen ? this.selectedSessionDeviceId : '',
-        activeSessionId: this.newSessionDraftOpen ? '' : this.selectedSessionId,
-        onOpen: (target: IncomingShareDestination): void => {
-        if (target.ownerKey !== AppServices.instance.usageCardOwner) return;
-        this.moduleRequest = null;
-        this.selectedDeviceId = target.deviceId;
-        if (target.sessionId.length === 0) this.openNewSession();
-        else {
-          this.newSessionDraftOpen = false;
-          this.setSelectedTask(target.deviceId, target.sessionId, '');
-          if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage',
-            params: { deviceId: target.deviceId, sessionId: target.sessionId } });
+            },
+          }).width(this.splitLayoutEnabled() ? this.detailPaneWidth() : '100%').height('100%')
+            .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() + this.foldGapWidth() : 0, y: 0 })
+            // 从新建任务页打开新建项目时，面板盖在草稿上方；其余入口打开前都会先关闭草稿。
+            .zIndex(this.newSessionDraftOpen ? 1 : 0)
         }
-      } })
 
-      if (this.bulkMode) {
-        this.bulkActionBar()
+        // 新任务草稿始终由同一个节点持有：窄屏覆盖整页，宽屏只覆盖详情栏。
+        // 旋转或折叠只更新尺寸，避免组件重建时释放尚未发送的附件。
+        if (this.newSessionDraftOpen) {
+          NewSessionPageContent({
+            registerComposerBack: (handler: (() => boolean) | undefined): void => { this.draftComposerBack = handler; },
+            paneDeviceId: this.newSessionDraftDeviceId,
+            paneKeyboardInset: this.newSessionKeyboardInset(),
+            paneComposerBottomInset: this.detailComposerBottomInset(),
+            embedded: this.splitLayoutEnabled(),
+            createdProject: this.draftCreatedProject,
+            onCreateProject: (deviceId: string): void => this.openProjectCreateFromDraft(deviceId),
+            onClose: (): void => {
+              this.newSessionDraftOpen = false;
+              this.updateKeyboardAvoidance();
+              this.ensureWideSelection();
+            },
+            onSessionStarted: (deviceId: string, sessionId: string): void => {
+              this.newSessionDraftOpen = false;
+              this.updateKeyboardAvoidance();
+              this.setSelectedTask(deviceId, sessionId, '');
+              this.showSelectedTask();
+            },
+          })
+            .width(this.splitLayoutEnabled()
+              ? this.detailPaneWidth() : '100%')
+            .height('100%')
+            .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() + this.foldGapWidth() : 0, y: 0 })
+            .transition(uiRevealTransition())
+        }
+
+        if (this.canDragTaskDivider()) {
+          this.splitDivider()
+        }
+
+        IncomingShareSurface({
+          activeDeviceId: this.newSessionDraftOpen ? this.newSessionDraftDeviceId
+            : (this.splitLayoutEnabled() || this.compactDetailOpen) && !this.listPaneFullscreen
+              && this.moduleRequest === null && !this.usageOpen ? this.selectedSessionDeviceId : '',
+          activeSessionId: this.newSessionDraftOpen ? '' : this.selectedSessionId,
+          onOpen: (target: IncomingShareDestination): void => {
+          if (target.ownerKey !== AppServices.instance.usageCardOwner) return;
+          this.moduleRequest = null;
+          this.selectedDeviceId = target.deviceId;
+          if (target.sessionId.length === 0) this.openNewSession();
+          else {
+            this.newSessionDraftOpen = false;
+            this.setSelectedTask(target.deviceId, target.sessionId, '');
+            this.showSelectedTask();
+          }
+        } })
+
+        if (this.bulkMode) {
+          this.bulkActionBar()
+        }
       }
+      .width(this.viewportWidth > 0 ? this.foregroundWidth() : '100%')
+      .height(this.horizontalFoldRegionUsable() ? this.foregroundHeight() : '100%')
+      .align(Alignment.TopStart)
+      .offset({ x: this.foregroundX(), y: this.foregroundY() })
     }
-    .backgroundColor($r('app.color.bg_page'))
     .width('100%')
     .height('100%')
-    .expandSafeArea(
-      this.splitLayoutEnabled()
-        ? [SafeAreaType.SYSTEM, SafeAreaType.KEYBOARD]
-        : [SafeAreaType.SYSTEM],
-      this.splitLayoutEnabled()
-        ? [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]
-        : [SafeAreaEdge.BOTTOM],
-    )
     .onAreaChange((oldArea: Area, newArea: Area) => {
       this.handleAreaChange(oldArea, newArea);
     })
@@ -2774,10 +2959,10 @@ struct TaskListPage {
     // 三个隐藏页会让标题栏读取到错误的滚动/模糊状态。
     .bindToScrollable([this.scrollerForCategory(this.activeListTab)])
     .width(this.splitLayoutEnabled() ? this.listPaneWidth() : '100%')
-    .height('100%')
+    .height(this.listPaneHeight())
     .backgroundColor(this.splitLayoutEnabled() ? Color.Transparent : $r('app.color.bg_page'))
     // 收起时只隐藏、不销毁，展开后列表滚动位置与 Tab 状态保持不变。
-    .visibility(this.usageOpen || this.listPaneShown() ? Visibility.Visible : Visibility.None)
+    .visibility((this.usageOpen && this.splitLayoutEnabled()) || this.listPaneShown() ? Visibility.Visible : Visibility.None)
   }
 
   private clearRosterTimers(): void {
@@ -3049,10 +3234,11 @@ struct TaskListPage {
   usageDestination() {
     Column() {
       Row() {
-        this.headerSymbolButton($r('sys.symbol.chevron_left'), () => this.closeUsage(), this.v12String('v139_home_restore'))
-        Text($r('app.string.usage_title')).fontSize(18).fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary')).layoutWeight(1)
-      }.width('100%').height(56).padding({ left: 8, right: 20 })
+        Column() {
+          UiPanelHeading({ heading: $r('app.string.usage_title') })
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        this.headerSymbolButton($r('sys.symbol.chevron_left'), () => this.closeUsage(), this.v12String('v139_home_back'))
+      }.width('100%').constraintSize({ minHeight: 56 }).alignItems(VerticalAlign.Center).padding({ right: 16 })
       UsageDashboardPanel({ active: this.usageOpen,
         pinnedDeviceId: this.activeUsageCardId ? this.selectedDeviceId : '', scroller: this.usageScroller })
         .layoutWeight(1)
@@ -3094,7 +3280,7 @@ struct TaskListPage {
         .fontColor([$r('app.color.accent')]),
     }, label)
       .labelStyle({
-        font: { size: 11, weight: FontWeight.Medium },
+        font: { size: UI_FONT_CAPTION, weight: FontWeight.Medium },
         selectedColor: $r('app.color.text_primary'),
         unselectedColor: $r('app.color.text_secondary'),
         maxLines: 1,
@@ -3105,19 +3291,7 @@ struct TaskListPage {
 
   @Builder
   newSessionMiniBar() {
-    Button() {
-      SymbolGlyph($r('sys.symbol.plus'))
-        .fontSize(22)
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(FLOATING_BAR_HEIGHT)
-    .height(FLOATING_BAR_HEIGHT)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .accessibilityText('新建任务')
-    .onClick(() => this.openNewSession())
+    UiIconButton({ glyph: $r('sys.symbol.plus'), label: '新建任务', onAction: () => this.openNewSession() })
   }
 
   @Builder
@@ -3133,17 +3307,51 @@ struct TaskListPage {
       }
       .width(1)
       .height('100%')
+      .hitTestBehavior(HitTestMode.None)
 
-      SplitHandle({ overrun: this.dividerOverrun })
+      UiSplitHandle({
+        label: this.v12String('home_task_split_resize'),
+        narrowLabel: $r('app.string.home_task_split_narrow'),
+        widenLabel: $r('app.string.home_task_split_widen'),
+        paneStartActionLabel: this.usageOpen ? undefined : $r('app.string.v134_pane_list_expand'),
+        paneEndActionLabel: !this.usageOpen && this.selectedTaskKey().length > 0
+          ? $r('app.string.v134_pane_list_collapse') : undefined,
+        leadingWidthVp: this.listPaneWidth(),
+        minWidthVp: taskListPaneWidth(this.foregroundWidth(), 1),
+        maxWidthVp: taskListPaneWidth(this.foregroundWidth(), TASK_SPLIT_MAX_LIST_WIDTH),
+        overrun: this.dividerOverrun,
+        onWidthChange: (next: number): void => { this.requestedListPaneWidth = next; },
+        onPaneStartAction: (): void => this.focusListPane(),
+        onPaneEndAction: (): void => {
+          this.toggleListPane();
+          if (this.splitHandleFocused) this.restoreFocusAfterDivider();
+        },
+      })
+      .onFocus((): void => { this.splitHandleFocused = true; })
+      .onBlur((): void => { this.splitHandleFocused = false; })
     }
-    .width(TASK_SPLIT_DIVIDER_WIDTH)
+    .width(UI_TOUCH_TARGET_MIN)
     .height('100%')
-    .position({ x: this.listPaneWidth() - TASK_SPLIT_DIVIDER_WIDTH / 2, y: 0 })
+    .responseRegion([
+      { x: (UI_TOUCH_TARGET_MIN - TASK_SPLIT_DIVIDER_WIDTH) / 2, y: 0,
+        width: TASK_SPLIT_DIVIDER_WIDTH, height: '100%' },
+      { x: 0, y: 'calc(50% - 22vp)', width: UI_TOUCH_TARGET_MIN, height: UI_TOUCH_TARGET_MIN },
+    ])
+    .position({ x: this.listPaneWidth() - UI_TOUCH_TARGET_MIN / 2, y: 0 })
     // 命中区跨在交界线两侧；只有中部指示符可见，整列不铺底。
     .backgroundColor(Color.Transparent)
-    .onTouch((event: TouchEvent) => {
-      this.handleDividerTouch(event);
-    })
+    // A recognized pan wins over the child Button's tap. Below the movement
+    // threshold the tap still opens the native menu.
+    .priorityGesture(
+      PanGesture({ direction: PanDirection.Horizontal, distance: 6 })
+        .onActionStart((): void => {
+          this.dividerTouchStartWidth = this.listPaneWidth();
+          this.dividerDragging = true;
+        })
+        .onActionUpdate((event: GestureEvent): void => this.handleDividerPan(event.offsetX, false))
+        .onActionEnd((event: GestureEvent): void => this.handleDividerPan(event.offsetX, true))
+        .onActionCancel((): void => this.resetDividerTouch()),
+    )
   }
 
   @Builder
@@ -3160,11 +3368,12 @@ struct TaskListPage {
             else this.residentBackHandlers.delete(pane.key);
           },
           paneDeviceId: pane.deviceId,
-          allowSideBySide: !this.safeWindowMultiWindow,
+          allowSideBySide: this.splitLayoutEnabled() && !this.safeWindowMultiWindow,
           paneSessionId: pane.sessionId,
           paneMessageClientId: this.paneSelected(pane) ? this.selectedMessageClientId : '',
           paneMessageRevision: this.paneSelected(pane) ? this.selectedMessageRevision : 0,
-          paneActive: this.paneSelected(pane) && !this.usageOpen && !this.listPaneFullscreen,
+          paneActive: this.paneSelected(pane) && !this.usageOpen && !this.listPaneFullscreen
+            && (this.splitLayoutEnabled() || this.compactDetailOpen),
           paneListCollapsed: !this.listPaneShown(),
           onTogglePaneList: (): void => this.toggleListPane(),
           paneComposerBottomInset: this.detailComposerBottomInset(),
@@ -3179,17 +3388,14 @@ struct TaskListPage {
     }
     .width('100%')
     .height('100%')
+    .id('home-task-detail')
+    .focusable(true)
   }
 
   @Builder
   emptyDetailPane() {
-    Column({ space: 10 }) {
-      SymbolGlyph($r('sys.symbol.rectangle_stack'))
-        .fontSize(28)
-        .fontColor([$r('app.color.text_tertiary')])
-      Text('选择一个任务')
-        .fontSize(15)
-        .fontColor($r('app.color.text_secondary'))
+    Column() {
+      UiEmptyState({ heading: '选择一个任务' })
     }
     .width('100%')
     .height('100%')
@@ -3197,88 +3403,74 @@ struct TaskListPage {
     .backgroundColor($r('app.color.bg_page'))
   }
 
+  private narrowListChrome(): boolean {
+    const width = this.splitLayoutEnabled() ? this.listPaneWidth() : this.foregroundWidth();
+    return width <= 360;
+  }
+
   @Builder
   pageHeader() {
-    Row({ space: 8 }) {
+    Row({ space: 2 }) {
       Button() {
         Row({ space: 6 }) {
           Text(this.selectedDeviceLabel())
-            .fontSize(18)
-            .lineHeight(24)
-            .fontWeight(FontWeight.Medium)
+            .fontSize(UI_FONT_TITLE_S)
+            .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .flexShrink(1)
           SymbolGlyph($r('sys.symbol.chevron_down'))
-            .fontSize(13)
+            .fontSize(UI_FONT_CAPTION)
             .fontColor([$r('app.color.text_secondary')])
         }
-        .width('100%')
+        .width('100%').justifyContent(FlexAlign.Start)
       }
       .type(ButtonType.Normal)
+      .id('home-task-scope')
       .layoutWeight(1)
-      .height(44)
+      .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
       .padding(0)
-      .backgroundColor(Color.Transparent)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
+      .buttonStyle(ButtonStyleMode.TEXTUAL)
+      .accessibilityText(this.selectedDeviceLabel())
       .onClick(() => {
         this.openDeviceScopeMenu();
       })
       .bindMenu(this.scopeMenuOpen, this.scopeMenuContent(),
         uiMenuOptions((): void => { this.scopeMenuOpen = false; }, Placement.BottomLeft, 'scope-menu'))
 
-      this.headerSymbolButton($r('sys.symbol.gauge_with_dots_needle_33percent'),
-        () => this.openUsage(), this.v12String('usage_tab'))
+      if (!this.narrowListChrome()) {
+        this.headerSymbolButton($r('sys.symbol.gauge_with_dots_needle_33percent'),
+          () => this.openUsage(), this.v12String('usage_tab'))
+      }
       this.sortHeaderButton()
       this.headerSymbolButton($r('sys.symbol.magnifyingglass'), () => this.toggleSearch(), this.v12String('v138_search'))
-      if (this.listPaneFullscreen) {
+      if (this.listPaneFullscreen && this.splitLayoutEnabled()) {
         this.headerSymbolButton($r('sys.symbol.open_sidebar'), () => this.toggleListPane(),
           this.v12String('v139_home_restore'))
       }
-      this.headerSymbolButton(
-        $r('sys.symbol.gearshape'),
-        () => this.openSettings(),
-        '设置',
-      )
+      if (!this.narrowListChrome()) {
+        this.headerSymbolButton($r('sys.symbol.gearshape'), () => this.openSettings(), this.v12String('home_list_settings'))
+      }
     }
     .width('100%')
-    .height(56)
+    .constraintSize({ minHeight: 56 })
     .padding({ left: LIST_INSET, right: LIST_INSET, bottom: 8 })
   }
 
   @Builder
   headerSymbolButton(symbol: Resource, action: () => void, accessibilityLabel: string = '') {
-    Button() {
-      SymbolGlyph(symbol)
-        .fontSize(18)
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .accessibilityText(accessibilityLabel)
-    .onClick(action)
+    UiIconButton({ glyph: symbol, label: accessibilityLabel, onAction: action })
   }
 
   /** 排序按钮：系统操作菜单（见 docs/overlay-standard.md §3.1），无自绘遮罩。 */
   @Builder
   sortHeaderButton() {
-    Button() {
-      SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
-        .fontSize(18)
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .accessibilityText(this.v12String('v138_sort'))
-    .onClick(() => this.openSortMenu())
+    UiIconButton({
+      glyph: this.narrowListChrome() ? $r('sys.symbol.ellipsis_circle') : $r('sys.symbol.slider_horizontal_2'),
+      label: this.v12String(this.narrowListChrome() ? 'home_list_more' : 'v138_sort'),
+      onAction: () => this.openSortMenu(),
+    })
     .bindMenu(this.sortMenuOpen, this.sortMenuContent(),
       uiMenuOptions((): void => { this.sortMenuOpen = false; }, Placement.BottomRight, 'sort-menu'))
   }
@@ -3311,14 +3503,16 @@ struct TaskListPage {
         .fontSize(16)
         .fontColor([$r('app.color.text_secondary')])
       TextInput({ placeholder: $r('app.string.v12_search_placeholder'), text: this.searchQuery })
-        .fontSize(14)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor($r('app.color.text_primary'))
         .placeholderColor($r('app.color.text_placeholder'))
         .caretColor($r('app.color.accent'))
         .backgroundColor(Color.Transparent)
         .layoutWeight(1)
-        .height(40)
+        .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
         .padding(0)
+        .onFocus((): void => { this.listSearchFocused = true; })
+        .onBlur((): void => { this.listSearchFocused = false; })
         .onChange((value: string) => {
           this.searchQuery = value;
           this.scheduleTaskSearch();
@@ -3332,8 +3526,8 @@ struct TaskListPage {
             .fontColor([$r('app.color.text_secondary')])
         }
         .type(ButtonType.Circle)
-        .width(32)
-        .height(32)
+        .width(UI_TOUCH_TARGET_MIN)
+        .height(UI_TOUCH_TARGET_MIN)
         .padding(0)
         .backgroundColor(Color.Transparent)
         .accessibilityText($r('app.string.v12_clear_search'))
@@ -3374,11 +3568,11 @@ struct TaskListPage {
       .height(24)
     }
     .type(ButtonType.Circle)
-    .width(32)
-    .height(32)
+    .width(UI_TOUCH_TARGET_MIN)
+    .height(UI_TOUCH_TARGET_MIN)
     .padding(0)
     .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
+    .buttonStyle(ButtonStyleMode.TEXTUAL)
     .accessibilityText($r('app.string.v12_search_filter'))
     .onClick(() => this.openTaskSearchFilter())
     .bindSheet($$this.taskSearchFilterOpen, this.taskSearchFilterSheet(), this.taskSearchFilterSheetOptions())
@@ -3386,16 +3580,8 @@ struct TaskListPage {
 
   @Builder
   buildTaskListEmpty(category: TaskListCategory) {
-    Column({ space: 8 }) {
-      Text(this.emptyTitle())
-        .fontSize(16)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-      Text(this.emptyCopy())
-        .fontSize(13)
-        .lineHeight(19)
-        .fontColor($r('app.color.text_secondary'))
-        .textAlign(TextAlign.Center)
+    Column() {
+      UiEmptyState({ heading: this.emptyTitle(), message: this.emptyCopy() })
     }
     .width('100%')
     .layoutWeight(1)
@@ -3408,12 +3594,7 @@ struct TaskListPage {
 
   @Builder
   communicationSectionTitle(title: string) {
-    Text(title)
-      .fontSize(13)
-      .fontWeight(FontWeight.Medium)
-      .fontColor($r('app.color.text_secondary'))
-      .width('100%')
-      .padding({ left: LIST_INSET + 14, right: LIST_INSET + 14, top: 14, bottom: 6 })
+    UiPanelHeading({ heading: title })
   }
 
   /**
@@ -3488,24 +3669,24 @@ struct TaskListPage {
     Row({ space: 8 }) {
       SymbolGlyph($r('sys.symbol.person_2')).fontSize(20).fontColor([$r('app.color.text_secondary')]).width(24)
       Text(this.v12String('v138_teammates'))
-        .fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+        .accessibilityText(this.v12String('v138_teammates') + ', ' + this.visibleTeammateKeys.length)
+        .fontSize(UI_FONT_LIST_TITLE).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
       if (!this.teammateCompact) {
         this.teammateAddMenu()
       }
-      Text(`${this.scopedTeammates().length}`)
-        .fontSize(12).fontColor($r('app.color.text_tertiary'))
-      Button({ type: ButtonType.Normal }) {
-        Row() {
-          this.collapseChevron(this.teammateCompact)
-        }.width('100%').justifyContent(FlexAlign.End)
-      }.width(44).height(44).padding(0).backgroundColor(Color.Transparent)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
+      if (!this.narrowListChrome()) {
+        Text(`${this.visibleTeammateKeys.length}`)
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_tertiary')).accessibilityLevel('no')
+      }
+      Button({ type: ButtonType.Circle }) {
+        this.collapseChevron(this.teammateCompact)
+      }.width(UI_TOUCH_TARGET_MIN).height(UI_TOUCH_TARGET_MIN).padding(0).buttonStyle(ButtonStyleMode.TEXTUAL)
         .accessibilityText(this.v12String(this.teammateCompact ? 'home_companion_expand' : 'home_companion_compact'))
         .onClick((): void => this.toggleTeammateView())
     }
     .width('100%')
-    .height(52)
+    .constraintSize({ minHeight: 52 })
     .padding({ left: LIST_INSET, right: LIST_INSET })
   }
 
@@ -3516,15 +3697,15 @@ struct TaskListPage {
         .opacity(this.teammateAvatarOnline(row) ? 1 : 0.55)
       Column({ space: 4 }) {
         Text(row.name)
-          .fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+          .fontSize(UI_FONT_LIST_TITLE).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(this.teammateDeviceLabel(row))
-          .fontSize(12).fontColor($r('app.color.text_secondary'))
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         if (this.teammateRunning(row)) {
-          Text($r('app.string.teammate_activity_running')).fontSize(12).fontColor($r('app.color.text_secondary'))
+          Text($r('app.string.teammate_activity_running')).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
         } else if (row.preview.length > 0) {
-          Text(row.preview).fontSize(12).fontColor($r('app.color.text_secondary'))
+          Text(row.preview).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
       }
@@ -3535,7 +3716,7 @@ struct TaskListPage {
           .accessibilityText(this.teammateStatusLabel(row))
       }
       SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(12)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor([$r('app.color.text_tertiary')])
     }
     .constraintSize({ minHeight: 56 })
@@ -3757,8 +3938,8 @@ struct TaskListPage {
       Column({ space: 4 }) {
         Row({ space: 10 }) {
           Text(taskDisplayTitle(result.session))
-            .fontSize(15)
-            .lineHeight(20)
+            .fontSize(UI_FONT_LIST_TITLE)
+
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
@@ -3766,22 +3947,22 @@ struct TaskListPage {
             .layoutWeight(1)
           if (taskRelativeTime(taskActivityAt(result.session), this.now).length > 0) {
             Text(taskRelativeTime(taskActivityAt(result.session), this.now))
-              .fontSize(11)
+              .fontSize(UI_FONT_CAPTION)
               .fontColor($r('app.color.text_tertiary'))
           }
         }
         .width('100%')
         if (taskPreviewText(result.contentPreview).length > 0) {
           Text(taskPreviewText(result.contentPreview))
-            .fontSize(12)
-            .lineHeight(16)
+            .fontSize(UI_FONT_SECONDARY)
+
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
         }
         Text(this.taskSearchResultSubtitle(result))
-          .fontSize(11)
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3820,16 +4001,8 @@ struct TaskListPage {
 
   @Builder
   activeTabEmptyState(category: TaskListCategory) {
-    Column({ space: 8 }) {
-      Text(this.activeTabEmptyTitle(category))
-        .fontSize(15)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-      Text(this.activeTabEmptyCopy(category))
-        .fontSize(13)
-        .lineHeight(19)
-        .fontColor($r('app.color.text_secondary'))
-        .textAlign(TextAlign.Center)
+    Column() {
+      UiEmptyState({ heading: this.activeTabEmptyTitle(category), message: this.activeTabEmptyCopy(category) })
     }
     .width('100%')
     .constraintSize({ minHeight: 180 })
@@ -3848,12 +4021,12 @@ struct TaskListPage {
         .fontSize(16)
         .fontColor([$r('app.color.text_secondary')])
       Text(title)
-        .fontSize(14)
+        .fontSize(UI_FONT_ACTION_SMALL)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
         .layoutWeight(1)
       Text(count)
-        .fontSize(12)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor($r('app.color.text_tertiary'))
     }
     .width('100%')
@@ -3893,8 +4066,8 @@ struct TaskListPage {
       Column({ space: 4 }) {
         Row({ space: 10 }) {
           Text(taskDisplayTitle(entry.session))
-            .fontSize(15)
-            .lineHeight(20)
+            .fontSize(UI_FONT_LIST_TITLE)
+
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
@@ -3906,16 +4079,16 @@ struct TaskListPage {
 
         if (entry.session.agentDeviceId.length > 0) {
           Text(harmonyV12String(this.getUIContext().getHostContext(), 'v132_agent_location', this.agentDeviceLabel(entry)))
-            .fontSize(12)
+            .fontSize(UI_FONT_SECONDARY)
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
-            .lineHeight(16)
+
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         if (taskPreviewText(entry.session.preview).length > 0) {
           Text(taskPreviewText(entry.session.preview))
-            .fontSize(12)
-            .lineHeight(16)
+            .fontSize(UI_FONT_SECONDARY)
+
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -4087,7 +4260,7 @@ struct TaskListPage {
         SymbolGlyph($r('sys.symbol.folder')).fontSize(20).fontColor([$r('app.color.text_secondary')]).width(24)
       }
       Text(AppServices.instance.taskProjectAliases.alias(group.deviceId, this.projectNativeKey(group)) || group.title)
-        .fontSize(15)
+        .fontSize(UI_FONT_LIST_TITLE)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
         .maxLines(1)
@@ -4095,14 +4268,14 @@ struct TaskListPage {
         .layoutWeight(1)
       if (this.projectMachineLabel(group).length > 0) {
         Text(this.projectMachineLabel(group))
-          .fontSize(11)
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_tertiary'))
           .maxLines(1)
           .constraintSize({ maxWidth: '38%' })
           .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       Text(`${group.entries.length}`)
-        .fontSize(12)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor($r('app.color.text_tertiary'))
       Button({ type: ButtonType.Circle }) {
         SymbolGlyph($r('sys.symbol.gearshape')).fontSize(16).fontColor([$r('app.color.text_secondary')])
@@ -4122,7 +4295,7 @@ struct TaskListPage {
       this.collapseChevron(this.projectCollapsed(group.key))
     }
     .width('100%')
-    .height(52)
+    .constraintSize({ minHeight: 52 })
     .padding({ left: LIST_INSET, right: LIST_INSET })
     .backgroundColor(this.projectOrderDraggingKey === group.key
       ? $r('app.color.bg_chip') : Color.Transparent)
@@ -4267,52 +4440,67 @@ struct TaskListPage {
 
   @Builder
   bulkActionBar() {
-    Row({ space: 6 }) {
-      Button('取消')
-        .height(38)
-        .fontSize(13)
-        .fontColor($r('app.color.text_primary'))
-        .backgroundColor($r('app.color.bg_chip'))
-        .borderRadius(UI_RADIUS_PILL)
-        .onClick(() => this.cancelBulkSelection())
-      Text(`已选 ${this.selectedEntryKeys.length}`)
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-        .layoutWeight(1)
-      this.bulkActionButton('置顶', () => this.bulkAction('pin'))
-      this.bulkActionButton('归档', () => this.bulkAction('archive'))
-      this.bulkActionButton('取消归档', () => this.bulkAction('restore'))
-      this.bulkActionButton('删除', () => this.bulkAction('delete'), true)
+    Column() {
+      Blank().layoutWeight(1).hitTestBehavior(HitTestMode.None)
+      Column({ space: 8 }) {
+        Row({ space: 8 }) {
+          Text(`已选 ${this.selectedEntryKeys.length}`)
+            .fontSize(UI_FONT_SECONDARY)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          UiIconButton({
+            glyph: $r('sys.symbol.ellipsis_circle'),
+            label: this.v12String('home_list_more'),
+            actionEnabled: !this.sessionActionBusy,
+            onAction: (): void => { this.bulkMoreOpen = true; },
+          })
+          .bindMenu(this.bulkMoreOpen, this.bulkMoreMenu(),
+            uiMenuOptions((): void => { this.bulkMoreOpen = false; }, Placement.TopRight))
+        }.width('100%')
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End }) {
+          UiActionButton({ label: $r('app.string.v139_home_cancel'), onAction: () => this.cancelBulkSelection() })
+            .margin({ right: 8 })
+          UiActionButton({
+            label: '删除', kind: UiActionKind.Danger, actionEnabled: !this.sessionActionBusy,
+            onAction: () => this.bulkAction('delete'),
+          })
+        }.width('100%')
+      }
+      .width('100%')
+      .padding(12)
+      .backgroundColor($r('app.color.task_list_menu_surface'))
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_CONTAINER)
     }
-    .width('calc(100% - 24vp)')
-    .height(58)
-    .padding({ left: 10, right: 10 })
-    .margin({ left: 12, right: 12, bottom: 12 })
-    .backgroundColor($r('app.color.task_list_menu_surface'))
-    .border({ width: 1, color: $r('app.color.border') })
-    .borderRadius(UI_RADIUS_CONTAINER)
-    .position({ x: 12, y: 'calc(100% - 70vp)' })
+    .width('100%').height('100%')
+    .padding({ left: 12, right: 12, bottom: 12 })
+    .hitTestBehavior(HitTestMode.Transparent)
     .transition(uiOverlayTransition())
   }
 
   @Builder
-  bulkActionButton(label: string, action: () => void, danger: boolean = false) {
-    Button(label)
-      .height(34)
-      .padding({ left: 10, right: 10 })
-      .fontSize(12)
-      .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
-      .backgroundColor($r('app.color.bg_chip'))
-      .borderRadius(UI_RADIUS_PILL)
-      .enabled(!this.sessionActionBusy)
-      .onClick(action)
+  bulkMoreMenu() {
+    Menu() {
+      MenuItem({ content: '置顶' }).enabled(!this.sessionActionBusy).onClick(() => this.bulkAction('pin'))
+      MenuItem({ content: $r('app.string.v139_home_archive') })
+        .enabled(!this.sessionActionBusy).onClick(() => this.bulkAction('archive'))
+      MenuItem({ content: '取消归档' }).enabled(!this.sessionActionBusy).onClick(() => this.bulkAction('restore'))
+    }
   }
 
   /** 排序菜单：任务排序一组；项目页再加项目排序（组脚说明同步状态）与展开 / 收起全部项目。 */
   @Builder
   sortMenuContent() {
     Menu() {
+      if (this.narrowListChrome()) {
+        MenuItemGroup() {
+          MenuItem({ content: $r('app.string.usage_tab') })
+            .onClick((): void => { this.closeSortMenu(); this.openUsage(); })
+          MenuItem({ content: $r('app.string.home_list_settings') })
+            .onClick((): void => { this.closeSortMenu(); this.openSettings(); })
+        }
+      }
       MenuItemGroup() {
         this.sortMenuItem('最近优先', 'recency')
         this.sortMenuItem('字母排序', 'alphabetic')

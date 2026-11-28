@@ -418,6 +418,11 @@
     {"name": "home_companion_compact", "value": "コンパクト表示に切り替え"},
     {"name": "home_companion_show_all", "value": "すべて表示（%d）"},
     {"name": "home_companion_show_less", "value": "折りたたむ"},
-    {"name": "composer_picker_permission", "value": "権限"}
+    {"name": "composer_picker_permission", "value": "権限"},
+    {"name": "home_task_split_resize", "value": "タスクリストの幅を調整"},
+    {"name": "home_task_split_narrow", "value": "タスクリストの幅を狭くする"},
+    {"name": "home_task_split_widen", "value": "タスクリストの幅を広くする"},
+    {"name": "home_list_more", "value": "その他の操作"},
+    {"name": "home_list_settings", "value": "設定"}
   ]
 }

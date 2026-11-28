@@ -1,6 +1,7 @@
+import { UiActionButton, UiActionKind, UiIconButton } from '../common/UiActions';
 import { SymbolGlyphModifier } from '@kit.ArkUI';
 import { harmonyV12String } from '../../core/HarmonyStrings';
-import { UI_ICON_CLICK_EFFECT, UI_RADIUS_PILL } from '../UiKit';
+import { UI_FONT_BODY, UI_FONT_SECONDARY, UI_RADIUS_PILL, UI_SPACE_PAGE, UI_SPACE_SECTION, UI_TOUCH_TARGET_MIN } from '../UiKit';
 import { CompanionCreateSheet, CompanionCreateSheetState } from './CompanionCreateSheet';
 import {
   UiSheetExtras, uiConfirm, uiConfirmCopy, uiMenuOptions, uiOverlayBuildId, uiOverlayTrace, uiSheetOptions,
@@ -215,35 +216,29 @@ export struct CompanionCreateMenu {
         .type(InputType.URL)
         .enterKeyType(EnterKeyType.Go)
         .maxLength(8192)
-        .fontSize(16)
+        .fontSize(UI_FONT_BODY)
         .fontColor($r('app.color.text_primary'))
         .placeholderColor($r('app.color.text_placeholder'))
         .caretColor($r('app.color.accent'))
         .backgroundColor($r('app.color.bg_page'))
         .border({ width: 1, color: $r('app.color.border') })
         .borderRadius(UI_RADIUS_PILL)
-        .padding({ left: 16, right: 16 })
-        .height(50)
+        .padding({ left: UI_SPACE_PAGE, right: UI_SPACE_PAGE })
+        .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
         .width('100%')
         .accessibilityText(this.copy('v140_group_join_input_label'))
         .onChange((value: string): void => { this.joinInput = value; })
         .onSubmit((): void => this.submitJoin())
       Text(this.copy('v140_group_join_description'))
-        .fontSize(13)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor($r('app.color.text_secondary'))
         .width('100%')
         .margin({ top: 8 })
-      Button(this.copy('v140_group_join_continue'), { type: ButtonType.Capsule })
-        .width('100%')
-        .height(50)
-        .margin({ top: 24 })
-        .fontSize(16)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.chat_cta_text'))
-        .backgroundColor($r('app.color.chat_cta'))
-        .enabled(this.joinInput.trim().length > 0)
-        .opacity(this.joinInput.trim().length > 0 ? 1 : 0.45)
-        .onClick((): void => this.submitJoin())
+      UiActionButton({
+        label: this.copy('v140_group_join_continue'), kind: UiActionKind.Primary,
+        actionEnabled: this.joinInput.trim().length > 0,
+        onAction: (): void => this.submitJoin(),
+      }).width('100%').margin({ top: UI_SPACE_SECTION })
     }
     .width('100%')
     .padding({ left: 24, right: 24, top: 12, bottom: 24 })
@@ -252,19 +247,13 @@ export struct CompanionCreateMenu {
   build() {
     // 两张 sheet 分别挂在按钮和外层上，避免同一节点绑定两个 bindSheet。
     Column() {
-      Button({ type: ButtonType.Circle, stateEffect: true }) {
-        SymbolGlyph($r('sys.symbol.plus'))
-          .fontSize(18)
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .width(44)
-      .height(44)
-      .backgroundColor(Color.Transparent)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .accessibilityText(this.copy('v140_companion_create_menu'))
-      .onClick((): void => {
-        uiOverlayTrace('companion-menu', 'open');
-        this.menuOpen = true;
+      UiIconButton({
+        glyph: $r('sys.symbol.plus'),
+        label: this.copy('v140_companion_create_menu'),
+        onAction: (): void => {
+          uiOverlayTrace('companion-menu', 'open');
+          this.menuOpen = true;
+        },
       })
       .bindMenu(this.menuOpen, this.menuContent(),
         uiMenuOptions((): void => this.menuDisappeared(), Placement.BottomRight, 'companion-menu'))

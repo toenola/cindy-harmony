@@ -42,7 +42,7 @@ import {
 import {
   RichInteractionMemory, RichMessageSender, RichSubmissionController, RichSubmissionStatus,
 } from '../core/messages/RichInteractionMemory';
-import { UI_CLICK_EFFECT, UI_RADIUS_PILL, uiFontSize, uiLineHeight } from './UiKit';
+import { UI_CLICK_EFFECT, UI_FONT_ACTION, UI_FONT_BODY, UI_FONT_LIST_TITLE, UI_FONT_SECONDARY, UI_FONT_TITLE_M, UI_RADIUS_PILL, UI_TOUCH_TARGET_MIN, uiFontSize } from './UiKit';
 
 const PHONE_LAYOUT_MAX_WIDTH = 600;
 const STACK_GAP = 16;
@@ -75,27 +75,25 @@ export class RichAnswerHost {
 }
 
 class RichTextRole {
-  size: number = 17;
-  lineHeight: number = 26;
+  size: string = UI_FONT_BODY;
   weight: FontWeight = FontWeight.Regular;
   color: ResourceColor = $r('app.color.text_primary');
 }
 
-function textRole(size: number, lineHeight: number, weight: FontWeight, color: ResourceColor): RichTextRole {
+function textRole(size: string, weight: FontWeight, color: ResourceColor): RichTextRole {
   const role = new RichTextRole();
   role.size = size;
-  role.lineHeight = lineHeight;
   role.weight = weight;
   role.color = color;
   return role;
 }
 
-const ROLE_TEXT = textRole(17, 26, FontWeight.Regular, $r('app.color.text_primary'));
-const ROLE_HEADING = textRole(18, 26, FontWeight.Medium, $r('app.color.text_primary'));
-const ROLE_CAPTION = textRole(13, 18, FontWeight.Regular, $r('app.color.text_secondary'));
-const ROLE_ICON_TITLE = textRole(17, 26, FontWeight.Medium, $r('app.color.text_primary'));
-const ROLE_STAT = textRole(24, 30, FontWeight.Medium, $r('app.color.text_primary'));
-const ROLE_BUTTON = textRole(16, 22, FontWeight.Medium, $r('app.color.text_primary'));
+const ROLE_TEXT = textRole(UI_FONT_BODY, FontWeight.Regular, $r('app.color.text_primary'));
+const ROLE_HEADING = textRole(UI_FONT_LIST_TITLE, FontWeight.Medium, $r('app.color.text_primary'));
+const ROLE_CAPTION = textRole(UI_FONT_SECONDARY, FontWeight.Regular, $r('app.color.text_secondary'));
+const ROLE_ICON_TITLE = textRole(UI_FONT_BODY, FontWeight.Medium, $r('app.color.text_primary'));
+const ROLE_STAT = textRole(UI_FONT_TITLE_M, FontWeight.Medium, $r('app.color.text_primary'));
+const ROLE_BUTTON = textRole(UI_FONT_ACTION, FontWeight.Medium, $r('app.color.text_primary'));
 
 export function richRoleColor(role: string): ResourceColor | undefined {
   if (role === 'primary') return $r('app.color.text_primary');
@@ -195,8 +193,7 @@ function richIcon(name: string): Resource {
 @Builder
 function richPlainMarkdown(text: string, _key: string) {
   Text(text)
-    .fontSize(uiFontSize(17))
-    .lineHeight(uiLineHeight(26))
+    .fontSize(UI_FONT_BODY)
     .fontColor($r('app.color.text_primary'))
     .copyOption(CopyOptions.LocalDevice)
     .width('100%')
@@ -311,8 +308,7 @@ export struct RichAnswerView {
       }, (id: string) => id)
       if (this.richDoc.issues > 0) {
         Text(this.richState.incomplete)
-          .fontSize(uiFontSize(13))
-          .lineHeight(uiLineHeight(18))
+          .fontSize(UI_FONT_SECONDARY)
           .fontColor($r('app.color.text_secondary'))
       }
     }
@@ -438,18 +434,18 @@ struct RichNodeView {
     return value !== undefined ? value : fallback;
   }
 
-  private textSize(role: RichTextRole): number {
+  private textSize(role: RichTextRole): string {
     const size = styleNumber(this.textStyle(), 'fontSize');
-    return uiFontSize(size !== undefined ? size : role.size);
+    // Explicit answer-authored values are content styling, not application chrome.
+    return size !== undefined ? `${uiFontSize(size)}fp` : role.size;
   }
 
-  private textLineHeight(role: RichTextRole): number {
+  private textLineHeight(role: RichTextRole): string | undefined {
     const style = this.textStyle();
-    const size = styleNumber(style, 'fontSize');
     const line = styleNumber(style, 'lineHeight');
-    const fontSize = size !== undefined ? size : role.size;
-    if (line === undefined) return uiLineHeight(fontSize * role.lineHeight / role.size);
-    return uiLineHeight(line <= 4 ? fontSize * line : line);
+    if (line === undefined) return undefined;
+    const size = styleNumber(style, 'fontSize') ?? parseFloat(role.size);
+    return `${Math.max(size, line <= 4 ? size * line : line)}fp`;
   }
 
   private textColor(role: RichTextRole): ResourceColor {
@@ -629,8 +625,7 @@ struct RichNodeView {
   @Builder
   chip(label: () => string, mode: string, choice: string, action: () => void) {
     Text(label())
-      .fontSize(uiFontSize(ROLE_BUTTON.size))
-      .lineHeight(uiLineHeight(ROLE_BUTTON.lineHeight))
+      .fontSize(ROLE_BUTTON.size)
       .fontWeight(ROLE_BUTTON.weight)
       .fontColor($r('app.color.text_primary'))
       .padding({ left: 16, right: 16, top: 8, bottom: 8 })
@@ -647,8 +642,7 @@ struct RichNodeView {
   @Builder
   caption(text: () => string) {
     Text(text())
-      .fontSize(uiFontSize(ROLE_CAPTION.size))
-      .lineHeight(uiLineHeight(ROLE_CAPTION.lineHeight))
+      .fontSize(ROLE_CAPTION.size)
       .fontColor($r('app.color.text_secondary'))
   }
 
@@ -674,8 +668,7 @@ struct RichNodeView {
         this.caption(() => richSendText(this.node(), this.richState.values) ?? '')
       }
       Text(this.sendActionLabel())
-        .fontSize(uiFontSize(ROLE_BUTTON.size))
-        .lineHeight(uiLineHeight(ROLE_BUTTON.lineHeight))
+        .fontSize(ROLE_BUTTON.size)
         .fontWeight(ROLE_BUTTON.weight)
         .fontColor($r('app.color.text_primary'))
         .padding({ left: 16, right: 16, top: 8, bottom: 8 })
@@ -786,7 +779,7 @@ struct RichNodeView {
           placeholder: richString(this.node(), 'placeholder'),
         })
           .maxLength(4096)
-          .fontSize(uiFontSize(16))
+          .fontSize(UI_FONT_ACTION)
           .fontColor($r('app.color.text_primary'))
           .placeholderColor($r('app.color.text_placeholder'))
           .backgroundColor($r('app.color.bg_chip'))
@@ -802,10 +795,10 @@ struct RichNodeView {
       Column({ space: 4 }) {
         Row({ space: 12 }) {
           Text(this.label())
-            .fontSize(uiFontSize(17)).lineHeight(uiLineHeight(26)).fontColor($r('app.color.text_primary'))
+            .fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary'))
             .layoutWeight(1)
           Text(`${richRange(this.node(), this.current()).value}${richString(this.node(), 'suffix')}`)
-            .fontSize(uiFontSize(17)).lineHeight(uiLineHeight(26)).fontColor($r('app.color.text_primary'))
+            .fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary'))
         }
         .width('100%')
         Slider({
@@ -815,7 +808,7 @@ struct RichNodeView {
           step: richRange(this.node(), this.current()).step,
         })
           .width('100%')
-          .height(44)
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
           .blockColor($r('app.color.text_primary'))
           .trackColor($r('app.color.border'))
           .selectedColor($r('app.color.text_secondary'))
@@ -830,7 +823,7 @@ struct RichNodeView {
     } else if (this.node().kind === 'check') {
       Row({ space: 12 }) {
         Text(this.label().length > 0 ? this.label() : richString(this.node(), 'text'))
-          .fontSize(uiFontSize(17)).lineHeight(uiLineHeight(26)).fontColor($r('app.color.text_primary'))
+          .fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary'))
           .layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.current() === true })
           .selectedColor($r('app.color.text_secondary'))

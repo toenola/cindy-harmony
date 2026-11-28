@@ -1,3 +1,6 @@
+import { KeyCode } from '@kit.InputKit';
+import { UiActionButton, UiIconButton } from '../../components/common/UiActions';
+import { UiCard } from '../../components/common/UiList';
 import { image } from '@kit.ImageKit';
 import { SymbolGlyphModifier } from '@kit.ArkUI';
 import { WorkdirAnnotation } from './WorkdirAnnotation';
@@ -18,7 +21,7 @@ import { MermaidDiagramView } from '../../components/MermaidDiagramView';
 import { MdBlock, parseMarkdown } from '../../core/messages/MarkdownParser';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { uiMenuOptions, uiOverlayBuildId, uiOverlayTrace, uiSheetOptions, uiToast } from '../../components/common/UiOverlay';
-import { UI_ICON_CLICK_EFFECT, UI_LIST_CLICK_EFFECT, UI_RADIUS_CONTROL, UI_RADIUS_PILL } from '../../components/UiKit';
+import { UI_FONT_CHART_LABEL, UI_FONT_LIST_TITLE, UI_FONT_TITLE_S, UI_FONT_BODY, UI_FONT_SECONDARY, UI_FONT_CAPTION, UI_SPACE_TIGHT, UI_SPACE_INLINE, UI_SPACE_GROUP, UI_ICON_SIZE_STANDARD, UI_TOUCH_TARGET_MIN, UI_RADIUS_CONTENT, UI_ICON_CLICK_EFFECT, UI_LIST_CLICK_EFFECT, UI_RADIUS_CONTROL, UI_RADIUS_PILL } from '../../components/UiKit';
 import { i18n } from '@kit.LocalizationKit';
 import { AppServices } from '../../core/AppServices';
 import { readStr, recordOrEmpty } from '../../core/tasks/TaskModels';
@@ -28,7 +31,6 @@ import { WorkdirEntry, WorkdirReadFence, WorkdirRequest, WorkdirWatchDebounce, w
 const THUMB_WIDTH = 76;
 const THUMB_HEIGHT = 96;
 /** 标题栏左右两侧等宽（右侧胶囊放两个 44vp 图标按钮），保证标题居中。 */
-const HEADER_SIDE = 96;
 
 /**
  * 文件夹浏览页自带一层导航标题栏（返回 / 标题 / 搜索与更多），宿主 bindSheet 时不再显示系统标题和关闭按钮，
@@ -634,7 +636,7 @@ export struct WorkdirBrowser {
         ForEach(this.sourceLines, (line: string, index: number) => {
           ListItem() {
             Text((index + 1).toString() + '  ' + line).width('100%')
-              .fontFamily('monospace').fontSize(13).copyOption(CopyOptions.LocalDevice)
+              .fontFamily('monospace').fontSize(UI_FONT_SECONDARY).copyOption(CopyOptions.LocalDevice)
               .fontColor(index + 1 === this.preview?.line ? $r('app.color.accent') : $r('app.color.text_primary'))
           }
         }, (_line: string, index: number): string => String(index))
@@ -647,7 +649,7 @@ export struct WorkdirBrowser {
               Text(block.type === 'code' ? block.code : (block.type === 'list' ? block.items.join('\n') :
                 (block.type === 'table' ? [block.headers.join(' · ')].concat(
                   block.rows.map((row: string[]): string => row.join(' · '))).join('\n') : block.text)))
-                .width('100%').fontSize(block.type === 'heading' ? 20 : 15)
+                .width('100%').fontSize(block.type === 'heading' ? UI_FONT_TITLE_S : UI_FONT_BODY)
                 .fontWeight(block.type === 'heading' ? FontWeight.Medium : FontWeight.Regular)
                 .fontFamily(block.type === 'code' ? 'monospace' : 'sans-serif')
                 .fontColor($r('app.color.text_primary')).copyOption(CopyOptions.LocalDevice)
@@ -854,8 +856,7 @@ export struct WorkdirBrowser {
         .clip(true)
     } else if (!row.folder && this.thumbnail(row)) {
       Text(this.thumbnail(row))
-        .fontSize(7)
-        .lineHeight(9)
+        .fontSize(UI_FONT_CHART_LABEL)
         .fontFamily('monospace')
         .fontColor($r('app.color.text_secondary'))
         .maxLines(9)
@@ -864,7 +865,7 @@ export struct WorkdirBrowser {
         .align(Alignment.TopStart)
         .width(THUMB_WIDTH)
         .height(THUMB_HEIGHT)
-        .padding(6)
+        .padding(UI_SPACE_TIGHT)
         .backgroundColor($r('app.color.bg_card'))
         .border({ width: 1, color: $r('app.color.border') })
         .borderRadius(UI_RADIUS_CONTROL)
@@ -872,7 +873,7 @@ export struct WorkdirBrowser {
     } else {
       Stack() {
         SymbolGlyph(row.folder ? $r('sys.symbol.folder') : $r('sys.symbol.doc'))
-          .fontSize(row.folder ? THUMB_WIDTH : THUMB_WIDTH - 8)
+          .fontSize(UI_ICON_SIZE_STANDARD)
           .fontColor([$r('app.color.text_secondary')])
       }
       .width(THUMB_WIDTH)
@@ -885,67 +886,60 @@ export struct WorkdirBrowser {
     Column() {
       this.thumbFrame(row)
       Text(row.name)
-        .fontSize(14)
+        .fontSize(UI_FONT_SECONDARY)
         .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .wordBreak(WordBreak.BREAK_ALL)
         .textAlign(TextAlign.Center)
         .width('100%')
-        .margin({ top: 8 })
+        .margin({ top: UI_SPACE_INLINE })
       Text(this.meta(row))
-        .fontSize(12)
+        .fontSize(UI_FONT_CAPTION)
         .fontColor($r('app.color.text_secondary'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .textAlign(TextAlign.Center)
         .width('100%')
-        .margin({ top: 2 })
+        .margin({ top: UI_SPACE_TIGHT })
     }
     .width('100%')
-    .padding({ left: 4, right: 4, top: 8, bottom: 8 })
+    .padding({ left: UI_SPACE_TIGHT, right: UI_SPACE_TIGHT, top: UI_SPACE_INLINE, bottom: UI_SPACE_INLINE })
   }
 
   @Builder
   listRow(row: WorkdirEntry) {
-    Row({ space: 12 }) {
+    Row({ space: UI_SPACE_GROUP }) {
       Stack() {
         if (!row.folder && this.thumbnail(row).startsWith('data:image/')) {
           Image(this.thumbnail(row))
-            .width(40)
-            .height(40)
+            .width(UI_TOUCH_TARGET_MIN)
+            .height(UI_TOUCH_TARGET_MIN)
             .objectFit(ImageFit.Cover)
             .borderRadius(UI_RADIUS_CONTROL)
             .border({ width: 1, color: $r('app.color.border') })
             .clip(true)
         } else {
           SymbolGlyph(row.folder ? $r('sys.symbol.folder') : $r('sys.symbol.doc'))
-            .fontSize(30)
+            .fontSize(UI_ICON_SIZE_STANDARD)
             .fontColor([$r('app.color.text_secondary')])
         }
       }
-      .width(40)
-      .height(40)
-      Column({ space: 2 }) {
-        Text(row.name)
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(this.meta(row))
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .width(UI_TOUCH_TARGET_MIN)
+      .height(UI_TOUCH_TARGET_MIN)
+      Column({ space: UI_SPACE_TIGHT }) {
+        Text(row.name).fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary'))
+          .width('100%').wordBreak(WordBreak.BREAK_ALL)
+        Text(this.meta(row)).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         if (row.excerpt) {
           Text(row.excerpt)
-            .fontSize(12)
+            .fontSize(UI_FONT_CAPTION)
             .fontFamily('monospace')
             .fontColor($r('app.color.text_primary'))
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
-            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-            .margin({ top: 2 })
+            .padding({ left: UI_SPACE_INLINE, right: UI_SPACE_INLINE, top: UI_SPACE_TIGHT, bottom: UI_SPACE_TIGHT })
+            .margin({ top: UI_SPACE_TIGHT })
             .backgroundColor($r('app.color.bg_chip'))
             .borderRadius(UI_RADIUS_CONTROL)
         }
@@ -953,28 +947,38 @@ export struct WorkdirBrowser {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
       if (row.folder) {
-        SymbolGlyph($r('sys.symbol.chevron_right'))
-          .fontSize(12)
-          .fontColor([$r('app.color.text_tertiary')])
+        SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(UI_ICON_SIZE_STANDARD)
+          .fontColor([$r('app.color.text_tertiary')]).accessibilityLevel('no').focusable(false)
       }
     }
     .width('100%')
     .constraintSize({ minHeight: 56 })
-    .padding({ top: 8, bottom: 8 })
+    .padding({ top: UI_SPACE_TIGHT, bottom: UI_SPACE_TIGHT })
   }
 
   @Builder
   item(row: WorkdirEntry, compact: boolean) {
-    Column() {
-      if (compact) {
-        this.listRow(row)
-      } else {
-        this.gridCell(row)
-      }
+    Button({ type: ButtonType.Normal }) {
+      Column() {
+        if (compact) {
+          this.listRow(row)
+        } else {
+          UiCard({ inset: UI_SPACE_TIGHT }) { this.gridCell(row) }
+        }
+      }.width('100%').accessibilityLevel('no-hide-descendants')
     }
+    .buttonStyle(ButtonStyleMode.TEXTUAL).backgroundColor(Color.Transparent).padding(0)
+    .borderRadius(UI_RADIUS_CONTENT).focusable(true)
+    .accessibilityLevel('yes').accessibilityText(row.name + '，' + this.meta(row))
     .width('100%')
     .clickEffect(UI_LIST_CLICK_EFFECT)
     .onClick((): void => this.open(row))
+    .onKeyEvent((event: KeyEvent): void => {
+      if (event.type === KeyType.Down && event.keyCode === KeyCode.KEYCODE_MENU) {
+        this.itemMenuKey = this.rowMenuKey(row);
+        event.stopPropagation();
+      }
+    })
     .gesture(LongPressGesture().onAction((): void => { this.itemMenuKey = this.rowMenuKey(row); }))
     .bindMenu(this.itemMenuKey === this.rowMenuKey(row), this.itemMenu(row),
       uiMenuOptions((): void => {
@@ -998,49 +1002,40 @@ export struct WorkdirBrowser {
     else this.close();
   }
 
-  /** 标题栏：圆形返回 / 关闭，标题 + ⌄（祖先路径），右侧胶囊放搜索与更多；中性底色，不用强调色实心。 */
+  /** 左侧返回 / 关闭和路径标题，右侧保留搜索与更多。 */
   @Builder
   header() {
     Row() {
-      Row() {
-        Button({ type: ButtonType.Circle, stateEffect: true }) {
-          SymbolGlyph(this.atRoot() ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_left'))
-            .fontSize(20)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .width(44)
-        .height(44)
-        .backgroundColor($r('app.color.bg_chip'))
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .accessibilityText(this.atRoot() ? '关闭' : '返回')
-        .onClick((): void => this.back())
-      }
-      .width(HEADER_SIDE)
-      .justifyContent(FlexAlign.Start)
-
+      UiIconButton({ label: this.atRoot() ? '关闭' : '返回',
+        glyph: this.atRoot() ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_left'),
+        onAction: () => this.back() })
       Column({ space: 2 }) {
         if (this.preview !== null) {
           Text(this.preview?.name ?? '')
-            .fontSize(17)
+            .fontSize(UI_FONT_LIST_TITLE)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         } else {
-          Row({ space: 4 }) {
-            Text(workdirName(this.path || this.workdir))
-              .fontSize(17)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .flexShrink(1)
-            SymbolGlyph($r('sys.symbol.chevron_down'))
-              .fontSize(13)
-              .fontColor([$r('app.color.text_secondary')])
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: UI_SPACE_TIGHT }) {
+              Text(workdirName(this.path || this.workdir))
+                .fontSize(UI_FONT_LIST_TITLE)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .flexShrink(1)
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(UI_FONT_SECONDARY)
+                .fontColor([$r('app.color.text_secondary')])
+            }.accessibilityLevel('no-hide-descendants')
           }
+          .buttonStyle(ButtonStyleMode.TEXTUAL).backgroundColor(Color.Transparent).padding(0)
+          .focusable(true)
           .constraintSize({ minHeight: 44 })
-          .padding({ left: 8, right: 8 })
+          .padding({ right: UI_SPACE_TIGHT })
           .borderRadius(UI_RADIUS_PILL)
           .clickEffect(UI_ICON_CLICK_EFFECT)
           .accessibilityText(workdirName(this.path || this.workdir))
@@ -1052,58 +1047,36 @@ export struct WorkdirBrowser {
             uiMenuOptions((): void => { if (this.headerMenu === 'path') this.headerMenu = ''; }, Placement.Bottom,
               'workdir-path'))
           Text((this.deviceName || this.device) + ' · 工作目录')
-            .fontSize(12)
+            .fontSize(UI_FONT_CAPTION)
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
       }
       .layoutWeight(1)
-      .alignItems(HorizontalAlign.Center)
+      .alignItems(HorizontalAlign.Start)
 
       Row() {
         if (this.preview === null && !this.drawing) {
           Row() {
-            Button({ type: ButtonType.Circle, stateEffect: true }) {
-              SymbolGlyph($r('sys.symbol.magnifyingglass'))
-                .fontSize(19)
-                .fontColor([this.searching ? $r('app.color.accent') : $r('app.color.text_primary')])
-            }
-            .width(44)
-            .height(44)
-            .backgroundColor(Color.Transparent)
-            .clickEffect(UI_ICON_CLICK_EFFECT)
-            .accessibilityText('搜索')
-            .onClick((): void => { this.searching = !this.searching; this.search(); })
-            Button({ type: ButtonType.Circle, stateEffect: true }) {
-              SymbolGlyph($r('sys.symbol.more'))
-                .fontSize(19)
-                .fontColor([$r('app.color.text_primary')])
-            }
-            .width(44)
-            .height(44)
-            .backgroundColor(Color.Transparent)
-            .clickEffect(UI_ICON_CLICK_EFFECT)
-            .accessibilityText('更多')
-            .onClick((): void => {
-              uiOverlayTrace('workdir-more', 'open');
-              this.headerMenu = 'more';
-              const wasSupported = this.showIgnoredSupported === true &&
-                this.ignoredScope === AppServices.instance.moduleScope;
-              void this.resolveIgnoredCapability().then((): void => {
-                if (!wasSupported && this.showIgnoredDirs && this.showIgnoredSupported === true) this.reload();
-              });
-            })
+            UiIconButton({ label: '搜索', glyph: $r('sys.symbol.magnifyingglass'),
+              onAction: (): void => { this.searching = !this.searching; this.search(); } })
+            UiIconButton({ label: '更多', glyph: $r('sys.symbol.more'),
+              onAction: (): void => {
+                uiOverlayTrace('workdir-more', 'open');
+                this.headerMenu = 'more';
+                const wasSupported = this.showIgnoredSupported === true &&
+                  this.ignoredScope === AppServices.instance.moduleScope;
+                void this.resolveIgnoredCapability().then((): void => {
+                  if (!wasSupported && this.showIgnoredDirs && this.showIgnoredSupported === true) this.reload();
+                });
+              } })
             .bindMenu(this.headerMenu === 'more', this.moreMenu(),
               uiMenuOptions((): void => { if (this.headerMenu === 'more') this.headerMenu = ''; }, Placement.BottomRight,
                 'workdir-more'))
           }
-          .height(44)
-          .borderRadius(UI_RADIUS_PILL)
-          .backgroundColor($r('app.color.bg_chip'))
         }
       }
-      .width(HEADER_SIDE)
       .justifyContent(FlexAlign.End)
     }
     .width('100%')
@@ -1113,15 +1086,7 @@ export struct WorkdirBrowser {
   /** 预览底部、搜索切换等文字操作：中性胶囊，44vp 高。 */
   @Builder
   pillButton(label: string, enabled: boolean, action: () => void) {
-    Button(label, { type: ButtonType.Capsule, stateEffect: true })
-      .height(44)
-      .padding({ left: 16, right: 16 })
-      .fontSize(14)
-      .fontColor($r('app.color.text_primary'))
-      .backgroundColor($r('app.color.bg_chip'))
-      .enabled(enabled)
-      .opacity(enabled ? 1 : 0.45)
-      .onClick(action)
+    UiActionButton({ label: label, actionEnabled: enabled, onAction: action })
   }
 
   build() {
@@ -1138,7 +1103,7 @@ export struct WorkdirBrowser {
             .onAction((event: GestureEvent): void => {
               if (this.previewKind !== 'model') this.pagePreview(Math.abs(event.angle) < 90 ? -1 : 1);
             }))
-        Row({ space: 8 }) {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center }) {
           this.pillButton('上一项', true, (): void => this.pagePreview(-1))
           this.pillButton(this.sharing ? '准备中…' : '导出／分享', !this.sharing,
             (): void => { if (this.preview !== null) void this.share(this.preview); })
@@ -1147,25 +1112,20 @@ export struct WorkdirBrowser {
               (): void => { void this.openDrawing(); })
           }
           this.pillButton('下一项', true, (): void => this.pagePreview(1))
-        }.width('100%').justifyContent(FlexAlign.Center)
+        }.width('100%')
       } else {
         if (this.searching) {
-          Row({ space: 8 }) {
-            TextInput({ text: this.query, placeholder: '搜索工作目录' }).layoutWeight(1)
-              .height(44)
-              .fontSize(15)
-              .fontColor($r('app.color.text_primary'))
-              .placeholderColor($r('app.color.text_placeholder'))
-              .caretColor($r('app.color.accent'))
-              .backgroundColor($r('app.color.bg_chip'))
-              .borderRadius(UI_RADIUS_PILL)
+          Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
+            Search({ value: this.query, placeholder: '搜索工作目录' })
+              .constraintSize({ minWidth: 160 }).flexGrow(1)
+              .caretStyle({ color: $r('app.color.accent') })
               .onChange((value: string): void => { this.query = value; this.search(); })
             this.pillButton(this.contents ? '搜文件名' : '搜内容', true,
               (): void => { this.contents = !this.contents; this.search(); })
-          }
+          }.width('100%')
         }
         if (this.searching && this.contents && this.searchSummary) {
-          Text(this.searchSummary).fontSize(12).fontColor($r('app.color.text_secondary'))
+          Text(this.searchSummary).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
         }
         if (this.error) {
           Text(this.error).fontColor($r('app.color.text_secondary')).onClick((): void => { void this.reload(); })
@@ -1198,9 +1158,9 @@ export struct WorkdirBrowser {
         if (!this.searching) {
           Text(this.entries.filter((row: WorkdirEntry): boolean => row.folder).length + ' 个文件夹、' +
             this.entries.filter((row: WorkdirEntry): boolean => !row.folder).length + ' 个文件')
-            .fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+            .fontSize(UI_FONT_SECONDARY).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
           Text(this.watching ? '已连接 · 即时同步' : '未启用即时同步')
-            .fontSize(12).fontColor($r('app.color.text_secondary'))
+            .fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
         }
       }
     }.width('100%').height('100%').padding(16)

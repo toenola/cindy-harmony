@@ -1,3 +1,6 @@
+import { UiPanelHeading } from './common/UiNavigation';
+import { UiIconButton } from './common/UiActions';
+import { UI_FONT_BODY, UI_FONT_CAPTION, UI_RADIUS_CARD, UI_TOUCH_TARGET_MIN, getSystemFontSizeScale } from './UiKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   RemoteImageRef,
@@ -11,7 +14,6 @@ import {
 } from '../core/messages/ComposerDocument';
 import {
   UI_CLICK_EFFECT,
-  UI_ICON_CLICK_EFFECT,
   UI_CURVE_MOVE,
   UI_MOTION_BASE,
   UI_MOTION_FAST,
@@ -20,7 +22,6 @@ import {
   UI_RADIUS_PILL,
   uiFontSize,
   uiScaledMaxWidth,
-  uiLineHeight,
   uiRevealTransition,
 } from './UiKit';
 import { uiMaterial } from '@kit.ArkUI';
@@ -143,6 +144,7 @@ export struct ConversationComposer {
   private pickerScrollFromFull: boolean = false;
   private pickerScrollResizing: boolean = false;
   private pickerFrameCount: number = 0;
+  @State private pickerHeadingHeight: number = 56;
   private pickerViewport: number = 0;
   private pickerContent: number = 0;
   @State private editorDragHeight: number = 0;
@@ -251,7 +253,7 @@ export struct ConversationComposer {
   }
 
   private pickerBodyHeight(): number {
-    return Math.max(1, this.pickerHeightLimit() - 56);
+    return Math.max(1, this.pickerHeightLimit() - this.pickerHeadingHeight);
   }
 
   private pickerHeightLimit(): number {
@@ -371,40 +373,37 @@ export struct ConversationComposer {
   @Builder
   composerImageItem(image: ComposerImage) {
     Column({ space: 3 }) {
-      Stack({ alignContent: Alignment.TopEnd }) {
+      Row() {
         Image(image.uri)
           .width(56)
           .height(56)
           .borderRadius(UI_RADIUS_CONTROL)
           .objectFit(ImageFit.Cover)
+          .accessibilityText('预览图片 · ' + image.name)
           .onClick(() => {
             if (image.status === 'ready') this.onPreviewImage(image);
           })
-        Button() {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(11)
-            .fontColor([$r('app.color.chat_overlay_text')])
-        }
-        .type(ButtonType.Circle)
-        .width(28)
-        .height(28)
-        .padding(0)
-        .backgroundColor($r('app.color.overlay'))
-        .borderRadius(UI_RADIUS_PILL)
-        .clickEffect(UI_ICON_CLICK_EFFECT)
-        .zIndex(1)
-        .onClick(() => this.onRemoveImage(image.localId))
-      }
+        // Reserve the complete delete target beside the thumbnail. Expansion stays inside this slot.
+        Stack({ alignContent: Alignment.TopStart }) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.xmark')).fontSize(12)
+              .fontColor([$r('app.color.text_primary')]).accessibilityLevel('no')
+          }
+          .type(ButtonType.Circle).width(24).height(24).padding(0)
+          .backgroundColor($r('app.color.bg_chip'))
+          .responseRegion({ x: 0, y: 0, width: UI_TOUCH_TARGET_MIN, height: UI_TOUCH_TARGET_MIN })
+          .accessibilityText('移除图片 · ' + image.name)
+          .onClick(() => this.onRemoveImage(image.localId))
+        }.width(UI_TOUCH_TARGET_MIN).height(UI_TOUCH_TARGET_MIN)
+      }.alignItems(VerticalAlign.Top)
       if (image.status === 'uploading') {
         Text('上传中…')
-          .fontSize(uiFontSize(10))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_secondary'))
       } else if (image.status === 'failed') {
-        Text('重试')
-          .fontSize(uiFontSize(10))
-          .fontColor($r('app.color.danger'))
-          .decoration({ type: TextDecorationType.Underline })
-          .onClick(() => this.onRetryImage(image.localId))
+        Button('重试').buttonStyle(ButtonStyleMode.TEXTUAL).fontSize(UI_FONT_CAPTION)
+          .fontColor($r('app.color.danger')).constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+          .padding(0).onClick(() => this.onRetryImage(image.localId))
       } else {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(11)
@@ -422,14 +421,14 @@ export struct ConversationComposer {
         .fontColor([$r('app.color.text_secondary')])
       Column({ space: 1 }) {
         Text(file.name)
-          .fontSize(uiFontSize(12))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(file.status === 'uploading' ? '上传中…'
           : file.status === 'failed' ? (file.errorText || '上传失败')
             : file.size > 0 ? `${(file.size / 1024).toFixed(1)} KB` : '已就绪')
-          .fontSize(uiFontSize(10))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor(file.status === 'failed' ? $r('app.color.danger') : $r('app.color.text_tertiary'))
           .maxLines(1)
       }
@@ -437,26 +436,16 @@ export struct ConversationComposer {
       .alignItems(HorizontalAlign.Start)
       if (file.status === 'failed') {
         Button('重试')
-          .height(26)
-          .fontSize(uiFontSize(11))
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.accent'))
           .padding({ left: 8, right: 8 })
           .backgroundColor(Color.Transparent)
           .onClick(() => this.onRetryFile(file.localId))
       }
-      Button() {
-        SymbolGlyph($r('sys.symbol.xmark'))
-          .fontSize(uiFontSize(10))
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .type(ButtonType.Circle)
-      .width(26)
-      .height(26)
-      .padding(0)
-      .backgroundColor($r('app.color.bg_chip'))
-      .onClick(() => this.onRemoveFile(file.localId))
+      UiIconButton({ glyph: $r('sys.symbol.xmark'), label: '移除附件', onAction: () => this.onRemoveFile(file.localId) })
     }
-    .height(54)
+    .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
     .padding({ left: 10, right: 6 })
     .margin({ right: 8 })
     .backgroundColor($r('app.color.bg_chip'))
@@ -474,14 +463,14 @@ export struct ConversationComposer {
         .fontColor([$r('app.color.text_secondary')])
       Column({ space: 1 }) {
         Text(atom.label)
-          .fontSize(uiFontSize(11))
+          .fontSize(UI_FONT_CAPTION)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         if (atom.detail.length > 0) {
           Text(atom.detail)
-            .fontSize(uiFontSize(10))
+            .fontSize(UI_FONT_CAPTION)
             .fontColor($r('app.color.text_tertiary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -489,20 +478,9 @@ export struct ConversationComposer {
       }
       .constraintSize({ maxWidth: 160 })
       .alignItems(HorizontalAlign.Start)
-      Button() {
-        SymbolGlyph($r('sys.symbol.xmark'))
-          .fontSize(uiFontSize(9))
-          .fontColor([$r('app.color.text_secondary')])
-      }
-      .type(ButtonType.Circle)
-      .width(24)
-      .height(24)
-      .padding(0)
-      .backgroundColor(Color.Transparent)
-      .clickEffect(UI_ICON_CLICK_EFFECT)
-      .onClick(() => this.onRemoveAtom(atom))
+      UiIconButton({ glyph: $r('sys.symbol.xmark'), label: '移除上下文', onAction: () => this.onRemoveAtom(atom) })
     }
-    .height(42)
+    .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
     .padding({ left: 10, right: 4 })
     .margin({ right: 8 })
     .backgroundColor($r('app.color.bg_chip'))
@@ -514,86 +492,73 @@ export struct ConversationComposer {
   @Builder
   composerIconButton(
     symbol: Resource,
-    tint: Resource,
     enabled: boolean,
     accessibilityLabel: string,
     action: () => void,
   ) {
-    Button() {
-      SymbolGlyph(symbol)
-        .fontSize(18)
-        .fontColor([tint])
-    }
-    .type(ButtonType.Circle)
-    .width(44)
-    .height(44)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(enabled)
-    .opacity(enabled ? 1 : 0.4)
-    .accessibilityText(accessibilityLabel)
-    .onClick(action)
+    UiIconButton({ glyph: symbol, label: accessibilityLabel, actionEnabled: enabled, onAction: action })
   }
 
   /** 权限图标保留档位读屏名，选项与确认仍由页面提供。 */
   @Builder
   composerPermissionButton() {
-    Button() {
-      SymbolGlyph(composerPermissionSymbol(this.permissionMode))
-        .fontSize(18)
-        .fontColor([composerPermissionTint(this.permissionMode)])
-    }
-    .type(ButtonType.Circle)
-    .width(44)
-    .height(44)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_CLICK_EFFECT)
-    .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
-    .opacity(this.composerEnabled && !this.sending && !this.contextBusy ? 1 : 0.4)
-    .accessibilityText(`权限模式：${this.permissionLabel}`)
-    .onClick(() => this.onPermission())
+    UiIconButton({
+      glyph: composerPermissionSymbol(this.permissionMode),
+      label: `权限模式：${this.permissionLabel}`,
+      iconRole: this.permissionMode === 'bypassPermissions' ? 'danger' : 'normal',
+      actionEnabled: this.composerEnabled && !this.sending && !this.contextBusy,
+      onAction: () => this.onPermission(),
+    })
   }
 
   /** 工具栏里的模型胶囊；窄屏只压缩文字，不挤占上方输入区域。 */
   @Builder
   composerModelButton() {
-    Button() {
-      Row({ space: 4 }) {
-        if (this.agentLabel.length > 0) {
-          Text(this.agentLabel === 'Codex' ? '✣' : this.agentLabel === 'Pi' ? 'π' : '♟')
-            .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).accessibilityLevel('no')
+    if (getSystemFontSizeScale() >= 1.3) {
+      UiIconButton({ glyph: $r('sys.symbol.square_grid_2x2'),
+        label: this.modelAccessibilityLabel(),
+        actionEnabled: this.hasModelOptions && !this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy,
+        onAction: () => this.onModel() })
+    } else {
+      Button() {
+        Row({ space: 4 }) {
+          if (this.agentLabel.length > 0) {
+            Text(this.agentLabel === 'Codex' ? '✣' : this.agentLabel === 'Pi' ? 'π' : '♟')
+              .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).accessibilityLevel('no')
+          }
+          Text(this.effortLabel.length > 0
+            ? `${this.modelLabel} · ${this.effortLabel}`
+            : this.modelLabel)
+            .fontSize(UI_FONT_CAPTION)
+            .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            // 上限随系统字号放大，避免放大字体后模型名 / 强度被截成省略号。
+            .constraintSize({ maxWidth: uiScaledMaxWidth(176, 264) })
+          SymbolGlyph($r('sys.symbol.chevron_down'))
+            .fontSize(11)
+            .fontColor([$r('app.color.text_tertiary')])
         }
-        Text(this.effortLabel.length > 0
-          ? `${this.modelLabel} · ${this.effortLabel}`
-          : this.modelLabel)
-          .fontSize(uiFontSize(12))
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          // 上限随系统字号放大，避免放大字体后模型名 / 强度被截成省略号。
-          .constraintSize({ maxWidth: uiScaledMaxWidth(176, 264) })
-        SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(11)
-          .fontColor([$r('app.color.text_tertiary')])
+        .alignItems(VerticalAlign.Center)
       }
-      .alignItems(VerticalAlign.Center)
+      .type(ButtonType.Normal)
+      .buttonStyle(ButtonStyleMode.TEXTUAL)
+      .height(UI_TOUCH_TARGET_MIN)
+      .constraintSize({ maxWidth: uiScaledMaxWidth(208, 300) })
+      .padding({ left: 12, right: 10 })
+      .borderRadius(UI_RADIUS_PILL)
+      .backgroundColor(Color.Transparent)
+      // 读屏播报完整元信息：视觉可能省略，但强度不能只靠看。
+      .enabled(this.hasModelOptions && !this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
+      .accessibilityText(this.modelAccessibilityLabel())
+      .onClick(() => this.onModel())
     }
-    .type(ButtonType.Normal)
-    .height(44)
-    .constraintSize({ maxWidth: uiScaledMaxWidth(208, 300) })
-    .padding({ left: 12, right: 10 })
-    .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_CLICK_EFFECT)
-    // 读屏播报完整元信息：视觉可能省略，但强度不能只靠看。
-    .enabled(this.hasModelOptions && !this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
-    .opacity(!this.hasModelOptions || this.runtimeRouteLocked ? 0.4 : 1)
-    .accessibilityText(this.effortLabel.length > 0
+  }
+
+  private modelAccessibilityLabel(): string {
+    return this.effortLabel.length > 0
       ? `模型：${this.agentLabel} ${this.modelLabel}，思考强度：${this.effortLabel}`
-      : `模型：${this.agentLabel} ${this.modelLabel}`)
-    .onClick(() => this.onModel())
+      : `模型：${this.agentLabel} ${this.modelLabel}`;
   }
 
   /** 工具栏里的独立 Agent 胶囊，位于模型胶囊之前。 */
@@ -602,7 +567,7 @@ export struct ConversationComposer {
     Button() {
       Row({ space: 4 }) {
         Text(this.agentLabel)
-          .fontSize(uiFontSize(12))
+          .fontSize(UI_FONT_CAPTION)
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -635,19 +600,16 @@ export struct ConversationComposer {
       }.height(12).width('100%').justifyContent(FlexAlign.Center).accessibilityLevel('no')
       Row() {
         if (this.pickerPage === 'model' && this.modelPickerTitle) {
-          Button() {
-            SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(16).fontColor([$r('app.color.text_primary')])
-          }.type(ButtonType.Circle).width(44).height(44).backgroundColor(Color.Transparent)
-            .accessibilityText('返回模型').onClick(() => this.onModelPickerBack())
-        } else {
-          Blank().width(44)
+          UiIconButton({ glyph: $r('sys.symbol.chevron_left'), label: '返回模型',
+            onAction: () => this.onModelPickerBack() })
         }
-        Text(this.pickerTitle()).fontSize(uiFontSize(15)).fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary')).textAlign(TextAlign.Center).layoutWeight(1)
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-        Blank().width(44)
-      }.width('100%').height(44)
+        UiPanelHeading({ heading: this.pickerTitle() }).layoutWeight(1)
+      }.width('100%').constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
       }.width('100%')
+      .onAreaChange((_old: Area, next: Area) => {
+        const measured = Number(next.height);
+        if (measured > 0 && Math.abs(this.pickerHeadingHeight - measured) >= 1) this.pickerHeadingHeight = measured;
+      })
       .gesture(PanGesture({ direction: PanDirection.Vertical })
         .onActionStart(() => this.beginPickerDrag())
         .onActionUpdate((event: GestureEvent) => this.updatePickerDrag(event.offsetY))
@@ -691,47 +653,22 @@ export struct ConversationComposer {
     .height(this.fullPicker || this.pickerDragHeight > 0 ? this.pickerHeightLimit() : undefined)
     .onAreaChange((_old: Area, next: Area) => { this.pickerMeasuredHeight = Number(next.height); })
     .backgroundColor($r('app.color.bg_card'))
-    .borderRadius(UI_RADIUS_CONTAINER)
+    .borderRadius(UI_RADIUS_CARD)
     .clip(true)
     .transition(this.pickerSlide())
   }
 
   @Builder
   composerPrimaryButton() {
-    Button() {
-      if (this.sending) {
-        LoadingProgress()
-          .width(15)
-          .height(15)
-          .color($r('app.color.text_primary'))
-      } else if (this.primaryShowsStop()) {
-        SymbolGlyph($r('sys.symbol.square_fill'))
-          .fontSize(12)
-          .fontColor([$r('app.color.danger')])
-      } else {
-        SymbolGlyph($r('sys.symbol.arrow_up'))
-          .fontSize(16)
-          .fontColor([this.canSend
-            ? $r('app.color.text_primary')
-            : $r('app.color.text_tertiary')])
-      }
-    }
-    .type(ButtonType.Circle)
-    .width(44)
-    .height(44)
-    .padding(0)
-    .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor(Color.Transparent)
-    .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(this.composerEnabled && !this.sending
-      && ((this.primaryShowsStop()) || this.canSend))
-    .accessibilityText(this.sending
-      ? '发送中'
-      : this.primaryShowsStop()
-        ? '停止'
-        : '发送')
-    .onClick(() => this.tapPrimaryAction())
+    UiIconButton({
+      glyph: !this.sending && this.primaryShowsStop() ? $r('sys.symbol.square_fill') : $r('sys.symbol.arrow_up'),
+      label: !this.sending && this.primaryShowsStop() ? '停止' : '发送',
+      iconRole: !this.sending && this.primaryShowsStop() ? 'danger' : 'normal',
+      loading: this.sending,
+      loadingLabel: '发送中',
+      actionEnabled: this.composerEnabled && (this.primaryShowsStop() || this.canSend),
+      onAction: () => this.tapPrimaryAction(),
+    })
   }
 
   /** 打开态与关闭态使用不同的 ArkUI 分支，关闭时直接销毁承载原生 Popup 的锚点节点。 */
@@ -761,7 +698,6 @@ export struct ConversationComposer {
   composerAddButton() {
     this.composerIconButton(
       $r('sys.symbol.plus'),
-      $r('app.color.text_primary'),
       this.composerEnabled && !this.sending && !this.pickingImages && !this.pickingFiles,
       '添加附件或上下文',
       () => this.onAdd(),
@@ -790,7 +726,7 @@ export struct ConversationComposer {
         Row() {
           Button('计划')
             .height(44)
-            .fontSize(uiFontSize(12))
+            .fontSize(UI_FONT_CAPTION)
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
             .borderRadius(UI_RADIUS_PILL)
@@ -823,7 +759,7 @@ export struct ConversationComposer {
         .height(16)
         .color($r('app.color.text_tertiary'))
       Text('正在加载工具栏…')
-        .fontSize(uiFontSize(12))
+        .fontSize(UI_FONT_CAPTION)
         .fontColor($r('app.color.text_tertiary'))
         .maxLines(1)
     }
@@ -843,14 +779,12 @@ export struct ConversationComposer {
             .height(12)
             .color($r('app.color.chat_status_accent'))
           Text('思考中…')
-            .fontSize(uiFontSize(12))
-            .lineHeight(uiLineHeight(18))
+            .fontSize(UI_FONT_CAPTION)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.chat_status_accent'))
           Row().layoutWeight(1)
           Text(this.streamingElapsedText)
-            .fontSize(uiFontSize(12))
-            .lineHeight(uiLineHeight(18))
+            .fontSize(UI_FONT_CAPTION)
             .fontColor($r('app.color.text_tertiary'))
         }
         .width('100%')
@@ -889,7 +823,8 @@ export struct ConversationComposer {
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
-          .height(76)
+          .height(this.images.some((image: ComposerImage): boolean => image.status === 'failed')
+            ? 106 : Math.max(76, 62 + 16 * getSystemFontSizeScale()))
           .transition(uiRevealTransition())
         }
 
@@ -902,7 +837,7 @@ export struct ConversationComposer {
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
-          .height(60)
+          .height(Math.max(56, 34 * getSystemFontSizeScale() + 8))
           .transition(uiRevealTransition())
         }
 
@@ -915,7 +850,7 @@ export struct ConversationComposer {
           }
           .listDirection(Axis.Horizontal)
           .width('100%')
-          .height(48)
+          .height(Math.max(48, 34 * getSystemFontSizeScale() + 8))
           .transition(uiRevealTransition())
         }
 
@@ -925,9 +860,8 @@ export struct ConversationComposer {
               TextArea({ placeholder: this.placeholder, text: this.input })
                 .id(this.inputId)
                 .enabled(this.composerEnabled)
-                .fontSize(uiFontSize(15))
-                .placeholderFont({ size: uiFontSize(15) })
-                .lineHeight(uiLineHeight(22))
+                .fontSize(UI_FONT_BODY)
+                .placeholderFont({ size: UI_FONT_BODY })
                 .fontColor($r('app.color.text_primary'))
                 .placeholderColor($r('app.color.text_placeholder'))
                 .caretColor($r('app.color.chat_input_caret'))
@@ -980,7 +914,7 @@ export struct ConversationComposer {
             }
             Button() {
               Text(this.input.length > 0 ? this.input : this.placeholder)
-                .fontSize(uiFontSize(15))
+                .fontSize(UI_FONT_BODY)
                 .fontColor(this.input.length > 0 ? $r('app.color.text_primary') : $r('app.color.text_placeholder'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -989,8 +923,8 @@ export struct ConversationComposer {
             }
             .type(ButtonType.Normal)
             .layoutWeight(1)
-            .height(44)
-            .padding({ left: 4, right: 4 })
+            .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
+            .padding({ left: 4, right: 4, top: 4, bottom: 4 })
             .backgroundColor(Color.Transparent)
             .enabled(this.composerEnabled)
             .accessibilityText(this.input.length > 0 ? this.input : this.placeholder)
@@ -1001,7 +935,7 @@ export struct ConversationComposer {
             }
           }
           .width('100%')
-          .height(44)
+          .constraintSize({ minHeight: UI_TOUCH_TARGET_MIN })
           .alignItems(VerticalAlign.Center)
         }
         }

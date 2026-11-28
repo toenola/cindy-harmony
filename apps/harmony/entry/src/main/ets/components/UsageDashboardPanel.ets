@@ -1,4 +1,7 @@
-import { ChatSegmented } from './chat/ChatChrome';
+import { CapsuleSegmentButtonV2, SegmentButtonV2ItemOptions, SegmentButtonV2Items } from '@kit.ArkUI';
+import { UiCard, UiListRow } from './common/UiList';
+import { UiInlineError, UiEmptyState } from './common/UiStatus';
+import { UiIconButton } from './common/UiActions';
 import { uiToast } from './common/UiOverlay';
 import { PluginEngineMark } from './PluginEngineMark';
 import { PluginEngine, PluginUsage, PluginUsageBalance, PluginUsageWindow } from '../core/plugin-engines/PluginEngines';
@@ -11,7 +14,7 @@ import {
   UsageSnapshot, UsageSource, UsageSeries, UsageDay, UsageWindow, UsageTotals, usageCompact, usageSeries, usageTotals, usageRangeStart, usageHasModels,
   usageResetLabel, readUsageDashboard, usageCandidates,
 } from '../core/usage/UsageDashboard';
-import { UI_RADIUS_CONTAINER } from './UiKit';
+import { UI_FONT_TITLE_L, UI_FONT_TITLE_S, UI_FONT_LIST_TITLE, UI_FONT_BODY, UI_FONT_SECONDARY, UI_FONT_CAPTION, UI_FONT_CAPTION_SMALL, UI_RADIUS_CONTENT, UI_SPACE_GROUP, UI_SPACE_PAGE } from './UiKit';
 
 class PluginQuotaRow {
   engine: PluginEngine = new PluginEngine();
@@ -248,23 +251,29 @@ export struct UsageDashboardPanel {
     const local = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     return this.today().date && this.today().date !== local ? this.today().date : this.text('usage_today');
   }
+  private modelRowDetail(series: UsageSeries): string {
+    const estimate = this.showModelEstimates() && series.estimated !== null
+      ? this.text('usage_estimated') + ' ' + this.money(series.estimated) : '';
+    return [series.harness, estimate].filter((part: string): boolean => part.length > 0).join(' · ');
+  }
   private showModelEstimates(): boolean {
     return this.chartRows.some((row: UsageSeries): boolean => (!this.modelKey || row.key === this.modelKey) && row.hasEstimate);
   }
   private money(value: number): string { return this.data().moneySymbol + value.toFixed(2); }
   private stale(): boolean { const d = this.data(); return this.now - (d.updatedAtMs || d.generatedAtMs) >= 3600000; }
+  // P2-13: data-series colors are not action colors. Keep legend and chart on the same mapping.
   private tint(series: UsageSeries): Resource {
     if (series.other) return $r('app.color.usage_chart_other');
     const colors: Resource[] = [$r('app.color.usage_chart_teal'), $r('app.color.usage_chart_pink'),
-      $r('app.color.usage_chart_purple'), $r('app.color.accent'), $r('app.color.warn')];
+      $r('app.color.usage_chart_purple'), $r('app.color.usage_chart_blue'), $r('app.color.usage_chart_amber')];
     return colors[series.colorIndex % colors.length];
   }
   private windowTint(color: string): Resource {
     if (color === 'claude' || color === 'claude2' || color === 'claude3') {
       return color === 'claude2' ? $r('app.color.usage_chart_pink')
-        : color === 'claude3' ? $r('app.color.usage_chart_purple') : $r('app.color.warn');
+        : color === 'claude3' ? $r('app.color.usage_chart_purple') : $r('app.color.usage_chart_amber');
     }
-    if (color === 'codex') return $r('app.color.accent');
+    if (color === 'codex') return $r('app.color.usage_chart_blue');
     if (color === 'warn') return $r('app.color.warn');
     if (color === 'crit' || color === 'error') return $r('app.color.danger');
     if (color.startsWith('ink')) return $r('app.color.text_tertiary');
@@ -297,25 +306,20 @@ export struct UsageDashboardPanel {
     Scroll(this.scroller) {
       Column({ space: 18 }) {
         Row({ space: 12 }) {
-          Text(this.deviceName).fontSize(16).fontWeight(FontWeight.Medium)
+          Text(this.deviceName).fontSize(UI_FONT_BODY).fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_secondary')).maxLines(2).layoutWeight(1)
-          Button() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise')).fontSize(20).fontColor([$r('app.color.text_primary')])
-          }
-          .type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor(Color.Transparent)
-          .opacity(this.loading ? 0.4 : 1).enabled(!this.loading)
-          .accessibilityText(this.loading ? $r('app.string.usage_loading') : $r('app.string.usage_refresh'))
-          .onClick(() => void this.refresh(true))
+          UiIconButton({ label: this.text(this.loading ? 'usage_loading' : 'usage_refresh'),
+            glyph: $r('sys.symbol.arrow_clockwise'), actionEnabled: !this.loading, onAction: () => void this.refresh(true) })
         }.width('100%')
         if (this.issue) {
-          Text(this.notice()).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
+          UiInlineError({ message: this.notice() })
         }
         if (this.snapshot !== null) {
           if (this.accounts().length > 0 || this.pluginQuotaRows.length > 0) this.quotaCard()
           this.tokenCard()
           if (this.data().updatedAtMs || this.data().generatedAtMs) {
             Text(this.text('usage_updated') + ' ' + new Date(this.data().updatedAtMs || this.data().generatedAtMs).toLocaleString())
-              .fontSize(12).fontColor($r('app.color.text_tertiary')).width('100%')
+              .fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary')).width('100%')
           }
         } else if (this.loading) {
           LoadingProgress().width(32).height(32).margin({ top: 48 })
@@ -341,56 +345,56 @@ export struct UsageDashboardPanel {
 
   @Builder
   quotaCard() {
-    Column({ space: 24 }) {
-      Row() {
-        Text($r('app.string.usage_plans')).fontSize(18).fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary')).layoutWeight(1)
-        if (this.stale()) Text($r('app.string.usage_stale')).fontSize(12).fontColor($r('app.color.warn'))
-      }.width('100%')
-      if (this.accounts().length > 0) {
-        GridRow({ columns: this.quotaColumnCount(), gutter: { y: 12 } }) {
-          ForEach(this.accounts(), (source: UsageSource) => {
-            GridCol({ span: 1 }) {
-              this.quotaColumn(source, this.quotaGridWidth / this.quotaColumnCount() < 100)
-            }
-          }, (source: UsageSource) => source.id)
+    UiCard({ inset: UI_SPACE_PAGE }) {
+      Column({ space: UI_SPACE_GROUP }) {
+        Row() {
+          Text($r('app.string.usage_plans')).fontSize(UI_FONT_LIST_TITLE).fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary')).layoutWeight(1)
+          if (this.stale()) Text($r('app.string.usage_stale')).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.warn'))
         }.width('100%')
-          .onAreaChange((_old: Area, area: Area) => {
-            const width = Number(area.width);
-            if (width > 0 && width !== this.quotaGridWidth) this.quotaGridWidth = width;
-          })
-      }
-      ForEach(this.accounts(), (source: UsageSource) => {
-        if (this.expandedQuota === source.id && source.detail !== null) {
-          this.quotaDetails(source)
+        if (this.accounts().length > 0) {
+          GridRow({ columns: this.quotaColumnCount(), gutter: { y: 12 } }) {
+            ForEach(this.accounts(), (source: UsageSource) => {
+              GridCol({ span: 1 }) {
+                this.quotaColumn(source, this.quotaGridWidth / this.quotaColumnCount() < 100)
+              }
+            }, (source: UsageSource) => source.id)
+          }.width('100%')
+            .onAreaChange((_old: Area, area: Area) => {
+              const width = Number(area.width);
+              if (width > 0 && width !== this.quotaGridWidth) this.quotaGridWidth = width;
+            })
         }
-      }, (source: UsageSource) => 'detail:' + source.id)
-      ForEach(this.pluginQuotaRows, (row: PluginQuotaRow) => {
-        this.pluginQuotaRow(row)
-      }, (row: PluginQuotaRow) => row.engine.providerId)
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(24)
-      .backgroundColor($r('app.color.bg_card')).borderRadius(UI_RADIUS_CONTAINER)
-      .border({ width: 1, color: $r('app.color.border') })
+        ForEach(this.accounts(), (source: UsageSource) => {
+          if (this.expandedQuota === source.id && source.detail !== null) {
+            this.quotaDetails(source)
+          }
+        }, (source: UsageSource) => 'detail:' + source.id)
+        ForEach(this.pluginQuotaRows, (row: PluginQuotaRow) => {
+          this.pluginQuotaRow(row)
+        }, (row: PluginQuotaRow) => row.engine.providerId)
+      }.width('100%').alignItems(HorizontalAlign.Start)
+    }
   }
   @Builder
   pluginQuotaRow(row: PluginQuotaRow) {
     Column({ space: 6 }) {
       Row({ space: 8 }) {
         PluginEngineMark({ iconDataUrl: row.engine.iconDataUrl, markSize: 24 })
-        Text(row.engine.name).fontSize(16).lineHeight(24).fontColor($r('app.color.text_primary'))
+        Text(row.engine.name).fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary'))
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
       }.width('100%').alignItems(VerticalAlign.Center)
       ForEach(row.usage.windows, (window: PluginUsageWindow) => {
         Text(harmonyV12String(this.getUIContext().getHostContext(), 'v131_usage_remaining',
           window.label, String(Math.round(window.remainingPercent)) + '%'))
-          .fontSize(13).fontColor($r('app.color.text_secondary'))
+          .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
         if (window.resetsAt) {
           Text(harmonyV12String(this.getUIContext().getHostContext(), 'v131_usage_reset',
-            new Date(window.resetsAt).toLocaleString())).fontSize(12).fontColor($r('app.color.text_tertiary'))
+            new Date(window.resetsAt).toLocaleString())).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
         }
       }, (window: PluginUsageWindow, index: number) => window.label + ':' + String(index))
       ForEach(row.usage.balances, (balance: PluginUsageBalance) => {
-        Text(balance.amount + ' ' + balance.currency).fontSize(13).fontColor($r('app.color.text_secondary'))
+        Text(balance.amount + ' ' + balance.currency).fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
       }, (balance: PluginUsageBalance, index: number) => balance.currency + ':' + String(index))
     }.width('100%').alignItems(HorizontalAlign.Start)
   }
@@ -399,30 +403,30 @@ export struct UsageDashboardPanel {
   quotaDetails(source: UsageSource) {
     Column({ space: 8 }) {
       Text(source.detail?.title || source.name)
-        .fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+        .fontSize(UI_FONT_BODY).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
       if (source.detail?.plan) {
-        Text(source.detail?.plan ?? '').fontSize(13).fontColor($r('app.color.text_secondary'))
+        Text(source.detail?.plan ?? '').fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
       }
       ForEach(source.detail?.windows ?? [], (window: UsageWindow, index: number) => {
         Row({ space: 8 }) {
           Circle().width(8).height(8).fill(this.windowTint(window.color))
           Text(window.label || this.usageCopy(String(index + 1))).layoutWeight(1)
-            .fontSize(13).fontColor($r('app.color.text_primary'))
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_primary'))
           Text(String(Math.round(window.fraction * 100)) + '%')
-            .fontSize(13).fontColor($r('app.color.text_secondary'))
+            .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
         }.width('100%')
       }, (window: UsageWindow, index: number) => String(index) + ':' + window.label)
     }.width('100%').alignItems(HorizontalAlign.Start).padding(12)
-      .backgroundColor($r('app.color.bg_chip')).borderRadius(8)
+      .backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTENT)
   }
 
   @Builder
   quotaColumn(source: UsageSource, compact: boolean) {
     Column({ space: compact ? 5 : 8 }) {
       Text((source.value || source.label || '—') + (source.reserve ? '' : source.unit))
-        .fontSize(compact ? 21 : 28).minFontSize(compact ? 16 : 22).maxFontSize(compact ? 21 : 28).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+        .fontSize(compact ? UI_FONT_LIST_TITLE : UI_FONT_TITLE_S).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      if (source.reserve && source.unit) Text(source.unit).fontSize(12).fontColor($r('app.color.text_secondary'))
+      if (source.reserve && source.unit) Text(source.unit).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
       Stack({ alignContent: Alignment.Bottom }) {
         Column().width('100%').height(source.fill > 0 ? Math.max(3, (compact ? 58 : 68) * source.fill) : 0)
           .backgroundColor(this.quotaTint(source)).borderRadius(10)
@@ -437,26 +441,26 @@ export struct UsageDashboardPanel {
         } else {
           // MobileProviderMark uses the first code point of monogram, or of name when absent.
           Text((Array.from((source.monogram || source.name).trim())[0] ?? '?').toUpperCase())
-            .fontSize(11).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+            .fontSize(UI_FONT_CAPTION_SMALL).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
             .width(compact ? 16 : 18).height(compact ? 16 : 18).textAlign(TextAlign.Center).align(Alignment.Center).flexShrink(0)
             .border({ width: 1, color: $r('app.color.text_primary') }).borderRadius(4)
         }
-        Text(source.name).fontSize(compact ? 12 : 16).lineHeight(compact ? 17 : 24).fontColor($r('app.color.text_primary'))
+        Text(source.name).fontSize(compact ? UI_FONT_CAPTION : UI_FONT_BODY).fontColor($r('app.color.text_primary'))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
       }.alignItems(VerticalAlign.Center).justifyContent(FlexAlign.Center).width('100%')
       Text(usageResetLabel(source, this.data().strings, this.now, this.text('usage_reset_pending')))
-        .fontSize(compact ? 11 : 12).fontColor($r('app.color.text_secondary'))
+        .fontSize(compact ? UI_FONT_CAPTION_SMALL : UI_FONT_CAPTION).fontColor($r('app.color.text_secondary'))
         .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Center)
       if (source.stale) {
-        Text($r('app.string.usage_stale')).fontSize(11).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
+        Text($r('app.string.usage_stale')).fontSize(UI_FONT_CAPTION_SMALL).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
       }
       if (source.unusedAtReset && !source.stale && !this.stale()) {
-        Text(this.usageCopy('unused')).fontSize(11).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
+        Text(this.usageCopy('unused')).fontSize(UI_FONT_CAPTION_SMALL).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
       }
       if (source.detail !== null) {
         Button({ type: ButtonType.Normal }) {
           SymbolGlyph(this.expandedQuota === source.id ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
-            .fontSize(14).fontColor([$r('app.color.text_secondary')])
+            .fontSize(UI_FONT_SECONDARY).fontColor([$r('app.color.text_secondary')])
         }.height(44).width('100%').padding(0).backgroundColor(Color.Transparent)
           .accessibilityText(source.detail?.title || source.name)
           .onClick((): void => { this.expandedQuota = this.expandedQuota === source.id ? '' : source.id; })
@@ -465,85 +469,81 @@ export struct UsageDashboardPanel {
     .width('100%')
     .padding({ left: compact ? 2 : 4, right: compact ? 2 : 4 })
   }
+  private rangeItems(): SegmentButtonV2Items {
+    return new SegmentButtonV2Items(this.rangeLabels().map((label: string): SegmentButtonV2ItemOptions => {
+      return { text: label };
+    }));
+  }
+
   @Builder
   tokenCard() {
-    Column({ space: 20 }) {
-      Row({ space: 12 }) {
-        Text(this.pickedDay >= 0 ? this.rangeCaption() : this.rangeIndex === 0 ? this.todayLabel()
-          : this.rangeLabels()[this.rangeIndex]).fontSize(18).fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary')).layoutWeight(1)
-        if (this.data().scope !== 'local' || this.deviceName) {
-          Text(this.data().scope === 'local'
-            ? harmonyV12String(this.getUIContext().getHostContext(), 'usage_only_device', this.deviceName)
-            : $r('app.string.usage_all_devices'))
-            .fontSize(13).fontColor($r('app.color.text_secondary')).maxLines(2)
-        }
-      }.width('100%')
-      if (this.data().days.length > 0) {
-        ChatSegmented({ labels: this.rangeLabels(), selected: this.rangeIndex,
-          onSelect: (index: number): void => {
-            this.rangeIndex = index; this.pickedDay = -1; this.rebuildUsage();
-          } })
-        Column({ space: 6 }) {
-          Text(this.rangeCaption()).fontSize(12).fontColor($r('app.color.text_tertiary'))
-          Text(usageCompact(this.summary.tokens) + ' token').fontSize(32).fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-          if (this.summary.estimated !== null) {
-            Text(this.text('usage_estimated') + ' ' + this.money(this.summary.estimated))
-              .fontSize(13).fontColor($r('app.color.text_secondary'))
+    UiCard({ inset: UI_SPACE_PAGE }) {
+      Column({ space: UI_SPACE_GROUP }) {
+        Row({ space: 12 }) {
+          Text(this.pickedDay >= 0 ? this.rangeCaption() : this.rangeIndex === 0 ? this.todayLabel()
+            : this.rangeLabels()[this.rangeIndex]).fontSize(UI_FONT_LIST_TITLE).fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary')).layoutWeight(1)
+          if (this.data().scope !== 'local' || this.deviceName) {
+            Text(this.data().scope === 'local'
+              ? harmonyV12String(this.getUIContext().getHostContext(), 'usage_only_device', this.deviceName)
+              : $r('app.string.usage_all_devices'))
+              .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary')).maxLines(2)
+              .constraintSize({ maxWidth: '45%' }).textOverflow({ overflow: TextOverflow.Ellipsis })
           }
-          if (this.summary.paid !== null) {
-            Text(this.text('usage_paid') + ' ' + this.money(this.summary.paid))
-              .fontSize(13).fontColor($r('app.color.text_secondary'))
+        }.width('100%')
+        if (this.data().days.length > 0) {
+          CapsuleSegmentButtonV2({ items: this.rangeItems(), selectedIndex: this.rangeIndex,
+            onItemClicked: (index: number): void => {
+              this.rangeIndex = index; this.pickedDay = -1; this.rebuildUsage();
+            } })
+          Column({ space: 6 }) {
+            Text(this.rangeCaption()).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
+            Text(usageCompact(this.summary.tokens) + ' token').fontSize(UI_FONT_TITLE_L).fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+            if (this.summary.estimated !== null) {
+              Text(this.text('usage_estimated') + ' ' + this.money(this.summary.estimated))
+                .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
+            }
+            if (this.summary.paid !== null) {
+              Text(this.text('usage_paid') + ' ' + this.money(this.summary.paid))
+                .fontSize(UI_FONT_SECONDARY).fontColor($r('app.color.text_secondary'))
+            }
+          }.width('100%').alignItems(HorizontalAlign.Start)
+          Column({ space: 8 }) {
+            Text(this.text('usage_average') + ' ' + usageCompact(this.summary.average) + ' token')
+              .fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.End)
+            this.historyChart()
+            Row() {
+              Text(this.data().days[0].date).layoutWeight(1).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
+              Text(this.today().date).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
+            }.width('100%').constraintSize({ minHeight: 30 })
+              .onClick((): void => { if (this.pickedDay >= 0) { this.pickedDay = -1; this.rebuildUsage(); } })
+          }.width('100%')
+          Divider().color($r('app.color.border'))
+          if (usageHasModels(this.data())) {
+            Text(this.usageCopy('models')).fontSize(UI_FONT_CAPTION).fontColor($r('app.color.text_tertiary'))
           }
-        }.width('100%').alignItems(HorizontalAlign.Start)
-        Column({ space: 8 }) {
-          Text(this.text('usage_average') + ' ' + usageCompact(this.summary.average) + ' token')
-            .fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.End)
-          this.historyChart()
-          Row() {
-            Text(this.data().days[0].date).layoutWeight(1).fontSize(12).fontColor($r('app.color.text_tertiary'))
-            Text(this.today().date).fontSize(12).fontColor($r('app.color.text_tertiary'))
-          }.width('100%').height(30)
-            .onClick((): void => { if (this.pickedDay >= 0) { this.pickedDay = -1; this.rebuildUsage(); } })
-        }.width('100%')
-        Divider().color($r('app.color.border'))
-        if (usageHasModels(this.data())) {
-          Text(this.usageCopy('models')).fontSize(12).fontColor($r('app.color.text_tertiary'))
+          Column({ space: 4 }) {
+            ForEach(this.chartRows, (series: UsageSeries) => {
+              Row({ space: 8 }) {
+                if (this.modelKey === series.key) {
+                  SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.accent')]).flexShrink(0)
+                } else {
+                  Circle().width(8).height(8).fill(this.tint(series)).flexShrink(0)
+                }
+                UiListRow({ label: series.name, detail: this.modelRowDetail(series), value: usageCompact(series.total),
+                  showChevron: usageHasModels(this.data()), onRowClick: usageHasModels(this.data())
+                    ? (): void => { this.modelKey = this.modelKey === series.key ? '' : series.key; this.rebuildUsage(); }
+                    : undefined }).layoutWeight(1)
+              }.width('100%').alignItems(VerticalAlign.Center)
+                .borderRadius(UI_RADIUS_CONTENT).backgroundColor(this.modelKey === series.key ? $r('app.color.bg_chip') : Color.Transparent)
+            }, (series: UsageSeries) => series.key)
+          }.width('100%')
+        } else {
+          UiEmptyState({ heading: $r('app.string.usage_no_history') })
         }
-        Column({ space: 4 }) {
-          ForEach(this.chartRows, (series: UsageSeries) => {
-            Row({ space: 8 }) {
-              Circle().width(8).height(8).fill(this.tint(series))
-              Column({ space: 2 }) {
-                Text(series.name).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .fontSize(14).fontColor($r('app.color.text_primary'))
-                if (series.harness) Text(series.harness).fontSize(11).fontColor($r('app.color.text_tertiary'))
-              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-              Column({ space: 2 }) {
-                Text(usageCompact(series.total)).fontSize(14).fontColor($r('app.color.text_secondary'))
-                if (this.showModelEstimates() && series.estimated !== null) Text(this.text('usage_estimated') + ' ' + this.money(series.estimated))
-                  .fontSize(11).fontColor($r('app.color.text_secondary'))
-              }.alignItems(HorizontalAlign.End)
-              if (usageHasModels(this.data())) {
-                SymbolGlyph(this.modelKey === series.key ? $r('sys.symbol.checkmark') : $r('sys.symbol.chevron_right'))
-                  .fontSize(12).fontColor([$r('app.color.text_secondary')])
-              }
-            }.width('100%').alignItems(VerticalAlign.Center).constraintSize({ minHeight: 44 }).padding({ left: 4, right: 4 })
-              .borderRadius(8).backgroundColor(this.modelKey === series.key ? $r('app.color.bg_chip') : Color.Transparent)
-              .onClick((): void => {
-                if (!usageHasModels(this.data())) return;
-                this.modelKey = this.modelKey === series.key ? '' : series.key;
-                this.rebuildUsage();
-              })
-          }, (series: UsageSeries) => series.key)
-        }.width('100%')
-      } else {
-        Text($r('app.string.usage_no_history')).fontSize(14).fontColor($r('app.color.text_secondary'))
-      }
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(24)
-      .backgroundColor($r('app.color.bg_card')).borderRadius(UI_RADIUS_CONTAINER)
-      .border({ width: 1, color: $r('app.color.border') })
+      }.width('100%').alignItems(HorizontalAlign.Start)
+    }
   }
   private averageDashes(): number[] {
     const indices: number[] = [];

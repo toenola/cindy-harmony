@@ -1,5 +1,8 @@
+import { UI_FONT_BODY, UI_SPACE_GROUP, UI_SPACE_INLINE, UI_TOUCH_TARGET_MIN } from '../UiKit';
+import { UiActionButton, UiActionKind } from '../common/UiActions';
+import { UiInlineError } from '../common/UiStatus';
 import { ChatStore } from '../../core/chat/ChatStore';
-import { ChatMember, ChatActor, chatManager } from '../../core/chat/ChatModels';
+import { ChatRead, ChatMember, ChatActor, chatManager } from '../../core/chat/ChatModels';
 import { ChatInviteShares } from '../../core/chat/ChatInvitationStore';
 import { chatActionStrings, chatErrorText, chatDestructiveText, chatRevokeInviteText } from '../../core/chat/ChatStrings';
 import { util } from '@kit.ArkTS';
@@ -83,29 +86,37 @@ export struct ChatSettingsPanel {
     }catch(e){this.error=e instanceof Error?e.message:'CHAT_UNAVAILABLE';}finally{this.busy=false;}
   }
   private async copyInvite(): Promise<void> { if (this.invite) await pasteboard.getSystemPasteboard().setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.invite)); }
+  private notificationKind(mode: string): UiActionKind {
+    const reads = this.store?.page?.snapshot.reads;
+    if (reads === undefined) return UiActionKind.Secondary;
+    const main = reads.find((read: ChatRead): boolean => read.thread_key === 'main');
+    const current = main?.muted ? 'none' : main?.notification_scope ?? 'all';
+    return current === mode ? UiActionKind.Primary : UiActionKind.Secondary;
+  }
+
   build() {
     Scroll() {
       Column({ space: 12 }) {
         if (this.version >= 0 && this.store?.page) {
           Text(this.nameLabel || chatActionStrings(this.locale).name).fontColor($r('app.color.text_secondary')).width('100%')
-          TextInput({ text: this.name }).height(44).fontColor($r('app.color.text_primary')).enabled(!this.busy && this.editable()).onChange((name: string): void => { this.name = name; })
-          if (this.editable()) { Button(this.saveLabel || chatActionStrings(this.locale).save).height(44).enabled(!this.busy && !!this.name.trim()).onClick((): void => { this.saveName(); }) }
+          TextInput({ text: this.name }).constraintSize({ minHeight: UI_TOUCH_TARGET_MIN }).fontSize(UI_FONT_BODY).fontColor($r('app.color.text_primary')).enabled(!this.busy && this.editable()).onChange((name: string): void => { this.name = name; })
+          if (this.editable()) { UiActionButton({ label: this.saveLabel || chatActionStrings(this.locale).save, kind: UiActionKind.Primary, actionEnabled: !this.busy && !!this.name.trim(), onAction: (): void => { this.saveName(); } }) }
           if (this.manager() && !this.store.page.snapshot.room.dissolved_at) {
-            Button(this.store.page.snapshot.room.archived ? this.restoreLabel || chatActionStrings(this.locale).restore : this.archiveLabel || chatActionStrings(this.locale).archive).height(44).enabled(!this.busy).onClick((): void => { this.simple(this.store?.page?.snapshot.room.archived ? 'restore' : 'archive'); })
+            UiActionButton({ label: this.store.page.snapshot.room.archived ? this.restoreLabel || chatActionStrings(this.locale).restore : this.archiveLabel || chatActionStrings(this.locale).archive, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.simple(this.store?.page?.snapshot.room.archived ? 'restore' : 'archive'); } })
           }
           if (!this.store.page.snapshot.room.archived && !this.store.page.snapshot.room.dissolved_at) {
             Text(chatActionStrings(this.locale).nickname).fontColor($r('app.color.text_secondary'))
-            TextInput({ text: this.nickname }).height(44).onChange((value: string): void => { this.nickname = value; })
-            Button(chatActionStrings(this.locale).save).height(44).enabled(!this.busy).onClick((): void => { this.saveNickname(); })
-            if (this.pickAvatar && this.store.capability('groupMemberAvatar')) { Button(chatActionStrings(this.locale).photos).height(44).enabled(!this.busy).onClick((): void => { this.avatar(); }) }
-            if (this.shares && (this.manager() || this.store.page.snapshot.room.allow_member_invites)) { Button(chatActionStrings(this.locale).invite).height(44).enabled(!this.busy).onClick((): void => { this.createInvite(); }) }
-            if (this.invite) { Text(this.invite).fontColor($r('app.color.text_primary')).copyOption(CopyOptions.LocalDevice); Button(chatActionStrings(this.locale).copy).height(44).onClick((): void => { this.copyInvite(); }); if(this.confirm&&this.shares){Button(chatRevokeInviteText(this.locale)).height(44).enabled(!this.busy).onClick(():void=>{this.revokeInvite();})} }
+            TextInput({ text: this.nickname }).constraintSize({ minHeight: UI_TOUCH_TARGET_MIN }).fontSize(UI_FONT_BODY).onChange((value: string): void => { this.nickname = value; })
+            UiActionButton({ label: chatActionStrings(this.locale).save, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.saveNickname(); } })
+            if (this.pickAvatar && this.store.capability('groupMemberAvatar')) { UiActionButton({ label: chatActionStrings(this.locale).photos, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.avatar(); } }) }
+            if (this.shares && (this.manager() || this.store.page.snapshot.room.allow_member_invites)) { UiActionButton({ label: chatActionStrings(this.locale).invite, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.createInvite(); } }) }
+            if (this.invite) { Text(this.invite).fontColor($r('app.color.text_primary')).copyOption(CopyOptions.LocalDevice); UiActionButton({ label: chatActionStrings(this.locale).copy, kind: UiActionKind.Secondary, actionEnabled: true, onAction: (): void => { this.copyInvite(); } }); if(this.confirm&&this.shares){UiActionButton({ label: chatRevokeInviteText(this.locale), kind: UiActionKind.Danger, actionEnabled: !this.busy, onAction: ():void=>{this.revokeInvite();} })} }
             if (this.store.capability('groupNotificationSettings')) {
               Text(chatActionStrings(this.locale).notifications).fontColor($r('app.color.text_secondary'))
               Flex({ wrap: FlexWrap.Wrap }) {
-                Button(chatActionStrings(this.locale).all).height(44).enabled(!this.busy).onClick((): void => { this.notifications('all'); })
-                Button(chatActionStrings(this.locale).mentions).height(44).enabled(!this.busy).onClick((): void => { this.notifications('mentions'); })
-                Button(chatActionStrings(this.locale).none).height(44).enabled(!this.busy).onClick((): void => { this.notifications('none'); })
+                UiActionButton({ label: chatActionStrings(this.locale).all, kind: this.notificationKind('all'), actionEnabled: !this.busy, onAction: (): void => { this.notifications('all'); } })
+                UiActionButton({ label: chatActionStrings(this.locale).mentions, kind: this.notificationKind('mentions'), actionEnabled: !this.busy, onAction: (): void => { this.notifications('mentions'); } })
+                UiActionButton({ label: chatActionStrings(this.locale).none, kind: this.notificationKind('none'), actionEnabled: !this.busy, onAction: (): void => { this.notifications('none'); } })
               }
             }
             if (this.editable() && this.store.capability('groupMemberInvites')) { Row() { Text(chatActionStrings(this.locale).invite).layoutWeight(1); Toggle({ type: ToggleType.Switch, isOn: this.store.page.snapshot.room.allow_member_invites === true }).enabled(!this.busy).onChange((value: boolean): void => { this.toggle('allowMemberInvites', value); }) } }
@@ -115,25 +126,35 @@ export struct ChatSettingsPanel {
               Column({ space: 8 }) {
                 Row({ space: 8 }) { Text(member.nickname || member.name).layoutWeight(1).fontColor($r('app.color.text_primary')); Text(this.role(member.role)).fontColor($r('app.color.text_secondary')) }
                 Flex({ wrap: FlexWrap.Wrap }) {
-                  if ((this.editable() && member.role !== 'owner') || this.own(member)) { Button(chatActionStrings(this.locale).remove).height(44).enabled(!this.busy).onClick((): void => { this.member(member, 'remove'); }) }
                   if (this.editable() && this.owner() && member.role !== 'owner') {
-                    Button(this.role(member.role === 'admin' ? 'member' : 'admin')).height(44).enabled(!this.busy).onClick((): void => { this.member(member, 'role'); })
-                    Button(chatActionStrings(this.locale).transfer).height(44).enabled(!this.busy).onClick((): void => { this.transfer(member); })
+                    UiActionButton({ label: this.role(member.role === 'admin' ? 'member' : 'admin'), actionEnabled: !this.busy, onAction: (): void => { this.member(member, 'role'); } })
                   }
                   if (this.own(member) && member.accessRevision !== undefined) {
-                    ForEach(['none', 'chat', 'tools'], (value: string) => { Button(value).height(44).enabled(!this.busy).onClick((): void => { this.access(member, value); }) }, (value: string): string => value)
+                    ForEach(['none', 'chat', 'tools'], (value: string) => { UiActionButton({ label: value, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.access(member, value); } }) }, (value: string): string => value)
                   }
                 }
-              }.width('100%').padding(8)
+                if ((this.editable() && member.role !== 'owner') || this.own(member)) {
+                  Divider().color($r('app.color.border'))
+                  Flex({ wrap: FlexWrap.Wrap }) {
+                    UiActionButton({ label: chatActionStrings(this.locale).remove, kind: UiActionKind.Danger,
+                      actionEnabled: !this.busy, onAction: (): void => { this.member(member, 'remove'); } })
+                    if (this.editable() && this.owner() && member.role !== 'owner') {
+                      UiActionButton({ label: chatActionStrings(this.locale).transfer, kind: UiActionKind.Danger,
+                        actionEnabled: !this.busy, onAction: (): void => { this.transfer(member); } })
+                    }
+                  }
+                }
+              }.width('100%').padding(UI_SPACE_INLINE)
             }, (member: ChatMember): string => member.id)
-            ForEach(this.store.actors.filter((a: ChatActor): boolean => !this.store?.page?.snapshot.members.some((m: ChatMember): boolean => m.id === a.id && m.state === 'joined')), (actor: ChatActor) => { Button(`+ ${actor.name}`).height(44).enabled(!this.busy).onClick((): void => { this.addBot(actor); }) }, (actor: ChatActor): string => actor.id)
+            ForEach(this.store.actors.filter((a: ChatActor): boolean => !this.store?.page?.snapshot.members.some((m: ChatMember): boolean => m.id === a.id && m.state === 'joined')), (actor: ChatActor) => { UiActionButton({ label: `+ ${actor.name}`, kind: UiActionKind.Secondary, actionEnabled: !this.busy, onAction: (): void => { this.addBot(actor); } }) }, (actor: ChatActor): string => actor.id)
             if (this.confirm) {
-              Button(chatActionStrings(this.locale).leave).height(44).enabled(!this.busy).onClick((): void => { this.simple('leave'); })
-              if (this.owner() && this.store.capability('groupLifecycleVersion')) { Button(chatActionStrings(this.locale).dissolve).height(44).enabled(!this.busy).onClick((): void => { this.simple('dissolve'); }) }
+              Divider().color($r('app.color.border')).margin({ top: UI_SPACE_GROUP })
+              UiActionButton({ label: chatActionStrings(this.locale).leave, kind: UiActionKind.Danger, actionEnabled: !this.busy, onAction: (): void => { this.simple('leave'); } })
+              if (this.owner() && this.store.capability('groupLifecycleVersion')) { UiActionButton({ label: chatActionStrings(this.locale).dissolve, kind: UiActionKind.Danger, actionEnabled: !this.busy, onAction: (): void => { this.simple('dissolve'); } }) }
             }
           }
         }
-        if (this.error) { Text(chatErrorText(this.locale, this.error)).fontColor($r('app.color.danger')) }
+        if (this.error) { UiInlineError({ message: chatErrorText(this.locale, this.error) }) }
       }.width('100%').padding(16)
     }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
   }

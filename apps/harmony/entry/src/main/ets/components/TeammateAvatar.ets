@@ -122,7 +122,7 @@ export struct TeammateAvatar {
       } else if (this.accountCurrent) {
         Text(this.teammate.avatarKind === 'emoji' && this.teammate.avatarValue
           ? this.teammate.avatarValue : this.teammate.avatarFallback)
-          .fontSize(Math.round(this.diameter / 2)).maxLines(1).fontColor($r('app.color.text_primary'))
+          .fontSize(`${Math.round(this.diameter / 2)}fp`).maxFontScale(1).maxLines(1).fontColor($r('app.color.text_primary'))
       }
     }
     .width(this.diameter).height(this.diameter).borderRadius(this.diameter / 2).clip(true)

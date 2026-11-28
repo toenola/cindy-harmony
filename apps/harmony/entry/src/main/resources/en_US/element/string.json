@@ -418,6 +418,11 @@
     {"name": "home_companion_compact", "value": "Switch to compact view"},
     {"name": "home_companion_show_all", "value": "Show all %d"},
     {"name": "home_companion_show_less", "value": "Show less"},
-    {"name": "composer_picker_permission", "value": "Permissions"}
+    {"name": "composer_picker_permission", "value": "Permissions"},
+    {"name": "home_task_split_resize", "value": "Resize task list"},
+    {"name": "home_task_split_narrow", "value": "Narrow task list"},
+    {"name": "home_task_split_widen", "value": "Widen task list"},
+    {"name": "home_list_more", "value": "More actions"},
+    {"name": "home_list_settings", "value": "Settings"}
   ]
 }

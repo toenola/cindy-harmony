@@ -1,3 +1,4 @@
+import { UiInlineError } from '../../components/common/UiStatus';
 import { PdfView, pdfService, pdfViewManager } from '@kit.PDFKit';
 import { HarmonyHttp } from '../../network/HarmonyHttp';
 
@@ -44,7 +45,7 @@ export struct WorkdirPdf {
         showScroll: true, isContinuous: true, pageFit: pdfService.PageFit.FIT_WIDTH })
         .width('100%').height('100%')
       if (this.hint) {
-        Text(this.hint).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_card'))
+        UiInlineError({ message: this.hint })
       }
     }.width('100%').height('100%')
   }

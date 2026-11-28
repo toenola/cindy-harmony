@@ -1,3 +1,6 @@
+import { UiActionButton, UiActionKind, UiIconButton } from '../../components/common/UiActions';
+import { UiPanelHeading } from '../../components/common/UiNavigation';
+import { UiInlineError } from '../../components/common/UiStatus';
 import { ComposerImage } from '../../components/ConversationComposer';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
@@ -76,13 +79,19 @@ export struct ChatResourceWorkspace {
   }
   build() {
     Column({ space: 8 }) {
-      Flex({ wrap: FlexWrap.Wrap }) {
-        Button(chatStrings(this.locale).back).height(44).onClick(this.onBack)
-        Text(this.title()).fontColor($r('app.color.text_primary'))
-        Button(chatStrings(this.locale).refresh).height(44).onClick((): void => { this.store?.refresh(); })
-        if (this.version >= 0 && this.store?.resource) { Button(chatStrings(this.locale).settings).height(44).onClick((): void => { if (this.store?.resource) this.onSettings(this.store.resource); }) }
+      Row() {
+        UiIconButton({ glyph: $r('sys.symbol.chevron_left'), label: chatStrings(this.locale).back, onAction: this.onBack })
+        Column() { UiPanelHeading({ heading: this.title() }) }.layoutWeight(1)
+        UiIconButton({ glyph: $r('sys.symbol.arrow_clockwise'), label: chatStrings(this.locale).refresh,
+          onAction: (): void => { this.store?.refresh(); } })
+        if (this.version >= 0 && this.store?.resource) {
+          UiIconButton({ glyph: $r('sys.symbol.gearshape'), label: chatStrings(this.locale).settings,
+            onAction: (): void => { if (this.store?.resource) this.onSettings(this.store.resource); } })
+        }
+      }.width('100%')
+      if (this.error || this.store?.error) {
+        UiInlineError({ message: chatErrorText(this.locale, this.error || this.store?.error || '') })
       }
-      if (this.error || this.store?.error) { Text(chatErrorText(this.locale, this.error || this.store?.error || '')).fontColor($r('app.color.danger')) }
       List({ space: 12 }) {
         ForEach(this.version >= 0 ? this.store?.messages.filter((m: ChatHostMessage): boolean => !m.threadRootId) ?? [] : [], (message: ChatHostMessage) => {
           ListItem() {
@@ -112,7 +121,9 @@ export struct ChatResourceWorkspace {
       }, (pending: ChatHostPending): string => pending.clientId)
       Row({ space: 8 }) {
         TextInput({ text: this.draft, placeholder: chatStrings(this.locale).message }).layoutWeight(1).onChange((value: string): void => { this.draftRevision++; this.draft = value; })
-        Button(chatStrings(this.locale).send).height(44).enabled(!this.sending && (!!this.draft.trim() || !!this.files.length || !!this.images.length)).onClick((): void => { this.send(); })
+        UiActionButton({ label: chatStrings(this.locale).send, kind: UiActionKind.Primary,
+          actionEnabled: !this.sending && (!!this.draft.trim() || !!this.files.length || !!this.images.length),
+          onAction: (): void => { this.send(); } })
       }.width('100%')
     }.padding(12).width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
   }
