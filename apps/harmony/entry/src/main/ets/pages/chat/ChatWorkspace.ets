@@ -9,6 +9,7 @@ import { chatStrings, chatActionStrings, chatErrorText, chatDestructiveText } fr
 import { ChatAttachmentPickerPort } from '../../core/chat/ChatAttachmentPicker';
 import { ChatConversationList } from '../../components/chat/ChatConversationList';
 import { ChatTimeline } from '../../components/chat/ChatTimeline';
+import { ChatIconButton, ChatTextButton } from '../../components/chat/ChatChrome';
 import { ChatDraftBook, ChatDraftContent } from '../../core/chat/ChatDraftHandoff';
 
 /** Embeddable native detail pane. Root owns fold navigation, account lifecycle and media presentation. */
@@ -25,6 +26,8 @@ export struct ChatWorkspace {
   @Prop locale: string = 'zh-CN';
   @Prop foreground: boolean = true;
   onBack: () => void = (): void => {};
+  @Builder noLeading() {}
+  @BuilderParam listLeading: () => void = this.noLeading;
   onCompanion: ((actor: ChatActor) => void) | null = null;
   onSettings: (store: ChatStore) => void = (_store: ChatStore): void => {};
   onMedia: (room: string, mediaId: string) => void = (_room: string, _media: string): void => {};
@@ -100,6 +103,9 @@ export struct ChatWorkspace {
       await store.send(body, sent.quoteId, (): void => { if (this.alive && this.store === store) this.handoff(key, sent); });
     }); this.sending = false;
   }
+  private refreshNow(): void {
+    this.run(async (): Promise<void> => { if (this.store?.page) await this.store.refresh(); else await this.store?.loadConversations(); });
+  }
   private async viewport(ids: string[], atEnd: boolean, first: number): Promise<void> {
     if (this.draftKey) this.positions.set(this.draftKey, first);
     if (this.reading || !this.foreground || !atEnd) return;
@@ -107,22 +113,32 @@ export struct ChatWorkspace {
   }
   build() {
     Column({ space: 8 }) {
-      Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
-        Button(chatStrings(this.locale).back).height(44).onClick(this.onBack)
-        Text(this.store?.page?.snapshot.room.name ?? chatStrings(this.locale).groups).fontColor($r('app.color.text_primary')).maxLines(1)
-        Button(chatStrings(this.locale).refresh).height(44).onClick((): void => {
-          this.run(async (): Promise<void> => { if (this.store?.page) await this.store.refresh(); else await this.store?.loadConversations(); });
-        })
-        if (this.invitation && !this.store?.page) { Button(chatActionStrings(this.locale).join).height(44).onClick((): void => { this.menu = this.menu === 'join' ? '' : 'join'; }) }
-        if (this.version >= 0 && this.store?.page?.snapshot.room.kind === 'group') {
-          Button(chatStrings(this.locale).settings).height(44).onClick((): void => { if (this.store) this.onSettings(this.store); })
-          Button(chatActionStrings(this.locale).topics).height(44).onClick((): void => { this.menu = this.menu === 'topics' ? '' : 'topics'; this.run(async (): Promise<void> => { await this.store?.loadTopics(); }); })
-          if (this.store.capability('personalMentionHistory') && this.store.capability('personalMask')) {
-            Button(chatActionStrings(this.locale).mentions).height(44).onClick((): void => { this.menu = 'mentions'; this.run(async (): Promise<void> => { await this.store?.loadMentions(); }); })
+      if (this.version >= 0 && this.store?.page) {
+        // Conversation header: one row, icon actions on the right.
+        Row() {
+          ChatIconButton({ symbol: $r('sys.symbol.chevron_left'), label: chatStrings(this.locale).back, onTap: this.onBack })
+          Text(this.store.page.snapshot.room.name).fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+          ChatIconButton({ symbol: $r('sys.symbol.arrow_clockwise'), label: chatStrings(this.locale).refresh, onTap: (): void => { this.refreshNow(); } })
+          if (this.store.page.snapshot.room.kind === 'group') {
+            ChatIconButton({ symbol: $r('sys.symbol.gearshape'), label: chatStrings(this.locale).settings, onTap: (): void => { if (this.store) this.onSettings(this.store); } })
+            ChatTextButton({ label: chatActionStrings(this.locale).topics, onTap: (): void => { this.menu = this.menu === 'topics' ? '' : 'topics'; this.run(async (): Promise<void> => { await this.store?.loadTopics(); }); } })
+            if (this.store.capability('personalMentionHistory') && this.store.capability('personalMask')) {
+              ChatTextButton({ label: chatActionStrings(this.locale).mentions, onTap: (): void => { this.menu = 'mentions'; this.run(async (): Promise<void> => { await this.store?.loadMentions(); }); } })
+            }
           }
-        }
-      }.width('100%')
-      if (this.error || this.store?.error) { Text(chatErrorText(this.locale, this.error || this.store?.error || '')).fontColor($r('app.color.danger')).width('100%') }
+        }.width('100%').alignItems(VerticalAlign.Center)
+      } else {
+        // Conversation list header: the parent supplies the leading switch; refresh / join stay as quiet icon actions.
+        Row() {
+          Column() { this.listLeading() }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+          ChatIconButton({ symbol: $r('sys.symbol.arrow_clockwise'), label: chatStrings(this.locale).refresh, onTap: (): void => { this.refreshNow(); } })
+          if (this.invitation) {
+            ChatIconButton({ symbol: $r('sys.symbol.link'), label: chatActionStrings(this.locale).join, onTap: (): void => { this.menu = this.menu === 'join' ? '' : 'join'; } })
+          }
+        }.width('100%').alignItems(VerticalAlign.Center).padding({ left: 16, right: 8 })
+      }
+      if (this.error || this.store?.error) { Text(chatErrorText(this.locale, this.error || this.store?.error || '')).fontColor($r('app.color.danger')).fontSize(13).width('100%').padding({ left: 16, right: 16 }) }
       if (this.version >= 0 && this.store?.loading) { LoadingProgress().width(32).height(32) }
       if (this.version >= 0 && this.store?.page) {
         if (this.store.page.verified === false) { Text(chatActionStrings(this.locale).offline).fontColor($r('app.color.warn')) }
@@ -213,6 +229,6 @@ export struct ChatWorkspace {
           onOpenGroup: (id: string): void => { this.run(async (): Promise<void> => { await this.store?.open(id); }); },
         }).layoutWeight(1)
       }
-    }.width('100%').height('100%').padding(12).backgroundColor($r('app.color.bg_page'))
+    }.width('100%').height('100%').padding(this.version >= 0 && !!this.store?.page ? 12 : 0).backgroundColor($r('app.color.bg_page'))
   }
 }

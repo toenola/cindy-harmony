@@ -567,6 +567,7 @@ export class DlClient {
     snap.deviceId = this.readStr(p, 'deviceId');
     snap.online = this.readBool(p, 'online', false);
     snap.deviceName = this.readStr(p, 'deviceName');
+    snap.selfName = this.readStr(p, 'selfName');
     snap.platform = this.readStr(p, 'platform');
     snap.appVersion = this.readStr(p, 'appVersion');
     snap.lastSeenAt = this.readNum(p, 'lastSeenAt', 0);

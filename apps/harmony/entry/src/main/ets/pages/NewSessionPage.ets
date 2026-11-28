@@ -12,10 +12,8 @@ import { providerCatalogUnavailable } from '../core/ComposerCatalog';
 import {
   KeyboardAvoidMode,
   LengthMetrics,
-  LevelMode,
-  promptAction,
   router,
-  uiMaterial,
+  SymbolGlyphModifier,
   window,
 } from '@kit.ArkUI';
 import {
@@ -116,13 +114,15 @@ import {
   UI_CLICK_EFFECT,
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
-  UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
   uiAnimateFastState,
   uiFontSize,
   uiLineHeight,
   uiOverlayTransition,
 } from '../components/UiKit';
+import {
+  uiConfirm, uiConfirmCopy, uiMenuOptions, uiOverlayBuildId, uiOverlayTrace, uiToast,
+} from '../components/common/UiOverlay';
 
 type NewAgentKind = 'claude-code' | 'codex' | 'pi';
 type WorkspaceKind = 'dialogue' | 'project';
@@ -200,6 +200,10 @@ export struct NewSessionPageContent {
         params: { deviceId: deviceId, sessionId: sessionId },
       });
     };
+  /** 首页承载时由 TaskListPage 在草稿上方打开现有「新建项目」面板；为空（独立页面）时退回目录浏览。 */
+  onCreateProject: ((deviceId: string) => void) | null = null;
+  /** 首页新建项目成功后回传「设备\n目录\n序号」，草稿保持不变并选中该项目。 */
+  @Prop @Watch('applyCreatedProject') createdProject: string = '';
   @State devices: PresenceSnapshot[] = [];
   @State projectAliasRevision: number = 0;
   @State selectedDeviceId: string = '';
@@ -812,7 +816,7 @@ export struct NewSessionPageContent {
     }
     if (this.creating || option.availability === 'requires_payment') {
       if (option.availability === 'requires_payment') {
-        promptAction.showToast({ message: '该模型需要付费后才能使用' });
+        uiToast(this.getUIContext(), '该模型需要付费后才能使用');
       }
       return;
     }
@@ -1083,7 +1087,7 @@ export struct NewSessionPageContent {
   private selectRecentImage(uri: string): void {
     if (uri.length === 0 || this.contextSelectedUris.includes(uri)) return;
     if (this.contextSelectedUris.length >= this.remainingImageSlots()) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.contextSelectedUris = this.contextSelectedUris.concat([uri]);
@@ -1104,7 +1108,7 @@ export struct NewSessionPageContent {
     if (this.pickingImages || this.creating) return;
     const remaining = this.remainingImageSlots();
     if (remaining <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.contextSheetOpen = false;
@@ -1133,7 +1137,7 @@ export struct NewSessionPageContent {
     if (this.pickingImages || this.creating) return;
     const remaining = this.remainingImageSlots();
     if (remaining <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.contextSheetOpen = false;
@@ -1156,7 +1160,7 @@ export struct NewSessionPageContent {
         if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
         if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
-          promptAction.showToast({ message: '无法打开截图选择器' });
+          uiToast(this.getUIContext(), '无法打开截图选择器');
         }
       });
     }, 160);
@@ -1165,7 +1169,7 @@ export struct NewSessionPageContent {
   private takePhoto(): void {
     if (this.pickingImages || this.creating || this.remainingImageSlots() <= 0) {
       if (this.remainingImageSlots() <= 0) {
-        promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+        uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       }
       return;
     }
@@ -1189,7 +1193,7 @@ export struct NewSessionPageContent {
         if (generation !== this.imagePickerGeneration) return;
         this.pickingImages = false;
         if (this.pageActive && !this.creating && !this.attachmentsDisposed) {
-          promptAction.showToast({ message: '无法打开相机' });
+          uiToast(this.getUIContext(), '无法打开相机');
         }
       });
     }, 160);
@@ -1198,7 +1202,7 @@ export struct NewSessionPageContent {
   private pickFiles(): void {
     if (this.pickingFiles || this.creating) return;
     if (this.fileQueue.remainingSlots() <= 0) {
-      promptAction.showToast({ message: '每条消息最多添加 20 个附件' });
+      uiToast(this.getUIContext(), '每条消息最多添加 20 个附件');
       return;
     }
     this.contextSheetOpen = false;
@@ -1223,7 +1227,7 @@ export struct NewSessionPageContent {
       remaining -= 1;
     }
     if (uris.length > accepted && remaining <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
     }
   }
 
@@ -2063,10 +2067,38 @@ export struct NewSessionPageContent {
     return current?.name ?? harmonyV12String(this.getUIContext().getHostContext(), 'v132_choose_drive');
   }
 
+  /**
+   * 对齐 Mobile `app/sessions/new.tsx` 项目选择器末尾的「新建项目」：电脑项目设置版本 ≥ 6 时
+   * 打开新建项目表单；版本更旧、尚未读到或没有承载者时退回目录浏览。
+   */
+  private openProjectCreate(): void {
+    if (this.selectedDeviceId.length === 0) {
+      uiToast(this.getUIContext(), '请先选择一台在线电脑');
+      return;
+    }
+    const create = this.onCreateProject;
+    if (create === null || AppServices.instance.taskProjectAliases.settingsVersion(this.selectedDeviceId) < 6) {
+      this.openProjectBrowse();
+      return;
+    }
+    this.workspacePopupOpen = false;
+    create(this.selectedDeviceId);
+  }
+
+  /** 新建项目保存后由首页回传；只接受当前草稿所选电脑上的项目。 */
+  private applyCreatedProject(): void {
+    const parts = this.createdProject.split('\n');
+    if (parts.length < 3) return;
+    const device = parts[0];
+    const path = parts.slice(1, parts.length - 1).join('\n');
+    if (device.length === 0 || device !== this.selectedDeviceId || path.trim().length === 0) return;
+    this.selectProject(path);
+  }
+
   private openProjectBrowse(): void {
     this.workspaceEditRevision += 1;
     if (this.selectedDeviceId.length === 0) {
-      promptAction.showToast({ message: '请先选择一台在线电脑' });
+      uiToast(this.getUIContext(), '请先选择一台在线电脑');
       return;
     }
     this.workspaceKind = 'project';
@@ -2214,19 +2246,19 @@ export struct NewSessionPageContent {
       if (this.composerImages[i].status === 'failed') failed = true;
     }
     if (uploading) {
-      promptAction.showToast({ message: '图片上传中，请稍候' });
+      uiToast(this.getUIContext(), '图片上传中，请稍候');
       return;
     }
     if (failed) {
-      promptAction.showToast({ message: '请重试或移除上传失败的图片' });
+      uiToast(this.getUIContext(), '请重试或移除上传失败的图片');
       return;
     }
     if (this.fileQueue.hasUploading()) {
-      promptAction.showToast({ message: '文件上传中，请稍候' });
+      uiToast(this.getUIContext(), '文件上传中，请稍候');
       return;
     }
     if (this.fileQueue.hasFailed()) {
-      promptAction.showToast({ message: '请重试或移除上传失败的文件' });
+      uiToast(this.getUIContext(), '请重试或移除上传失败的文件');
       return;
     }
     const readyImages = this.readyComposerImages();
@@ -2619,51 +2651,20 @@ export struct NewSessionPageContent {
     .enabled(!this.creating)
     .accessibilityText(`工作目录：${this.workspaceKind === 'dialogue'
       ? '对话' : this.workingDir}`)
-    .onClick(() => this.workspacePopupOpen = true)
-    .bindPopup(this.workspacePopupOpen, {
-      builder: this.workspacePopup,
-      placement: Placement.Bottom,
-      enableArrow: false,
-      targetSpace: 8,
-      autoCancel: true,
-      showInSubWindow: false,
-      followTransformOfTarget: true,
-      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
-      levelMode: LevelMode.EMBEDDED,
-      popupColor: Color.Transparent,
-      radius: UI_RADIUS_CONTAINER,
-      shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THIN,
-        colorInvert: true,
-        interactive: true,
-      }),
-      onStateChange: (event) => {
-        this.workspacePopupOpen = event.isVisible;
-      },
+    .onClick(() => {
+      uiOverlayTrace('workspace-menu', 'open');
+      this.workspacePopupOpen = true;
     })
+    .bindMenu(this.workspacePopupOpen, this.workspaceMenuContent(), this.workspaceMenuOptions())
   }
 
-  @Builder
-  workspacePopup() {
-    Column() {
-      Row() {
-        Text('切换工作目录')
-          .fontSize(uiFontSize(14))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_primary'))
-      }
-      .width('100%')
-      .height(38)
-      .padding({ left: 14, right: 14 })
-      this.workspacePanel()
-    }
-    .width(320)
-    .constraintSize({ maxHeight: 420 })
-    .borderRadius(UI_RADIUS_CONTAINER)
-    .clip(true)
+  /** 工作目录选择：系统操作菜单（docs/overlay-standard.md §3.1），标题沿用原「切换工作目录」。 */
+  private workspaceMenuOptions(): MenuOptions {
+    const options = uiMenuOptions((): void => { this.workspacePopupOpen = false; }, Placement.BottomLeft,
+      'workspace-menu');
+    options.title = '切换工作目录';
+    return options;
   }
-
 
   @Builder
   agentPanel() {
@@ -2702,115 +2703,53 @@ export struct NewSessionPageContent {
     .layoutWeight(1)
   }
 
+  /**
+   * 分组：对话 / 最近项目 / 选择其他项目文件夹与新建项目（对齐 Mobile 项目选择器，新建项目在末尾）。
+   */
   @Builder
-  workspacePanel() {
-    Column() {
-      Row({ space: 10 }) {
-        Text('◯')
-          .fontSize(18)
-          .fontColor($r('app.color.text_secondary'))
-          .width(24)
-        Text('对话')
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
-          .layoutWeight(1)
-        if (this.workspaceKind === 'dialogue') {
-          SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(18)
-            .fontColor([$r('app.color.text_primary')])
+  workspaceMenuContent() {
+    Menu() {
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.ellipsis_message')),
+          content: '对话',
+        })
+          .selected(this.workspaceKind === 'dialogue')
+          .selectIcon(true)
+          .onClick(() => this.selectDialogue())
+      }
+      MenuItemGroup() {
+        ForEach(this.recentProjects(), (project: RecentProject) => {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder')),
+            content: project.title,
+          })
+            .selected(this.workspaceKind === 'project' && this.workingDir === project.path)
+            .selectIcon(true)
+            .accessibilityText(`${project.title} ${project.path}`)
+            .onClick(() => this.selectProject(project.path))
+        }, (project: RecentProject) => JSON.stringify(['recent-project', project.path, project.title,
+          this.workspaceKind === 'project' && this.workingDir === project.path]))
+        if (this.recentProjects().length === 0) {
+          MenuItem({ content: '还没有最近项目' })
+            .enabled(false)
         }
       }
-      .width('100%')
-      .height(44)
-      .padding({ left: 10, right: 10 })
-      .backgroundColor(this.workspaceKind === 'dialogue'
-        ? $r('app.color.bg_chip') : Color.Transparent)
-      .borderRadius(UI_RADIUS_CONTROL)
-      .clickEffect(UI_LIST_CLICK_EFFECT)
-      .onClick(() => this.selectDialogue())
-      Divider()
-        .color($r('app.color.border'))
-        .strokeWidth(1)
-        .margin({ left: 10, right: 10 })
-      Scroll() {
-        Column() {
-          ForEach(this.recentProjects(), (project: RecentProject) => {
-            this.recentProjectOption(project)
-          }, (project: RecentProject) => JSON.stringify(['recent-project', project.path, project.title]))
-          if (this.recentProjects().length === 0) {
-            Text('还没有最近项目')
-              .fontSize(12)
-              .fontColor($r('app.color.text_secondary'))
-              .width('100%')
-              .padding({ left: 10, right: 10, top: 10, bottom: 10 })
-          }
-        }
-        .width('100%')
-      }
-      .width('100%')
-      .constraintSize({ maxHeight: 260 })
-      .scrollBar(BarState.Off)
-      Divider()
-        .color($r('app.color.border'))
-        .strokeWidth(1)
-        .margin({ left: 10, right: 10 })
-      Row({ space: 10 }) {
-        SymbolGlyph($r('sys.symbol.folder'))
-          .fontSize(19)
-          .fontColor([$r('app.color.text_secondary')])
-          .width(24)
-        Text('选择其他项目文件夹')
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
-          .layoutWeight(1)
-      }
-      .width('100%')
-      .height(48)
-      .padding({ left: 10, right: 10 })
-      .borderRadius(UI_RADIUS_CONTROL)
-      .clickEffect(UI_LIST_CLICK_EFFECT)
-      .onClick(() => this.openProjectBrowse())
-    }
-    .width('100%')
-    .padding({ left: 8, right: 8, bottom: 8 })
-  }
-
-  @Builder
-  recentProjectOption(project: RecentProject) {
-    Row({ space: 10 }) {
-      SymbolGlyph($r('sys.symbol.folder'))
-        .fontSize(19)
-        .fontColor([$r('app.color.text_secondary')])
-        .width(24)
-      Column({ space: 2 }) {
-        Text(project.title)
-          .fontSize(15)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-        Text(project.path)
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-      }
-      .layoutWeight(1)
-      if (this.workspaceKind === 'project' && this.workingDir === project.path) {
-        SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(18)
-          .fontColor([$r('app.color.text_primary')])
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder')),
+          content: '选择其他项目文件夹',
+        })
+          .onClick(() => this.openProjectBrowse())
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder_badge_plus')),
+          content: $r('app.string.v140_project_create'),
+        })
+          .enabled(!this.creating)
+          .onClick(() => this.openProjectCreate())
       }
     }
-    .width('100%')
-    .height(56)
-    .padding({ left: 10, right: 10 })
-    .backgroundColor(this.workspaceKind === 'project' && this.workingDir === project.path
-      ? $r('app.color.bg_chip') : Color.Transparent)
-    .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_LIST_CLICK_EFFECT)
-    .onClick(() => this.selectProject(project.path))
+    .id(uiOverlayBuildId('workspace-menu'))
   }
 
   @Builder
@@ -3003,25 +2942,15 @@ export struct NewSessionPageContent {
     if (this.creating) return;
     if (option.id === 'bypassPermissions') {
       const runtimeGeneration = this.runtimeLoadGeneration;
-      this.getUIContext().showAlertDialog({
-        title: '确认完全访问',
-        message: 'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。',
-        primaryButton: {
-          value: '取消',
-          action: () => {
-          },
-        },
-        secondaryButton: {
-          value: '继续',
-          action: () => {
-            if (!this.pageActive || runtimeGeneration !== this.runtimeLoadGeneration) return;
-            this.runtimePermissionTouchedGeneration = this.runtimeLoadGeneration;
-            this.permissionMode = option.id;
-            this.permissionModeBeforePlan = option.id;
-            this.contextSheetOpen = false;
-            this.composerPermissionPopupOpen = false;
-          },
-        },
+      const copy = uiConfirmCopy('确认完全访问', 'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。',
+        '继续', '取消');
+      void uiConfirm(this.getUIContext(), copy).then((confirmed: boolean): void => {
+        if (!confirmed || !this.pageActive || runtimeGeneration !== this.runtimeLoadGeneration) return;
+        this.runtimePermissionTouchedGeneration = this.runtimeLoadGeneration;
+        this.permissionMode = option.id;
+        this.permissionModeBeforePlan = option.id;
+        this.contextSheetOpen = false;
+        this.composerPermissionPopupOpen = false;
       });
       return;
     }

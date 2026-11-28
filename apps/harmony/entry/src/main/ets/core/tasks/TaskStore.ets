@@ -150,6 +150,7 @@ export class TaskStore {
       const snap = new PresenceSnapshot();
       snap.deviceId = v.deviceId;
       snap.deviceName = v.name;
+      snap.selfName = v.selfName || existing?.selfName || '';
       snap.platform = v.platform;
       snap.appVersion = v.appVersion;
       snap.online = v.online;
@@ -171,6 +172,7 @@ export class TaskStore {
       this.notify();
       return;
     }
+    if (!snap.selfName) snap.selfName = this.devices.get(snap.deviceId)?.selfName ?? '';
     this.devices.set(snap.deviceId, snap);
     if (!snap.remoteControlEnabled) {
       // 显式关闭远程控制立即丢弃任务镜像；短暂离线仍保留最近快照。

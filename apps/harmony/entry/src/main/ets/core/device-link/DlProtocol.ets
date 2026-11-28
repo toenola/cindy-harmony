@@ -251,6 +251,7 @@ export class PresenceSetPayload {
 /** presence-changed 广播 / 设备列表共用的设备快照。 */
 export class PresenceSnapshot {
   deviceId: string = '';
+  selfName: string = '';
   online: boolean = false;
   deviceName: string = '';
   platform: string = '';

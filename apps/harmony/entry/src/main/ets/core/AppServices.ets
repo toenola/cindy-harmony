@@ -1,3 +1,5 @@
+import { isWorkdirRead, safeWorkdirRelative, WorkdirRequest, WorkdirWatchListener } from './files/WorkdirFiles';
+import { PluginEngineStore } from './plugin-engines/PluginEngineStore';
 import { parseOfficialSharedTaskInvitation } from './shared-tasks/SharedTaskInvitation';
 import { parseChatInviteReference } from './chat/ChatInvitationStore';
 import { SharedTaskRuntime, parseSharedTaskLink } from './SharedTaskRuntime';
@@ -140,6 +142,8 @@ export class AppServices {
   private backgroundReleaseHandlers: Array<() => void> = [];
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
+  readonly pluginEngines: PluginEngineStore;
+  appInForeground: boolean = true;
   private readonly routingStore: ModelRoutingStore;
   readonly orca: OrcaCollaboration;
   readonly teammateRoster: TeammateRoster;
@@ -165,6 +169,7 @@ export class AppServices {
   private moduleInvitationOwner: string = '';
   private moduleInvitationExpires: number = 0;
   private statusListeners: Array<(status: string) => void> = [];
+  private workdirWatchListeners: Set<WorkdirWatchListener> = new Set();
   private modulePushListeners: Set<(device: string, channel: string, payload: Object | undefined) => void> = new Set();
   private deepLinkListeners: Array<() => void> = [];
   private pendingDeepLink: SessionDeepLinkIntent | null = null;
@@ -217,6 +222,24 @@ export class AppServices {
     };
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
+    this.pluginEngines = new PluginEngineStore(
+      (): string => this.auth.isLoggedIn && !this.taskAccountTransition.active
+        ? JSON.stringify([this.auth.sessionEpoch, RelayRoute.instance.generation]) : '',
+      async (deviceId: string, channel: string, args: Object[], current: () => boolean): Promise<Object | undefined> => {
+        const options = new DlInvokeOptions();
+        options.channel = channel;
+        options.args = args;
+        const preSend = (): void => {
+          if (!current() || !this.appInForeground || this.client.getStatus() !== 'online'
+            || !this.tasks.deviceList.some((device: PresenceSnapshot): boolean =>
+              device.deviceId === deviceId && device.online && device.remoteControlEnabled)) {
+            throw new Error('PLUGIN_ENGINE_READ_NOT_CURRENT');
+          }
+        };
+        options.preSend = preSend;
+        preSend();
+        return unwrapInvokeResult(await this.client.invoke(deviceId, options));
+      });
     const routingPort = new AppModelRoutingPort();
     routingPort.invoke = async (deviceId: string, channel: string, args: Object[]): Promise<Object | undefined> => {
         const epoch = this.auth.sessionEpoch;
@@ -665,9 +688,22 @@ export class AppServices {
     await this.usageCards?.setOwner(this.usageCardOwner, this.auth.sessionEpoch);
   }
 
-  async syncUsageCards(snapshot: UsageSnapshot, device: string, name: string, epoch: number): Promise<void> {
+  usageAutomaticDevice(): string {
+    try {
+      return this.usageCards?.automaticDevice(this.usageCardOwner, this.auth.sessionEpoch) ?? '';
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  async markUsageAutomaticUnsupported(device: string, epoch: number): Promise<void> {
     if (epoch !== this.auth.sessionEpoch || !this.usageCardOwner) return;
-    await this.usageCards?.sync(this.usageCardOwner, epoch, snapshot, device, name);
+    await this.usageCards?.markAutomaticUnsupported(this.usageCardOwner, epoch, device);
+  }
+
+  async syncUsageCards(snapshot: UsageSnapshot, device: string, name: string, epoch: number, pinned: boolean): Promise<void> {
+    if (epoch !== this.auth.sessionEpoch || !this.usageCardOwner) return;
+    await this.usageCards?.sync(this.usageCardOwner, epoch, snapshot, device, name, pinned ? 'pinned' : 'auto');
   }
 
   acceptUsageCard(formId: string): boolean {
@@ -690,6 +726,55 @@ export class AppServices {
   onModulePush(listener: (device: string, channel: string, payload: Object | undefined) => void): () => void {
     this.modulePushListeners.add(listener);
     return (): void => { this.modulePushListeners.delete(listener); };
+  }
+
+  canReadWorkdir(device: string, workdir: string): boolean {
+    return !!this.moduleScope && !!workdir && !this.isSharedTaskPeer(device) &&
+      this.tasks.deviceList.some((row: PresenceSnapshot): boolean =>
+        row.deviceId === device && row.remoteControlEnabled);
+  }
+
+  async invokeOwnedWorkdir(device: string, request: WorkdirRequest, current: () => boolean): Promise<Object | undefined> {
+    const scope = this.moduleScope;
+    const allowed = (): boolean => current() && scope === this.moduleScope &&
+      this.canReadWorkdir(device, request.workdir);
+    if (!allowed() || !isWorkdirRead(request.op) || !safeWorkdirRelative(request.relPath ?? '')) {
+      throw new Error('REMOTE_DISABLED');
+    }
+    await this.openLink(device);
+    const requireOwner = (): void => { if (!allowed()) throw new Error('OWNER_CHANGED'); };
+    requireOwner();
+    const options = new DlInvokeOptions();
+    options.channel = 'file-browser:remote-op';
+    options.args = [request];
+    options.timeoutMs = 30000;
+    options.preSend = requireOwner;
+    const reply = await this.client.invoke(device, options);
+    requireOwner();
+    return unwrapInvokeResult(reply);
+  }
+
+  onWorkdirChanged(device: string, workdir: string, current: () => boolean, callback: () => void): () => void {
+    const listener = new WorkdirWatchListener(device, workdir, callback, current);
+    this.workdirWatchListeners.add(listener);
+    return (): void => { this.workdirWatchListeners.delete(listener); };
+  }
+
+  async subscribeWorkdir(device: string, workdir: string, current: () => boolean): Promise<void> {
+    const scope = this.moduleScope;
+    const allowed = (): boolean => current() && scope === this.moduleScope &&
+      this.canReadWorkdir(device, workdir) && this.appInForeground;
+    if (!allowed()) throw new Error('REMOTE_DISABLED');
+    await this.openLink(device);
+    if (!allowed()) throw new Error('OWNER_CHANGED');
+    await this.client.subscribe(device, ['fs-watch:' + workdir]);
+    if (!allowed()) throw new Error('OWNER_CHANGED');
+  }
+
+  async releaseWorkdir(device: string, workdir: string, scope: string): Promise<void> {
+    if (scope !== this.moduleScope || !this.canReadWorkdir(device, workdir) ||
+      this.client.getStatus() !== 'online') return;
+    await this.client.unsubscribe(device, ['fs-watch:' + workdir]);
   }
 
   async invokeOwnedModule(device: string, channel: string, args: Object[], timeoutMs?: number): Promise<Object | undefined> {
@@ -910,6 +995,7 @@ export class AppServices {
 
   /** App 回到前台：已登录才立即重连（未登录不启动网络重试循环）。 */
   onAppForeground(): void {
+    this.appInForeground = true;
     this.sharedRuntime?.setForeground(true);
     this.cloudChat.setForeground(true);
     void this.usageCards?.publishAll().catch((): void => {});
@@ -928,6 +1014,7 @@ export class AppServices {
    * 由页面注册回调，避免 core 反向依赖页面。
    */
   onAppBackground(): void {
+    this.appInForeground = false;
     this.sharedRuntime?.setForeground(false);
     this.cloudChat.setForeground(false);
     this.modulePushListeners.forEach((listener): void => listener('', 'app-foreground', false));
@@ -1151,6 +1238,7 @@ export class AppServices {
             const cert = readObj(view, 'certificate');
             const projected: Record<string, Object> = {
               'deviceId': readStr(cert, 'deviceId'), 'name': readStr(view, 'name'),
+              'selfName': readStr(view, 'selfName'),
               'platform': readStr(view, 'platform'), 'appVersion': readStr(view, 'appVersion'),
               'online': view['online'] === true, 'busy': view['busy'] === true,
               'remoteControlEnabled': view['remoteControlEnabled'] === true,
@@ -1305,6 +1393,15 @@ export class AppServices {
     payload: Object | undefined,
     ownerStamp: Object | undefined = undefined,
   ): void {
+    if (channel === 'maker:file-browser:event') {
+      const workdir = readStr(recordOrEmpty(payload), 'workdir');
+      if (workdir && this.canReadWorkdir(deviceId, workdir)) {
+        this.workdirWatchListeners.forEach((item: WorkdirWatchListener): void => {
+          item.dispatch(deviceId, workdir);
+        });
+      }
+      return;
+    }
     if (channel === 'maker:remote-resources:changed' || channel === PROJECT_ALIASES_CHANGED) {
       this.modulePushListeners.forEach((listener): void => listener(deviceId, channel, payload));
     }

@@ -79,6 +79,7 @@ export function safeErrorMessage(error: Object | undefined): string {
 /** REST /api/device-link/devices 的设备视图（对齐 DeviceView）。 */
 export class DeviceView {
   deviceId: string = '';
+  selfName: string = '';
   name: string = '';
   platform: string = '';
   appVersion: string = '';
@@ -94,6 +95,7 @@ export function parseDeviceView(raw: Record<string, Object>): DeviceView {
   const v = new DeviceView();
   v.deviceId = readStr(raw, 'deviceId');
   v.name = readStr(raw, 'name');
+  v.selfName = readStr(raw, 'selfName');
   v.platform = readStr(raw, 'platform');
   v.appVersion = readStr(raw, 'appVersion');
   v.online = readBool(raw, 'online', false);

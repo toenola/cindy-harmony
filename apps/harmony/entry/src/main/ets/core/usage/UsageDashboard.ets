@@ -155,19 +155,21 @@ export class UsageReadResult {
   deviceName: string = '';
   issue: string = 'unavailable';
 }
-export function usageCandidates(devices: PresenceSnapshot[], preferred: string): PresenceSnapshot[] {
+export function usageCandidates(devices: PresenceSnapshot[], preferred: string, pinned: string = ''): PresenceSnapshot[] {
+  const rank = (device: PresenceSnapshot): number =>
+    device.deviceId === preferred ? 0 : device.platform === 'darwin' ? 1 : 2;
   return devices.filter((device: PresenceSnapshot): boolean => device.online && device.remoteControlEnabled
     && (device.platform === 'darwin' || device.platform === 'win32' || device.platform === 'linux')
-    && (!preferred || device.deviceId === preferred))
-    .sort((a: PresenceSnapshot, b: PresenceSnapshot): number =>
-      Number(b.platform === 'darwin') - Number(a.platform === 'darwin'));
+    && (!pinned || device.deviceId === pinned))
+    .sort((a: PresenceSnapshot, b: PresenceSnapshot): number => rank(a) - rank(b));
 }
 /** Sequential fallback only until one computer answers; no polling or broadcast fan-out. */
 export async function readUsageDashboard(client: DlClient, devices: PresenceSnapshot[], preferred: string,
-  isCurrent: () => boolean): Promise<UsageReadResult> {
+  isCurrent: () => boolean, pinned: string = ''): Promise<UsageReadResult> {
   const result = new UsageReadResult();
-  const candidates = usageCandidates(devices, preferred);
+  const candidates = usageCandidates(devices, preferred, pinned);
   if (!candidates.length) { result.issue = 'offline'; return result; }
+  let tooOld = 0;
   for (const device of candidates) {
     if (!isCurrent()) return result;
     try {
@@ -179,11 +181,15 @@ export async function readUsageDashboard(client: DlClient, devices: PresenceSnap
       const snapshot = raw['ok'] === true ? parseUsageSnapshot(raw['snapshot']) : null;
       if (snapshot !== null) {
         result.snapshot = snapshot; result.deviceId = device.deviceId;
-        result.deviceName = device.deviceName; result.issue = ''; return result;
+        result.deviceName = device.selfName || device.deviceName; result.issue = ''; return result;
       }
     } catch (error) {
-      if ((error as Error).message.includes('CHANNEL_NOT_ALLOWED')) result.issue = 'unsupported';
+      if (String(error).includes('CHANNEL_NOT_ALLOWED')) tooOld++;
     }
+  }
+  if (tooOld === candidates.length) {
+    result.issue = 'unsupported';
+    result.deviceId = candidates[0].deviceId;
   }
   return result;
 }

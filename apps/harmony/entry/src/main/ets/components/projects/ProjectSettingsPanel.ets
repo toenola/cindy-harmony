@@ -1,3 +1,4 @@
+import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { resourceIssueText } from '../../core/resources/ResourceIssueStrings';
 import { isExplicitProjectRepositoryAddress, parseProjectRepository, projectCreationFolderName } from '../../core/projects/ProjectCreation';
 import { PROJECT_SYMBOL_NAMES } from '../../core/projects/ProjectSymbolPaths';
@@ -84,9 +85,7 @@ export struct ProjectSettingsPanel {
   private close(): void {
     if (this.store.saving || this.picking) return;
     if (this.draft() === this.initial) { this.onClose(); return; }
-    this.getUIContext().showAlertDialog({ title: this.labels.discard, message: '',
-      primaryButton: { value: this.labels.keepEditing, action: (): void => {} },
-      secondaryButton: { value: this.labels.cancel, action: (): void => this.onClose() } });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy(this.labels.discard, '', this.labels.cancel, this.labels.keepEditing, true)).then((confirmed: boolean): void => { if (confirmed) this.onClose(); });
   }
   private async choose(): Promise<void> {
     if (!this.onChooseDirectory || this.picking || this.store.saving) return;

@@ -49,6 +49,7 @@ export class ComposerImageQueue {
   picking: boolean = false;
   /** 页面退场时使系统图片选择器的迟到回包失效；不能依赖系统 picker 可取消。 */
   private pickerGeneration: number = 0;
+  private managedFiles: Map<string, () => void> = new Map();
 
   private setPicking(picking: boolean): void {
     this.picking = picking;
@@ -169,6 +170,7 @@ export class ComposerImageQueue {
       if (!sent.has(this.images[i].localId)) {
         remaining.push(this.images[i]);
       } else {
+        this.releaseManaged(this.images[i].uri);
         this.images[i].removed = true;
         this.images[i].uploadRevision += 1;
       }
@@ -284,6 +286,18 @@ export class ComposerImageQueue {
     }
   }
 
+  enqueueManaged(uri: string, release: () => void): boolean {
+    if (this.isBusy() || this.remainingSlots() <= 0) return false;
+    this.managedFiles.set(uri, release);
+    this.upload(uri, this.images.length);
+    return true;
+  }
+
+  private releaseManaged(uri: string): void {
+    this.managedFiles.get(uri)?.();
+    this.managedFiles.delete(uri);
+  }
+
   upload(uri: string, index: number): void {
     const image = new ComposerImage();
     image.uri = uri;
@@ -355,6 +369,7 @@ export class ComposerImageQueue {
 
   /** 回收中转 OSS 对象（best-effort，不阻断 Composer 操作）。 */
   private recycle(image: ComposerImage): void {
+    this.releaseManaged(image.uri);
     if (image.ref !== null) this.recycleRef(image.ref);
   }
 

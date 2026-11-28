@@ -2,6 +2,9 @@ import { describe, it, expect } from '@ohos/hypium';
 import { parseOrcaWorkers } from '../main/ets/core/tasks/OrcaCollaboration';
 import { parseTeammateRoster } from '../main/ets/core/tasks/TeammateRoster';
 import {
+  classifyCompanionCreateFailure, companionCreatedId, normalizeTeammateName, parseCompanionCreateForm,
+} from '../main/ets/core/tasks/CompanionCreate';
+import {
   parseMessage,
   parseSession,
   readAny,
@@ -720,6 +723,45 @@ export default function localUnitTest() {
       expect(rows[0].readAt).assertEqual(20);
       expect(rows[0].replyAt).assertEqual(20);
       expect(rows[0].running).assertTrue();
+    });
+
+    // 新建伙伴表单解析（契约：apps/desktop/src/main/localDb/ipc/botRemoteEditors.ts id==='create'）。
+    // 能力判定决定按钮能否提交：旧版/禁用/多出字段的电脑必须显示「不支持」，没有默认模型必须禁止提交，
+    // 否则会提交注定失败的请求。相邻测试只覆盖列表解析。unit tier，纯函数。
+    it('reads whether a computer can create a buddy from its create form', 0, () => {
+      const form = (action: string, chain: string): string => '{"ref":{"collectionId":"teammates","kind":"bot",'
+        + '"id":"create"},"blocks":[{"id":"create","primitive":"form","fallbackMarkdown":"New Buddy","data":{"actionId":'
+        + '"create","values":{"name":"","avatarImageBase64":""}' + chain + '}}],"actions":[' + action + ']}';
+      const fields = '"fields":[{"id":"name","label":{"fallback":"Name","translations":{"zh-CN":"名字"}},"kind":"text"},'
+        + '{"id":"avatarImageBase64","label":"Avatar","kind":"text"}]';
+      const ready = parseCompanionCreateForm(JSON.parse(form('{"id":"create","label":"New",' + fields + '}',
+        ',"creationModelChain":"[{\\"harness\\":\\"claude\\"}]"')) as Object, 'zh-CN');
+      expect(ready.actionId).assertEqual('create');
+      expect(ready.nameLabel).assertEqual('名字');
+      expect(ready.modelMissing).assertFalse();
+      const cases: string[][] = [
+        [form('{"id":"create","label":"New","disabled":true,' + fields + '}', ''), ''],
+        [form('{"id":"create","label":"New","fields":[{"id":"name","label":"N","kind":"text"}]}', ''), ''],
+        [form('', ''), ''],
+      ];
+      for (const item of cases) {
+        expect(parseCompanionCreateForm(JSON.parse(item[0]) as Object, 'en').actionId).assertEqual(item[1]);
+      }
+      expect(parseCompanionCreateForm(JSON.parse(form('{"id":"create","label":"New",' + fields + '}',
+        ',"creationModelChain":"[]"')) as Object, 'en').modelMissing).assertTrue();
+    });
+
+    // 重试安全（Mobile CompanionCreateSheet submit）：只有电脑端明确拒绝才换 requestId；超时等未确认结果
+    // 重试必须复用原 requestId，否则电脑端会再建一个伙伴。回执缺 navigate 视为未确认。unit tier。
+    it('keeps the create request for unconfirmed results and reads the confirmed buddy id', 0, () => {
+      expect(classifyCompanionCreateFailure(new Error('[ALREADY_EXISTS] Buddy name taken'))).assertEqual('taken');
+      expect(classifyCompanionCreateFailure(new Error('[INVALID_PARAMS] Avatar required'))).assertEqual('rejected');
+      expect(classifyCompanionCreateFailure(new Error('invoke timeout'))).assertEqual('unconfirmed');
+      expect(companionCreatedId(JSON.parse('{"effects":[{"kind":"refresh-collection","collectionId":"teammates"},'
+        + '{"kind":"navigate","target":{"kind":"resource","ref":{"collectionId":"teammates","kind":"bot",'
+        + '"id":"bot_mobile_1"}}}]}') as Object)).assertEqual('bot_mobile_1');
+      expect(companionCreatedId(JSON.parse('{"effects":[{"kind":"toast","message":"ok"}]}') as Object)).assertEqual('');
+      expect(normalizeTeammateName('  ＳＯＲＡ ')).assertEqual('sora');
     });
 
     // Unit regression for the production detail lookup after a normal task refresh.

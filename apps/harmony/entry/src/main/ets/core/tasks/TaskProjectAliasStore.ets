@@ -50,6 +50,8 @@ export class TaskProjectAliasStore {
   icon(device: string, key: string): string { return this.profiles.get(device)?.icons[key] ?? ''; }
   image(device: string, key: string): string { return this.images.get(JSON.stringify([device, key])) ?? ''; }
   alias(device: string, key: string): string { return this.profiles.get(device)?.aliases[key] ?? ''; }
+  /** 电脑端项目设置版本；尚未读到或不支持时为 0（与 Mobile `projectInfo?.settingsVersion ?? 0` 一致）。 */
+  settingsVersion(device: string): number { return this.profiles.get(device)?.settingsVersion ?? 0; }
   private listeners: Array<() => void> = [];
   private operations: Map<string, Promise<void>> = new Map();
   private revisions: Map<string, number> = new Map();

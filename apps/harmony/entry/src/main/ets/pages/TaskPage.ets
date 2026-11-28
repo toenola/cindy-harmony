@@ -1,3 +1,7 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { fileIo } from '@kit.CoreFileKit';
+import { WorkdirEntry, WorkdirRequest, workdirEntries, workdirName, workdirParent, workdirRelative } from '../core/files/WorkdirFiles';
+import { WorkdirBrowser, workdirBrowserSheetOptions } from './files/WorkdirBrowser';
 import { IncomingComposerIdleGate } from '../core/incoming-share/IncomingComposerIdleGate';
 import { HomeModulePanel, HomeModuleRequest } from '../components/HomeModulePanel';
 import { readFileBytes } from '../core/attachments/ImagePreprocess';
@@ -27,8 +31,10 @@ import { providerCatalogUnavailable } from '../core/ComposerCatalog';
  * 图片附件流转复用 core/attachments/ComposerImageQueue。
  */
 
-import { KeyboardAvoidMode, LengthMetrics, router, promptAction, window, display } from '@kit.ArkUI';
+import { KeyboardAvoidMode, LengthMetrics, router, window, display } from '@kit.ArkUI';
 import { LevelMode } from '@kit.ArkUI';
+import { SymbolGlyphModifier } from '@kit.ArkUI';
+import { uiMenuOptions, uiOverlayTrace, uiOverlayBuildId, uiSheetOptions, uiConfirm, uiConfirmCopy, uiToast, UiSheetExtras, UiSheetActionRow } from '../components/common/UiOverlay';
 import {
   BlurStrategy,
   HdsNavigation,
@@ -47,6 +53,8 @@ import { remoteModelPreferenceKey } from '../core/tasks/RemoteModelPreferenceSto
 import {
   initialTaskPaneMessage, residentPaneAllowsPositioning, taskComposerInputId,
 } from '../core/tasks/ResidentTaskPanes';
+import { PluginEngineMark } from '../components/PluginEngineMark';
+import { isPluginEngineSession, pluginEngineKey } from '../core/plugin-engines/PluginEngines';
 import { AccountUsageSummary, projectAccountUsage } from '../core/messages/AccountUsage';
 import { ModelPickerQuota, modelQuotaKey, modelQuotaLine, readModelPickerQuotas } from '../core/messages/ModelPickerQuota';
 import { HistoryWorkPresentation } from '../core/messages/HistoryWorkPresentation';
@@ -112,6 +120,7 @@ import {
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
+  UI_MOTION_BASE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
@@ -560,6 +569,10 @@ const ORCA_PRESENTATION_RESOURCES: Record<string, string> = {
   'interaction.collab.emptyMessageBody': 'v132_orca_empty_message_body',
 };
 
+@Builder
+function emptyCollabHeader() {
+}
+
 @Component
 export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
@@ -569,6 +582,13 @@ export struct TaskPageContent {
   @Prop collabReturnsToLead: boolean = false;
   @Prop collabRole: string = '';
   @Prop standaloneDetail: boolean = false;
+  /**
+   * 嵌在协同面板里的 Worker 会话：标题栏不再显示本会话的返回、标题、分支、文件夹和更多菜单，
+   * 改为承载协同面板传入的标签栏（与 Desktop OrcaWorkerPanel 内嵌会话不带会话头一致），
+   * 并沿用标题栏原有的沉浸渐变模糊。独立打开 Worker 会话时为 false，标题栏照常显示。
+   */
+  @Prop collabEmbedded: boolean = false;
+  @BuilderParam collabHeader: () => void = emptyCollabHeader;
   onCollab: () => void = (): void => {};
   onDetailBack: (() => void) | undefined = undefined;
   @Prop @Watch('onPaneMessageChanged') paneMessageClientId: string = '';
@@ -807,6 +827,12 @@ export struct TaskPageContent {
   private itemsRefreshScheduled: boolean = false;
   private itemsRefreshGeneration: number = 0;
   /** Composer 加号的原生上下文 Sheet。 */
+  @State private workdirChipMenu: number = -1;
+  @State private workdirBrowserFile: string = '';
+  private workdirLinkRead: number = 0;
+  @State workdirBrowserOpen: boolean = false;
+  @State workdirBrowserRoot: string = '';
+  @State workdirBrowserPath: string = '';
   @State contextSheetOpen: boolean = false;
   /** 分栏详情栏内的 Composer 选择层；不能使用窗口级 bindSheet 覆盖左侧任务列表。 */
   @State detailComposerSheetOpen: boolean = false;
@@ -836,8 +862,15 @@ export struct TaskPageContent {
   @State pendingModelSelectionKey: string = '';
   @State contextSelectedUris: string[] = [];
   /** 详情页任务菜单沿用列表页同一套受控操作，不依赖系统 ActionSheet 的不透明状态。 */
-  @State sessionActionOpen: boolean = false;
+  @State @Watch('onAccountUsageMenuChanged') sessionActionOpen: boolean = false;
+  @State sourceBadgeSheetOpen: boolean = false;
+  @State sourceBadgeSheetTitle: string = '';
+  @State sourceBadgeSheetMessage: string = '';
+  @State sourceBadgeSheetSettings: boolean = false;
+  private sourceBadgeSheetCopy: () => void = (): void => {};
+  private sourceBadgeSheetOpenSettings: () => void = (): void => {};
   @State accountUsage: AccountUsageSummary = new AccountUsageSummary();
+  @State private accountUsageIcon: string = '';
   @State accountUsageLoading: boolean = false;
   private accountUsageGeneration: number = 0;
   private accountUsageRoute: string = '';
@@ -1542,7 +1575,7 @@ export struct TaskPageContent {
       await AppServices.instance.inputQueue.cancelUsageLimitWait(this.deviceId, this.sessionId);
     } catch (_error) {
       if (this.isCurrentPageLifecycle(lifecycle)) {
-        promptAction.showToast({ message: this.v12String('v132_usage_limit_cancel_failed') });
+        uiToast(this.getUIContext(), this.v12String('v132_usage_limit_cancel_failed'));
       }
     }
   }
@@ -1860,13 +1893,11 @@ export struct TaskPageContent {
       title = host.length > 0 ? this.v12String('v135_relocate_title_host', host)
         : this.v12String('v135_relocate_title_host_unnamed');
     }
-    this.getUIContext().showAlertDialog({
-      title: title,
-      // 同引擎优先复制原生记录，跨引擎只能走交接摘要。
-      message: this.v12String(sameAgent ? 'v135_relocate_message_native' : 'v135_relocate_message'),
-      primaryButton: { value: this.v12String('v135_relocate_cancel'), action: (): void => {} },
-      secondaryButton: { value: this.v12String('v135_relocate_confirm'), action: (): void => onConfirm() },
-    });
+    // 同引擎优先复制原生记录，跨引擎只能走交接摘要。
+    void uiConfirm(this.getUIContext(), uiConfirmCopy(title,
+      this.v12String(sameAgent ? 'v135_relocate_message_native' : 'v135_relocate_message'),
+      this.v12String('v135_relocate_confirm'), this.v12String('v135_relocate_cancel'), false))
+      .then((confirmed: boolean): void => { if (confirmed) onConfirm(); });
   }
 
   private syncRemoteAgentCatalogs(): void {
@@ -1895,6 +1926,13 @@ export struct TaskPageContent {
     for (const device of AppServices.instance.tasks.deviceList) names.set(device.deviceId, device.deviceName);
     const location = agentLocationLabel(this.session(), this.pendingAgentSwitchIntent, names);
     return location.length > 0 ? this.v12String('v132_agent_location', location) : '';
+  }
+
+  /** 只取运行位置名（不带“Agent 在…运行”的外壳），给菜单信息头的紧凑行用。 */
+  private agentLocationName(): string {
+    const names = new Map<string, string>();
+    for (const device of AppServices.instance.tasks.deviceList) names.set(device.deviceId, device.deviceName);
+    return agentLocationLabel(this.session(), this.pendingAgentSwitchIntent, names);
   }
 
   private async loadPendingAgentSwitchIntent(): Promise<void> {
@@ -2056,7 +2094,7 @@ export struct TaskPageContent {
       this.planModeEnabled = next;
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: this.invokeFailureText(e, '计划模式更新失败，请重试') });
+        uiToast(this.getUIContext(), this.invokeFailureText(e, '计划模式更新失败，请重试'));
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2398,7 +2436,7 @@ export struct TaskPageContent {
   private openComposerControlPopup(page: string): void {
     if (page === 'model') void this.loadRouting();
     if ((page === 'model' || page === 'agent') && this.runtimeRouteLocked()) {
-      promptAction.showToast({ message: this.v12String('v132_remote_runtime_read_only') });
+      uiToast(this.getUIContext(), this.v12String('v132_remote_runtime_read_only'));
       return;
     }
     if (this.sending || this.contextRpcBusy || this.deviceDisabled
@@ -2542,7 +2580,7 @@ export struct TaskPageContent {
     if (kind === this.modelAgentTab) return true;
     if (this.contextRpcBusy) return false;
     if (!this.canSwitchSessionAgent()) {
-      promptAction.showToast({ message: '当前任务不支持切换 Agent' });
+      uiToast(this.getUIContext(), '当前任务不支持切换 Agent');
       return false;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
@@ -2568,7 +2606,7 @@ export struct TaskPageContent {
       this.alternateModelOptions = [];
       this.alternateEffortOptions = [];
       this.alternateFastModeCapability = false;
-      promptAction.showToast({ message: '无法加载该 Agent 的模型' });
+      uiToast(this.getUIContext(), '无法加载该 Agent 的模型');
       return false;
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2588,22 +2626,12 @@ export struct TaskPageContent {
     }
     if (option.id === 'bypassPermissions') {
       const lifecycleGeneration = this.pageLifecycleGeneration;
-      this.getUIContext().showAlertDialog({
-        title: '确认完全访问',
-        message: 'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。',
-        primaryButton: {
-          value: '取消',
-          action: () => {
-          },
-        },
-        secondaryButton: {
-          value: '继续',
-          action: () => {
-            if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-            void this.applyPermissionMode(option);
-          },
-        },
-      });
+      void uiConfirm(this.getUIContext(), uiConfirmCopy('确认完全访问',
+        'Cindy 将不再逐项询问工具操作。请仅在信任当前任务和项目时使用。', '继续', '取消', false))
+        .then((confirmed: boolean): void => {
+          if (!confirmed || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+          void this.applyPermissionMode(option);
+        });
       return;
     }
     void this.applyPermissionMode(option);
@@ -2623,7 +2651,7 @@ export struct TaskPageContent {
       this.closeContextSheet();
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: this.invokeFailureText(e, '权限模式更新失败，请重试') });
+        uiToast(this.getUIContext(), this.invokeFailureText(e, '权限模式更新失败，请重试'));
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2653,14 +2681,14 @@ export struct TaskPageContent {
     if (this.routingBusy || this.routingSession.binding === null) return;
     this.routingBusy = true;
     try { await AppServices.instance.modelRouting.unbind(this.deviceId, this.sessionId); }
-    catch (_error) { promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    catch (_error) { uiToast(this.getUIContext(), this.v12String('v139_route_unavailable')); }
     finally { this.routingBusy = false; }
   }
 
   private async completeRoutingSelection(ticket: ModelRoutingTicket): Promise<void> {
     const store = AppServices.instance.modelRouting;
     try { await store.accepted(ticket, this.sessionId, buildModelRoutingNote(ticket.result, this.session()?.model ?? '', '', (id: string): string => AppServices.instance.tasks.deviceList.find((device): boolean => device.deviceId === id)?.deviceName || id)); }
-    catch (_error) { promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    catch (_error) { uiToast(this.getUIContext(), this.v12String('v139_route_unavailable')); }
     finally {
       store.release(ticket);
       if (this.routingTicket === ticket) this.routingTicket = null;
@@ -2673,7 +2701,7 @@ export struct TaskPageContent {
     if (offer === null || this.queueActionBlocked() || !this.queueErrorRetryText || this.contextRpcBusy || this.routingBusy || this.runtimeRouteLocked()) return;
     const lifecycle = this.pageLifecycleGeneration, session = this.sessionId;
     if (offer.route.agentKind === 'acp' || (offer.route.agentDeviceId || null) !== this.nextAgentDeviceId()) {
-      promptAction.showToast({ message: this.v12String('v139_route_engine') }); return;
+      uiToast(this.getUIContext(), this.v12String('v139_route_engine')); return;
     }
     this.modelAgentTab = offer.route.agentKind === 'cc' ? 'claude-code' : offer.route.agentKind;
     this.routingBusy = true;
@@ -2684,7 +2712,7 @@ export struct TaskPageContent {
         && row.providerId === offer.route.providerId && row.agentDeviceId === offer.route.agentDeviceId);
       if (!option) throw new Error('MODEL_ROUTING_UNAVAILABLE');
       await this.selectComposerModel(option, false, false, null, offer);
-    } catch { if (this.isCurrentPageLifecycle(lifecycle)) promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    } catch { if (this.isCurrentPageLifecycle(lifecycle)) uiToast(this.getUIContext(), this.v12String('v139_route_unavailable')); }
     finally { if (this.isCurrentPageLifecycle(lifecycle)) this.routingBusy = false; }
   }
 
@@ -2725,9 +2753,8 @@ export struct TaskPageContent {
       this.routingTicket = null;
       const unsupported = failure instanceof Error
         && failure.message.indexOf('MODEL_ROUTING_ENGINE_UNSUPPORTED') >= 0;
-      if (this.isCurrentPageLifecycle(lifecycle)) promptAction.showToast({
-        message: this.v12String(unsupported ? 'v139_route_engine' : 'v139_route_unavailable'),
-      });
+      if (this.isCurrentPageLifecycle(lifecycle)) uiToast(this.getUIContext(),
+        this.v12String(unsupported ? 'v139_route_engine' : 'v139_route_unavailable'));
     } finally { if (this.isCurrentPageLifecycle(lifecycle)) this.routingBusy = false; }
   }
 
@@ -2739,13 +2766,13 @@ export struct TaskPageContent {
       return;
     }
     if (option.availability === 'requires_payment' && !this.modelOptionIsCurrent(option)) {
-      promptAction.showToast({ message: '该模型需要付费后才能使用' });
+      uiToast(this.getUIContext(), '该模型需要付费后才能使用');
       return;
     }
     const resolvedRoute = ticket !== null ? AppServices.instance.modelRouting.routeFor(ticket) : offer?.route ?? null;
     if (resolvedRoute !== null && (resolvedRoute.agentDeviceId || null) !== (session.remoteHostId ? null : this.nextAgentDeviceId())) {
       if (ticket !== null) AppServices.instance.modelRouting.cancel(ticket);
-      promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); return;
+      uiToast(this.getUIContext(), this.v12String('v139_route_unavailable')); return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const targetAgent = this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
@@ -2755,7 +2782,7 @@ export struct TaskPageContent {
     const pick = resolveAgentLocationPick(this.currentAgentDeviceId(), this.nextAgentDeviceId(),
       this.optionAgentDeviceId(option));
     if (pick.relocates && !this.agentLocationMovable()) {
-      promptAction.showToast({ message: this.v12String('v132_remote_runtime_read_only') });
+      uiToast(this.getUIContext(), this.v12String('v132_remote_runtime_read_only'));
       return;
     }
     if (pick.needsConfirm && !locationConfirmed) {
@@ -2766,28 +2793,18 @@ export struct TaskPageContent {
       return;
     }
     if (targetAgent !== currentAgent && !this.canSwitchSessionAgent()) {
-      promptAction.showToast({ message: '当前任务不支持切换 Agent' });
+      uiToast(this.getUIContext(), '当前任务不支持切换 Agent');
       return;
     }
     // 换电脑与换引擎是同一份交接风险：换电脑那一步已经确认过，不再叠一层换引擎确认。
     if (targetAgent !== currentAgent && !this.agentSwitchConfirmed && !pick.relocates) {
-      this.getUIContext().showAlertDialog({
-        title: `切换到 ${modelAgentLabel(targetAgent)}`,
-        message: '当前任务的上下文会保留，Agent 将在安全边界切换；正在运行时会等本轮结束后生效。',
-        primaryButton: {
-          value: '取消',
-          action: () => {
-          },
-        },
-        secondaryButton: {
-          value: '继续',
-          action: () => {
-            if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-            this.agentSwitchConfirmed = true;
-            void this.selectComposerModel(option, windowConfirmed, locationConfirmed, ticket, offer);
-          },
-        },
-      });
+      void uiConfirm(this.getUIContext(), uiConfirmCopy(`切换到 ${modelAgentLabel(targetAgent)}`,
+        '当前任务的上下文会保留，Agent 将在安全边界切换；正在运行时会等本轮结束后生效。', '继续', '取消', false))
+        .then((confirmed: boolean): void => {
+          if (!confirmed || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+          this.agentSwitchConfirmed = true;
+          void this.selectComposerModel(option, windowConfirmed, locationConfirmed, ticket, offer);
+        });
       return;
     }
     if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent && ticket === null && offer === null) {
@@ -2798,21 +2815,18 @@ export struct TaskPageContent {
     if (option.suspended) return;
     const windowDecision = modelWindowSwitchDecision(session.contextTokens, option.contextWindow, session.remoteHostId);
     if (windowDecision === 'blocked' || (windowDecision === 'confirm' && !windowConfirmed)) {
-      this.getUIContext().showAlertDialog({
-        title: windowDecision === 'blocked' ? this.v12String('v131_window_blocked_title') : this.v12String('v131_window_confirm_title'),
-        message: windowDecision === 'blocked'
+      void uiConfirm(this.getUIContext(), uiConfirmCopy(
+        windowDecision === 'blocked' ? this.v12String('v131_window_blocked_title') : this.v12String('v131_window_confirm_title'),
+        windowDecision === 'blocked'
           ? this.v12String('v131_window_blocked_message')
           : this.v12String('v131_window_confirm_message'),
-        primaryButton: { value: this.v12String('v131_cancel'), action: (): void => {} },
-        secondaryButton: {
-          value: windowDecision === 'blocked' ? this.v12String('v131_close') : this.v12String('v131_continue'),
-          action: (): void => {
-            if (windowDecision === 'blocked' || !this.isCurrentPageLifecycle(lifecycleGeneration)
-              || this.sessionId !== session.id) return;
-            void this.selectComposerModel(option, true, locationConfirmed, ticket, offer);
-          },
-        },
-      });
+        windowDecision === 'blocked' ? this.v12String('v131_close') : this.v12String('v131_continue'),
+        this.v12String('v131_cancel'), false))
+        .then((confirmed: boolean): void => {
+          if (!confirmed || windowDecision === 'blocked' || !this.isCurrentPageLifecycle(lifecycleGeneration)
+            || this.sessionId !== session.id) return;
+          void this.selectComposerModel(option, true, locationConfirmed, ticket, offer);
+        });
       return;
     }
     const route = ticket !== null ? AppServices.instance.modelRouting.routeFor(ticket) : offer?.route ?? null;
@@ -2867,7 +2881,7 @@ export struct TaskPageContent {
           }
         }
         if (runtimeSettingsFailed && this.isCurrentPageLifecycle(lifecycleGeneration)) {
-          promptAction.showToast({ message: '模型已切换，部分运行设置更新失败' });
+          uiToast(this.getUIContext(), '模型已切换，部分运行设置更新失败');
           if (ticket !== null || offer !== null) throw new Error('MODEL_ROUTING_RUNTIME_INCOMPLETE');
         }
       }
@@ -2879,7 +2893,7 @@ export struct TaskPageContent {
       } else if (this.routingSession.binding !== null) await this.stopRouting();
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)
         && readBool(result as Record<string, Object>, 'deferred', false)) {
-        promptAction.showToast({ message: '将在当前运行结束后切换模型' });
+        uiToast(this.getUIContext(), '将在当前运行结束后切换模型');
       }
       setTimeout(() => {
         if (this.isCurrentPageLifecycle(lifecycleGeneration)
@@ -2894,7 +2908,7 @@ export struct TaskPageContent {
           AppServices.instance.modelRouting.cancel(ticket);
           if (this.routingTicket === ticket) this.routingTicket = null;
         }
-        promptAction.showToast({ message: this.invokeFailureText(e, '模型切换失败，请重试') });
+        uiToast(this.getUIContext(), this.invokeFailureText(e, '模型切换失败，请重试'));
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2920,7 +2934,7 @@ export struct TaskPageContent {
       }
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: this.invokeFailureText(e, '推理强度更新失败，请重试') });
+        uiToast(this.getUIContext(), this.invokeFailureText(e, '推理强度更新失败，请重试'));
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2944,7 +2958,7 @@ export struct TaskPageContent {
       if (model !== null) this.rememberModelSpeed(model, enabled, tier);
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: this.invokeFailureText(e, 'Fast 模式更新失败，请重试') });
+        uiToast(this.getUIContext(), this.invokeFailureText(e, 'Fast 模式更新失败，请重试'));
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.contextRpcBusy = false;
@@ -2965,7 +2979,7 @@ export struct TaskPageContent {
     const objective = this.goalObjective.trim();
     if (objective.length === 0 || this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       if (objective.length === 0) {
-        promptAction.showToast({ message: '请先填写目标' });
+        uiToast(this.getUIContext(), '请先填写目标');
       }
       return;
     }
@@ -2980,13 +2994,13 @@ export struct TaskPageContent {
       const statusSynced = await AppServices.instance.goals.refresh(this.deviceId, this.sessionId);
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (!statusSynced) {
-        promptAction.showToast({ message: '无法确认当前目标状态，请重试' });
+        uiToast(this.getUIContext(), '无法确认当前目标状态，请重试');
         return;
       }
       const existing = AppServices.instance.goals.getState(this.sessionId, this.deviceId);
       if (existing !== null) {
         this.goalState = existing;
-        promptAction.showToast({ message: '当前任务已有目标' });
+        uiToast(this.getUIContext(), '当前任务已有目标');
         return;
       }
       await AppServices.instance.goals.start(this.deviceId, this.sessionId, objective, limits);
@@ -2998,7 +3012,7 @@ export struct TaskPageContent {
       this.takeOverTailAfterSend();
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '目标启动失败，请重试' });
+        uiToast(this.getUIContext(), '目标启动失败，请重试');
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.goalActionBusy = false;
@@ -3022,7 +3036,7 @@ export struct TaskPageContent {
       this.goalState = AppServices.instance.goals.getState(this.sessionId, this.deviceId);
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '目标状态更新失败，请重试' });
+        uiToast(this.getUIContext(), '目标状态更新失败，请重试');
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.goalActionBusy = false;
@@ -3035,17 +3049,12 @@ export struct TaskPageContent {
       return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
-    this.getUIContext().showActionSheet({
-      title: '终止目标',
-      message: '目标会停止自动推进，但已经产生的消息会保留。',
-      sheets: [{
-        title: '终止目标',
-        action: () => {
-          if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-          void this.clearGoal();
-        },
-      }],
-    });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy('终止目标',
+      '目标会停止自动推进，但已经产生的消息会保留。', '终止目标', '取消', true))
+      .then((confirmed: boolean): void => {
+        if (!confirmed || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+        void this.clearGoal();
+      });
   }
 
   private async clearGoal(): Promise<void> {
@@ -3059,7 +3068,7 @@ export struct TaskPageContent {
       this.goalState = null;
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '目标终止失败，请重试' });
+        uiToast(this.getUIContext(), '目标终止失败，请重试');
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.goalActionBusy = false;
@@ -3082,7 +3091,7 @@ export struct TaskPageContent {
     const text = serialized.text;
     if (this.sending || this.incomingImportBusy || this.pickingImages || this.pickingFiles) return;
     if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
-      promptAction.showToast({ message: '请先处理待确认请求' });
+      uiToast(this.getUIContext(), '请先处理待确认请求');
       return;
     }
     if (this.editingQueueClientId.length > 0) {
@@ -3100,23 +3109,23 @@ export struct TaskPageContent {
       return;
     }
     if (this.deviceDisabled) {
-      promptAction.showToast({ message: '设备已关闭远程控制，仅可查看' });
+      uiToast(this.getUIContext(), '设备已关闭远程控制，仅可查看');
       return;
     }
     if (this.imageQueue.hasUploading()) {
-      promptAction.showToast({ message: '图片上传中，请稍候' });
+      uiToast(this.getUIContext(), '图片上传中，请稍候');
       return;
     }
     if (this.imageQueue.hasFailed()) {
-      promptAction.showToast({ message: '请重试或移除上传失败的图片' });
+      uiToast(this.getUIContext(), '请重试或移除上传失败的图片');
       return;
     }
     if (this.fileQueue.hasUploading()) {
-      promptAction.showToast({ message: '文件上传中，请稍候' });
+      uiToast(this.getUIContext(), '文件上传中，请稍候');
       return;
     }
     if (this.fileQueue.hasFailed()) {
-      promptAction.showToast({ message: '请重试或移除上传失败的文件' });
+      uiToast(this.getUIContext(), '请重试或移除上传失败的文件');
       return;
     }
     const readyImages = this.imageQueue.readyImages();
@@ -3257,7 +3266,7 @@ export struct TaskPageContent {
     if (this.sending || this.incomingImportBusy || this.incomingBlocked || !this.incomingDraftRestored
       || this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
     if (this.composerImages.length > 0 || this.composerFiles.length > 0) {
-      promptAction.showToast({ message: '技能学习命令不能同时发送附件' }); return;
+      uiToast(this.getUIContext(), '技能学习命令不能同时发送附件'); return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration, epoch = AppServices.instance.auth.sessionEpoch;
     const deviceId = this.deviceId, sessionId = this.sessionId;
@@ -3297,7 +3306,7 @@ export struct TaskPageContent {
       AppServices.instance.messages.appendLocalSystemCard(sessionId, 'learn', data, deviceId);
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         if (incoming !== null) { this.incomingBlocked = true; this.error = this.v12String('v132_delivery_unknown'); }
-        else promptAction.showToast({ message: '技能学习未启动，草稿已保留' });
+        else uiToast(this.getUIContext(), '技能学习未启动，草稿已保留');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
@@ -3327,16 +3336,16 @@ export struct TaskPageContent {
     // 排队消息是针对回退前的旧上下文写的，重发会排到它们后面，先让用户处理队列。
     if (this.editingQueueClientId.length > 0 || AppServices.instance.inputQueue.getProjection(
       this.sessionId, this.deviceId).pendingQueue.length > 0) {
-      promptAction.showToast({ message: this.v12String('v135_edit_queue_not_empty') });
+      uiToast(this.getUIContext(), this.v12String('v135_edit_queue_not_empty'));
       return;
     }
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
-      promptAction.showToast({ message: this.v12String('v135_edit_uploads_pending') });
+      uiToast(this.getUIContext(), this.v12String('v135_edit_uploads_pending'));
       return;
     }
     // 输入框里的附件属于用户自己的草稿，不能混进这条消息重发。
     if (this.imageQueue.images.length > 0 || this.fileQueue.files.length > 0) {
-      promptAction.showToast({ message: this.v12String('v135_edit_tray_not_empty') });
+      uiToast(this.getUIContext(), this.v12String('v135_edit_tray_not_empty'));
       return;
     }
     if (this.editingMessageClientId.length === 0) this.messageEditStash = this.composerDocument;
@@ -3403,7 +3412,7 @@ export struct TaskPageContent {
     const session = this.session();
     if (clientId.length === 0 || session === undefined || this.messageEditSubmitting || this.sending) return;
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
-      promptAction.showToast({ message: this.v12String('v135_edit_uploads_pending') });
+      uiToast(this.getUIContext(), this.v12String('v135_edit_uploads_pending'));
       return;
     }
     const document = this.composerDocument;
@@ -3415,7 +3424,7 @@ export struct TaskPageContent {
     // 空文本又没有附件的重发会变成「只回退不重发」，那是「回到此处」不是编辑。
     if (serialized.text.trim().length === 0 && images.length === 0 && files.length === 0) return;
     if (AppServices.instance.inputQueue.getProjection(this.sessionId, this.deviceId).pendingQueue.length > 0) {
-      promptAction.showToast({ message: this.v12String('v135_edit_queue_not_empty') });
+      uiToast(this.getUIContext(), this.v12String('v135_edit_queue_not_empty'));
       return;
     }
     if (sessionSendNeedsModelReselection(this.modelVisibilityOverrides, session, this.pendingAgentSwitchIntent)) {
@@ -3541,7 +3550,7 @@ export struct TaskPageContent {
         deviceId, sessionId, clientId, true).catch(() => {
         if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
         this.cancelQueueEdit();
-        promptAction.showToast({ message: '无法锁定这条队列消息' });
+        uiToast(this.getUIContext(), '无法锁定这条队列消息');
       });
     };
     if (previous.length > 0) {
@@ -3580,7 +3589,7 @@ export struct TaskPageContent {
       void this.consumeIncomingShare();
     }).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '队列消息未保存，请重试' });
+        uiToast(this.getUIContext(), '队列消息未保存，请重试');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
@@ -3616,7 +3625,7 @@ export struct TaskPageContent {
     if (this.editingQueueClientId === clientId) this.cancelQueueEdit();
     AppServices.instance.inputQueue.remove(deviceId, sessionId, clientId).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '队列消息未删除，请重试' });
+        uiToast(this.getUIContext(), '队列消息未删除，请重试');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3640,7 +3649,7 @@ export struct TaskPageContent {
       deviceId, sessionId, clientId, targetIndex,
     ).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '队列顺序未更新，请重试' });
+        uiToast(this.getUIContext(), '队列顺序未更新，请重试');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3656,7 +3665,7 @@ export struct TaskPageContent {
     this.selectedQueueClientId = '';
     AppServices.instance.inputQueue.steer(deviceId, sessionId, clientId).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '插话未发送，请重试' });
+        uiToast(this.getUIContext(), '插话未发送，请重试');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3674,8 +3683,8 @@ export struct TaskPageContent {
     AppServices.instance.inputQueue.retry(scope.deviceId, scope.sessionId, clientId).catch((error: Error) => {
       if (this.isCurrentPresentationScope(scope)) {
         const safe = AppServices.instance.inputQueue.canRetryInputDelivery(scope.sessionId, clientId, scope.deviceId);
-        this.getUIContext().getPromptAction().showToast({ message: this.v12String(isRemoteBusyError(error)
-          ? 'v132_remote_busy' : safe ? 'v132_delivery_send_failed' : 'v132_delivery_unknown') });
+        uiToast(this.getUIContext(), this.v12String(isRemoteBusyError(error)
+          ? 'v132_remote_busy' : safe ? 'v132_delivery_send_failed' : 'v132_delivery_unknown'));
       }
     }).finally(() => {
       if (this.isCurrentPresentationScope(scope)) this.queueBusy = false;
@@ -3695,11 +3704,11 @@ export struct TaskPageContent {
       const key = state === 'accepted' ? 'v132_delivery_accepted' : state === 'pending'
         ? 'v132_delivery_pending' : state === 'removed' ? 'v132_delivery_removed'
           : safe ? (state === 'unknown' ? 'v132_delivery_absent' : 'v132_delivery_check_done') : 'v132_delivery_unknown';
-      this.getUIContext().getPromptAction().showToast({ message: this.v12String(key) });
+      uiToast(this.getUIContext(), this.v12String(key));
     } catch (error) {
       if (this.isCurrentPresentationScope(scope)) {
-        this.getUIContext().getPromptAction().showToast({ message: this.v12String(isRemoteBusyError(error)
-          ? 'v132_remote_busy' : 'v132_delivery_check_failed') });
+        uiToast(this.getUIContext(), this.v12String(isRemoteBusyError(error)
+          ? 'v132_remote_busy' : 'v132_delivery_check_failed'));
       }
     } finally {
       if (this.isCurrentPresentationScope(scope)) this.queueBusy = false;
@@ -3714,7 +3723,7 @@ export struct TaskPageContent {
     this.queueBusy = true;
     AppServices.instance.inputQueue.resume(deviceId, sessionId).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '队列未恢复，请重试' });
+        uiToast(this.getUIContext(), '队列未恢复，请重试');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3729,7 +3738,7 @@ export struct TaskPageContent {
     this.queueBusy = true;
     AppServices.instance.inputQueue.retryLastError(deviceId, sessionId).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '重试失败，请检查电脑端状态' });
+        uiToast(this.getUIContext(), '重试失败，请检查电脑端状态');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3744,7 +3753,7 @@ export struct TaskPageContent {
     this.queueBusy = true;
     AppServices.instance.inputQueue.clearError(deviceId, sessionId).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '暂时无法忽略该错误' });
+        uiToast(this.getUIContext(), '暂时无法忽略该错误');
       }
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.queueBusy = false;
@@ -3774,7 +3783,7 @@ export struct TaskPageContent {
       return;
     }
     if (this.contextSelectedUris.length >= this.imageQueue.remainingSlots()) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.contextSelectedUris = this.contextSelectedUris.concat([uri]);
@@ -3797,7 +3806,7 @@ export struct TaskPageContent {
       return;
     }
     if (this.imageQueue.remainingSlots() <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.closeContextSheet();
@@ -3809,7 +3818,7 @@ export struct TaskPageContent {
       return;
     }
     if (this.imageQueue.remainingSlots() <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.closeContextSheet();
@@ -3821,7 +3830,7 @@ export struct TaskPageContent {
       return;
     }
     if (this.imageQueue.remainingSlots() <= 0) {
-      promptAction.showToast({ message: `最多添加 ${MAX_COMPOSER_IMAGES} 张图片` });
+      uiToast(this.getUIContext(), `最多添加 ${MAX_COMPOSER_IMAGES} 张图片`);
       return;
     }
     this.closeContextSheet();
@@ -3831,7 +3840,7 @@ export struct TaskPageContent {
   private pickFiles(): void {
     if (this.pickingFiles || this.sending) return;
     if (this.fileQueue.remainingSlots() <= 0) {
-      promptAction.showToast({ message: '每条消息最多添加 20 个附件' });
+      uiToast(this.getUIContext(), '每条消息最多添加 20 个附件');
       return;
     }
     this.closeContextSheet();
@@ -4101,12 +4110,12 @@ export struct TaskPageContent {
         this.initialScrolled = false;
         this.routeMessageClientId = '';
         this.scrollToBottomOnce();
-        promptAction.showToast({ message: '找不到这条消息，可能已被删除' });
+        uiToast(this.getUIContext(), '找不到这条消息，可能已被删除');
       }
     }).catch(() => {
       if (generation !== this.messageFocusGeneration) return;
       this.messageFocusLoadStarted = false;
-      promptAction.showToast({ message: '消息定位失败，请检查连接后重试' });
+      uiToast(this.getUIContext(), '消息定位失败，请检查连接后重试');
     });
   }
 
@@ -4278,7 +4287,7 @@ export struct TaskPageContent {
 
   private enterShareSelection(item: RenderMessageItem | null = null): void {
     if (this.sessionStreaming) {
-      promptAction.showToast({ message: this.v12String('v12_share_still_generating') });
+      uiToast(this.getUIContext(), this.v12String('v12_share_still_generating'));
       return;
     }
     if (item !== null && !this.isShareableMessageItem(item)) return;
@@ -4330,13 +4339,13 @@ export struct TaskPageContent {
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const selectionMode = this.shareSelection.isActive();
     if (selectionMode && this.sessionStreaming) {
-      promptAction.showToast({ message: this.v12String('v12_share_still_generating') });
+      uiToast(this.getUIContext(), this.v12String('v12_share_still_generating'));
       return;
     }
     const sourceItems: RenderItem[] = selectionMode
       ? this.selectedShareableMessages() : this.items;
     if (selectionMode && sourceItems.length === 0) {
-      promptAction.showToast({ message: this.v12String('v12_select_messages_first') });
+      uiToast(this.getUIContext(), this.v12String('v12_select_messages_first'));
       return;
     }
     if (selectionMode) this.shareSelectionBusy = true;
@@ -4359,7 +4368,7 @@ export struct TaskPageContent {
       });
     if (projection.items.length === 0) {
       this.shareSelectionBusy = false;
-      promptAction.showToast({ message: this.v12String('v12_no_shareable_content') });
+      uiToast(this.getUIContext(), this.v12String('v12_no_shareable_content'));
       return;
     }
 
@@ -4388,7 +4397,7 @@ export struct TaskPageContent {
       this.shareError = this.shareService.lastError();
       this.shareFrozenItems = [];
       this.shareSelectionBusy = false;
-      promptAction.showToast({ message: this.shareError });
+      uiToast(this.getUIContext(), this.shareError);
       return;
     }
 
@@ -4405,7 +4414,7 @@ export struct TaskPageContent {
       this.shareRequiresNarrowing = true;
       this.shareService.fail(generation, this.v12String('v12_share_item_too_long'));
       this.syncShareStateFromService();
-      promptAction.showToast({ message: this.shareError });
+      uiToast(this.getUIContext(), this.shareError);
       return;
     }
     this.shareSegmentStarts = starts;
@@ -4451,7 +4460,7 @@ export struct TaskPageContent {
       this.shareService.fail(generation, prepared.error.length > 0
         ? prepared.error : this.v12String('v12_share_generation_failed_detail'));
       this.syncShareStateFromService();
-        promptAction.showToast({ message: this.shareError });
+        uiToast(this.getUIContext(), this.shareError);
       return;
     }
 
@@ -4632,14 +4641,7 @@ export struct TaskPageContent {
    */
   @Builder
   shareOverlayLayer() {
-    Stack() {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.overlay'))
-        .onClick(() => this.cancelConversationShare())
-
-      Column({ space: 14 }) {
+    Column({ space: 14 }) {
         if (this.shareStage === SHARE_STAGE_RENDERING) {
           Row({ space: 10 }) {
             LoadingProgress().width(20).height(20)
@@ -4705,15 +4707,16 @@ export struct TaskPageContent {
         }
         .width('100%')
       }
-      .width('86%')
-      .constraintSize({ maxWidth: 420 })
-      .padding(18)
-      .borderRadius(UI_RADIUS_CONTAINER)
-      .backgroundColor($r('app.color.bg_card'))
-      .alignItems(HorizontalAlign.Start)
-    }
     .width('100%')
-    .height('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 分享为图片：底部表单；用户下滑 / 点关闭只触发取消，状态回到 IDLE 后表单随 isShow 收起。 */
+  private shareSheetOptions(): SheetOptions {
+    const extras = new UiSheetExtras();
+    extras.onWillDismiss = (_action: DismissSheetAction): void => { this.cancelConversationShare(); };
+    return uiSheetOptions(this.v12String('v12_share_as_image'), (): void => {}, SheetSize.FIT_CONTENT, extras);
   }
 
   private cancelConversationShare(): void {
@@ -4952,7 +4955,7 @@ export struct TaskPageContent {
       } else {
         this.tailInterruptAcked = false;
       }
-      promptAction.showToast({ message: '任务未能继续，请检查连接后重试' });
+      uiToast(this.getUIContext(), '任务未能继续，请检查连接后重试');
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.tailBannerBusy = false;
     });
@@ -5413,6 +5416,13 @@ export struct TaskPageContent {
     }
   }
 
+  private subagentSheetOptions(): SheetOptions {
+    const extras = new UiSheetExtras();
+    extras.detents = [SheetSize.MEDIUM, SheetSize.LARGE];
+    return uiSheetOptions($r('app.string.v12_subagent_detail'), (): void => this.closeSubagentDetail(),
+      SheetSize.FIT_CONTENT, extras);
+  }
+
   private closeSubagentDetail(): void {
     const current = this.currentSubagentDetail();
     if (current !== null) this.loadDeferredWorkChildren([current], false);
@@ -5640,7 +5650,7 @@ export struct TaskPageContent {
     if (!this.initialLoadResolved && this.showInitialSync) return '正在同步';
     if (this.loadFailed) return '同步失败';
     if (this.pendingInteractions.length > 0) return `待处理 ${this.pendingInteractions.length}`;
-    if (this.collabRole.length > 0) return this.collabRole;
+    // 协同角色不再占标题下的第二行，改为标题栏右侧原分支标签位置的小标签（collabRoleBadge）。
     if (this.sessionStreaming) return '运行中';
     return '';
   }
@@ -6426,6 +6436,14 @@ export struct TaskPageContent {
               .justifyContent(FlexAlign.Center)
             }
 
+            if (this.fileBrowserRelative(this.filePreviewPath) !== null) {
+              Button('在文件夹中显示').height(44).onClick((): void => {
+                const relative = this.fileBrowserRelative(this.filePreviewPath);
+                if (relative === null) return;
+                this.closeFilePreview();
+                this.showProjectActions(workdirParent(relative));
+              })
+            }
             Button(this.fileShareBusy ? '正在准备…' : this.filePreviewIsPdf() ? '用系统阅读器打开' : '分享给其他应用')
               .fontSize(uiFontSize(14))
               .fontWeight(FontWeight.Medium)
@@ -6452,18 +6470,6 @@ export struct TaskPageContent {
         .transition(uiOverlayTransition())
       }
 
-      if (this.messageActionItemKey.length > 0) {
-        this.messageActionLayer()
-      }
-      if (shareFlowBusy(this.shareStage) || this.shareStage === SHARE_STAGE_FAILED) {
-        this.shareOverlayLayer()
-      }
-      if (this.sessionTreeOpen) {
-        this.sessionTreeLayer()
-      }
-      if (this.subagentDetailKey.length > 0) {
-        this.subagentDetailLayer()
-      }
             }
             .width('100%')
             .height('100%')
@@ -6491,7 +6497,7 @@ export struct TaskPageContent {
         },
         content: {
           title: { mainTitle: '' },
-          stackBuilder: (): void => this.taskHeader(),
+          stackBuilder: (): void => this.titleBarContent(),
         },
           })
           .hideBackButton(true)
@@ -6505,9 +6511,6 @@ export struct TaskPageContent {
           .height('100%')
           .backgroundColor(this.isEmbedded() ? Color.Transparent : $r('app.color.bg_page'))
 
-          if (this.detailComposerSheetOpen) {
-            this.detailComposerSheetLayer()
-          }
         }
         .width('100%')
         .height('100%')
@@ -6533,6 +6536,7 @@ export struct TaskPageContent {
   build() {
     Stack() {
       this.taskPageBody()
+      this.sessionSheetAnchors()
       if (this.sharedManagementOpen) {
         HomeModulePanel({ request: this.sharedManagementRequest(),
           onClose: (): void => { this.sharedManagementOpen = false; },
@@ -6568,7 +6572,18 @@ export struct TaskPageContent {
       session.agentDeviceId, this.pendingAgentSwitchIntent?.agentDeviceId]);
   }
 
-  private async loadAccountUsage(): Promise<void> {
+  private onAccountUsageMenuChanged(): void {
+    if (!this.sessionActionOpen) {
+      this.accountUsageGeneration++;
+      if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+      this.accountUsageRefreshTimer = -1;
+      this.accountUsageLoading = false;
+      return;
+    }
+    if (!this.isTeammateConversation()) void this.loadAccountUsage();
+  }
+
+  private async loadAccountUsage(refreshIcon: boolean = true): Promise<void> {
     if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
     this.accountUsageRefreshTimer = -1;
     const generation = ++this.accountUsageGeneration;
@@ -6577,21 +6592,83 @@ export struct TaskPageContent {
     const session = this.session();
     this.accountUsage = new AccountUsageSummary();
     this.accountUsageLoading = false;
-    if (session === undefined || session.remoteHostId.length > 0 || this.runtimeRouteLocked()) return;
-    const provider = this.effectiveProviderId(session);
+    this.accountUsageIcon = '';
+    const app = AppServices.instance;
+    if (session === undefined || session.remoteHostId.trim()
+      || app.isSharedTaskPeer(this.deviceId) || !app.appInForeground || this.runtimeRouteLocked()) {
+      hilog.debug(0, 'CindyAccountUsage', 'skip scope_unreadable');
+      return;
+    }
+    const provider = this.effectiveProviderId(session).trim();
     const model = this.effectiveModelId(session);
-    const current = (): boolean => {
-      const active = this.session();
-      return generation === this.accountUsageGeneration && this.isCurrentPageLifecycle(lifecycle)
-        && active !== undefined && active.id === session.id
-        && !this.runtimeRouteLocked()
-        && this.effectiveProviderId(active) === provider && this.effectiveModelId(active) === model;
+    const plugin = isPluginEngineSession(session.agentKind, provider);
+    const hostDevice = this.deviceId;
+    const executionDevice = session.agentDeviceId || hostDevice;
+    const remote = executionDevice !== hostDevice;
+    if (remote && (!provider || executionDevice.startsWith('share:'))) {
+      hilog.debug(0, 'CindyAccountUsage', 'skip remote_identity_unreadable');
+      return;
+    }
+    const accountEpoch = app.auth.sessionEpoch;
+    const relayGeneration = RelayRoute.instance.generation;
+    const route = this.accountUsageRoute;
+    const current = (): boolean => this.sessionActionOpen && app.appInForeground
+      && generation === this.accountUsageGeneration && this.isCurrentPageLifecycle(lifecycle)
+      && accountEpoch === app.auth.sessionEpoch && relayGeneration === RelayRoute.instance.generation
+      && this.currentUsageRoute() === route && !this.runtimeRouteLocked();
+    const invokeUsage = async (channel: string, args: Object[]): Promise<Object | undefined> => {
+      const options = new DlInvokeOptions();
+      options.channel = channel;
+      options.args = args;
+      options.preSend = (): void => {
+        if (!current()) throw new DlError('CANCELLED', 'Usage scope changed');
+      };
+      options.preSend();
+      await app.openLink(executionDevice);
+      options.preSend();
+      return unwrapInvokeResult(await app.client.invoke(executionDevice, options));
     };
+    hilog.debug(0, 'CindyAccountUsage', 'load_start remote=%{public}d plugin=%{public}d', Number(remote), Number(plugin));
     this.accountUsageLoading = true;
     try {
-      await this.loadProviderModelOptions(this.currentAgentTab());
+      if (plugin) {
+        if (!pluginEngineKey(provider) || !current()) return;
+        // Start with the account read. An unknown catalogue does not prove the engine
+        // cannot report usage, and its icon is optional.
+        const usage = await app.pluginEngines.readUsage(executionDevice, provider);
+        if (!current()) return;
+        if (usage === null) {
+          hilog.debug(0, 'CindyAccountUsage', 'empty plugin');
+          return;
+        }
+        const summary = new AccountUsageSummary();
+        summary.source = 'plugin';
+        summary.updatedAt = usage.updatedAt;
+        for (const window of usage.windows) {
+          const percent = window.remainingPercent.toLocaleString() + '%';
+          const reset = window.resetsAt > 0
+            ? ' · ' + this.v12String('v131_usage_reset', new Date(window.resetsAt).toLocaleString()) : '';
+          summary.lines.push(this.v12String('v131_usage_remaining', window.label, percent) + reset);
+        }
+        for (const balance of usage.balances) {
+          summary.lines.push(balance.amount + ' ' + balance.currency);
+        }
+        let engine = app.pluginEngines.find(executionDevice, provider);
+        if (engine === undefined && refreshIcon) {
+          await app.pluginEngines.load(executionDevice);
+          if (!current()) return;
+          engine = app.pluginEngines.find(executionDevice, provider);
+        }
+        summary.providerLabel = engine?.name ?? '';
+        this.accountUsageIcon = engine?.iconDataUrl ?? '';
+        this.accountUsage = summary;
+        hilog.debug(0, 'CindyAccountUsage', 'loaded plugin rows=%{public}d', summary.lines.length);
+        return;
+      }
+      if (!remote && provider !== 'openai') await this.loadProviderModelOptions(this.currentAgentTab());
       if (!current()) return;
-      const option = this.providerModelOptions.find((row: ComposerModelOption) =>
+      const options = remote ? this.remoteModelOptions() : this.providerModelOptions;
+      const option = options.find((row: ComposerModelOption) =>
         row.id === model && (provider ? row.providerId === provider : row.selectedRoute));
       const actualProvider = provider || option?.providerId || '';
       const openAi = actualProvider === 'openai' || option?.openAiSubscription === true;
@@ -6600,32 +6677,45 @@ export struct TaskPageContent {
         && !model.startsWith('codex/') && !model.startsWith('chatgpt/') && !model.startsWith('xai/');
       let raw: Object | undefined;
       if (gateway) {
-        raw = await this.invokeContextRpc('maker:usage:account', ['claude-code']);
+        raw = await invokeUsage('maker:usage:account', ['claude-code']);
       } else if (nativeCodex) {
         try {
-          raw = await this.invokeContextRpc('maker:usage:codex-rate-limits', actualProvider ? [actualProvider] : []);
+          raw = await invokeUsage('maker:usage:codex-rate-limits', actualProvider && actualProvider !== 'openai' ? [actualProvider] : []);
         } catch (e) {
-          if ((actualProvider && actualProvider !== 'openai') || (e instanceof Error && /PRECONDITION_FAILED/.test(e.message))) throw new Error('Account scope unavailable');
-          raw = await this.invokeContextRpc('maker:usage:account', ['codex']);
+          if ((actualProvider && actualProvider !== 'openai') || /PRECONDITION_FAILED|CANCELLED/.test(String(e))) {
+            throw (e instanceof Error ? e : new Error(String(e)));
+          }
+          hilog.debug(0, 'CindyAccountUsage', 'legacy_codex_read');
+          raw = await invokeUsage('maker:usage:account', ['codex']);
         }
       } else if (openAi && session.agentKind !== 'codex' && model.startsWith('chatgpt/')) {
-        raw = await this.invokeContextRpc('maker:usage:account', actualProvider && actualProvider !== 'openai' ? ['codex', actualProvider] : ['codex']);
-      } else return;
+        raw = await invokeUsage('maker:usage:account', actualProvider && actualProvider !== 'openai' ? ['codex', actualProvider] : ['codex']);
+      } else {
+        hilog.debug(0, 'CindyAccountUsage', 'skip unsupported_route');
+        return;
+      }
       if (!current()) return;
       const payload = recordOrEmpty(raw);
-      if (!gateway && actualProvider && actualProvider !== 'openai' && readStr(payload, 'providerId') !== actualProvider) return;
+      if (!gateway && actualProvider && actualProvider !== 'openai' && readStr(payload, 'providerId') !== actualProvider) {
+        hilog.debug(0, 'CindyAccountUsage', 'skip response_identity_mismatch');
+        return;
+      }
       if (!gateway && !nativeCodex) raw = payload['webSnapshot'] ?? (payload['source'] === 'openai-web' ? raw : undefined);
       this.accountUsage = projectAccountUsage(raw, gateway ? 'gateway' : 'chatgpt', model, Date.now(),
         (key: string, args: string[]): string => this.v12String(key, ...args));
       this.accountUsage.providerLabel = option?.providerName || actualProvider;
+      hilog.debug(0, 'CindyAccountUsage', 'loaded account rows=%{public}d', this.accountUsage.lines.length);
     } catch (e) {
-      if (current()) this.accountUsage = new AccountUsageSummary();
+      if (current()) {
+        this.accountUsage = new AccountUsageSummary();
+        hilog.debug(0, 'CindyAccountUsage', 'read_failed identity=%{public}d', Number(/PRECONDITION_FAILED/.test(String(e))));
+      }
     } finally {
       if (generation === this.accountUsageGeneration) this.accountUsageLoading = false;
-      if (current() && this.sessionActionOpen) {
+      if (current()) {
         this.accountUsageRefreshTimer = setTimeout(() => {
           this.accountUsageRefreshTimer = -1;
-          if (this.isCurrentPageLifecycle(lifecycle) && this.sessionActionOpen) void this.loadAccountUsage();
+          if (current()) void this.loadAccountUsage(false);
         }, 60000);
       }
     }
@@ -6639,7 +6729,14 @@ export struct TaskPageContent {
       if (this.accountUsageLoading) {
         Text(this.v12String('v131_usage_loading')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
       } else if (this.accountUsageRoute === this.currentUsageRoute() && this.accountUsage.lines.length > 0) {
-        if (this.accountUsage.providerLabel.length > 0) {
+        if (this.accountUsage.source === 'plugin') {
+          Row({ space: 6 }) {
+            PluginEngineMark({ iconDataUrl: this.accountUsageIcon, markSize: 16 })
+            if (this.accountUsage.providerLabel.length > 0) {
+              Text(this.accountUsage.providerLabel).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+            }
+          }
+        } else if (this.accountUsage.providerLabel.length > 0) {
           Text(this.accountUsage.providerLabel).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
         }
         ForEach(this.accountUsage.lines, (line: string, index: number) => {
@@ -6660,207 +6757,317 @@ export struct TaskPageContent {
 
   @Builder
   sessionActionLayer() {
-    if (this.isTeammateConversation()) {
+    Column() {
       TeammateSettingsPanel({ deviceId: this.deviceId, sessionId: this.sessionId, deviceDisabled: this.deviceDisabled })
-        .width(this.isEmbedded() ? 360 : 320)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+  }
+
+  /**
+   * 任务「…」菜单：顶部一个紧凑信息头（任务名 / Agent·模型·位置 / 额度），下面四组操作：
+   * 编辑 → 分享 → 整理 → 危险。分组顺序参考 iOS：先改这条任务本身，再对外分享，再归类，最后不可逆操作。
+   */
+  @Builder
+  ordinarySessionActionMenu() {
+    Menu() {
+      MenuItemGroup({ header: this.sessionMenuHeader() }) {
+        this.sessionMenuItem('重命名', $r('sys.symbol.doc_text'), false,
+          () => { this.sessionActionOpen = false; this.sessionRenameMode = true; })
+        this.sessionMenuItem('AI 起名', $r('sys.symbol.wand_and_stars'), false,
+          () => void this.generateSessionRename())
+      }
+      MenuItemGroup() {
+        this.sessionMenuItem(this.v12String('v139_home_shared'), $r('sys.symbol.person_2'), false,
+          () => { this.closeSessionActions(); this.sharedManagementOpen = true; })
+        this.sessionMenuItem('复制任务链接', $r('sys.symbol.link'), false, () => {
+          this.copyPlainText(`cindy://session/${encodeURIComponent(this.sessionId)}`, '已复制任务链接');
+        })
+        if (this.items.length > 0) {
+          this.sessionMenuItem(this.v12String('v12_select_messages_share'), $r('sys.symbol.checkmark_circle'), false, () => {
+            this.closeSessionActions();
+            this.enterShareSelection();
+          })
+          this.sessionMenuItem(this.v12String('v12_share_as_image'), $r('sys.symbol.arrow_up'), false, () => {
+            this.closeSessionActions();
+            void this.shareConversationAsImage();
+          })
+        }
+      }
+      MenuItemGroup() {
+        this.sessionMenuItem((this.session()?.pinnedAt ?? '').length > 0 ? '取消置顶' : '置顶',
+          $r('sys.symbol.pin'), false, () => this.toggleSessionPinned())
+        if (this.sessionAllowsProjectMove()) {
+          this.sessionMenuItem('移到项目', $r('sys.symbol.folder'), false, () => {
+            this.sessionActionOpen = false;
+            void this.openSessionProjectMove();
+          })
+        }
+        if ((this.session()?.agentKind ?? '') === 'pi') {
+          this.sessionMenuItem('任务分支', $r('sys.symbol.split'), false, () => this.openSessionTree())
+        }
+        this.sessionMenuItem('会话信息', $r('sys.symbol.doc_text'), false,
+          () => { this.sessionActionOpen = false; this.sessionActionInfoMode = true; })
+      }
+      MenuItemGroup() {
+        this.sessionMenuItem(this.session()?.status === 'archived' ? '取消归档' : '归档任务',
+          $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
+        this.sessionMenuItem('删除任务', $r('sys.symbol.trash'), true, () => this.confirmDeleteSession())
+      }
+    }
+    .width(264)
+    .font({ size: 15, weight: FontWeight.Regular })
+    .id(uiOverlayBuildId('session-menu'))
+  }
+
+  /** 菜单信息头：纯展示，不可点；颜色只用 app.color.*。 */
+  @Builder
+  sessionMenuHeader() {
+    Column({ space: 3 }) {
+      Text(this.sessionTitle())
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+      Row({ space: 4 }) {
+        Text(this.sessionMenuAgentGlyph())
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Text(this.sessionMenuMetaText())
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      // 额度区固定两行高：读取中 / 暂不可用 / 有数据三种状态高度一致，菜单弹出动画里不重排。
+      Column() {
+        if (this.runtimeRouteLocked()) {
+          Text(this.v12String('v132_remote_runtime_read_only'))
+            .fontSize(11)
+            .lineHeight(15)
+            .fontColor($r('app.color.text_tertiary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        } else {
+          this.sessionMenuUsageLines()
+        }
+      }
+      .width('100%')
+      .height(30)
+      .alignItems(HorizontalAlign.Start)
+      .clip(true)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+  }
+
+  /** 额度压成最多两行小字（读取与 accountUsageSection 相同的状态；数据和刷新逻辑不在这里）。 */
+  @Builder
+  sessionMenuUsageLines() {
+    if (this.accountUsageLoading) {
+      Text(this.v12String('v131_usage_loading'))
+        .fontSize(11).lineHeight(15).fontColor($r('app.color.text_tertiary')).width('100%')
+    } else if (this.accountUsageRoute === this.currentUsageRoute() && this.accountUsage.lines.length > 0) {
+      Row({ space: 4 }) {
+        if (this.accountUsage.source === 'plugin') {
+          PluginEngineMark({ iconDataUrl: this.accountUsageIcon, markSize: 12 })
+        }
+        Text(this.sessionMenuUsageText())
+          .fontSize(11)
+          .lineHeight(15)
+          .fontColor($r('app.color.text_tertiary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
     } else {
-      this.ordinarySessionActionLayer()
+      Text(this.v12String('v131_usage_unavailable'))
+        .fontSize(11).lineHeight(15).fontColor($r('app.color.text_tertiary')).width('100%')
     }
   }
 
+  private sessionMenuUsageText(): string {
+    const lines = this.accountUsage.lines.slice(0, 2);
+    const label = this.accountUsage.providerLabel;
+    if (lines.length > 0 && label.length > 0 && this.accountUsage.source !== 'plugin') lines[0] = `${label} · ${lines[0]}`;
+    return lines.join('\n');
+  }
+
+  private sessionMenuAgentGlyph(): string {
+    const kind = this.session()?.agentKind ?? '';
+    return kind === 'claude-code' ? '♟' : kind === 'codex' ? '✣' : kind === 'pi' ? 'π' : '•';
+  }
+
+  private sessionMenuMetaText(): string {
+    const parts: string[] = [modelAgentLabel(this.session()?.agentKind ?? ''), this.currentModelLabel() || '默认模型'];
+    const location = this.agentLocationName();
+    if (location.length > 0) parts.push(location);
+    return parts.join(' · ');
+  }
+
   @Builder
-  ordinarySessionActionLayer() {
+  sessionMenuItem(label: string, symbol: Resource, danger: boolean, action: () => void) {
+    MenuItem({ content: label, symbolStartIcon: this.sessionMenuSymbol(symbol, danger) })
+      .contentFontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
+      .enabled(!this.sessionActionBusy && !this.isCreationBlockingRemoteOps())
+      .onClick(action)
+  }
+
+  private sessionMenuSymbol(symbol: Resource, danger: boolean): SymbolGlyphModifier {
+    const modifier = new SymbolGlyphModifier(symbol);
+    modifier.fontColor([danger ? $r('app.color.danger') : $r('app.color.text_secondary')]);
+    return modifier;
+  }
+
+  private sessionSheetOptions(title: string, list: boolean): SheetOptions {
+    const extras = new UiSheetExtras();
+    if (list) extras.detents = [SheetSize.MEDIUM, SheetSize.LARGE];
+    return uiSheetOptions(title, (): void => {}, SheetSize.FIT_CONTENT, extras);
+  }
+
+  /** 重命名：底部表单，系统标题和关闭按钮；保存沿用 saveSessionRename。 */
+  @Builder
+  sessionRenameSheet() {
+    Column({ space: 12 }) {
+      TextInput({ placeholder: '任务名称', text: this.sessionRenameDraft })
+        .fontSize(uiFontSize(15))
+        .fontColor($r('app.color.text_primary'))
+        .caretColor($r('app.color.accent'))
+        .height(44)
+        .padding({ left: 12, right: 12 })
+        .backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL)
+        .enabled(!this.sessionActionBusy)
+        .onChange((value: string) => this.sessionRenameDraft = value)
+      Button(this.sessionActionBusy ? '保存中…' : '保存')
+        .width('100%')
+        .height(44)
+        .fontSize(uiFontSize(14))
+        .fontColor($r('app.color.chat_cta_text'))
+        .backgroundColor($r('app.color.chat_cta'))
+        .borderRadius(UI_RADIUS_PILL)
+        .enabled(!this.sessionActionBusy && this.sessionRenameDraft.trim().length > 0)
+        .onClick(() => this.saveSessionRename())
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+  }
+
+  /** 会话信息：底部表单，列出工作目录等元信息，点行复制。 */
+  @Builder
+  sessionInfoSheet() {
     Scroll() {
       Column({ space: 8 }) {
-          Row({ space: 10 }) {
-            if (this.sessionActionInfoMode || this.sessionActionProjectMode) {
-              Button() {
-                SymbolGlyph($r('sys.symbol.chevron_left'))
-                  .fontSize(uiFontSize(16))
-                  .fontColor([$r('app.color.text_secondary')])
-              }
-              .type(ButtonType.Circle)
-              .width(40)
-              .height(40)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .clickEffect(UI_ICON_CLICK_EFFECT)
-              .accessibilityText('返回任务操作')
-              .onClick(() => { this.sessionActionInfoMode = false; this.sessionActionProjectMode = false; })
-            }
-            Column({ space: 2 }) {
-              Text(this.sessionActionProjectMode ? '移到项目' : this.sessionActionInfoMode ? '会话信息' : this.sessionTitle())
-                .fontSize(uiFontSize(16))
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.text_primary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text(this.sessionActionInfoMode || this.sessionActionProjectMode
-                ? this.sessionTitle()
-                : `${modelAgentLabel(this.session()?.agentKind ?? '')} · ${this.currentModelLabel() || '默认模型'}`)
-                .fontSize(uiFontSize(12))
-                .fontColor($r('app.color.text_secondary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-          }
+        Text(this.sessionTitle())
+          .fontSize(uiFontSize(13))
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
-          .padding({ bottom: 4 })
-
-          if (!this.runtimeRouteLocked()) {
-            this.accountUsageSection()
-          }
-          if (this.agentLocationText().length > 0) {
-            Text(this.agentLocationText())
-              .fontSize(uiFontSize(12))
-              .fontColor($r('app.color.text_secondary'))
-              .copyOption(CopyOptions.LocalDevice)
-              .width('100%')
-          }
-          if (this.runtimeRouteLocked()) {
-            Text(this.v12String('v132_remote_runtime_read_only'))
-              .fontSize(uiFontSize(12))
-              .fontColor($r('app.color.text_secondary'))
-              .width('100%')
-          }
-
-          if (this.sessionActionProjectMode) {
-            Text('选择电脑上的项目，或输入目标目录。运行中的任务不能迁移。')
-              .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
-            if (this.sessionActionProjectLoading) {
-              Text('正在读取项目…').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-            }
-            if (this.sessionActionProjectError.length > 0) {
-              Text(this.sessionActionProjectError).fontSize(uiFontSize(13)).fontColor($r('app.color.danger'))
-            }
-            if (this.sessionActionProjectSupported) {
-              this.sessionActionOption('移出项目，作为普通任务', $r('sys.symbol.folder'), false,
-                () => void this.moveSessionProject(null))
-              ForEach(this.sessionActionProjects, (path: string) => {
-                this.sessionActionOption(path, $r('sys.symbol.folder'), false,
-                  () => void this.moveSessionProject(path))
-              }, (path: string) => path)
-            }
-            TextInput({ text: this.sessionActionProjectPath, placeholder: '其他项目目录' })
-              .onChange((value: string) => this.sessionActionProjectPath = value)
-              .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
-              .backgroundColor($r('app.color.bg_page'))
-              .border({ width: 1, color: $r('app.color.border') })
-              .borderRadius(UI_RADIUS_CONTROL).padding(10)
-            Button(this.sessionActionBusy ? '迁移中…' : '移到此目录')
-              .width('100%').height(40).fontSize(uiFontSize(14))
-              .fontColor($r('app.color.chat_cta_text')).backgroundColor($r('app.color.chat_cta'))
-              .borderRadius(UI_RADIUS_PILL)
-              .enabled(this.sessionActionProjectSupported && !this.sessionActionBusy && !this.sessionActionProjectLoading
-                && this.sessionActionProjectPath.trim().length > 0)
-              .onClick(() => void this.moveSessionProject(this.sessionActionProjectPath.trim()))
-          } else if (this.sessionActionInfoMode) {
-            if (!AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0) {
-              this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
-                this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
-              })
-            }
-            if ((this.session()?.worktreePath ?? '').length > 0) {
-              this.sessionMetadataRow('Worktree', this.session()?.worktreePath ?? '', () => {
-                this.copyPlainText(this.session()?.worktreePath ?? '', '已复制 Worktree 路径');
-              })
-            }
-            if (this.contextUsageLabel().length > 0) {
-              this.sessionMetadataRow('上下文用量', this.contextUsageLabel(), () => {})
-            }
-            ForEach(this.session()?.extraDirs ?? [], (path: string, index: number) => {
-              this.sessionMetadataRow(index === 0 ? '附加目录' : '', path,
-                () => this.copyPlainText(path, '已复制附加目录'))
-            }, (path: string, index: number) => `${index}-${path}`)
-            if ((this.session()?.parentSessionId ?? '').length > 0) {
-              this.sessionMetadataRow('父任务', this.session()?.parentSessionId ?? '', () => {
-                this.copyPlainText(this.session()?.parentSessionId ?? '', '已复制父任务 ID');
-              })
-            }
-            if ((this.session()?.orcaRole ?? '').length > 0) {
-              this.sessionMetadataRow('协作分支', this.session()?.orcaRole ?? '', () => {})
-            }
-          } else if (this.sessionRenameMode) {
-            TextInput({ placeholder: '任务名称', text: this.sessionRenameDraft })
-              .fontSize(uiFontSize(15))
-              .fontColor($r('app.color.text_primary'))
-              .caretColor($r('app.color.accent'))
-              .height(44)
-              .padding({ left: 12, right: 12 })
-              .backgroundColor($r('app.color.bg_chip'))
-              .border({ width: 1, color: $r('app.color.border') })
-              .borderRadius(UI_RADIUS_CONTROL)
-              .enabled(!this.sessionActionBusy)
-              .onChange((value: string) => this.sessionRenameDraft = value)
-            Row({ space: 8 }) {
-              Button('取消')
-                .layoutWeight(1)
-                .height(40)
-                .fontSize(uiFontSize(14))
-                .fontColor($r('app.color.text_primary'))
-                .backgroundColor($r('app.color.bg_chip'))
-                .borderRadius(UI_RADIUS_PILL)
-                .enabled(!this.sessionActionBusy)
-                .onClick(() => this.sessionRenameMode = false)
-              Button(this.sessionActionBusy ? '保存中…' : '保存')
-                .layoutWeight(1)
-                .height(40)
-                .fontSize(uiFontSize(14))
-                .fontColor($r('app.color.chat_cta_text'))
-                .backgroundColor($r('app.color.chat_cta'))
-                .borderRadius(UI_RADIUS_PILL)
-                .enabled(!this.sessionActionBusy && this.sessionRenameDraft.trim().length > 0)
-                .onClick(() => this.saveSessionRename())
-            }
-          } else {
-            this.sessionActionOption(this.v12String('v139_home_shared'), $r('sys.symbol.person_2'), false,
-              () => { this.closeSessionActions(); this.sharedManagementOpen = true; })
-            this.sessionActionOption('重命名', $r('sys.symbol.doc_text'), false,
-              () => this.sessionRenameMode = true)
-            this.sessionActionOption('AI 起名', $r('sys.symbol.wand_and_stars'), false,
-              () => void this.generateSessionRename())
-            this.sessionActionOption('复制任务链接', $r('sys.symbol.link'), false, () => {
-              this.copyPlainText(`cindy://session/${encodeURIComponent(this.sessionId)}`, '已复制任务链接');
-            })
-            if (this.items.length > 0) {
-              this.sessionActionOption(this.v12String('v12_select_messages_share'), $r('sys.symbol.checkmark_circle'), false, () => {
-                this.closeSessionActions();
-                this.enterShareSelection();
-              })
-              this.sessionActionOption(this.v12String('v12_share_as_image'), $r('sys.symbol.arrow_up'), false, () => {
-                this.closeSessionActions();
-                void this.shareConversationAsImage();
-              })
-            }
-            if ((this.session()?.agentKind ?? '') === 'pi') {
-              this.sessionActionOption('任务分支', $r('sys.symbol.split'), false,
-                () => this.openSessionTree())
-            }
-            this.sessionActionOption((this.session()?.pinnedAt ?? '').length > 0 ? '取消置顶' : '置顶',
-              $r('sys.symbol.pin'), false, () => this.toggleSessionPinned())
-            this.sessionActionOption(this.session()?.status === 'archived' ? '取消归档' : '归档任务',
-              $r('sys.symbol.archivebox'), false, () => this.archiveOrRestoreSession())
-            if (this.sessionAllowsProjectMove()) {
-              this.sessionActionOption('移到项目', $r('sys.symbol.folder'), false,
-                () => void this.openSessionProjectMove())
-            }
-
-            this.sessionActionOption('会话信息', $r('sys.symbol.doc_text'), false,
-              () => this.sessionActionInfoMode = true)
-
-            this.sessionActionOption('删除任务', $r('sys.symbol.trash'), true,
-              () => this.confirmDeleteSession())
-          }
+        if (!AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0) {
+          this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
+            this.sessionActionOpen = false;
+            this.showProjectActions();
+          })
+        }
+        if ((this.session()?.worktreePath ?? '').length > 0) {
+          this.sessionMetadataRow('Worktree', this.session()?.worktreePath ?? '', () => {
+            this.copyPlainText(this.session()?.worktreePath ?? '', '已复制 Worktree 路径');
+          })
+        }
+        if (this.contextUsageLabel().length > 0) {
+          this.sessionMetadataRow('上下文用量', this.contextUsageLabel(), () => {})
+        }
+        ForEach(this.session()?.extraDirs ?? [], (path: string, index: number) => {
+          this.sessionMetadataRow(index === 0 ? '附加目录' : '', path,
+            () => this.copyPlainText(path, '已复制附加目录'))
+        }, (path: string, index: number) => `${index}-${path}`)
+        if ((this.session()?.parentSessionId ?? '').length > 0) {
+          this.sessionMetadataRow('父任务', this.session()?.parentSessionId ?? '', () => {
+            this.copyPlainText(this.session()?.parentSessionId ?? '', '已复制父任务 ID');
+          })
+        }
+        if ((this.session()?.orcaRole ?? '').length > 0) {
+          this.sessionMetadataRow('协作分支', this.session()?.orcaRole ?? '', () => {})
+        }
       }
       .width('100%')
-      .padding(12)
+      .padding({ left: 16, right: 16, top: 8, bottom: 16 })
     }
-    .width(this.isEmbedded() ? 360 : 320)
-    .constraintSize({ maxHeight: this.isEmbedded() ? 520 : 480 })
-    .borderRadius(UI_RADIUS_CONTAINER)
-    .clip(true)
+    .width('100%')
+  }
+
+  /** 移到项目：列表类底部表单（MEDIUM / LARGE 两档）。 */
+  @Builder
+  sessionProjectSheet() {
+    Scroll() {
+      Column({ space: 8 }) {
+        Text('选择电脑上的项目，或输入目标目录。运行中的任务不能迁移。')
+          .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+        if (this.sessionActionProjectLoading) {
+          Text('正在读取项目…').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+        }
+        if (this.sessionActionProjectError.length > 0) {
+          Text(this.sessionActionProjectError).fontSize(uiFontSize(13)).fontColor($r('app.color.danger'))
+        }
+        if (this.sessionActionProjectSupported) {
+          this.sessionActionOption('移出项目，作为普通任务', $r('sys.symbol.folder'), false,
+            () => void this.moveSessionProject(null))
+          ForEach(this.sessionActionProjects, (path: string) => {
+            this.sessionActionOption(path, $r('sys.symbol.folder'), false,
+              () => void this.moveSessionProject(path))
+          }, (path: string) => path)
+        }
+        TextInput({ text: this.sessionActionProjectPath, placeholder: '其他项目目录' })
+          .onChange((value: string) => this.sessionActionProjectPath = value)
+          .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.bg_chip'))
+          .borderRadius(UI_RADIUS_CONTROL).padding(10)
+        Button(this.sessionActionBusy ? '迁移中…' : '移到此目录')
+          .width('100%').height(44).fontSize(uiFontSize(14))
+          .fontColor($r('app.color.chat_cta_text')).backgroundColor($r('app.color.chat_cta'))
+          .borderRadius(UI_RADIUS_PILL)
+          .enabled(this.sessionActionProjectSupported && !this.sessionActionBusy && !this.sessionActionProjectLoading
+            && this.sessionActionProjectPath.trim().length > 0)
+          .onClick(() => void this.moveSessionProject(this.sessionActionProjectPath.trim()))
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+    }
+    .width('100%')
+  }
+
+  /** 三个会话表单各绑一个零尺寸锚点：同一组件只能有一个 bindSheet。 */
+  @Builder
+  sessionSheetAnchors() {
+    Column().width(0).height(0)
+      .bindSheet(this.subagentDetailKey.length > 0 && this.currentSubagentDetail() !== null,
+        this.subagentDetailLayer(), this.subagentSheetOptions())
+    Column().width(0).height(0)
+      .bindSheet($$this.sessionTreeOpen, this.sessionTreeLayer(), this.sessionSheetOptions('任务分支', true))
+    Column().width(0).height(0)
+      .bindSheet(shareFlowBusy(this.shareStage) || this.shareStage === SHARE_STAGE_FAILED,
+        this.shareOverlayLayer(), this.shareSheetOptions())
+    Column().width(0).height(0)
+      .bindSheet(this.messageActionItemKey.length > 0, this.messageActionSheet(),
+        uiSheetOptions('消息操作', (): void => { this.messageActionItemKey = ''; }))
+    Column().width(0).height(0)
+      .bindSheet($$this.sourceBadgeSheetOpen, this.sourceBadgeSheet(),
+        uiSheetOptions(this.sourceBadgeSheetTitle, (): void => {}))
+    Column().width(0).height(0)
+      .bindSheet($$this.sessionRenameMode, this.sessionRenameSheet(), this.sessionSheetOptions('重命名', false))
+    Column().width(0).height(0)
+      .bindSheet($$this.sessionActionInfoMode, this.sessionInfoSheet(), this.sessionSheetOptions('会话信息', false))
+    Column().width(0).height(0)
+      .bindSheet($$this.sessionActionProjectMode, this.sessionProjectSheet(), this.sessionSheetOptions('移到项目', true))
   }
 
   @Builder
@@ -6917,24 +7124,7 @@ export struct TaskPageContent {
 
   @Builder
   sessionTreeLayer() {
-    Stack({ alignContent: Alignment.Bottom }) {
-      Column().width('100%').height('100%').backgroundColor($r('app.color.overlay'))
-        .onClick(() => this.closeSessionTree())
       Column({ space: 10 }) {
-        Row({ space: 8 }) {
-          Text('任务分支')
-            .fontSize(uiFontSize(18))
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-            .layoutWeight(1)
-          Button() {
-            SymbolGlyph($r('sys.symbol.xmark')).fontSize(uiFontSize(14))
-              .fontColor([$r('app.color.text_secondary')])
-          }
-          .type(ButtonType.Circle).width(36).height(36).padding(0)
-          .backgroundColor($r('app.color.bg_chip')).onClick(() => this.closeSessionTree())
-        }
-        .width('100%')
         if (this.sessionStreaming) {
           Text('任务运行中，结束后才能切换分支')
             .fontSize(uiFontSize(12)).fontColor($r('app.color.text_tertiary')).width('100%')
@@ -6988,13 +7178,7 @@ export struct TaskPageContent {
           .width('100%').layoutWeight(1)
         }
       }
-      .width('calc(100% - 24vp)').constraintSize({ maxWidth: 620, maxHeight: '82%' })
-      .padding(16).margin({ left: 12, right: 12, bottom: 12 })
-      .backgroundColor($r('app.color.task_list_menu_surface'))
-      .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_CONTAINER)
-      .transition(uiOverlayTransition())
-    }
-    .width('100%').height('100%').zIndex(101)
+      .width('100%').height('100%').padding({ left: 16, right: 16, top: 8, bottom: 16 })
   }
 
   @Builder
@@ -7038,6 +7222,30 @@ export struct TaskPageContent {
     .onClick(action)
   }
 
+  private headerFolderVisible(): boolean {
+    return !AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0;
+  }
+
+  /** 协同会话（Lead / Worker）不显示分支标签，由角色标签占它的位置；普通会话照旧显示分支。 */
+  private headerShowsBranch(): boolean {
+    return this.collabRole.length === 0;
+  }
+
+  /** 协同角色标签：放在原分支标签的位置，比分支标签更轻，只有描边没有底色。 */
+  @Builder
+  collabRoleBadge() {
+    Text(this.collabRole)
+      .fontSize(uiFontSize(12))
+      .fontColor($r('app.color.text_secondary'))
+      .maxLines(1)
+      .height(24)
+      .padding({ left: 8, right: 8 })
+      .border({ width: 1, color: $r('app.color.border') })
+      .borderRadius(UI_RADIUS_PILL)
+      .flexShrink(0)
+      .accessibilityText(this.collabRole)
+  }
+
   /** Git 分支只做标题栏辅助信息，限宽后不参与项目菜单交互。 */
   @Builder
   gitBranchBadge() {
@@ -7059,7 +7267,7 @@ export struct TaskPageContent {
     .borderRadius(UI_RADIUS_PILL)
   }
 
-  /** 会话菜单直接锚定标题栏按钮；Popup 自己处理避让，不再用全屏遮罩和固定 margin 猜位置。 */
+  /** 会话菜单直接锚定标题栏按钮；系统 Menu（bindMenu）自己处理避让和材质。 */
   @Builder
   sessionActionButton() {
     Button() {
@@ -7077,30 +7285,30 @@ export struct TaskPageContent {
     .opacity(this.isCreationBlockingRemoteOps() ? 0.4 : 1)
     .accessibilityText(this.isTeammateConversation() ? this.v12String('v138_settings') : this.v12String('v138_task_actions'))
     .onClick(() => this.showSessionActions())
-    .bindPopup(this.sessionActionOpen, {
-      builder: this.sessionActionLayer,
-      placement: Placement.BottomRight,
-      enableArrow: false,
-      targetSpace: 4,
-      autoCancel: true,
-      mask: false,
-      showInSubWindow: false,
-      followTransformOfTarget: true,
-      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
-      levelMode: LevelMode.EMBEDDED,
-      radius: UI_RADIUS_CONTAINER,
-      shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      onStateChange: (event) => {
-        this.sessionActionOpen = event.isVisible;
-        if (!event.isVisible) {
-          this.sessionActionInfoMode = false;
-          this.sessionRenameMode = false;
-        }
-      },
-    })
+    .bindMenu(this.sessionActionOpen && !this.isTeammateConversation(), this.ordinarySessionActionMenu, this.sessionMenuOptions())
+    .bindSheet(this.sessionActionOpen && this.isTeammateConversation(), this.sessionActionLayer,
+      uiSheetOptions(this.v12String('v138_settings'), (): void => { this.sessionActionOpen = false; }))
+  }
+
+  private sessionMenuOptions(): MenuOptions {
+    const options = uiMenuOptions((): void => {
+      this.sessionActionOpen = false;
+      if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
+      this.accountUsageRefreshTimer = -1;
+    }, Placement.BottomRight, 'session-menu');
+    return options;
   }
 
   /** 双栏两侧 Header 统一为 44vp 内容高；保留 40vp 动作槽，避免详情侧雾化下沿额外下探。 */
+  @Builder
+  titleBarContent() {
+    if (this.collabEmbedded) {
+      this.collabHeader()
+    } else {
+      this.taskHeader()
+    }
+  }
+
   @Builder
   taskHeader() {
     // 标题单独一层并居中；按钮层叠在上方，左右两组各自贴边（D-015）。
@@ -7159,17 +7367,22 @@ export struct TaskPageContent {
         Blank()
 
         Row({ space: 4 }) {
-          if (this.gitBranchName.length > 0) {
+          if (this.collabRole.length > 0) {
+            this.collabRoleBadge()
+          }
+          if (this.gitBranchName.length > 0 && this.headerShowsBranch()) {
             this.gitBranchBadge()
           }
 
-          if (!AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0) {
+          if (this.headerFolderVisible()) {
             this.taskIconButton($r('sys.symbol.folder'), 40, false,
               !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
           }
 
           this.sessionActionButton()
         }
+        .bindSheet($$this.workdirBrowserOpen, this.workdirBrowserSheet(),
+          workdirBrowserSheetOptions((): void => { this.workdirBrowserOpen = false; }))
         .onAreaChange((_old: Area, next: Area) => {
           this.headerTrailingWidth = Number(next.width);
         })
@@ -7306,7 +7519,7 @@ export struct TaskPageContent {
 
   private async returnNewSessionToEdit(): Promise<void> {
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) {
-      promptAction.showToast({ message: '请等待附件上传完成，或移除上传失败的附件' });
+      uiToast(this.getUIContext(), '请等待附件上传完成，或移除上传失败的附件');
       return;
     }
     const store = AppServices.instance.newSessionCreations;
@@ -7334,9 +7547,9 @@ export struct TaskPageContent {
     this.leavingForCreationEdit = false;
     this.sending = false;
     if (action === 'resume') {
-      promptAction.showToast({ message: '已找到电脑上的任务，正在继续发送首条消息' });
+      uiToast(this.getUIContext(), '已找到电脑上的任务，正在继续发送首条消息');
     } else if (action === 'unknown') {
-      promptAction.showToast({ message: '暂时无法确认任务状态，请稍后重试' });
+      uiToast(this.getUIContext(), '暂时无法确认任务状态，请稍后重试');
     }
   }
 
@@ -8091,50 +8304,6 @@ export struct TaskPageContent {
       })
     }
     .width('100%')
-  }
-
-  /** 分栏详情内的 Composer 选择层；模型使用紧凑弹窗，其它选择仍沿用底部面板。 */
-  @Builder
-  detailComposerSheetLayer() {
-    Stack({ alignContent: this.contextSheetPage === 'model' ? Alignment.Center : Alignment.Bottom }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.overlay'))
-        .onClick(() => {
-          if (this.contextSheetPage === 'model') {
-            this.returnToComposerAfterModelSheet();
-          } else {
-            this.closeContextSheet();
-          }
-        })
-
-      if (this.contextSheetPage === 'model') {
-        Column() {
-          this.contextSheet()
-        }
-        .width('calc(100% - 32vp)')
-        .constraintSize({ maxWidth: 480, maxHeight: 'calc(100% - 32vp)' })
-        .height(420)
-        .backgroundColor($r('app.color.bg_card'))
-        .borderRadius(UI_RADIUS_CONTAINER)
-        .clip(true)
-        .transition(uiOverlayTransition())
-      } else {
-        Column() {
-          this.contextSheet()
-        }
-        .width('100%')
-        .height('50%')
-        .backgroundColor($r('app.color.bg_card'))
-        .borderRadius(UI_RADIUS_CONTAINER)
-        .clip(true)
-        .transition(uiOverlayTransition())
-      }
-    }
-    .width('100%')
-    .height('100%')
-    .zIndex(98)
   }
 
   @Builder
@@ -9134,7 +9303,7 @@ export struct TaskPageContent {
             .backgroundColor($r('app.color.bg_chip'))
             .borderRadius(UI_RADIUS_CONTROL)
             .clickEffect(UI_LIST_CLICK_EFFECT)
-            .onClick(() => void this.openGeneratedFile(item.update?.outputFile ?? ''))
+            .onClick(() => void this.openChatWorkdirLink(item.update?.outputFile ?? '', fileTitleOf(item.update?.outputFile ?? '')))
           }
         }
         .width('100%')
@@ -9185,41 +9354,12 @@ export struct TaskPageContent {
 
   @Builder
   subagentDetailPanel(item: RenderSubagentGroupItem) {
-    Stack() {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.overlay'))
-        .onClick(() => this.closeSubagentDetail())
-
       Column({ space: 12 }) {
-        Row({ space: 8 }) {
-          Column({ space: 2 }) {
-            Text($r('app.string.v12_subagent_detail'))
-              .fontSize(uiFontSize(16))
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
-            Text(this.subagentStatusText(item))
-              .fontSize(uiFontSize(12))
-              .fontColor(this.subagentStatusTint(item.status))
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
-          Button() {
-            SymbolGlyph($r('sys.symbol.xmark'))
-              .fontSize(uiFontSize(14))
-              .fontColor([$r('app.color.text_secondary')])
-          }
-          .type(ButtonType.Circle)
-          .width(36)
-          .height(36)
-          .padding(0)
-          .backgroundColor($r('app.color.bg_chip'))
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .accessibilityText($r('app.string.v12_close_subagent_detail'))
-          .onClick(() => this.closeSubagentDetail())
-        }
-        .width('100%')
+        // 标题与关闭按钮由 bindSheet 的系统标题栏提供；这里只保留状态。
+        Text(this.subagentStatusText(item))
+          .fontSize(uiFontSize(12))
+          .fontColor(this.subagentStatusTint(item.status))
+          .width('100%')
 
         Text(this.subagentTitle(item))
           .fontSize(uiFontSize(18))
@@ -9286,19 +9426,10 @@ export struct TaskPageContent {
         .layoutWeight(1)
         .scrollBar(BarState.Auto)
       }
-      .width('calc(100% - 24vp)')
-      .height('86%')
-      .constraintSize({ maxWidth: 760 })
-      .padding(16)
-      .backgroundColor($r('app.color.bg_card'))
-      .border({ width: 1, color: $r('app.color.border') })
-      .borderRadius(UI_RADIUS_CONTAINER)
+      .width('100%')
+      .height('100%')
+      .padding({ left: 16, right: 16, top: 8, bottom: 16 })
       .alignItems(HorizontalAlign.Start)
-    }
-    .width('100%')
-    .height('100%')
-    .zIndex(110)
-    .transition(uiOverlayTransition())
   }
 
   @Builder
@@ -9692,7 +9823,7 @@ export struct TaskPageContent {
           .constraintSize({ minHeight: 44, maxWidth: '100%' })
           .onClick(() => {
             const path = readStr(artifact, 'path');
-            void this.openGeneratedFile(path, fileTitleOf(path));
+            void this.openChatWorkdirLink(path, fileTitleOf(path));
           })
       }, (artifact: Record<string, Object>) => readStr(artifact, 'path'))
     }
@@ -10769,12 +10900,48 @@ export struct TaskPageContent {
     return query >= 0 ? queryValue(normalized.slice(query + 1), 'path') : '';
   }
 
+  private async openChatWorkdirLink(raw: string, title: string): Promise<void> {
+    const sequence = ++this.workdirLinkRead;
+    const device = this.deviceId;
+    const session = this.sessionId;
+    const root = this.session()?.workingDir ?? '';
+    const lifecycle = this.pageLifecycleGeneration;
+    const relative = this.fileBrowserRelative(raw);
+    const current = (): boolean => sequence === this.workdirLinkRead && this.deviceId === device &&
+      this.sessionId === session && root === (this.session()?.workingDir ?? '') &&
+      this.isCurrentPageLifecycle(lifecycle);
+    if (relative !== null) {
+      if (!relative || /[\\/]$/.test(this.absoluteRemoteFilePath(raw))) {
+        this.showProjectActions(relative);
+        return;
+      }
+      // Mobile uses a remote type verdict. Resolve only on click, with the
+      // existing workdir-scoped read rather than a new general stat capability.
+      try {
+        const rows = workdirEntries(await AppServices.instance.invokeOwnedWorkdir(device,
+          new WorkdirRequest('listDir', root, workdirParent(relative)), current));
+        if (!current()) return;
+        const entry = rows.find((item: WorkdirEntry): boolean => item.path === relative);
+        if (entry?.folder === true) { this.showProjectActions(relative); return; }
+        if (entry !== undefined) { this.showProjectActions(workdirParent(relative), relative); return; }
+      } catch (_error) {
+        if (!current()) return;
+      }
+    }
+    if (current()) await this.openGeneratedFile(raw, title);
+  }
+
   private async openGeneratedFile(
     raw: string,
     title: string = '',
     mimeType: string = '',
     downloadableRaw: string = '',
   ): Promise<void> {
+    const directory = this.absoluteRemoteFilePath(raw);
+    if (/[\\/]$/.test(directory)) {
+      const relative = this.fileBrowserRelative(raw);
+      if (relative !== null) { this.showProjectActions(relative); return; }
+    }
     const generation = ++this.filePreviewGeneration;
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const deviceId = this.deviceId;
@@ -10880,9 +11047,7 @@ export struct TaskPageContent {
       else await this.remoteFileService.shareUrl(context, url, title);
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({
-          message: e instanceof Error ? e.message : '分享失败，请稍后重试',
-        });
+        uiToast(this.getUIContext(), e instanceof Error ? e.message : '分享失败，请稍后重试');
       }
     } finally {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.fileShareBusy = false;
@@ -10894,7 +11059,7 @@ export struct TaskPageContent {
     const url = await this.resolveDownloadableUrl(payload.url, payload.mimeType, true);
     if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
     if (url.length === 0) {
-      promptAction.showToast({ message: '媒体暂时不可用，请稍后重试' });
+      uiToast(this.getUIContext(), '媒体暂时不可用，请稍后重试');
       return;
     }
     this.openUrl(url);
@@ -11101,29 +11266,38 @@ export struct TaskPageContent {
       if (!this.isCurrentPresentationScope(scope)) return;
       this.copyPlainText(badge.id, this.v12String('v132_source_id_copied'), scope);
     };
-    if (badge.kind === 'mobile' || badge.kind === 'desktop') {
-      this.getUIContext().showActionSheet({
-        title: this.sourceBadgeLabel(badge),
-        message: this.sourceBadgeIdLabel(badge),
-        sheets: [{ title: this.v12String('v132_source_copy_id'), action: copyAction }, {
-          title: this.v12String('v132_source_open_settings'),
-          action: () => {
-            if (!this.isCurrentPresentationScope(scope)) return;
-            if (this.sourceDeviceDirectoryLoaded && !this.sourceDeviceNames.has(badge.id)) {
-              this.getUIContext().getPromptAction().showToast({ message: this.v12String('v132_source_device_removed') });
-              return;
-            }
-            void this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsPage' });
-          },
-        }],
-      });
-    } else {
-      this.getUIContext().showActionSheet({
-        title: this.sourceBadgeLabel(badge),
-        message: this.sourceBadgeIdLabel(badge),
-        sheets: [{ title: this.v12String('v132_source_copy_id'), action: copyAction }],
-      });
+    this.sourceBadgeSheetTitle = this.sourceBadgeLabel(badge);
+    this.sourceBadgeSheetMessage = this.sourceBadgeIdLabel(badge);
+    this.sourceBadgeSheetSettings = badge.kind === 'mobile' || badge.kind === 'desktop';
+    this.sourceBadgeSheetCopy = (): void => { this.sourceBadgeSheetOpen = false; copyAction(); };
+    this.sourceBadgeSheetOpenSettings = (): void => {
+      this.sourceBadgeSheetOpen = false;
+      if (!this.isCurrentPresentationScope(scope)) return;
+      if (this.sourceDeviceDirectoryLoaded && !this.sourceDeviceNames.has(badge.id)) {
+        uiToast(this.getUIContext(), this.v12String('v132_source_device_removed'));
+        return;
+      }
+      void this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsPage' });
+    };
+    this.sourceBadgeSheetOpen = true;
+  }
+
+  /** 消息来源标识的操作：底部表单（复制 ID / 打开设置）。 */
+  @Builder
+  sourceBadgeSheet() {
+    Column({ space: 8 }) {
+      Text(this.sourceBadgeSheetMessage)
+        .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
+        .copyOption(CopyOptions.LocalDevice)
+      UiSheetActionRow({ label: this.v12String('v132_source_copy_id'), symbol: $r('sys.symbol.doc_text'),
+        onAction: (): void => this.sourceBadgeSheetCopy() })
+      if (this.sourceBadgeSheetSettings) {
+        UiSheetActionRow({ label: this.v12String('v132_source_open_settings'), symbol: $r('sys.symbol.gearshape'),
+          onAction: (): void => this.sourceBadgeSheetOpenSettings() })
+      }
     }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
   }
 
   @Builder
@@ -12322,7 +12496,12 @@ export struct TaskPageContent {
           .fontFamily('monospace').fontColor($r('app.color.code_text'))
           .textBackgroundStyle({ color: $r('app.color.bg_chip') })
           .decoration({ type: TextDecorationType.Underline })
-          .onClick(() => void this.openGeneratedFile(t.url, t.value))
+          .onClick(() => void this.openChatWorkdirLink(t.url, t.value))
+          .gesture(LongPressGesture().onAction((): void => {
+            if (this.fileBrowserRelative(t.url) !== null) this.workdirChipMenu = t.seq;
+          }))
+          .bindMenu(this.workdirChipMenu >= 0 && this.workdirChipMenu === t.seq, this.workdirChipActions(t.url),
+            uiMenuOptions((): void => { if (this.workdirChipMenu === t.seq) this.workdirChipMenu = -1; }))
       } else if (t.kind === 'link') {
         Span(t.value)
           .fontSize(uiFontSize(fontSize)).lineHeight(uiLineHeight(lineHeight))
@@ -12704,7 +12883,12 @@ export struct TaskPageContent {
             .fontColor($r('app.color.code_text'))
             .textBackgroundStyle({ color: $r('app.color.bg_chip') })
             .decoration({ type: TextDecorationType.Underline })
-            .onClick(() => void this.openGeneratedFile(t.url, t.value))
+            .onClick(() => void this.openChatWorkdirLink(t.url, t.value))
+          .gesture(LongPressGesture().onAction((): void => {
+            if (this.fileBrowserRelative(t.url) !== null) this.workdirChipMenu = t.seq;
+          }))
+          .bindMenu(this.workdirChipMenu >= 0 && this.workdirChipMenu === t.seq, this.workdirChipActions(t.url),
+            uiMenuOptions((): void => { if (this.workdirChipMenu === t.seq) this.workdirChipMenu = -1; }))
         } else if (t.kind === 'link') {
           Span(t.value)
             .fontColor($r('app.color.text_primary'))
@@ -12924,27 +13108,94 @@ export struct TaskPageContent {
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, value);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
       if (this.isCurrentPresentationScope(scope)) {
-        promptAction.showToast({ message: successMessage });
+        uiToast(this.getUIContext(), successMessage);
       }
     }).catch(() => {
       if (this.isCurrentPresentationScope(scope)) {
-        promptAction.showToast({ message: '复制失败' });
+        uiToast(this.getUIContext(), '复制失败');
       }
     });
   }
 
-  private showProjectActions(): void {
+  @Builder
+  workdirBrowserSheet() {
+    WorkdirBrowser({
+      device: this.deviceId,
+      workdir: this.workdirBrowserRoot,
+      deviceName: AppServices.instance.tasks.deviceList.find((peer: PresenceSnapshot): boolean =>
+        peer.deviceId === this.deviceId)?.deviceName ?? '',
+      close: (): void => { this.workdirBrowserOpen = false; },
+      initialPath: this.workdirBrowserPath,
+      initialFile: this.workdirBrowserFile,
+      annotate: (bytes: ArrayBuffer): boolean => this.attachWorkdirAnnotation(bytes),
+      reference: (path: string, folder: boolean): void => this.referenceWorkdirItem(path, folder),
+    })
+  }
+
+  private showProjectActions(initialPath: string = '', initialFile: string = ''): void {
     if (this.isCreationBlockingRemoteOps()) return;
     const workingDir = this.session()?.workingDir ?? '';
-    if (workingDir.length === 0) return;
-    this.getUIContext().showActionSheet({
-      title: '项目文件',
-      message: workingDir,
-      sheets: [{
-        title: '复制项目路径',
-        action: () => this.copyPlainText(workingDir, '已复制项目路径'),
-      }],
-    });
+    if (!AppServices.instance.canReadWorkdir(this.deviceId, workingDir)) return;
+    this.workdirBrowserRoot = workingDir;
+    this.workdirBrowserPath = initialPath;
+    this.workdirBrowserFile = initialFile;
+    this.workdirBrowserOpen = true;
+  }
+
+  private attachWorkdirAnnotation(bytes: ArrayBuffer): boolean {
+    if (!this.workdirBrowserOpen || this.workdirBrowserRoot !== (this.session()?.workingDir ?? '') ||
+      !AppServices.instance.canReadWorkdir(this.deviceId, this.workdirBrowserRoot) ||
+      this.imageQueue.remainingSlots() <= 0 || this.imageQueue.isBusy()) return false;
+    const context = getContext(this) as common.UIAbilityContext;
+    const path = context.cacheDir + '/cindy-annotation-' + util.generateRandomUUID() + '.jpg';
+    const release = (): void => { try { fileIo.unlinkSync(path); } catch (_error) {} };
+    try {
+      const file = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
+      try { fileIo.writeSync(file.fd, bytes); } finally { fileIo.closeSync(file); }
+      if (!this.imageQueue.enqueueManaged(path, release)) { release(); return false; }
+      this.workdirBrowserOpen = false;
+      this.expandComposerForEditing(true);
+      return true;
+    } catch (_error) {
+      release();
+      return false;
+    }
+  }
+
+  private referenceWorkdirItem(path: string, folder: boolean): void {
+    if (!this.workdirBrowserOpen || this.workdirBrowserRoot !== (this.session()?.workingDir ?? '') ||
+      !AppServices.instance.canReadWorkdir(this.deviceId, this.workdirBrowserRoot)) return;
+    const item = new ComposerPaletteItem();
+    item.kind = folder ? 'dir' : 'file';
+    item.name = path ? workdirName(path) : './';
+    item.relPath = path || './';
+    const token = this.paletteMentionRaw(item);
+    const draft = composerDocumentProjectedText(this.composerDocument);
+    if (!draft.includes(token)) {
+      const nodes: ComposerNode[] = [];
+      if (draft && !/\s$/.test(draft)) nodes.push(textNode(' '));
+      nodes.push(mentionNode(item.kind, item.name, token), textNode(' '));
+      this.setComposerDocument(replaceComposerTextRange(this.composerDocument, draft.length, draft.length, nodes));
+    }
+    this.workdirBrowserOpen = false;
+    this.expandComposerForEditing(true);
+  }
+
+  @Builder
+  workdirChipActions(raw: string) {
+    Menu() {
+      MenuItem({ content: '在文件夹中显示' }).onClick((): void => {
+        this.workdirChipMenu = -1;
+        const relative = this.fileBrowserRelative(raw);
+        if (relative !== null) this.showProjectActions(workdirParent(relative));
+      })
+    }
+  }
+
+  private fileBrowserRelative(raw: string): string | null {
+    const workdir = this.session()?.workingDir ?? '';
+    if (!AppServices.instance.canReadWorkdir(this.deviceId, workdir)) return null;
+    return workdirRelative(workdir, this.absoluteRemoteFilePath(raw));
   }
 
   private syncTeammate(): void {
@@ -12972,10 +13223,9 @@ export struct TaskPageContent {
     this.sessionActionInfoMode = false;
     this.sessionActionProjectMode = false;
     this.sessionRenameMode = false;
-    if (!this.isTeammateConversation()) void this.loadAccountUsage();
-    uiAnimateState(this.getUIContext(), () => {
-      this.sessionActionOpen = true;
-    });
+    uiOverlayTrace('session-menu', 'open');
+    // isShow 不能包在 animateTo 里（overlay-standard §3.1）：直接赋值。
+    this.sessionActionOpen = true;
   }
 
   private sessionAllowsProjectMove(): boolean {
@@ -13175,7 +13425,7 @@ export struct TaskPageContent {
     if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return false;
     this.sessionActionBusy = false;
     if (!ok) {
-      promptAction.showToast({ message: '任务更新失败，请重试' });
+      uiToast(this.getUIContext(), '任务更新失败，请重试');
       return false;
     }
     this.closeSessionActions();
@@ -13201,7 +13451,7 @@ export struct TaskPageContent {
     if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
     this.sessionActionBusy = false;
     if (title.length === 0) {
-      promptAction.showToast({ message: '暂时无法生成标题' });
+      uiToast(this.getUIContext(), '暂时无法生成标题');
       return;
     }
     this.sessionRenameDraft = title;
@@ -13228,21 +13478,14 @@ export struct TaskPageContent {
   private confirmDeleteSession(): void {
     if (this.isCreationBlockingRemoteOps()) return;
     const lifecycleGeneration = this.pageLifecycleGeneration;
-    this.getUIContext().showAlertDialog({
-      title: '删除任务？',
-      message: '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。',
-      primaryButton: { value: '取消', action: () => {} },
-      secondaryButton: {
-        value: '删除',
-        fontColor: $r('app.color.danger'),
-        action: () => {
-          if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-          const patch = new SessionMetaPatch();
-          patch.status = 'deleted';
-          void this.patchCurrentSession(patch, true);
-        },
-      },
-    });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy('删除任务？',
+      '删除后将从任务列表移除。此操作无法在鸿蒙端撤销。', '删除', '取消', true))
+      .then((confirmed: boolean): void => {
+        if (!confirmed || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+        const patch = new SessionMetaPatch();
+        patch.status = 'deleted';
+        void this.patchCurrentSession(patch, true);
+      });
   }
 
   private addMessageToComposer(item: RenderMessageItem): void {
@@ -13251,7 +13494,7 @@ export struct TaskPageContent {
     const next = this.input.trim().length === 0 ? body : `${this.input}\n\n${body}`;
     this.setComposerDocument(reconcileComposerProjectedText(this.composerDocument, next));
     this.expandComposerForEditing(true);
-    promptAction.showToast({ message: '已添加到输入框' });
+    uiToast(this.getUIContext(), '已添加到输入框');
   }
 
   private messageActionItem(): RenderMessageItem | null {
@@ -13277,7 +13520,7 @@ export struct TaskPageContent {
   private copyMessageLink(item: RenderMessageItem): void {
     const clientId = item.message?.clientId ?? '';
     if (clientId.length === 0) {
-      promptAction.showToast({ message: '无法定位消息' });
+      uiToast(this.getUIContext(), '无法定位消息');
       return;
     }
     const link = `cindy://session/${encodeURIComponent(this.sessionId)}?message=${encodeURIComponent(clientId)}`;
@@ -13294,16 +13537,10 @@ export struct TaskPageContent {
     const clientId = item.message?.clientId ?? '';
     if (!this.canDeleteMessage(item) || this.messageActionBusyId.length > 0) return;
     const scope = this.presentationScope();
-    this.getUIContext().showAlertDialog({
-      title: this.v12String('v132_message_delete_title'),
-      message: this.v12String('v132_message_delete_body'),
-      primaryButton: { value: this.v12String('v131_cancel'), action: () => {} },
-      secondaryButton: {
-        value: this.v12String('v132_message_delete_one'),
-        fontColor: $r('app.color.danger'),
-        action: () => void this.deleteMessage(clientId, item.key, scope),
-      },
-    });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy(this.v12String('v132_message_delete_title'),
+      this.v12String('v132_message_delete_body'), this.v12String('v132_message_delete_one'),
+      this.v12String('v131_cancel'), true))
+      .then((confirmed: boolean): void => { if (confirmed) void this.deleteMessage(clientId, item.key, scope); });
   }
 
   private async deleteMessage(
@@ -13322,17 +13559,17 @@ export struct TaskPageContent {
       if (deleted.length === 0) throw new Error('empty delete result');
       await AppServices.instance.messages.reloadSession(scope.deviceId, scope.sessionId);
       if (!this.isCurrentPresentationScope(scope)) return;
-      this.getUIContext().getPromptAction().showToast({ message: deleted.length > 1
+      uiToast(this.getUIContext(), deleted.length > 1
         ? this.v12String('v132_message_delete_success_many', String(deleted.length))
-        : this.v12String('v132_message_delete_success') });
+        : this.v12String('v132_message_delete_success'));
     } catch (error) {
       if (this.isCurrentPresentationScope(scope)) {
         const detail = error instanceof Error ? error.message : '';
         const running = (error instanceof DlError && error.code === 'SESSION_RUNNING')
           || detail.startsWith('[SESSION_RUNNING]');
-        this.getUIContext().getPromptAction().showToast({ message: this.v12String(running
+        uiToast(this.getUIContext(), this.v12String(running
           ? 'v132_message_delete_busy' : isRemoteBusyError(error)
-            ? 'v132_remote_busy' : 'v132_message_delete_failed') });
+            ? 'v132_remote_busy' : 'v132_message_delete_failed'));
       }
     } finally {
       if (this.isCurrentPresentationScope(scope)) this.messageActionBusyId = '';
@@ -13346,17 +13583,10 @@ export struct TaskPageContent {
     });
   }
 
+  /** 消息操作：底部表单（系统标题 / 关闭按钮 / 拖动条），不再自绘遮罩和面板。 */
   @Builder
-  messageActionLayer() {
-    Stack({ alignContent: Alignment.Bottom }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor($r('app.color.task_list_overlay'))
-        .onClick(() => this.closeMessageActions())
-
-      Column({ space: 8 }) {
-        Column() {
+  messageActionSheet() {
+    Column() {
           this.messageActionOption('添加到对话', $r('sys.symbol.ellipsis_message'), false, () => {
             const item = this.messageActionItem();
             if (item !== null) this.selectMessageAction(() => this.addMessageToComposer(item));
@@ -13388,42 +13618,16 @@ export struct TaskPageContent {
           if (this.messageActionItem() !== null && this.canDeleteMessage(this.messageActionItem() as RenderMessageItem)) {
             Divider()
               .strokeWidth(0.5)
-              .color($r('app.color.message_action_border'))
+              .color($r('app.color.border'))
+              .margin({ left: 16, right: 16 })
             this.messageActionOption(this.v12String('v132_message_delete_one'), $r('sys.symbol.trash'), true, () => {
               const item = this.messageActionItem();
               if (item !== null) this.selectMessageAction(() => this.confirmDeleteMessage(item));
             })
           }
-        }
-        .width('100%')
-        .backgroundColor($r('app.color.message_action_surface'))
-        .backgroundBlurStyle(BlurStyle.Thin)
-        .border({ width: 0.5, color: $r('app.color.message_action_border') })
-        .borderRadius(UI_RADIUS_CONTAINER)
-
-        Button('取消')
-          .type(ButtonType.Normal)
-          .width('100%')
-          .height(54)
-          .fontSize(uiFontSize(16))
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.message_action_text'))
-          .backgroundColor($r('app.color.message_action_surface'))
-          .backgroundBlurStyle(BlurStyle.Thin)
-          .border({ width: 0.5, color: $r('app.color.message_action_border') })
-          .borderRadius(UI_RADIUS_CONTAINER)
-          .clickEffect(UI_LIST_CLICK_EFFECT)
-          .onClick(() => this.closeMessageActions())
-      }
-      .width('calc(100% - 24vp)')
-      .constraintSize({ maxWidth: 620 })
-      .margin({ left: 12, right: 12, bottom: 12 })
-      .transition(uiOverlayTransition())
     }
     .width('100%')
-    .height('100%')
-    .position({ x: 0, y: 0 })
-    .zIndex(98)
+    .padding({ bottom: 16 })
   }
 
   @Builder
@@ -13431,13 +13635,12 @@ export struct TaskPageContent {
     Button() {
       Row({ space: 12 }) {
         SymbolGlyph(symbol)
-          .fontSize(uiFontSize(22))
-          .fontColor([danger ? $r('app.color.danger') : $r('app.color.message_action_text')])
+          .fontSize(uiFontSize(20))
+          .fontColor([danger ? $r('app.color.danger') : $r('app.color.text_secondary')])
           .width(24)
         Text(label)
           .fontSize(uiFontSize(16))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(danger ? $r('app.color.danger') : $r('app.color.message_action_text'))
+          .fontColor(danger ? $r('app.color.danger') : $r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
@@ -13447,7 +13650,7 @@ export struct TaskPageContent {
     }
     .type(ButtonType.Normal)
     .width('100%')
-    .height(54)
+    .height(52)
     .padding({ left: 16, right: 16 })
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_LIST_CLICK_EFFECT)
@@ -13468,22 +13671,14 @@ export struct TaskPageContent {
     this.resolveClientId(item).then((clientId: string) => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (clientId.length === 0) {
-        promptAction.showToast({ message: '无法定位消息' });
+        uiToast(this.getUIContext(), '无法定位消息');
         return;
       }
-      AlertDialog.show({
-        title: '分叉任务',
-        message: '将以这条消息为起点创建新任务，原任务保持不变。',
-        primaryButton: {
-          value: '取消',
-          action: () => {
-          },
-        },
-        secondaryButton: {
-          value: '分叉',
-          action: () => this.doFork(clientId, lifecycleGeneration, deviceId, sessionId),
-        },
-      });
+      void uiConfirm(this.getUIContext(), uiConfirmCopy('分叉任务',
+        '将以这条消息为起点创建新任务，原任务保持不变。', '分叉', '取消', false))
+        .then((confirmed: boolean): void => {
+          if (confirmed) this.doFork(clientId, lifecycleGeneration, deviceId, sessionId);
+        });
     });
   }
 
@@ -13495,7 +13690,7 @@ export struct TaskPageContent {
     this.resolveClientId(item).then((clientId: string) => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (clientId.length === 0) {
-        promptAction.showToast({ message: '无法定位消息' });
+        uiToast(this.getUIContext(), '无法定位消息');
         return;
       }
       void this.previewRewind(clientId, draftText, lifecycleGeneration, deviceId, sessionId);
@@ -13530,28 +13725,14 @@ export struct TaskPageContent {
       const preview = await AppServices.instance.messages.rewindPreview(
         deviceId, sessionId, clientId);
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-      AlertDialog.show({
-        title: '回退任务',
-        message: this.rewindPreviewMessage(preview),
-        primaryButton: { value: '取消', action: () => {} },
-        secondaryButton: {
-          value: preview.canRewind ? '回退' : '只回退对话',
-          action: () => void this.doRewind(
-            clientId, draftText, lifecycleGeneration, deviceId, sessionId),
-        },
-      });
+      const confirmed = await uiConfirm(this.getUIContext(), uiConfirmCopy('回退任务',
+        this.rewindPreviewMessage(preview), preview.canRewind ? '回退' : '只回退对话', '取消', true));
+      if (confirmed) void this.doRewind(clientId, draftText, lifecycleGeneration, deviceId, sessionId);
     } catch (e) {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
-      AlertDialog.show({
-        title: '回退任务',
-        message: '暂时无法读取文件影响。你仍可回退对话，之后的消息会被移除。',
-        primaryButton: { value: '取消', action: () => {} },
-        secondaryButton: {
-          value: '继续回退',
-          action: () => void this.doRewind(
-            clientId, draftText, lifecycleGeneration, deviceId, sessionId),
-        },
-      });
+      const confirmed = await uiConfirm(this.getUIContext(), uiConfirmCopy('回退任务',
+        '暂时无法读取文件影响。你仍可回退对话，之后的消息会被移除。', '继续回退', '取消', true));
+      if (confirmed) void this.doRewind(clientId, draftText, lifecycleGeneration, deviceId, sessionId);
     }
   }
 
@@ -13866,7 +14047,7 @@ export struct TaskPageContent {
       uri: url,
     }).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '无法打开链接' });
+        uiToast(this.getUIContext(), '无法打开链接');
       }
     });
   }
@@ -13927,7 +14108,7 @@ export struct TaskPageContent {
     AppServices.instance.interactions.resolve(
       deviceId, item.sessionId, item.requestId, decision).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '提交失败，请重试' });
+        uiToast(this.getUIContext(), '提交失败，请重试');
       }
     });
   }
@@ -14578,15 +14759,15 @@ export struct TaskPageContent {
     AppServices.instance.messages.fork(deviceId, sessionId, clientId).then((newSessionId: string) => {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (newSessionId.length > 0) {
-        promptAction.showToast({ message: '已创建新任务' });
+        uiToast(this.getUIContext(), '已创建新任务');
         // 返回任务列表（列表会刷新显示新任务）。嵌入式详情留在右侧，等待列表选择状态更新。
         if (!this.isEmbedded()) this.leaveDetailPage();
       } else {
-        promptAction.showToast({ message: '分叉失败' });
+        uiToast(this.getUIContext(), '分叉失败');
       }
     }).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '分叉失败' });
+        uiToast(this.getUIContext(), '分叉失败');
       }
     });
   }
@@ -14610,10 +14791,10 @@ export struct TaskPageContent {
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       this.setComposerDocument(textComposerDocument(draftText));
       this.expandComposerForEditing(true);
-      promptAction.showToast({ message: '已回退，可编辑原消息后重新发送' });
+      uiToast(this.getUIContext(), '已回退，可编辑原消息后重新发送');
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '回退失败' });
+        uiToast(this.getUIContext(), '回退失败');
       }
     }
   }
@@ -14801,29 +14982,75 @@ struct TaskPage {
   }
 }
 
+/** 层叠标签里一个 Worker 的位置：未选中的只露图标，离选中项越远露出越少、越小、越淡、越靠后。 */
+class WorkerTabSlot {
+  x: number = 0;
+  scale: number = 1;
+  opacity: number = 1;
+  z: number = 0;
+  visible: boolean = true;
+}
+
+class WorkerTabLayout {
+  slots: WorkerTabSlot[] = [];
+  selectedWidth: number = 0;
+  /** 两端放不下时收进「+N」的个数、位置和点击后要切到的最近一个。 */
+  leftMore: number = 0;
+  rightMore: number = 0;
+  leftMoreX: number = 0;
+  rightMoreX: number = 0;
+  leftMoreIndex: number = -1;
+  rightMoreIndex: number = -1;
+}
+
+const WORKER_TAB_CHIP = 28;
+const WORKER_TAB_GAP = 4;
+const WORKER_TAB_MORE = 30;
+const WORKER_TAB_SELECTED_MIN = 72;
+
+/** 距选中项第 k 个（k≥2）图标比前一个多露出的宽度；第 1 个完整露出。 */
+function workerTabStep(distance: number): number {
+  const steps: number[] = [0, WORKER_TAB_CHIP, 18, 12, 8, 6];
+  return distance < steps.length ? steps[distance] : 4;
+}
+
+function workerTabSideWidth(count: number, hidden: number): number {
+  let width = 0;
+  if (count > 0) {
+    width = WORKER_TAB_GAP + WORKER_TAB_CHIP;
+    for (let k = 2; k <= count; k++) width += workerTabStep(k);
+  }
+  return width + (hidden > 0 ? WORKER_TAB_GAP + WORKER_TAB_MORE : 0);
+}
+
 /** Both layouts use the same task content and host-owned Worker identities. */
 @Component
 export struct OrcaTaskDetail {
-  @Prop paneDeviceId: string = '';
-  @Prop paneSessionId: string = '';
+  @Prop @Watch('taskChanged') paneDeviceId: string = '';
+  @Prop @Watch('taskChanged') paneSessionId: string = '';
   @Prop paneMessageClientId: string = '';
   @Prop paneMessageRevision: number = 0;
   @Prop @Watch('activationChanged') paneActive: boolean = true;
   @Prop paneListCollapsed: boolean = false;
   @Prop paneComposerBottomInset: number = 16;
   @Prop paneKeyboardInset: number = 0;
-  @Prop allowSideBySide: boolean = false;
+  @Prop @Watch('syncVisibleWorkerSelection') allowSideBySide: boolean = false;
   onTogglePaneList: (() => void) | undefined = undefined;
   onBack: (() => void) | undefined = undefined;
   registerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
   @State role: string = '';
   @State workers: OrcaWorker[] = [];
   @State selected: OrcaWorker[] = [];
-  @State listOpen: boolean = false;
+  @State compactWorkerPaneOpen: boolean = false;
   @State loadState: string = '';
   @State widthVp: number = 0;
   @State folded: boolean = false;
   @State workerPaneCollapsed: boolean = false;
+  /** 并排时协同面板临时占满主控 + 协同两栏；不持久化，切换任务、收起面板或角色变化时复位。 */
+  @State workerExpanded: boolean = false;
+  @State private workerTabsWidth: number = 0;
+  private workerTabLayoutKey: string = '';
+  private workerTabLayoutCache: WorkerTabLayout = new WorkerTabLayout();
   @State leadPaneFraction: number = 0.5;
   private dividerStartX: number = 0;
   private dividerStartWidth: number = 0;
@@ -14831,6 +15058,7 @@ export struct OrcaTaskDetail {
   private foldListening: boolean = false;
   private foldChanged: (state: display.FoldStatus) => void = (state: display.FoldStatus): void => {
     this.folded = state === display.FoldStatus.FOLD_STATUS_FOLDED;
+    this.syncVisibleWorkerSelection();
   };
   private mounted: boolean = false;
   private epoch: number = -1;
@@ -14838,6 +15066,10 @@ export struct OrcaTaskDetail {
   private workerReadActive: boolean = false;
   private workerReadQueued: boolean = false;
   @State private workersNeedingInteraction: string[] = [];
+  /** 插件引擎图标读到后递增，让标签重新取图标。 */
+  @State private pluginIconRevision: number = 0;
+  /** 本面板已为哪些电脑读过插件引擎目录；每台只读一次，不随 Worker 刷新重复读取。 */
+  private pluginIconDevices: Set<string> = new Set<string>();
   private detachTasks: (() => void) | undefined = undefined;
   private detachWorkers: (() => void) | undefined = undefined;
   private detachStatus: (() => void) | undefined = undefined;
@@ -14854,11 +15086,6 @@ export struct OrcaTaskDetail {
     this.detachAuth = services.auth.onChanged(() => this.updateRole());
     this.detachWorkers = services.orca.onChanged((device: string, lead: string): void => {
       if (device === this.paneDeviceId && lead === this.paneSessionId) {
-        const selected = services.orca.selection(device, lead);
-        if (selected && this.selected[0] !== selected) {
-          this.selected = [selected];
-          this.workerPaneCollapsed = false;
-        }
         void this.refreshWorkers();
       }
     });
@@ -14893,11 +15120,15 @@ export struct OrcaTaskDetail {
     this.registerBack?.(undefined);
   }
 
+  private taskChanged(): void {
+    this.workerExpanded = false;
+  }
+
   private activationChanged(): void {
     if (!this.mounted) return;
     if (!this.paneActive) {
       this.readGeneration += 1;
-      this.listOpen = false;
+      this.compactWorkerPaneOpen = false;
     } else if (!this.updateRole()) {
       void this.refreshWorkers();
     }
@@ -14912,12 +15143,12 @@ export struct OrcaTaskDetail {
     if (nextRole === this.role) return false;
     this.role = nextRole;
     this.workerPaneCollapsed = false;
+    this.workerExpanded = false;
     this.readGeneration += 1;
     this.workers = [];
     this.loadState = '';
-    this.listOpen = false;
-    const worker = nextRole === 'lead' ? services.orca.selection(this.paneDeviceId, this.paneSessionId) : undefined;
-    this.selected = worker ? [worker] : [];
+    this.compactWorkerPaneOpen = false;
+    this.selected = [];
     if (nextRole === 'lead') void this.refreshWorkers();
     return true;
   }
@@ -14936,14 +15167,10 @@ export struct OrcaTaskDetail {
       const workers = await services.orca.list(this.paneDeviceId, this.paneSessionId, this.epoch);
       if (generation !== this.readGeneration || this.epoch !== services.auth.sessionEpoch) return;
       this.workers = workers;
+      this.loadPluginIcons(workers);
       this.syncWorkerActivity();
       this.loadState = 'ready';
-      if (this.selected.length > 0) {
-        const current = workers.find((w: OrcaWorker) => w.id === this.selected[0].id
-          || (w.deviceId === this.selected[0].deviceId && w.sessionId === this.selected[0].sessionId));
-        this.selected = current ? [current] : [];
-        services.orca.select(this.paneDeviceId, this.paneSessionId, current);
-      }
+      this.reconcileWorkerSelection(workers);
     } catch (_error) {
       if (generation === this.readGeneration && this.epoch === services.auth.sessionEpoch) this.loadState = 'error';
     } finally {
@@ -14952,6 +15179,26 @@ export struct OrcaTaskDetail {
         this.workerReadQueued = false;
         void this.refreshWorkers();
       }
+    }
+  }
+
+  private reconcileWorkerSelection(workers: OrcaWorker[]): void {
+    const orca = AppServices.instance.orca;
+    const current = this.selected[0];
+    const remembered = orca.selection(this.paneDeviceId, this.paneSessionId);
+    const retained = workers.find((w: OrcaWorker) => w.id === current?.id)
+      ?? workers.find((w: OrcaWorker) => w.id === remembered?.id);
+    // 预读不替尚未打开的面板选默认项。面板真正显示时才按最新列表选择。
+    const worker = retained ?? (this.workerVisible()
+      ? workers.find((w: OrcaWorker) => w.status === 'running') ?? workers[0]
+      : undefined);
+    this.selected = worker ? [worker] : [];
+    orca.select(this.paneDeviceId, this.paneSessionId, worker);
+  }
+
+  private syncVisibleWorkerSelection(): void {
+    if (this.workerVisible() && this.selected.length === 0 && this.workers.length > 0) {
+      this.reconcileWorkerSelection(this.workers);
     }
   }
 
@@ -14964,11 +15211,23 @@ export struct OrcaTaskDetail {
   }
 
   private workerVisible(): boolean {
-    return this.sideBySide() || (!this.workerPaneCollapsed && this.selected.length > 0);
+    return this.role === 'lead'
+      && (this.supportsSideBySide() ? this.sideBySide() : this.compactWorkerPaneOpen);
   }
 
   private leadVisible(): boolean {
-    return this.sideBySide() || !this.workerVisible();
+    return (this.sideBySide() && !this.workerExpanded) || !this.workerVisible();
+  }
+
+  private expanded(): boolean {
+    return this.sideBySide() && this.workerExpanded;
+  }
+
+  private toggleExpanded(): void {
+    if (!this.sideBySide()) return;
+    this.getUIContext().getFocusController().clearFocus();
+    this.dividerDragging = false;
+    uiAnimateState(this.getUIContext(), () => { this.workerExpanded = !this.workerExpanded; });
   }
 
   private leadPaneWidth(): number {
@@ -14980,7 +15239,7 @@ export struct OrcaTaskDetail {
       this.dividerDragging = false;
       return;
     }
-    if (!this.sideBySide() || event.changedTouches.length === 0) return;
+    if (!this.sideBySide() || this.workerExpanded || event.changedTouches.length === 0) return;
     const x = event.changedTouches[0].displayX;
     if (event.type === TouchType.Down) {
       this.dividerStartX = x;
@@ -14995,38 +15254,40 @@ export struct OrcaTaskDetail {
   private collapseWorkerPane(): void {
     this.getUIContext().getFocusController().clearFocus();
     this.dividerDragging = false;
-    this.listOpen = false;
+    this.compactWorkerPaneOpen = false;
     this.workerPaneCollapsed = true;
+    this.workerExpanded = false;
   }
 
   private returnToLead(): boolean {
-    if (!this.sideBySide() && this.listOpen) {
-      this.listOpen = false;
+    if (!this.workerVisible()) return false;
+    // 展开占满两栏时，返回先恢复分栏，再一次返回才收起协同面板。
+    if (this.expanded()) {
+      this.toggleExpanded();
       return true;
     }
-    if (this.selected.length === 0) return false;
-    this.selected = [];
-    AppServices.instance.orca.select(this.paneDeviceId, this.paneSessionId, undefined);
+    this.collapseWorkerPane();
     return true;
   }
 
-  private selectWorker(worker: OrcaWorker): void {
+  private selectWorker(workerId: string): void {
+    const worker = this.workers.find((w: OrcaWorker) => w.id === workerId);
+    if (!worker || this.selected[0]?.id === worker.id) return;
     this.getUIContext().getFocusController().clearFocus();
-    this.workerPaneCollapsed = false;
     this.selected = [worker];
     AppServices.instance.orca.select(this.paneDeviceId, this.paneSessionId, worker);
-    if (!this.sideBySide()) this.listOpen = false;
   }
 
   private openWorkers(): void {
-    if (this.role !== 'lead') return;
+    if (this.role !== 'lead' || this.returnToLead()) return;
     this.getUIContext().getFocusController().clearFocus();
-    if (this.supportsSideBySide() && this.workerPaneCollapsed) {
+    if (this.supportsSideBySide()) {
       this.workerPaneCollapsed = false;
-      return;
+    } else {
+      this.compactWorkerPaneOpen = true;
+      if (this.loadState !== 'loading') void this.refreshWorkers();
     }
-    this.listOpen = !this.listOpen;
-    if (this.listOpen && this.loadState !== 'loading') void this.refreshWorkers();
+    this.syncVisibleWorkerSelection();
   }
 
   @Builder
@@ -15066,50 +15327,306 @@ export struct OrcaTaskDetail {
     return this.label('v138_idle');
   }
 
+  private selectedWorkerTabIndex(): number {
+    return Math.max(0, this.workers.findIndex((worker: OrcaWorker) => worker.id === this.selected[0]?.id));
+  }
+
+  private workerSelected(worker: OrcaWorker): boolean {
+    return this.selected[0]?.id === worker.id;
+  }
+
+  private pluginIconUrl(worker: OrcaWorker): string {
+    return AppServices.instance.pluginEngines.find(worker.deviceId, worker.providerId)?.iconDataUrl ?? '';
+  }
+
+  /** 与 Desktop WorkerListToolbar 相同：有插件引擎 Worker 时读一次那台电脑的引擎目录取图标。 */
+  private loadPluginIcons(workers: OrcaWorker[]): void {
+    const engines = AppServices.instance.pluginEngines;
+    for (const worker of workers) {
+      if (!isPluginEngineSession(worker.agentKind, worker.providerId) || this.pluginIconUrl(worker)
+        || this.pluginIconDevices.has(worker.deviceId)) continue;
+      this.pluginIconDevices.add(worker.deviceId);
+      void engines.load(worker.deviceId).then((): void => {
+        if (this.mounted) this.pluginIconRevision += 1;
+      }).catch((): void => {});
+    }
+  }
+
+  /**
+   * 状态不再单独占一行：对齐 Desktop WorkerAvatar，在图标右上角用 6vp 小圆点轻量提示。
+   * 等待处理优先，其次出错、运行中；空闲 / 完成不加标记。连不上的 Worker 整个标签变淡。
+   */
+  private workerDot(worker: OrcaWorker): string {
+    if (!worker.reachable) return '';
+    if (this.workersNeedingInteraction.includes(worker.id)) return 'attention';
+    if (worker.status === 'error') return 'error';
+    if (worker.status === 'running') return 'running';
+    return '';
+  }
+
   @Builder
-  workerList() {
-    Column({ space: 8 }) {
-      Text(this.summary()).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).width('100%')
-      if (this.loadState === 'error') {
-        Button(this.label('v138_workers_retry')).height(44).fontColor($r('app.color.text_primary'))
-          .backgroundColor($r('app.color.bg_chip')).onClick(() => void this.refreshWorkers())
-      } else if (this.loadState === 'ready' && this.workers.length === 0) {
-        Text(this.label('v138_workers_empty')).fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
+  workerMark(worker: OrcaWorker, selected: boolean) {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      Stack() {
+        if (worker.agentKind === 'codex' || worker.agentKind === 'cc' || worker.agentKind === 'claude-code') {
+          if (selected) {
+            Image(worker.agentKind === 'codex' ? $r('app.media.usage_provider_openai')
+              : $r('app.media.usage_provider_anthropic'))
+              .width(16).height(16).objectFit(ImageFit.Contain)
+              .fillColor($r('app.color.chat_cta_text'))
+          } else {
+            Image(worker.agentKind === 'codex' ? $r('app.media.usage_provider_openai')
+              : $r('app.media.usage_provider_anthropic'))
+              .width(16).height(16).objectFit(ImageFit.Contain)
+          }
+        } else if (isPluginEngineSession(worker.agentKind, worker.providerId)) {
+          PluginEngineMark({ iconDataUrl: this.pluginIconUrl(worker), markSize: 16, monochrome: !selected,
+            running: worker.status === 'running' })
+        } else {
+          Text(worker.agentKind === 'pi' ? 'Pi' : 'AI')
+            .fontSize(uiFontSize(10))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(selected ? $r('app.color.chat_cta_text') : $r('app.color.text_secondary'))
+        }
       }
-      Scroll() {
-        Column({ space: 4 }) {
-          ForEach(this.workers, (worker: OrcaWorker) => {
-            Button() {
-              Row({ space: 8 }) {
-                Column({ space: 2 }) {
-                  Text(worker.name).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
-                  if (worker.model.length > 0) {
-                    Text(worker.model).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-                  }
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Text(this.workerStatus(worker)).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
-                SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(13).fontColor([$r('app.color.text_secondary')])
-              }.width('100%')
-            }
-            .type(ButtonType.Normal)
-            .width('100%')
-            .constraintSize({ minHeight: 52 })
-            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-            .backgroundColor($r('app.color.bg_chip'))
-            .borderRadius(UI_RADIUS_CONTAINER)
-            .onClick(() => this.selectWorker(worker))
-          }, (worker: OrcaWorker) => JSON.stringify([worker.id, worker.deviceId, worker.sessionId, worker.name,
-            worker.model, this.workerStatus(worker)]))
-        }.width('100%')
-      }.layoutWeight(1).width('100%')
+      .width(18)
+      .height(18)
+      if (this.workerDot(worker) === 'attention') {
+        Circle().width(6).height(6).fill($r('app.color.accent'))
+      } else if (this.workerDot(worker) === 'error') {
+        Circle().width(6).height(6).fill($r('app.color.danger'))
+      } else if (this.workerDot(worker) === 'running') {
+        Circle().width(6).height(6).fill($r('app.color.chat_status_accent'))
+      }
+    }
+    .width(20)
+    .height(20)
+  }
+
+  private workerTabName(worker: OrcaWorker): string {
+    return worker.displayName || worker.name;
+  }
+
+  private workerTabNameWidth(worker: OrcaWorker): number {
+    const measure = this.getUIContext().getMeasureUtils();
+    return this.getUIContext().px2vp(Number(measure.measureTextSize({
+      textContent: this.workerTabName(worker), fontSize: uiFontSize(13), fontWeight: FontWeight.Medium,
+    }).width));
+  }
+
+  /**
+   * 层叠排布：选中项完整显示「图标 + 名字」，两侧其余 Worker 只露图标，按距离依次压缩叠压。
+   * 总宽超出标签栏时先压缩选中项名字，再把最远的收进两端「+N」，两侧轮流收，保证不溢出。
+   */
+  private workerTabLayout(): WorkerTabLayout {
+    const selected = this.selectedWorkerTabIndex();
+    const key = JSON.stringify([this.workers.map((worker: OrcaWorker) => worker.id),
+      this.workers.length > 0 ? this.workerTabName(this.workers[selected]) : '', selected, this.workerTabsWidth]);
+    if (key === this.workerTabLayoutKey) return this.workerTabLayoutCache;
+    const layout = this.computeWorkerTabLayout(selected);
+    this.workerTabLayoutKey = key;
+    this.workerTabLayoutCache = layout;
+    return layout;
+  }
+
+  private computeWorkerTabLayout(selected: number): WorkerTabLayout {
+    const layout = new WorkerTabLayout();
+    const count = this.workers.length;
+    if (count === 0) return layout;
+    const available = this.workerTabsWidth > 0 ? this.workerTabsWidth : Number.MAX_VALUE;
+    const natural = 6 + 20 + 6 + Math.min(160, this.workerTabNameWidth(this.workers[selected])) + 12;
+    const neighbours = (selected > 0 ? 1 : 0) + (selected < count - 1 ? 1 : 0);
+    layout.selectedWidth = Math.max(WORKER_TAB_SELECTED_MIN,
+      Math.min(natural, available - neighbours * (WORKER_TAB_GAP + WORKER_TAB_CHIP)));
+    let left = selected;
+    let right = count - 1 - selected;
+    let hiddenLeft = 0;
+    let hiddenRight = 0;
+    while ((left > 0 || right > 0) && workerTabSideWidth(left, hiddenLeft) + layout.selectedWidth
+      + workerTabSideWidth(right, hiddenRight) > available) {
+      if (left > 0 && (left >= right || right === 0)) {
+        left -= 1;
+        hiddenLeft += 1;
+      } else {
+        right -= 1;
+        hiddenRight += 1;
+      }
+    }
+    const selectedX = workerTabSideWidth(left, hiddenLeft);
+    for (let index = 0; index < count; index++) {
+      const slot = new WorkerTabSlot();
+      const distance = Math.abs(index - selected);
+      if (distance === 0) {
+        slot.x = selectedX;
+        slot.z = 200;
+      } else {
+        const shown = index < selected ? left : right;
+        const k = Math.min(distance, Math.max(shown, 1));
+        let offset = WORKER_TAB_GAP;
+        for (let j = 2; j <= k; j++) offset += workerTabStep(j);
+        slot.x = index < selected ? selectedX - offset - WORKER_TAB_CHIP : selectedX + layout.selectedWidth + offset;
+        slot.visible = distance <= shown;
+        slot.scale = Math.max(0.72, 1 - 0.07 * (distance - 1));
+        slot.opacity = slot.visible ? Math.max(0.5, 1 - 0.12 * (distance - 1)) : 0;
+        slot.z = 100 - distance;
+      }
+      layout.slots.push(slot);
+    }
+    layout.leftMore = hiddenLeft;
+    layout.rightMore = hiddenRight;
+    layout.leftMoreIndex = hiddenLeft > 0 ? selected - left - 1 : -1;
+    layout.rightMoreIndex = hiddenRight > 0 ? selected + right + 1 : -1;
+    layout.leftMoreX = 0;
+    layout.rightMoreX = selectedX + layout.selectedWidth + workerTabSideWidth(right, 0) + WORKER_TAB_GAP;
+    return layout;
+  }
+
+  private workerTabSlot(worker: OrcaWorker): WorkerTabSlot {
+    const index = this.workers.findIndex((item: OrcaWorker) => item.id === worker.id);
+    const slots = this.workerTabLayout().slots;
+    return index >= 0 && index < slots.length ? slots[index] : new WorkerTabSlot();
+  }
+
+  @Builder
+  workerMoreBadge(count: number, x: number, target: number) {
+    Text('+' + count)
+      .fontSize(uiFontSize(11))
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('app.color.text_secondary'))
+      .textAlign(TextAlign.Center)
+      .width(WORKER_TAB_MORE)
+      .height(24)
+      .backgroundColor($r('app.color.bg_chip'))
+      .borderRadius(UI_RADIUS_PILL)
+      .translate({ x: x })
+      .zIndex(1)
+      .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
+      .accessibilityText('+' + count)
+      .onClick(() => {
+        if (target >= 0 && target < this.workers.length) this.selectWorker(this.workers[target].id);
+      })
+  }
+
+  /**
+   * 层叠标签：用 Stack + 按距选中项的距离计算 translate / scale / opacity / zIndex 代替横向 List。
+   * 切换时各项位置随隐式动画平滑重排；ForEach 的 key 不含选中状态，保证切换时是同一节点在移动。
+   */
+  @Builder
+  workerTabs() {
+    Stack({ alignContent: Alignment.Start }) {
+      ForEach(this.workers, (worker: OrcaWorker) => {
+        Row({ space: 6 }) {
+          this.workerMark(worker, this.workerSelected(worker))
+          if (this.workerSelected(worker)) {
+            Text(this.workerTabName(worker))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+              .fontSize(uiFontSize(13))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.chat_cta_text'))
+          }
+        }
+        .width(this.workerSelected(worker) ? this.workerTabLayout().selectedWidth : WORKER_TAB_CHIP)
+        .height(this.workerSelected(worker) ? 32 : WORKER_TAB_CHIP)
+        .padding({ left: this.workerSelected(worker) ? 6 : 4, right: this.workerSelected(worker) ? 12 : 4 })
+        .justifyContent(this.workerSelected(worker) ? FlexAlign.Start : FlexAlign.Center)
+        .backgroundColor(this.workerSelected(worker) ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+        .border({ width: this.workerSelected(worker) ? 0 : 1, color: $r('app.color.border') })
+        .borderRadius(UI_RADIUS_PILL)
+        .clip(true)
+        .translate({ x: this.workerTabSlot(worker).x })
+        .scale({ x: this.workerTabSlot(worker).scale, y: this.workerTabSlot(worker).scale })
+        .opacity(this.workerTabSlot(worker).opacity * (worker.reachable ? 1 : 0.5))
+        .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
+        .zIndex(this.workerTabSlot(worker).z)
+        .hitTestBehavior(this.workerTabSlot(worker).visible ? HitTestMode.Default : HitTestMode.None)
+        .clickEffect(UI_CLICK_EFFECT)
+        .accessibilityGroup(true)
+        .accessibilityText(this.workerTabName(worker) + ', ' + this.workerStatus(worker))
+        .accessibilitySelected(this.workerSelected(worker))
+        .onClick(() => this.selectWorker(worker.id))
+      }, (worker: OrcaWorker) => JSON.stringify([worker.id, worker.displayName, worker.agentKind, worker.providerId,
+        worker.reachable, this.workerStatus(worker), this.pluginIconRevision]))
+      if (this.workerTabLayout().leftMore > 0) {
+        this.workerMoreBadge(this.workerTabLayout().leftMore, this.workerTabLayout().leftMoreX,
+          this.workerTabLayout().leftMoreIndex)
+      }
+      if (this.workerTabLayout().rightMore > 0) {
+        this.workerMoreBadge(this.workerTabLayout().rightMore, this.workerTabLayout().rightMoreX,
+          this.workerTabLayout().rightMoreIndex)
+      }
+    }
+    .layoutWeight(1)
+    .height(44)
+    .clip(true)
+    .onAreaChange((_old: Area, area: Area) => {
+      const width = Number(area.width);
+      if (width > 0 && Math.abs(width - this.workerTabsWidth) >= 1) this.workerTabsWidth = width;
+    })
+  }
+
+  /**
+   * 协同面板顶部：Worker 层叠标签 + 右侧展开按钮。选中 Worker 时这一行放进该 Worker 会话的标题栏，
+   * 沿用标题栏的沉浸渐变模糊，消息从下面滚过；没有 Worker 会话时直接放在面板顶部。
+   * 展开按钮只在并排时显示：单栏时协同面板本来就占满详情区，按钮按下也不会有变化。
+   * 单栏没有并排的主控，保留左侧返回图标回到主控（系统返回手势同样有效）。
+   */
+  @Builder
+  collabBar() {
+    Row({ space: 4 }) {
+      if (!this.sideBySide()) {
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(uiFontSize(20))
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .width(44)
+        .height(44)
+        .backgroundColor(Color.Transparent)
+        .clickEffect(UI_ICON_CLICK_EFFECT)
+        .accessibilityText(this.label('v138_return_to_lead'))
+        .onClick(() => { this.returnToLead(); })
+      }
+      if (this.workers.length > 0) {
+        this.workerTabs()
+      } else {
+        Blank()
+      }
+      if (this.sideBySide()) {
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph(this.workerExpanded ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
+            : $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
+            .fontSize(uiFontSize(18))
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .width(44)
+        .height(44)
+        .backgroundColor(Color.Transparent)
+        .clickEffect(UI_ICON_CLICK_EFFECT)
+        .accessibilityText(this.label(this.workerExpanded ? 'v138_collapse' : 'v138_expand'))
+        .onClick(() => this.toggleExpanded())
+      }
     }
     .width('100%')
-    .height('100%')
-    .alignItems(HorizontalAlign.Start)
+    .height(44)
+    .padding({ left: this.sideBySide() ? 8 : 4, right: 4 })
+  }
+
+  @Builder
+  workerPaneEmpty() {
+    Column({ space: 8 }) {
+      Text(this.loadState === 'ready' ? this.label('v138_workers_empty') : this.summary())
+        .fontSize(uiFontSize(14)).fontColor($r('app.color.text_secondary'))
+        .textAlign(TextAlign.Center)
+      if (this.loadState === 'error') {
+        this.workerPaneButton(this.label('v138_workers_retry'), () => void this.refreshWorkers())
+      }
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
     .padding(12)
-    .backgroundColor($r('app.color.bg_page'))
   }
 
   build() {
@@ -15130,24 +15647,23 @@ export struct OrcaTaskDetail {
         .width(this.sideBySide() ? this.leadPaneWidth() : '100%')
         .height('100%')
         .visibility(this.leadVisible() ? Visibility.Visible : Visibility.None)
-      if (this.sideBySide() || this.selected.length > 0) {
+      if (this.workerVisible() || (this.supportsSideBySide() && this.selected.length > 0)) {
         Column() {
-          if (this.sideBySide()) {
-            Row() {
-              Text(this.label('v138_collaboration')).fontSize(uiFontSize(14)).fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.text_primary')).layoutWeight(1)
-              this.workerPaneButton(this.label('v138_collapse'), () => this.collapseWorkerPane())
-            }.width('100%').padding({ left: 12, right: 12 })
-          }
-          if (this.sideBySide() && (this.listOpen || this.selected.length === 0)) {
-            Column() { this.workerList() }
-              .layoutWeight(this.selected.length > 0 ? 0.54 : 1)
+          if (this.selected.length === 0) {
+            this.collabBar()
+            if (this.workers.length === 0) {
+              this.workerPaneEmpty()
+            }
           }
           ForEach(this.selected, (worker: OrcaWorker) => {
             TaskPageContent({
               paneDeviceId: worker.deviceId, paneSessionId: worker.sessionId,
               paneActive: this.paneActive && this.workerVisible(),
               standaloneDetail: !this.sideBySide(),
+              collabEmbedded: true,
+              collabHeader: (): void => {
+                this.collabBar();
+              },
               paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
               collabRole: this.label('v138_worker'), collabLabel: this.label('v138_return_to_lead'),
               collabReturnsToLead: true,
@@ -15156,15 +15672,17 @@ export struct OrcaTaskDetail {
             }).width('100%').layoutWeight(1)
           }, (worker: OrcaWorker) => JSON.stringify([worker.deviceId, worker.sessionId]))
         }
-        .width(this.sideBySide() ? this.widthVp - this.leadPaneWidth() : '100%')
+        .width(this.expanded() ? this.widthVp
+          : this.sideBySide() ? this.widthVp - this.leadPaneWidth() : '100%')
         .height('100%')
         .visibility(this.workerVisible() ? Visibility.Visible : Visibility.None)
-        .border({ width: { left: this.sideBySide() ? 1 : 0 }, color: $r('app.color.border') })
+        .backgroundColor($r('app.color.bg_page'))
+        .border({ width: { left: this.sideBySide() && !this.workerExpanded ? 1 : 0 }, color: $r('app.color.border') })
       }
     }
     .width('100%')
     .height('100%')
-    if (this.sideBySide()) {
+    if (this.sideBySide() && !this.workerExpanded) {
       Column() {
         Row() {
           Row().width(2).height(24).backgroundColor($r('app.color.text_tertiary'))
@@ -15179,16 +15697,9 @@ export struct OrcaTaskDetail {
     }
     }
     .width('100%').height('100%')
-    .onAreaChange((_old: Area, area: Area) => { this.widthVp = Number(area.width); })
-    .bindSheet(this.listOpen && !this.sideBySide(), this.workerList(), {
-      title: { title: this.label('v138_collaboration') },
-      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
-      preferType: SheetType.BOTTOM,
-      backgroundColor: $r('app.color.bg_card'),
-      maskColor: $r('app.color.overlay'),
-      onDisappear: (): void => {
-        if (!this.sideBySide()) this.listOpen = false;
-      },
+    .onAreaChange((_old: Area, area: Area) => {
+      this.widthVp = Number(area.width);
+      this.syncVisibleWorkerSelection();
     })
   }
 }

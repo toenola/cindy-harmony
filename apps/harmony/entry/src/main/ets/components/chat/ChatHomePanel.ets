@@ -1,3 +1,4 @@
+import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { ChatHomeAuthIdentity, captureChatHomeAccount } from '../../core/chat/ChatHomeAccount';
 import { ChatHostMediaResolver, ChatHostMediaOpen } from '../../core/chat/ChatHostMedia';
 import { common } from '@kit.AbilityKit';
@@ -17,6 +18,7 @@ import { ChatOwnedTaskTarget } from '../../core/chat/ChatCards';
 import { ChatWorkspace } from '../../pages/chat/ChatWorkspace';
 import { ChatResourceWorkspace } from '../../pages/chat/ChatResourceWorkspace';
 import { ChatSettingsPanel } from './ChatSettingsPanel';
+import { ChatIconButton, ChatTextButton, ChatSegmented } from './ChatChrome';
 import { ChatInvitePanel } from './ChatInvitePanel';
 import { ChatGroupCreatePanel } from './ChatGroupCreatePanel';
 import { TeammateRosterEntry } from '../../core/tasks/TeammateRoster';
@@ -47,6 +49,8 @@ export struct ChatHomePanel {
   resourceInvoke:ChatRemoteInvoke|null=null;
   subscribePush:ChatHomePushSubscribe|null=null;
   @Prop @Watch('receiveInitialInvitation') initialInvitation:string='';
+  /** 首页「+ → 新建群聊」选定电脑后的一次性入口；每次点击递增，0 表示没有。 */
+  @Prop @Watch('receiveInitialCreate') initialCreate:number=0;
   @Prop @Watch('reconcile') scopeKey:string='';
   @Prop @Watch('reconcile') foreground:boolean=true;
   @Prop @Watch('sourceChanged') selectedDevice:string='';
@@ -65,6 +69,7 @@ export struct ChatHomePanel {
   resolveHostMedia:ChatHostMediaResolver=async(_device:string,_reference:string,_thumbnail:boolean):Promise<string>=>'';
   onHostMedia:ChatHostMediaOpen=(_device:string,_reference:string,_name:string,_mime:string):void=>{};
   onClose:()=>void=():void=>{};
+  @Prop title:string='';
   onSelectDevice:(()=>void)|null=null;
   onCloudVisibility:(visible:boolean,listVisible:boolean)=>void=(_visible:boolean,_list:boolean):void=>{};
   @State private mode:string='cloud';
@@ -78,6 +83,7 @@ export struct ChatHomePanel {
   private hostNavigation:number=0;
   private prepared:string='';
   private invitationSeen:string='';
+  private createSeen:string='';
   private invitationNavigating:string='';
   private offInvitation:(()=>void)|null=null;
   private hostSource:string='';
@@ -109,7 +115,7 @@ export struct ChatHomePanel {
     const cloudScope=this.cloudScope();
     if(this.prepared!==cloudScope||!this.ready){this.prepared=cloudScope;this.prepare();}
     else {
-      this.sourceChanged();this.receiveInitialInvitation();
+      this.sourceChanged();this.receiveInitialInvitation();this.receiveInitialCreate();
       const invitation=this.services?.invitation,joined=invitation?.joinedRoom;
       if(this.mode==='invite'&&invitation?.phase==='joined'&&joined){this.invitationJoined(joined);return;}
       if(this.mode==='host-list')this.directory?.refresh();else if(this.mode==='host')this.host?.refresh();
@@ -130,7 +136,7 @@ export struct ChatHomePanel {
       this.services=createOfficialChatInviteServices(store.owner,api,auth,scope);
       this.offInvitation=this.services.invitation.onChanged(():void=>{if(live()){this.version++;if(this.services?.invitation.phase!=='joining')this.receiveInitialInvitation();}});
       this.picker=new ChatAttachmentPicker(context,createChatAuthenticatedRequest(auth,this.chatBaseUrl,live),live);
-      this.mode='cloud';this.ready=true;this.error='';this.sourceChanged();this.receiveInitialInvitation();this.syncCloudVisibility();if(!this.incomingVisible())await store.ensureConversations();
+      this.mode='cloud';this.ready=true;this.error='';this.sourceChanged();this.receiveInitialInvitation();this.receiveInitialCreate();this.syncCloudVisibility();if(!this.incomingVisible())await store.ensureConversations();
     }catch(e){if(live())this.error=e instanceof Error?e.message:'CHAT_UNAVAILABLE';}
   }
   private incomingVisible():boolean{return this.mode==='invite';}
@@ -175,7 +181,15 @@ export struct ChatHomePanel {
       const adapter=new ChatResourceAdapter(this.scopedInvoke(),this.selectedDevice,this.locale);this.adapter=adapter;
       this.directory=new ChatHostDirectory(adapter,this.locale,():boolean=>this.alive&&this.current()&&this.foreground);
       this.offDirectory=this.directory.onChanged(():void=>{this.version++;});
-    }this.syncCloudVisibility();
+    }this.syncCloudVisibility();this.receiveInitialCreate();
+  }
+  /** 只在当前电脑的来源已建好后进入；同一账号、电脑与点击只进入一次，不覆盖正在查看的邀请。 */
+  private receiveInitialCreate():void{
+    const token=this.initialCreate;
+    if(token<=0||!this.alive||!this.ready||!this.foreground||!this.current()||!this.selectedDevice||this.mode==='invite')return;
+    if(this.hostSource!==JSON.stringify([this.scopeKey,this.selectedDevice]))return;
+    const key=JSON.stringify([this.prepared,this.selectedDevice,token]);if(key===this.createSeen)return;
+    this.createSeen=key;this.showCreate();
   }
   private releaseHost():void{
     this.hostNavigation++;const old=this.host,remove=this.offHostDrain;this.offHost?.();this.offHost=null;this.offHostDrain=null;this.host=null;
@@ -201,7 +215,7 @@ export struct ChatHomePanel {
     const refs=data['resourceRefs'];
     if((this.mode==='host'||this.mode==='host-settings')&&this.host&&(!Array.isArray(refs)||(refs as Object[]).some((r:Object):boolean=>readStr(recordOrEmpty(r),'id')===this.host?.groupId)))this.host.refresh();
   }
-  private async confirm(title:string,body:string):Promise<boolean>{return new Promise<boolean>((resolve)=>this.getUIContext().showAlertDialog({title,message:body,primaryButton:{value:chatActionStrings(this.locale).cancel,action:():void=>resolve(false)},secondaryButton:{value:chatActionStrings(this.locale).confirm,action:():void=>resolve(true)},cancel:():void=>resolve(false)}));}
+  private async confirm(title:string,body:string):Promise<boolean>{return uiConfirm(this.getUIContext(),uiConfirmCopy(title,body,chatActionStrings(this.locale).confirm,chatActionStrings(this.locale).cancel,true));}
   private async avatar():Promise<string>{const auth=this.auth,g=this.generation;if(!auth)return '';const accountCurrent=captureChatHomeAccount(new ChatHomeAuthIdentity(auth),this.current);const live=():boolean=>this.alive&&g===this.generation&&accountCurrent();return pickChatAvatar(createAuthenticatedCloudRequest(auth,this.ossBaseUrl||(this.region==='cn'?'https://oss.cindy.com.cn':'https://oss.cindy.app'),'/api/',live),live);}
   private async hostThumbnail(device:string,reference:string,thumbnail:boolean):Promise<string>{
     const auth=this.auth,g=this.generation,source=this.hostSource,host=this.host;
@@ -224,41 +238,71 @@ export struct ChatHomePanel {
     }catch(e){this.error=e instanceof Error?e.message:'CHAT_UNAVAILABLE';}finally{this.hostBusy=false;}
   }
   private cloudBack():void{if(this.cloudStore?.page)this.cloudStore.closePage();else this.onClose();}
+  private inCloudConversation():boolean{return this.version>=0&&this.mode==='cloud'&&!!this.cloudStore?.page;}
+  private disabledTabs():number[]{const off:number[]=[];if(!this.selectedDevice&&this.onSelectDevice===null)off.push(1);return off;}
+  private selectedTabIndex():number{return this.mode==='host-list'?1:0;}
+  private tabLabels():string[]{
+    const l=homeLabels(this.locale);
+    return [l.cloud,this.selectedDevice?`${l.host} · ${this.deviceName(this.selectedDevice)}`:l.choose];
+  }
+  private selectTab(index:number):void{
+    if(index===0){this.mode='cloud';this.cloudStore?.closePage();this.syncCloudVisibility();}
+    else this.showHostList();
+  }
+  /** Single title bar for every chat sub-page: back + title, with the secondary "create" action as a quiet icon. */
+  @Builder
+  headerBar(title:string,onBack:()=>void,backEnabled:boolean,showCreate:boolean){
+    Row(){
+      ChatIconButton({symbol:$r('sys.symbol.chevron_left'),label:chatStrings(this.locale).back,enable:backEnabled,onTap:onBack})
+      Text(title).fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
+      if(showCreate){ChatIconButton({symbol:$r('sys.symbol.plus'),label:homeLabels(this.locale).create,enable:!!this.selectedDevice&&this.resourceInvoke!==null,onTap:():void=>{this.showCreate();}})}
+    }.width('100%').height(56).padding({left:4,right:8}).alignItems(VerticalAlign.Center)
+  }
+  /** Cloud / computer switch; handed to ChatWorkspace so it shares one row with refresh and join. */
+  @Builder
+  cloudTabs(){
+    ChatSegmented({labels:this.tabLabels(),selected:this.selectedTabIndex(),disabledIndexes:this.disabledTabs(),onSelect:(index:number):void=>{this.selectTab(index);}})
+  }
   build(){
-    Column({space:8}){
-      Flex({wrap:FlexWrap.Wrap}){
-        Button(homeLabels(this.locale).cloud).height(44).onClick(():void=>{this.mode='cloud';this.cloudStore?.closePage();this.syncCloudVisibility();})
-        Button(this.selectedDevice?`${homeLabels(this.locale).host} · ${this.deviceName(this.selectedDevice)}`:homeLabels(this.locale).choose).height(44).enabled(!!this.selectedDevice||this.onSelectDevice!==null).onClick(():void=>{this.showHostList();})
-        Button(homeLabels(this.locale).create).height(44).enabled(!!this.selectedDevice&&this.resourceInvoke!==null).onClick(():void=>{this.showCreate();})
-      }.width('100%')
-      if(this.error){Text(chatErrorText(this.locale,this.error)).fontColor($r('app.color.danger'))}
+    Column(){
+      if(!this.inCloudConversation()&&this.mode!=='host'){
+        if(this.mode==='invite'){this.headerBar(chatActionStrings(this.locale).invite,():void=>this.closeInvitation(),this.version>=0&&this.services?.invitation.phase!=='joining',false)}
+        else if(this.mode==='settings'){this.headerBar(chatStrings(this.locale).settings,():void=>{this.mode='cloud';this.syncCloudVisibility();},true,false)}
+        else if(this.mode==='create'){this.headerBar(homeLabels(this.locale).create,():void=>{this.mode='cloud';this.syncCloudVisibility();},true,false)}
+        else if(this.mode==='host-settings'){this.headerBar(chatStrings(this.locale).settings,():void=>{this.mode='host';},true,false)}
+        else{this.headerBar(this.title||chatStrings(this.locale).groups,this.onClose,true,true)}
+      }
+      if(this.mode==='host-list'){
+        Row(){
+          Column(){ChatSegmented({labels:this.tabLabels(),selected:this.selectedTabIndex(),disabledIndexes:this.disabledTabs(),onSelect:(index:number):void=>{this.selectTab(index);}})}.layoutWeight(1)
+          ChatIconButton({symbol:$r('sys.symbol.arrow_clockwise'),label:chatStrings(this.locale).refresh,onTap:():void=>{if(!this.directory){this.hostSource='';this.sourceChanged();}this.directory?.refresh();}})
+        }.width('100%').alignItems(VerticalAlign.Center).padding({left:16,right:8})
+      }
+      if(this.error){Text(chatErrorText(this.locale,this.error)).fontSize(13).fontColor($r('app.color.danger')).width('100%').padding({left:16,right:16,top:4,bottom:4})}
       if(!this.ready){LoadingProgress().width(32).height(32)}
       else if(this.mode==='invite'){
-        Button(chatStrings(this.locale).back).height(44).enabled(this.version>=0&&this.services?.invitation.phase!=='joining').onClick(():void=>this.closeInvitation())
         ChatInvitePanel({store:this.services?.invitation??null,initialInput:this.initialInvitation,locale:this.locale,
           inputLabel:chatActionStrings(this.locale).invite,previewLabel:chatActionStrings(this.locale).preview,
           acceptLabel:chatActionStrings(this.locale).join,openLabel:chatStrings(this.locale).groups,retryLabel:chatStrings(this.locale).retry,
           uncertainLabel:chatStrings(this.locale).unknown,onJoined:(id:string):void=>{this.invitationJoined(id);}}).layoutWeight(1)
       }else if(this.mode==='settings'){
-        Button(chatStrings(this.locale).back).height(44).onClick(():void=>{this.mode='cloud';this.syncCloudVisibility();})
         ChatSettingsPanel({store:this.cloudStore,locale:this.locale,shares:this.services?.shares??null,pickAvatar:():Promise<string>=>this.avatar(),confirm:(title:string,body:string):Promise<boolean>=>this.confirm(title,body)})
       }else if(this.mode==='create'){
-        Button(chatStrings(this.locale).back).height(44).onClick(():void=>{this.mode='cloud';this.syncCloudVisibility();})
         ChatGroupCreatePanel({adapter:this.adapter,actors:this.cloudStore?.actors??[],locale:this.locale,onCreated:(id:string,_device:string):void=>{this.openHost(id);},onReviewUnknown:():void=>{this.showHostList();}}).layoutWeight(1)
       }else if(this.mode==='host-list'){
         if(this.version>=0&&this.directory?.loading){LoadingProgress().width(32).height(32)}
-        if(this.version>=0&&this.directory?.error){Text(chatErrorText(this.locale,this.directory.error)).fontColor($r('app.color.danger'))}
-        Button(chatStrings(this.locale).refresh).height(44).onClick(():void=>{if(!this.directory){this.hostSource='';this.sourceChanged();}this.directory?.refresh();})
+        if(this.version>=0&&this.directory?.error){Text(chatErrorText(this.locale,this.directory.error)).fontSize(13).fontColor($r('app.color.danger')).width('100%').padding({left:16,right:16,top:4,bottom:4})}
         List(){
-          ForEach(this.version>=0?this.directory?.items??[]:[],(item:ResourceItem)=>{ListItem(){Column({space:4}){Text(item.title).fontColor($r('app.color.text_primary'));Text(item.preview||item.subtitle).fontSize(12).fontColor($r('app.color.text_secondary')).maxLines(2)}.width('100%').padding(12).onClick(():void=>{this.openHost(item.ref.id);})}},(item:ResourceItem):string=>item.ref.id)
-          if(this.directory?.nextCursor){ListItem(){Button(chatStrings(this.locale).older).height(44).onClick(():void=>{this.directory?.refresh(true);})}}
-        }.width('100%').layoutWeight(1)
+          ForEach(this.version>=0?this.directory?.items??[]:[],(item:ResourceItem)=>{ListItem(){Column({space:2}){Text(item.title).fontSize(16).lineHeight(22).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis});Text(item.preview||item.subtitle).fontSize(13).lineHeight(18).fontColor($r('app.color.text_secondary')).maxLines(2).textOverflow({overflow:TextOverflow.Ellipsis})}.width('100%').alignItems(HorizontalAlign.Start).padding({left:16,right:16,top:10,bottom:10}).constraintSize({minHeight:68}).justifyContent(FlexAlign.Center).onClick(():void=>{this.openHost(item.ref.id);})}},(item:ResourceItem):string=>item.ref.id)
+          if(this.directory?.nextCursor){ListItem(){Row(){ChatTextButton({label:chatStrings(this.locale).older,onTap:():void=>{this.directory?.refresh(true);}})}.width('100%').justifyContent(FlexAlign.Center)}}
+        }.width('100%').layoutWeight(1).scrollBar(BarState.Off).divider({strokeWidth:0.5,color:$r('app.color.border'),startMargin:16,endMargin:16})
       }else if(this.mode==='host-settings'){
-        Button(chatStrings(this.locale).back).height(44).onClick(():void=>{this.mode='host';})
-        TextInput({text:this.hostName,placeholder:chatActionStrings(this.locale).name}).height(44).enabled(!this.hostBusy&&this.hostAction('update')).onChange((value:string):void=>{this.hostName=value;})
-        if(this.hostAction('update')){Button(chatActionStrings(this.locale).save).height(44).enabled(!this.hostBusy&&!!this.hostName.trim()).onClick(():void=>{this.hostAct('update');})}
-        if(this.hostAction('leave')){Button(chatActionStrings(this.locale).leave).height(44).enabled(!this.hostBusy).onClick(():void=>{this.hostAct('leave');})}
-        if(this.hostAction('dissolve')){Button(chatActionStrings(this.locale).dissolve).height(44).enabled(!this.hostBusy).onClick(():void=>{this.hostAct('dissolve');})}
+        Column({space:8}){
+          TextInput({text:this.hostName,placeholder:chatActionStrings(this.locale).name}).height(44).enabled(!this.hostBusy&&this.hostAction('update')).onChange((value:string):void=>{this.hostName=value;})
+          if(this.hostAction('update')){Button(chatActionStrings(this.locale).save).height(44).enabled(!this.hostBusy&&!!this.hostName.trim()).onClick(():void=>{this.hostAct('update');})}
+          if(this.hostAction('leave')){Button(chatActionStrings(this.locale).leave).height(44).enabled(!this.hostBusy).onClick(():void=>{this.hostAct('leave');})}
+          if(this.hostAction('dissolve')){Button(chatActionStrings(this.locale).dissolve).height(44).enabled(!this.hostBusy).onClick(():void=>{this.hostAct('dissolve');})}
+        }.width('100%').padding({left:16,right:16})
       }else if(this.mode==='host'){
         ChatResourceWorkspace({store:this.host,locale:this.locale,foreground:this.foreground,
           resolveHostMedia:(device:string,reference:string,thumbnail:boolean):Promise<string>=>this.hostThumbnail(device,reference,thumbnail),
@@ -266,6 +310,7 @@ export struct ChatHomePanel {
           onBack:():void=>{this.showHostList();},onSettings:(resource:ChatResource):void=>{const name=resource.blocks.find((b:ChatResourceBlock):boolean=>b.primitive==='bot-group-chat')?.data['name'];this.hostName=typeof name==='string'?name:'';this.mode='host-settings';}}).layoutWeight(1)
       }else{
         ChatWorkspace({store:this.cloudStore,locale:this.locale,foreground:this.foreground,localCompanions:this.localCompanions,invitation:this.services?.invitation??null,attachmentPicker:this.picker,
+          listLeading:this.cloudTabs,
           onBack:():void=>this.cloudBack(),onLocalCompanion:this.onLocalCompanion,deviceName:this.deviceName,canControlDevice:this.canControlDevice,onOwnedTask:this.onOwnedTask,onMedia:this.onMedia,onSettings:():void=>{this.mode='settings';this.syncCloudVisibility();}}).layoutWeight(1)
       }
     }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))

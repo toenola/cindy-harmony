@@ -1,6 +1,9 @@
 import { DlClient, DlInvokeOptions } from '../device-link/DlClient';
 import { RemoteSession, readNum, readObj, readStr, recordOrEmpty } from './TaskModels';
 import { unwrapInvokeResult } from './TaskStore';
+import {
+  COMPANION_CREATE_REF_ID, CompanionCreateForm, companionCreatedId, normalizeTeammateName, parseCompanionCreateForm,
+} from './CompanionCreate';
 
 export class TeammateRosterEntry {
   id: string = '';
@@ -184,6 +187,42 @@ export class TeammateRoster {
     const receipt = recordOrEmpty(await this.invoke(row.deviceId, 'maker:remote-resources:invoke', request, preSend));
     if (!Array.isArray(receipt['effects'])) throw new Error('电脑未确认保存');
     this.changed(row.deviceId, request);
+  }
+
+  /** 已读到的该电脑伙伴名（规范化后），用于提交前的重名提示；电脑端仍会拒绝列表外的重名。 */
+  takenNames(device: string): string[] {
+    return (this.entriesByDevice.get(device) ?? []).map((row: TeammateRosterEntry) => normalizeTeammateName(row.name));
+  }
+
+  /** 读取电脑端的新建伙伴表单（Mobile loadCompanionProfile(ref=teammates/bot/create)）。 */
+  async createForm(device: string, locale: string): Promise<CompanionCreateForm> {
+    const request = this.request(true, false);
+    (request['client'] as Record<string, Object>)['locale'] = locale;
+    request['ref'] = this.resourceRef(COMPANION_CREATE_REF_ID);
+    return parseCompanionCreateForm(await this.invoke(device, 'maker:remote-resources:get', request), locale);
+  }
+
+  /**
+   * 提交新建伙伴；返回电脑端确认的伙伴 id。requestId 由调用方保管：结果未确认时重试必须复用，
+   * 电脑端按「同一控制端 + requestId」找回同一个伙伴。成功后按 changed 推送同样的路径刷新列表。
+   */
+  async create(device: string, locale: string, actionId: string, name: string, avatar: string,
+    requestId: string): Promise<string> {
+    const request = this.request(true);
+    (request['client'] as Record<string, Object>)['locale'] = locale;
+    const input: Record<string, Object> = {};
+    input['name'] = name;
+    input['avatarImageBase64'] = avatar;
+    input['requestId'] = requestId;
+    request['resourceRef'] = this.resourceRef(COMPANION_CREATE_REF_ID);
+    request['actionId'] = actionId;
+    request['input'] = input;
+    const id = companionCreatedId(await this.invoke(device, 'maker:remote-resources:invoke', request));
+    if (!id) throw new Error('Creation receipt missing');
+    const change: Record<string, Object> = {};
+    change['collectionId'] = 'teammates';
+    this.changed(device, change);
+    return id;
   }
 
   expectVisible(row: TeammateRosterEntry): void {

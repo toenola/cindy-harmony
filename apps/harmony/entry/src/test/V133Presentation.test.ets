@@ -102,15 +102,18 @@ export default function v133PresentationTest(): void {
       expect(usageSeries(snapshot, 'Other')[0].name).assertEqual('Codex');
       expect(usageSeries(snapshot, 'Other')[0].total).assertEqual(50);
     });
-    it('usage_candidate_selection_respects_explicit_scope_and_excludes_offline_or_noncomputers', 0, () => {
+    // Unit: one Mac and the last responding PC distinguish automatic order from pinned filtering.
+    it('usage_candidates_rank_last_answer_then_mac_and_keep_card_scope_strict', 0, () => {
       const mac = new PresenceSnapshot(); mac.deviceId = 'mac'; mac.platform = 'darwin'; mac.online = true; mac.remoteControlEnabled = true;
       const pc = new PresenceSnapshot(); pc.deviceId = 'pc'; pc.platform = 'win32'; pc.online = true; pc.remoteControlEnabled = true;
       const phone = new PresenceSnapshot(); phone.deviceId = 'phone'; phone.platform = 'harmony'; phone.online = true; phone.remoteControlEnabled = true;
       expect(usageCandidates([pc, phone, mac], '')[0].deviceId).assertEqual('mac');
-      expect(usageCandidates([pc, mac], 'pc').length).assertEqual(1);
+      expect(usageCandidates([pc, mac], 'pc').length).assertEqual(2);
+      expect(usageCandidates([pc, mac], 'pc', 'pc').length).assertEqual(1);
       expect(usageCandidates([pc, mac], 'pc')[0].deviceId).assertEqual('pc');
       mac.online = false;
-      expect(usageCandidates([pc, mac], 'mac').length).assertEqual(0);
+      expect(usageCandidates([pc, mac], 'mac')[0].deviceId).assertEqual('pc');
+      expect(usageCandidates([pc, mac], '', 'mac').length).assertEqual(0);
     });
 
     it('failed_sampling_attempt_folds_into_work_and_never_completes_a_turn', 0, () => {

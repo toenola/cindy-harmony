@@ -1,3 +1,6 @@
+import { PluginEngineMark } from './PluginEngineMark';
+import { PluginEngine, PluginUsage, PluginUsageBalance, PluginUsageWindow } from '../core/plugin-engines/PluginEngines';
+
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { AppServices } from '../core/AppServices';
 import { RelayRoute } from '../core/device-link/RelayRoute';
@@ -6,15 +9,24 @@ import {
   UsageSnapshot, UsageSource, UsageSeries, UsageDay, usageSum, usageCompact, usageSeries,
   usageResetLabel, readUsageDashboard, usageCandidates,
 } from '../core/usage/UsageDashboard';
-import { UI_RADIUS_CONTAINER, UI_RADIUS_PILL } from './UiKit';
+import { UI_RADIUS_CONTAINER } from './UiKit';
 
+class PluginQuotaRow {
+  engine: PluginEngine = new PluginEngine();
+  usage: PluginUsage = new PluginUsage();
+}
 /** Same snapshot / grouping as iOS. Only visible openings and reconnects read the computer. */
 @Component
 export struct UsageDashboardPanel {
   @Prop @Watch('contextChanged') active: boolean = false;
-  @Prop @Watch('contextChanged') scopeDeviceId: string = '';
+  @Prop @Watch('contextChanged') pinnedDeviceId: string = '';
   scroller: Scroller = new Scroller();
   @State private snapshot: UsageSnapshot | null = null;
+  @State private pluginQuotaRows: PluginQuotaRow[] = [];
+  private pluginDeviceId: string = '';
+  private pluginReadGeneration: number = 0;
+  private pluginOpeningPending: boolean = false;
+  private wasActive: boolean = false;
   @State private deviceName: string = '';
   @State private loading: boolean = false;
   @State private issue: string = '';
@@ -30,12 +42,17 @@ export struct UsageDashboardPanel {
   private timer: number = -1;
   private unsubs: Array<() => void> = [];
 
+  private currentCandidateKey(): string {
+    return usageCandidates(AppServices.instance.tasks.deviceList, '', this.pinnedDeviceId)
+      .map((device: PresenceSnapshot): string => device.deviceId).sort().join(':');
+  }
+
   aboutToAppear(): void {
     this.mounted = true;
+    this.candidateKey = this.currentCandidateKey();
     this.unsubs.push(AppServices.instance.auth.onChanged(() => this.contextChanged()));
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
-      const key = usageCandidates(AppServices.instance.tasks.deviceList, this.scopeDeviceId)
-        .map((device: PresenceSnapshot): string => device.deviceId).sort().join(':');
+      const key = this.currentCandidateKey();
       if (key === this.candidateKey) return;
       this.candidateKey = key;
       if (this.active) this.contextChanged();
@@ -47,48 +64,77 @@ export struct UsageDashboardPanel {
     this.contextChanged();
   }
   aboutToDisappear(): void {
-    this.mounted = false; this.generation++;
+    this.mounted = false; this.generation++; this.pluginReadGeneration++;
     this.unsubs.forEach((unsubscribe: () => void): void => unsubscribe()); this.unsubs = [];
     if (this.timer >= 0) clearInterval(this.timer);
     this.timer = -1;
   }
   private text(key: string): string { return harmonyV12String(this.getUIContext().getHostContext(), key); }
   private syncIdentity(): void {
-    const identity = `${AppServices.instance.auth.sessionEpoch}:${RelayRoute.instance.generation}:${this.scopeDeviceId}`;
+    const identity = `${AppServices.instance.auth.sessionEpoch}:${RelayRoute.instance.generation}:${this.pinnedDeviceId}`;
     if (identity === this.identity) return;
     this.identity = identity; this.generation++;
     this.snapshot = null; this.deviceName = ''; this.issue = '';
+    this.clearPluginQuota();
+    this.pluginOpeningPending = this.active;
     if (this.request) this.reloadRequested = true;
   }
   private contextChanged(): void {
     if (!this.mounted) return;
+    this.candidateKey = this.currentCandidateKey();
     this.syncIdentity();
     if (this.timer >= 0) clearInterval(this.timer);
     this.timer = -1;
-    if (!this.active) { this.generation++; return; }
+    if (!this.active) {
+      this.wasActive = false;
+      this.pluginOpeningPending = false;
+      this.generation++;
+      this.clearPluginQuota();
+      return;
+    }
+    if (!this.wasActive) this.pluginOpeningPending = true;
+    this.wasActive = true;
     this.now = Date.now();
     // Countdown only; never a network poll.
     this.timer = setInterval(() => { this.now = Date.now(); }, 60000);
     if (this.request) this.reloadRequested = true;
     else void this.refresh();
   }
-  private async refresh(): Promise<void> {
+  private async refresh(manual: boolean = false): Promise<void> {
     if (!this.mounted || !this.active || this.request) return;
     this.syncIdentity();
+    const loadPlugins = manual || this.pluginOpeningPending;
+    this.pluginOpeningPending = false;
+    if (loadPlugins) this.clearPluginQuota();
     const generation = this.generation;
     const epoch = AppServices.instance.auth.sessionEpoch;
     const route = RelayRoute.instance.generation;
+    const pinned = this.pinnedDeviceId;
     const current = (): boolean => this.mounted && this.active && generation === this.generation
       && epoch === AppServices.instance.auth.sessionEpoch && route === RelayRoute.instance.generation;
     this.request = true; this.loading = true; this.issue = '';
     try {
       const result = await readUsageDashboard(AppServices.instance.client,
-        AppServices.instance.tasks.deviceList, this.scopeDeviceId, current);
+        AppServices.instance.tasks.deviceList, AppServices.instance.usageAutomaticDevice(), current, pinned);
       if (!current()) return;
       this.issue = result.issue;
       if (result.snapshot !== null) {
         this.snapshot = result.snapshot; this.deviceName = result.deviceName;
-        void AppServices.instance.syncUsageCards(result.snapshot, result.deviceId, result.deviceName, epoch).catch((): void => {});
+        if (this.pluginDeviceId && this.pluginDeviceId !== result.deviceId) this.clearPluginQuota();
+        if (loadPlugins && AppServices.instance.appInForeground) {
+          this.pluginDeviceId = result.deviceId;
+          void this.readPluginQuota(result.deviceId, manual, current);
+        }
+        void AppServices.instance.syncUsageCards(result.snapshot, result.deviceId, result.deviceName, epoch, !!pinned).catch((): void => {});
+      } else {
+        this.clearPluginQuota();
+        if (result.issue === 'unsupported') {
+          this.snapshot = null;
+          this.deviceName = '';
+          if (!pinned) {
+            void AppServices.instance.markUsageAutomaticUnsupported(result.deviceId, epoch).catch((): void => {});
+          }
+        }
       }
       this.now = Date.now();
     } catch (_error) {
@@ -99,6 +145,33 @@ export struct UsageDashboardPanel {
       if (this.reloadRequested) { this.reloadRequested = false; if (this.mounted && this.active) void this.refresh(); }
     }
   }
+  private clearPluginQuota(): void {
+    this.pluginDeviceId = '';
+    this.pluginReadGeneration++;
+    this.pluginQuotaRows = [];
+  }
+
+  private async readPluginQuota(deviceId: string, manual: boolean, panelCurrent: () => boolean): Promise<void> {
+    const app = AppServices.instance;
+    const generation = ++this.pluginReadGeneration;
+    const current = (): boolean => panelCurrent() && this.pluginReadGeneration === generation
+      && app.appInForeground && this.pluginDeviceId === deviceId;
+    const engines = await app.pluginEngines.load(deviceId, manual);
+    const rows: PluginQuotaRow[] = [];
+    for (const engine of engines) {
+      if (!current()) return;
+      if (!engine.reportsUsage) continue;
+      const usage = await app.pluginEngines.readUsage(deviceId, engine.providerId);
+      if (!current()) return;
+      if (usage === null) continue;
+      const row = new PluginQuotaRow();
+      row.engine = engine;
+      row.usage = usage;
+      rows.push(row);
+      this.pluginQuotaRows = rows.slice();
+    }
+  }
+
   private data(): UsageSnapshot { return this.snapshot ?? new UsageSnapshot(); }
   private accounts(): UsageSource[] { return this.data().sources.filter((s: UsageSource): boolean => s.kind === 'subscription'); }
   private series(): UsageSeries[] { return usageSeries(this.data(), this.text('usage_other')); }
@@ -135,17 +208,19 @@ export struct UsageDashboardPanel {
         Row({ space: 12 }) {
           Text(this.deviceName).fontSize(16).fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_secondary')).maxLines(2).layoutWeight(1)
-          Button(this.loading ? $r('app.string.usage_loading') : $r('app.string.usage_refresh'))
-            .height(44).fontSize(14).padding({ left: 18, right: 18 })
-            .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-            .borderRadius(UI_RADIUS_PILL).enabled(!this.loading)
-            .onClick(() => void this.refresh())
+          Button() {
+            SymbolGlyph($r('sys.symbol.arrow_clockwise')).fontSize(20).fontColor([$r('app.color.text_primary')])
+          }
+          .type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor(Color.Transparent)
+          .opacity(this.loading ? 0.4 : 1).enabled(!this.loading)
+          .accessibilityText(this.loading ? $r('app.string.usage_loading') : $r('app.string.usage_refresh'))
+          .onClick(() => void this.refresh(true))
         }.width('100%')
         if (this.issue) {
           Text(this.notice()).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
         }
         if (this.snapshot !== null) {
-          if (this.accounts().length > 0) this.quotaCard()
+          if (this.accounts().length > 0 || this.pluginQuotaRows.length > 0) this.quotaCard()
           this.tokenCard()
           if (this.data().updatedAtMs || this.data().generatedAtMs) {
             Text(this.text('usage_updated') + ' ' + new Date(this.data().updatedAtMs || this.data().generatedAtMs).toLocaleString())
@@ -171,15 +246,43 @@ export struct UsageDashboardPanel {
           .fontColor($r('app.color.text_primary')).layoutWeight(1)
         if (this.stale()) Text($r('app.string.usage_stale')).fontSize(12).fontColor($r('app.color.warn'))
       }.width('100%')
-      Flex({ wrap: FlexWrap.Wrap }) {
-        ForEach(this.accounts(), (source: UsageSource) => {
-          this.quotaColumn(source)
-        }, (source: UsageSource) => source.id)
-      }.width('100%')
+      if (this.accounts().length > 0) {
+        Flex({ wrap: FlexWrap.Wrap }) {
+          ForEach(this.accounts(), (source: UsageSource) => {
+            this.quotaColumn(source)
+          }, (source: UsageSource) => source.id)
+        }.width('100%')
+      }
+      ForEach(this.pluginQuotaRows, (row: PluginQuotaRow) => {
+        this.pluginQuotaRow(row)
+      }, (row: PluginQuotaRow) => row.engine.providerId)
     }.width('100%').alignItems(HorizontalAlign.Start).padding(24)
       .backgroundColor($r('app.color.bg_card')).borderRadius(UI_RADIUS_CONTAINER)
       .border({ width: 1, color: $r('app.color.border') })
   }
+  @Builder
+  pluginQuotaRow(row: PluginQuotaRow) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        PluginEngineMark({ iconDataUrl: row.engine.iconDataUrl, markSize: 24 })
+        Text(row.engine.name).fontSize(16).lineHeight(24).fontColor($r('app.color.text_primary'))
+          .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+      }.width('100%').alignItems(VerticalAlign.Center)
+      ForEach(row.usage.windows, (window: PluginUsageWindow) => {
+        Text(harmonyV12String(this.getUIContext().getHostContext(), 'v131_usage_remaining',
+          window.label, String(Math.round(window.remainingPercent)) + '%'))
+          .fontSize(13).fontColor($r('app.color.text_secondary'))
+        if (window.resetsAt) {
+          Text(harmonyV12String(this.getUIContext().getHostContext(), 'v131_usage_reset',
+            new Date(window.resetsAt).toLocaleString())).fontSize(12).fontColor($r('app.color.text_tertiary'))
+        }
+      }, (window: PluginUsageWindow, index: number) => window.label + ':' + String(index))
+      ForEach(row.usage.balances, (balance: PluginUsageBalance) => {
+        Text(balance.amount + ' ' + balance.currency).fontSize(13).fontColor($r('app.color.text_secondary'))
+      }, (balance: PluginUsageBalance, index: number) => balance.currency + ':' + String(index))
+    }.width('100%').alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   quotaColumn(source: UsageSource) {
     Column({ space: 8 }) {
@@ -198,8 +301,12 @@ export struct UsageDashboardPanel {
           Image(source.logo === 'codex' ? $r('app.media.usage_provider_openai')
             : $r('app.media.usage_provider_anthropic'))
             .width(24).height(24).objectFit(ImageFit.Contain).flexShrink(0)
-        } else if (source.monogram) {
-          Text(source.monogram).fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+        } else {
+          // MobileProviderMark uses the first code point of monogram, or of name when absent.
+          Text((Array.from((source.monogram || source.name).trim())[0] ?? '?').toUpperCase())
+            .fontSize(11).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+            .width(18).height(18).textAlign(TextAlign.Center).align(Alignment.Center).flexShrink(0)
+            .border({ width: 1, color: $r('app.color.text_primary') }).borderRadius(4)
         }
         Text(source.name).fontSize(16).lineHeight(24).fontColor($r('app.color.text_primary'))
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
@@ -216,8 +323,12 @@ export struct UsageDashboardPanel {
       Row({ space: 12 }) {
         Text(this.todayLabel()).fontSize(18).fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary')).layoutWeight(1)
-        Text(this.data().scope === 'all' ? $r('app.string.usage_all_devices') : this.deviceName)
-          .fontSize(13).fontColor($r('app.color.text_secondary')).maxLines(2)
+        if (this.data().scope !== 'local' || this.deviceName) {
+          Text(this.data().scope === 'local'
+            ? harmonyV12String(this.getUIContext().getHostContext(), 'usage_only_device', this.deviceName)
+            : $r('app.string.usage_all_devices'))
+            .fontSize(13).fontColor($r('app.color.text_secondary')).maxLines(2)
+        }
       }.width('100%')
       if (this.data().days.length > 0) {
         Column({ space: 6 }) {

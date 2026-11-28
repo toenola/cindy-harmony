@@ -1,3 +1,4 @@
+import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { SharedTasksStore } from '../../core/shared-tasks/SharedTasksStore';
 import { UnavailableSharedTasksHost, SharedTaskItem, SharedTaskMember } from '../../core/shared-tasks/SharedTaskModels';
 import { SharedTaskAccess } from '../../core/shared-tasks/SharedTaskAccess';
@@ -34,9 +35,7 @@ export struct SharedTasksPanel {
   }
   aboutToDisappear(): void { this.unsubscribe?.(); this.unsubscribe = null; this.store.setVisible(false); this.input = ''; this.joinOpen = false; }
   private confirm(title: string, action: () => void): void {
-    this.getUIContext().showAlertDialog({ title, message: this.labels.confirmBody,
-      primaryButton: { value: this.labels.cancel, action: (): void => {} },
-      secondaryButton: { value: this.labels.confirm, action } });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy(title, this.labels.confirmBody, this.labels.confirm, this.labels.cancel, true)).then((confirmed: boolean): void => { if (confirmed) action(); });
   }
   build() {
     Column({ space: 12 }) {

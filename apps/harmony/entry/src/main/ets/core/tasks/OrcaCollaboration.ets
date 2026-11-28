@@ -7,6 +7,12 @@ export class OrcaWorker {
   deviceId: string = '';
   sessionId: string = '';
   name: string = '';
+  /** 显示名：label 存在且不同于 role 时用 label，否则用 role（不带「role #」前缀）。 */
+  displayName: string = '';
+  /** Worker 会话的 Agent：codex / claude-code / pi / acp（插件引擎）。 */
+  agentKind: string = '';
+  /** 插件引擎 Worker 的引擎（acp-plugin:<插件>:<引擎>）。 */
+  providerId: string = '';
   model: string = '';
   status: string = '';
   reachable: boolean = true;
@@ -35,6 +41,9 @@ export function parseOrcaWorkers(value: Object | undefined, leadDevice: string):
     const label = readStr(row, 'label');
     const role = readStr(row, 'role') || 'developer';
     worker.name = label && label !== role ? role + ' #' + label : role;
+    worker.displayName = label && label !== role ? label : role;
+    worker.agentKind = readStr(session, 'agentKind');
+    worker.providerId = readStr(session, 'providerId');
     worker.model = [readStr(session, 'agentKind'), readStr(session, 'model'), readStr(execution, 'deviceName')]
       .filter((part: string) => part.length > 0).join(' · ');
     worker.status = readStr(row, 'status');

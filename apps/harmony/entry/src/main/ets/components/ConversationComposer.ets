@@ -23,6 +23,7 @@ import {
   uiRevealTransition,
 } from './UiKit';
 import { LevelMode, uiMaterial } from '@kit.ArkUI';
+import { uiOverlayBuildId, uiOverlayTrace } from './common/UiOverlay';
 
 /** 待发送图片（上传状态机：uploading → ready / failed）。 */
 export class ComposerImage {
@@ -128,14 +129,8 @@ export struct ConversationComposer {
       // 容器内有横向列表和多个按钮，交互反馈由子控件承担，整块背板不参与形变。
       interactive: false,
     });
-  /** Popup 内容刷新时保持材质实例稳定，避免模型状态变化反复重建系统材质。 */
-  private readonly popupGlassMaterial: uiMaterial.ImmersiveMaterial =
-    new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.THIN,
-      colorInvert: true,
-      // Popup 内容保留系统材质交互命中；实际退场由下方锚点分支负责强制收口。
-      interactive: true,
-    });
+  // 三个选择弹层按 docs/overlay-standard.md §3.1 例外条款用 bindPopup：mask:false，不设 systemMaterial
+  // （沉浸材质会带出空间动效，真机打开时明暗闪烁），使用系统默认 Popup 样式；内容由父页面通过 @BuilderParam 提供。
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
@@ -401,7 +396,10 @@ export struct ConversationComposer {
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
     .opacity(this.composerEnabled && !this.sending && !this.contextBusy ? 1 : 0.4)
     .accessibilityText(`权限模式：${this.permissionLabel}`)
-    .onClick(() => this.onPermission())
+    .onClick(() => {
+      uiOverlayTrace('composer-permission', 'open');
+      this.onPermission();
+    })
     .bindPopup(this.permissionPopupPresented, {
       builder: this.composerPermissionPopup,
       placement: Placement.Top,
@@ -414,11 +412,9 @@ export struct ConversationComposer {
       keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
       avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
       levelMode: LevelMode.EMBEDDED,
-      popupColor: Color.Transparent,
-      radius: UI_RADIUS_CONTAINER,
-      shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: this.popupGlassMaterial,
+      mask: false,
       onStateChange: (event) => {
+        uiOverlayTrace('composer-permission', event.isVisible ? 'visible' : 'hidden');
         this.permissionPopupPresented = event.isVisible;
         if (!event.isVisible) this.onPermissionPopupDismiss();
       },
@@ -458,7 +454,10 @@ export struct ConversationComposer {
     .accessibilityText(this.effortLabel.length > 0
       ? `模型：${this.modelLabel}，思考强度：${this.effortLabel}`
       : `模型：${this.modelLabel}`)
-    .onClick(() => this.onModel())
+    .onClick(() => {
+      uiOverlayTrace('composer-model', 'open');
+      this.onModel();
+    })
     .bindPopup(this.modelPopupPresented, {
       builder: this.composerModelPopup,
       placement: Placement.Top,
@@ -471,11 +470,9 @@ export struct ConversationComposer {
       keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
       avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
       levelMode: LevelMode.EMBEDDED,
-      popupColor: Color.Transparent,
-      radius: UI_RADIUS_CONTAINER,
-      shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: this.popupGlassMaterial,
+      mask: false,
       onStateChange: (event) => {
+        uiOverlayTrace('composer-model', event.isVisible ? 'visible' : 'hidden');
         this.modelPopupPresented = event.isVisible;
         if (!event.isVisible) this.onModelPopupDismiss();
       },
@@ -509,7 +506,10 @@ export struct ConversationComposer {
     .enabled(!this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
     .opacity(this.runtimeRouteLocked ? 0.4 : 1)
     .accessibilityText(`Agent：${this.agentLabel}`)
-    .onClick(() => this.onAgent())
+    .onClick(() => {
+      uiOverlayTrace('composer-agent', 'open');
+      this.onAgent();
+    })
     .bindPopup(this.agentPopupPresented, {
       builder: this.composerAgentPopup,
       placement: Placement.Top,
@@ -522,11 +522,9 @@ export struct ConversationComposer {
       keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
       avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
       levelMode: LevelMode.EMBEDDED,
-      popupColor: Color.Transparent,
-      radius: UI_RADIUS_CONTAINER,
-      shadow: ShadowStyle.OUTER_DEFAULT_XS,
-      systemMaterial: this.popupGlassMaterial,
+      mask: false,
       onStateChange: (event) => {
+        uiOverlayTrace('composer-agent', event.isVisible ? 'visible' : 'hidden');
         this.agentPopupPresented = event.isVisible;
         if (!event.isVisible) this.onAgentPopupDismiss();
       },
@@ -555,8 +553,8 @@ export struct ConversationComposer {
     }
     .width(304)
     .height(190)
-    .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
+    .id(uiOverlayBuildId('composer-agent'))
   }
 
   @Builder
@@ -567,8 +565,8 @@ export struct ConversationComposer {
     }
     .width(304)
     .height(264)
-    .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
+    .id(uiOverlayBuildId('composer-permission'))
   }
 
   @Builder
@@ -579,8 +577,8 @@ export struct ConversationComposer {
     }
     .width(304)
     .height(352)
-    .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
+    .id(uiOverlayBuildId('composer-model'))
   }
 
   @Builder

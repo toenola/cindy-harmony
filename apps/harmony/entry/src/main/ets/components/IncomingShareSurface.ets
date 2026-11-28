@@ -2,7 +2,7 @@ import { AppServices } from '../core/AppServices';
 import { IncomingShareBatch, IncomingShareDestination, incomingShareText } from '../core/incoming-share/IncomingShareStore';
 import { IncomingSharePreview, IncomingShareTarget, IncomingSharePreviewLabels } from '../incomingshareextension/IncomingSharePreview';
 import { harmonyV12String } from '../core/HarmonyStrings';
-import { UI_RADIUS_CONTAINER } from './UiKit';
+import { uiSheetOptions, UiSheetExtras } from './common/UiOverlay';
 
 /** One account-bound preview. Navigation follows durable adoption; it never sends. */
 @Component
@@ -92,28 +92,36 @@ export struct IncomingShareSurface {
     catch (_error) { if (this.alive && epoch === services.auth.sessionEpoch) this.error = this.copy('failed'); }
     finally { if (this.alive) { this.busy = false; this.refresh(); } }
   }
+  private sheetOptions(): SheetOptions {
+    const extras = new UiSheetExtras();
+    extras.detents = [SheetSize.MEDIUM, SheetSize.LARGE];
+    // 系统关闭按钮 / 下滑等同于「取消」；批次被取消后 isShow 变 false，表单随之收起。
+    extras.onWillDismiss = (_action: DismissSheetAction): void => { void this.cancel(); };
+    return uiSheetOptions(this.copy('title'), (): void => {}, SheetSize.FIT_CONTENT, extras);
+  }
+  @Builder
+  private previewSheet() {
+    Column() {
+      if (this.batch !== null) {
+        IncomingSharePreview({ batch: this.batch, targets: this.targets, labels: this.labels(), busy: this.busy,
+          error: this.error,
+          canOpenInvite: this.batch.items.length === 1 && AppServices.instance.moduleInvitationKind(incomingShareText(this.batch)).length > 0,
+          onOpenInvite: (): void => { void this.openInvitation(); }, onConfirm: (id: string): void => { void this.adopt(id); },
+          onCancel: (): void => { void this.cancel(); },
+        })
+      }
+    }.width('100%').padding({ left: 16, right: 16, bottom: 16 })
+  }
   build() {
-    if (this.batch !== null) {
-      Stack() {
-        Column().width('100%').height('100%').backgroundColor($r('app.color.task_list_overlay'))
-        Column() {
-          IncomingSharePreview({ batch: this.batch, targets: this.targets, labels: this.labels(), busy: this.busy,
-            error: this.error,
-            canOpenInvite: this.batch.items.length === 1 && AppServices.instance.moduleInvitationKind(incomingShareText(this.batch)).length > 0,
-            onOpenInvite: (): void => { void this.openInvitation(); }, onConfirm: (id: string): void => { void this.adopt(id); },
-            onCancel: (): void => { void this.cancel(); },
-          })
-        }.width('92%').constraintSize({ maxWidth: 560 }).backgroundColor($r('app.color.bg_page'))
-          .borderRadius(UI_RADIUS_CONTAINER).border({ width: 1, color: $r('app.color.border') })
-      }.width('100%').height('100%')
-    } else if (this.recovery !== null) {
-      Column() {
+    Column() {
+      if (this.batch === null && this.recovery !== null) {
         Button(this.copy('resume')).height(44).margin(16)
           .onClick((): void => {
             const target = this.recovery;
             if (target !== null) { this.recovery = null; this.onOpen(target); }
           })
-      }.width('100%').height('100%').justifyContent(FlexAlign.End).hitTestBehavior(HitTestMode.Transparent)
-    }
+      }
+    }.width('100%').height('100%').justifyContent(FlexAlign.End).hitTestBehavior(HitTestMode.Transparent)
+      .bindSheet(this.batch !== null, this.previewSheet(), this.sheetOptions())
   }
 }

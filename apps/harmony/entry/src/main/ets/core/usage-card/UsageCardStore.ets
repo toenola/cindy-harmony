@@ -18,6 +18,7 @@ export class UsageCardLedger {
   version: number = 1; owner: string = ''; generation: number = 0;
   instances: UsageCardInstance[] = []; snapshots: UsageCardSnapshot[] = [];
   autoDeviceId: string = '';
+  autoUnsupported: boolean = false;
 }
 /** Synchronous private-file transactions in the card provider app process. Native adapter reads
  * the current on-disk owner on every operation; no credential or auth token is stored here. */
@@ -68,7 +69,7 @@ export class UsageCardStore {
     const ownerChanged = state.owner !== owner;
     state.owner = owner; state.generation = generation;
     if (ownerChanged || !owner) {
-      state.snapshots = []; state.autoDeviceId = '';
+      state.snapshots = []; state.autoDeviceId = ''; state.autoUnsupported = false;
       state.instances.forEach((instance: UsageCardInstance): void => { instance.owner = owner; instance.deviceId = ''; });
     }
     this.save(state); return this.publishAll();
@@ -97,17 +98,35 @@ export class UsageCardStore {
     instance.deviceId = deviceId; this.save(state); return this.publishAll();
   }
   /** Publish only a current owner's already-authorized snapshot. Never fetch vendors/background WS. */
-  sync(owner: string, generation: number, snapshot: UsageSnapshot, deviceId: string, deviceName: string): Promise<void> {
+  sync(owner: string, generation: number, snapshot: UsageSnapshot, deviceId: string, deviceName: string,
+    target: string = 'all'): Promise<void> {
     const state = this.read();
     if (!owner || owner !== state.owner || generation !== state.generation) throw new Error('USAGE_CARD_STALE');
     if (!deviceId) throw new Error('USAGE_CARD_INVALID_DEVICE');
     const entry = new UsageCardSnapshot(); entry.deviceId = deviceId; entry.data = projectUsageCard(snapshot, deviceId, deviceName);
     state.snapshots = state.snapshots.filter((item: UsageCardSnapshot): boolean => item.deviceId !== deviceId).concat([entry]).slice(-64);
-    state.autoDeviceId = deviceId; this.save(state); return this.publishAll();
+    if (target !== 'pinned') {
+      state.autoDeviceId = deviceId;
+      state.autoUnsupported = false;
+    }
+    this.save(state);
+    return this.publishAll(target, deviceId);
+  }
+  automaticDevice(owner: string, generation: number): string {
+    const state = this.read();
+    return owner && owner === state.owner && generation === state.generation ? state.autoDeviceId : '';
+  }
+  markAutomaticUnsupported(owner: string, generation: number, deviceId: string): Promise<void> {
+    const state = this.read();
+    if (!owner || owner !== state.owner || generation !== state.generation || !deviceId) return Promise.resolve();
+    if (state.autoDeviceId === deviceId && state.autoUnsupported === true) return Promise.resolve();
+    state.autoDeviceId = deviceId; state.autoUnsupported = true;
+    this.save(state);
+    return this.publishAll('auto');
   }
   invalidateDevice(deviceId: string): Promise<void> {
     const state = this.read(); state.snapshots = state.snapshots.filter((entry: UsageCardSnapshot): boolean => entry.deviceId !== deviceId);
-    if (state.autoDeviceId === deviceId) state.autoDeviceId = '';
+    if (state.autoDeviceId === deviceId) { state.autoDeviceId = ''; state.autoUnsupported = false; }
     this.save(state); return this.publishAll();
   }
   data(formId: string): UsageCardData {
@@ -115,6 +134,10 @@ export class UsageCardStore {
     const blank = new UsageCardData(); blank.formId = formId;
     if (!state.owner || !instance || instance.owner !== state.owner) return blank;
     blank.dimension = instance.dimension; blank.status = 'unavailable'; blank.deviceId = instance.deviceId;
+    if (!instance.deviceId && state.autoUnsupported === true) {
+      blank.status = 'unsupported';
+      return blank;
+    }
     const snapshot = state.snapshots.find((snapshot: UsageCardSnapshot): boolean => snapshot.deviceId === (instance.deviceId || state.autoDeviceId));
     if (!snapshot) return blank;
     const data = JSON.parse(JSON.stringify(snapshot.data)) as UsageCardData;
@@ -129,10 +152,14 @@ export class UsageCardStore {
   }
   failedPublications(): string[] { return Array.from(this.failedForms); }
   /** System onUpdateForm only republishes the cached projection and recomputes its age. */
-  publishAll(): Promise<void> {
+  publishAll(target: string = 'all', deviceId: string = ''): Promise<void> {
     const run = UsageCardStore.publishing.then(async (): Promise<void> => {
-      const ids = this.read().instances.map((instance: UsageCardInstance): string => instance.formId);
-      for (const id of ids) {
+      const instances = this.read().instances;
+      const ids = instances.map((instance: UsageCardInstance): string => instance.formId);
+      for (const instance of instances) {
+        if (target === 'auto' && instance.deviceId) continue;
+        if (target === 'pinned' && instance.deviceId !== deviceId) continue;
+        const id = instance.formId;
         const data = this.data(id); // Ledger read failures remain reportable, outside the publish-only catch.
         try { await this.publish(id, data); this.failedForms.delete(id); }
         catch { this.failedForms.add(id); }

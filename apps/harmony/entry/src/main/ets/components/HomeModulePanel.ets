@@ -1,3 +1,4 @@
+import { uiConfirm, uiConfirmCopy, uiSheetOptions, UiSheetExtras } from './common/UiOverlay';
 import { ChatHomePanel } from './chat/ChatHomePanel';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { SharedTasksStore } from '../core/shared-tasks/SharedTasksStore';
@@ -39,6 +40,8 @@ export class HomeModuleRequest {
   projectKey: string = '';
   title: string = '';
   create: boolean = false;
+  /** chat：首页「+ → 新建群聊」的一次性进入令牌，0 表示不自动进入新建群聊。 */
+  createToken: number = 0;
 }
 
 /** Native detail content; parent owns the same single node across folding changes. */
@@ -230,7 +233,13 @@ export struct HomeModulePanel {
         Button(this.copy('confirm')).height(44).layoutWeight(1).enabled(!this.directoryLoading && !!this.directoryPath)
           .onClick((): void => this.finishDirectory(this.directoryPath))
       }.width('100%')
-    }.width('100%').padding(20).backgroundColor($r('app.color.bg_page'))
+    }.width('100%').padding({ left: 20, right: 20, top: 8, bottom: 20 })
+  }
+  /** 目录选择：底部表单；系统关闭按钮 / 下滑等同于取消，沿用 finishDirectory('') 结算挂起的选择。 */
+  private directorySheetOptions(): SheetOptions {
+    const extras = new UiSheetExtras();
+    extras.onWillDismiss = (_action: DismissSheetAction): void => { this.finishDirectory(''); };
+    return uiSheetOptions(createProjectLabels(this.locale).directory, (): void => {}, SheetSize.FIT_CONTENT, extras);
   }
   private async pickProjectImage(): Promise<string> {
     const generation = this.generation;
@@ -256,16 +265,11 @@ export struct HomeModulePanel {
     } finally { bitmap?.release(); packer.release(); source.release(); }
   }
   private async confirm(title: string, message: string): Promise<boolean> {
-    return new Promise<boolean>((resolve) => this.getUIContext().showAlertDialog({ title, message,
-      primaryButton: { value: this.copy('cancel'), action: (): void => resolve(false) },
-      secondaryButton: { value: this.copy('confirm'), action: (): void => resolve(true) },
-      cancel: (): void => resolve(false) }));
+    return uiConfirm(this.getUIContext(), uiConfirmCopy(title, message, this.copy('confirm'), this.copy('cancel')));
   }
   @Builder
   private content() {
-    if (this.choosingDirectory) {
-      this.directoryPicker()
-    } else if (this.request.kind === 'shared' && this.sharedReady) {
+    if (this.request.kind === 'shared' && this.sharedReady) {
       SharedTasksPanel({ store: this.shared ?? undefined, labels: createSharedTaskLabels(this.locale),
         ownerDeviceId: this.request.deviceId, ownerSessionId: this.request.sessionId,
         initialInvitation: this.request.invitation,
@@ -283,7 +287,8 @@ export struct HomeModulePanel {
         subscribePush: (listener) => AppServices.instance.onModulePush(listener),
         foreground: this.foreground, locale: this.locale, region: AppConfig.region, realm: AppConfig.region,
         chatBaseUrl: AppConfig.chatApiBaseUrl, shareBaseUrl: AppConfig.shareBaseUrl, ossBaseUrl: AppConfig.ossApiBaseUrl,
-        initialInvitation: this.request.invitation,
+        initialInvitation: this.request.invitation, title: this.request.title || this.copy('chat'),
+        initialCreate: this.request.createToken,
         localCompanions: this.localCompanions, onLocalCompanion: this.onLocalCompanion,
         deviceName: (device: string): string => AppServices.instance.tasks.getDeviceName(device),
         canControlDevice: (device: string): boolean => AppServices.instance.tasks.deviceList.some((row): boolean => row.deviceId === device && row.remoteControlEnabled),
@@ -313,14 +318,26 @@ export struct HomeModulePanel {
   build() {
     Stack() {
       Column() {
-        Row({ space: 12 }) {
-          Button(this.copy('back')).height(44).onClick(this.onClose)
-          Text(this.request.title || this.copy(this.request.kind)).fontSize(17).fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary')).layoutWeight(1).maxLines(1)
-        }.height(56).width('100%').padding({ left: 12, right: 16 })
+        // Chat owns its own title bar once ready (one bar, one back); every other state keeps the module bar.
+        if (!(this.request.kind === 'chat' && this.chatReady && !this.choosingDirectory)) {
+          Row({ space: 4 }) {
+            Button({ type: ButtonType.Circle }) {
+              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).fontColor([$r('app.color.text_primary')])
+            }.width(44).height(44).padding(0).backgroundColor(Color.Transparent)
+              .accessibilityText(this.copy('back')).onClick(this.onClose)
+            Text(this.request.title || this.copy(this.request.kind)).fontSize(17).fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary')).layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }.height(56).width('100%').padding({ left: 4, right: 16 }).alignItems(VerticalAlign.Center)
+        }
         if (this.error) {
-          Text(this.error).fontSize(13).fontColor($r('app.color.danger')).padding(12)
-          if (this.request.kind === 'chat') Button(this.copy('refresh')).height(44).onClick((): void => { void this.prepareChat(); })
+          Row({ space: 8 }) {
+            Text(this.error).fontSize(13).fontColor($r('app.color.danger')).layoutWeight(1)
+            if (this.request.kind === 'chat') {
+              Button(this.copy('refresh'), { type: ButtonType.Normal }).height(44).padding({ left: 8, right: 8 })
+                .fontSize(14).fontColor($r('app.color.accent')).backgroundColor(Color.Transparent)
+                .onClick((): void => { void this.prepareChat(); })
+            }
+          }.width('100%').padding({ left: 16, right: 8 }).alignItems(VerticalAlign.Center)
         }
         Column() { if (this.revision >= 0) this.content() }.width('100%').layoutWeight(1)
       }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
@@ -331,5 +348,6 @@ export struct HomeModulePanel {
         }.width('100%').height('100%').backgroundColor($r('app.color.bg_page'))
       }
     }.width('100%').height('100%')
+    .bindSheet(this.choosingDirectory, this.directoryPicker(), this.directorySheetOptions())
   }
 }

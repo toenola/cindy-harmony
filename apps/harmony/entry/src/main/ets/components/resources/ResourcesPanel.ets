@@ -1,3 +1,4 @@
+import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { resourceIssueText } from '../../core/resources/ResourceIssueStrings';
 import { ResourceStore } from '../../core/resources/ResourceStore';
 import { ResourceItem, ResourceBlock, ResourceCollection, ResourceAction, ResourceLink, resourceKey, resourceUnread } from '../../core/resources/ResourceModels';
@@ -28,10 +29,10 @@ export struct ResourcesPanel {
   aboutToDisappear(): void { this.unsubscribe?.(); this.unsubscribe = null; this.store.setVisible(false); }
   private action(action: ResourceAction): void {
     if (!action.confirmation) { void this.store.runAction(action.id); return; }
-    this.getUIContext().showAlertDialog({ title: action.confirmation, message: action.confirmationBody,
-      primaryButton: { value: this.labels.cancel, action: (): void => {} },
-      secondaryButton: { value: action.confirmLabel || this.labels.confirm,
-        action: (): void => { void this.store.runAction(action.id, true); } } });
+    void uiConfirm(this.getUIContext(), uiConfirmCopy(action.confirmation, action.confirmationBody,
+      action.confirmLabel || this.labels.confirm, this.labels.cancel, action.destructive)).then((confirmed: boolean): void => {
+      if (confirmed) void this.store.runAction(action.id, true);
+    });
   }
   @Builder
   private actions(actions: ResourceAction[]) {

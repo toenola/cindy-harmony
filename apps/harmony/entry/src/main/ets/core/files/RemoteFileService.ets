@@ -1,3 +1,4 @@
+import { util } from '@kit.ArkTS';
 /** 远端生成文件的本机临时落盘与系统分享。 */
 
 import { common, wantConstant } from '@kit.AbilityKit';
@@ -34,8 +35,14 @@ export class RemoteFileService {
     });
   }
 
-  async shareUrl(context: common.UIAbilityContext, url: string, name: string): Promise<void> {
-    const bytes = await new HarmonyHttp().downloadBytes(url);
+  async shareUrl(context: common.UIAbilityContext, url: string, name: string,
+    current: () => boolean = (): boolean => true): Promise<void> {
+    if (!current()) throw new Error('OWNER_CHANGED');
+    const encoded = /^data:image\/[a-z0-9.+-]+;base64,([A-Za-z0-9+/=]+)$/i.exec(url);
+    const decoded = encoded === null ? null : new util.Base64Helper().decodeSync(encoded[1]);
+    const bytes = decoded === null ? await new HarmonyHttp().downloadBytes(url) :
+      decoded.buffer.slice(decoded.byteOffset, decoded.byteOffset + decoded.byteLength);
+    if (!current()) throw new Error('OWNER_CHANGED');
     const path = `${context.cacheDir}/cindy-file-${Date.now()}-${safeFileName(name)}`;
     const file = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE);
     try {

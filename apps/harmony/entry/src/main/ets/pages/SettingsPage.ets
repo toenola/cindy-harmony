@@ -9,7 +9,8 @@ import { RelaySettingsPanel } from '../components/RelaySettingsPanel';
  * 本页只调整它的分组、行高和颜色语义；推送开关、token 获取/刷新/删除流程不改。
  */
 
-import { router, promptAction } from '@kit.ArkUI';
+import { router } from '@kit.ArkUI';
+import { uiSheetOptions, uiToast, uiNotice } from '../components/common/UiOverlay';
 import { common } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { AppConfig } from '../AppConfig';
@@ -165,38 +166,30 @@ struct SettingsPage {
       : await service.disable();
     this.syncTaskCompletionPushState();
     if (!success && service.errorMessage.length > 0) {
-      promptAction.showToast({ message: service.errorMessage });
+      uiToast(this.getUIContext(), service.errorMessage);
     }
   }
 
   private async refreshTaskCompletionPushToken(): Promise<void> {
     const success = await AppServices.instance.taskCompletionPush.refreshToken();
     this.syncTaskCompletionPushState();
-    promptAction.showToast({
-      message: success ? 'Push Token 已更新' : AppServices.instance.taskCompletionPush.errorMessage,
-    });
+    uiToast(this.getUIContext(),
+      success ? 'Push Token 已更新' : AppServices.instance.taskCompletionPush.errorMessage);
   }
 
   private copyTaskCompletionPushToken(): void {
     if (this.taskCompletionPushToken.length === 0) return;
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.taskCompletionPushToken);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-      promptAction.showToast({ message: 'Push Token 已复制' });
+      uiToast(this.getUIContext(), 'Push Token 已复制');
     }).catch(() => {
-      promptAction.showToast({ message: '复制失败' });
+      uiToast(this.getUIContext(), '复制失败');
     });
   }
 
   private showTaskCompletionPushInfo(): void {
-    this.getUIContext().showAlertDialog({
-      title: '任务完成推送',
-      message: '鸿蒙端的任务完成推送通过桌面端插件实现。请先在 Cindy Desktop 安装并配置“华为任务完成推送”插件。',
-      primaryButton: {
-        value: '知道了',
-        action: () => {
-        },
-      },
-    });
+    void uiNotice(this.getUIContext(), '任务完成推送',
+      '鸿蒙端的任务完成推送通过桌面端插件实现。请先在 Cindy Desktop 安装并配置“华为任务完成推送”插件。', '知道了');
   }
 
   // ─── Mobile 对齐能力 ───────────────────────────────────────────────────────
@@ -375,7 +368,7 @@ struct SettingsPage {
   private selectLanguage(value: string): void {
     this.languageSheetOpen = false;
     if (value === 'system') {
-      promptAction.showToast({ message: '当前 Harmony 版本使用简体中文界面' });
+      uiToast(this.getUIContext(), '当前 Harmony 版本使用简体中文界面');
     }
   }
 
@@ -383,16 +376,16 @@ struct SettingsPage {
     if (value.length === 0) return;
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, value);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-      promptAction.showToast({ message: successMessage });
+      uiToast(this.getUIContext(), successMessage);
     }).catch(() => {
-      promptAction.showToast({ message: '复制失败' });
+      uiToast(this.getUIContext(), '复制失败');
     });
   }
 
   private openExternal(url: string): void {
     const context = getContext(this) as common.UIAbilityContext;
     context.startAbility({ action: 'ohos.want.action.viewData', uri: url }).catch(() => {
-      promptAction.showToast({ message: '无法打开链接' });
+      uiToast(this.getUIContext(), '无法打开链接');
     });
   }
 
@@ -480,7 +473,7 @@ struct SettingsPage {
         challenge.challengeId, challenge.receiptToken, this.deletionCode,
       );
       await AppServices.instance.auth.completeAccountDeletion();
-      promptAction.showToast({ message: '账号注销已提交' });
+      uiToast(this.getUIContext(), '账号注销已提交');
       router.replaceUrl({ url: 'pages/LoginPage' });
     } catch (e) {
       this.deletionError = this.errorText(e, '操作未完成，请稍后重试。');
@@ -510,11 +503,11 @@ struct SettingsPage {
     this.loggingOut = true;
     AppServices.instance.client.stop();
     AppServices.instance.auth.logout().then(() => {
-      promptAction.showToast({ message: '已退出登录' });
+      uiToast(this.getUIContext(), '已退出登录');
       router.replaceUrl({ url: 'pages/LoginPage' });
     }).catch(() => {
       this.loggingOut = false;
-      promptAction.showToast({ message: '退出登录失败，请重试' });
+      uiToast(this.getUIContext(), '退出登录失败，请重试');
     });
   }
 
@@ -824,49 +817,29 @@ struct SettingsPage {
         .width('100%')
         .height('100%')
         .scrollBar(BarState.Auto)
-
-        if (this.languageSheetOpen) {
-          Column() {
-          }
-          .width('100%')
-          .height('100%')
-          .backgroundColor($r('app.color.overlay'))
-          .onClick(() => this.languageSheetOpen = false)
-
-          Column({ space: 4 }) {
-            Row() {
-              Text('语言')
-                .fontSize(uiFontSize(17))
-                .fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_primary'))
-                .layoutWeight(1)
-              Button('关闭')
-                .fontSize(uiFontSize(13))
-                .fontColor($r('app.color.text_secondary'))
-                .backgroundColor(Color.Transparent)
-                .onClick(() => this.languageSheetOpen = false)
-            }
-            .width('100%')
-            .padding({ left: 16, right: 10, top: 12, bottom: 8 })
-            HarmonySettingsRow({
-              label: '跟随系统',
-              value: '当前不支持',
-              onRowClick: () => this.selectLanguage('system'),
-            })
-            HarmonySettingsRow({ label: '简体中文', value: '已选择' })
-          }
-          .width('100%')
-          .backgroundColor($r('app.color.bg_card'))
-          .borderRadius({ topLeft: UI_RADIUS_CONTAINER, topRight: UI_RADIUS_CONTAINER })
-          .padding({ bottom: 16 })
-        }
       }
       .width('100%')
       .layoutWeight(1)
+      .bindSheet($$this.languageSheetOpen, this.languageSheet(), uiSheetOptions('语言', (): void => {}))
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
+  }
+
+  /** 语言选择：底部表单，系统标题和关闭按钮。 */
+  @Builder
+  private languageSheet() {
+    Column() {
+      HarmonySettingsRow({
+        label: '跟随系统',
+        value: '当前不支持',
+        onRowClick: () => this.selectLanguage('system'),
+      })
+      HarmonySettingsRow({ label: '简体中文', value: '已选择' })
+    }
+    .width('100%')
+    .padding({ bottom: 16 })
   }
 
   private accountUserId(): string {

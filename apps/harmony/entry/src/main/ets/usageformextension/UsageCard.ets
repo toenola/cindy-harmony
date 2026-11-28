@@ -57,7 +57,8 @@ struct UsageCard {
         }
         Text(new Date(this.updatedAt).toLocaleString()).fontSize(10).fontColor($r('app.color.text_tertiary')).maxLines(1).width('100%')
       } else {
-        Text($r('app.string.usage_unavailable')).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%')
+        Text(this.status === 'unsupported' ? $r('app.string.usage_unsupported')
+          : $r('app.string.usage_unavailable')).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%')
       }
     }.width('100%').height('100%').padding(12).alignItems(HorizontalAlign.Start)
     .backgroundColor($r('app.color.bg_card'))

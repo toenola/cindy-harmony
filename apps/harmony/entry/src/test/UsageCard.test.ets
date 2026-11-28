@@ -96,6 +96,26 @@ export default function usageCardTests(): void {
       try { await store.setOwner('', 2); } catch (error) { failure = String(error); }
       expect(failure.includes('DISK_FAILURE')).assertTrue();
     });
+    // Unit: the real ledger distinguishes widget publications with two forms on one computer.
+    it('automatic_snapshot_and_unsupported_do_not_publish_pinned_forms', 0, async () => {
+      const publisher = new CardPublisher();
+      const store = new UsageCardStore(new CardStorage(),
+        (id: string, data: UsageCardData): Promise<void> => publisher.publish(id, data));
+      await store.setOwner('owner', 1);
+      store.register('auto'); store.register('pinned', 'a');
+      await store.sync('owner', 1, snapshot(), 'a', 'A', 'pinned');
+      expect(store.automaticDevice('owner', 1)).assertEqual('');
+      expect(publisher.data.length).assertEqual(1);
+      expect(publisher.data[0].formId).assertEqual('pinned');
+      await store.sync('owner', 1, snapshot(), 'a', 'A', 'auto');
+      expect(publisher.data.length).assertEqual(2);
+      expect(publisher.data[1].formId).assertEqual('auto');
+      expect(store.automaticDevice('owner', 1)).assertEqual('a');
+      await store.markAutomaticUnsupported('owner', 1, 'a');
+      expect(publisher.data.length).assertEqual(3);
+      expect(publisher.data[2].status).assertEqual('unsupported');
+      expect(store.data('pinned').status).assertEqual('snapshot');
+    });
     it('revoked_computer_projection_is_removed_without_affecting_other_form', 0, async () => {
       const publisher = new CardPublisher(), store = new UsageCardStore(new CardStorage(), (id: string, data: UsageCardData): Promise<void> => publisher.publish(id, data));
       await store.setOwner('owner', 1); store.register('a', 'a'); store.register('b', 'b');

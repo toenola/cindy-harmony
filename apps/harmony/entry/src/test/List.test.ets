@@ -1,3 +1,5 @@
+import workdirFilesTests from './WorkdirFiles.test';
+import pluginEnginesTests from './PluginEngines.test';
 import sharedTaskMediaTests from './SharedTaskMedia.test';
 import sharedTaskAgentNetTests from './SharedTaskAgentNet.test';
 import v139IntegrationTests from './V139Integration.test';
@@ -31,7 +33,9 @@ import v133SpeedTests from './V133Speed.test';
 import v133PresentationTests from './V133Presentation.test';
 
 export default function testsuite() {
+  workdirFilesTests();
   localUnitTest();
+  pluginEnginesTests();
   sharedTaskMediaTests();
   sharedTaskAgentNetTests();
   v139IntegrationTests();
