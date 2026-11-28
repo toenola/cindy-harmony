@@ -1,3 +1,4 @@
+import { ModelPickerListRow } from '../components/ModelPickerListRow';
 import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
 import { pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption } from '../core/ComposerCatalog';
 import { SPLIT_HANDLE_HIT_WIDTH, SplitHandle } from '../components/common/SplitHandle';
@@ -2231,11 +2232,21 @@ export struct TaskPageContent {
         .placeholderColor($r('app.color.text_secondary')).backgroundColor($r('app.color.bg_chip'))
         .onChange((value: string) => { this.pickerModelSearch = value; })
       Button() {
+        Row({ space: 6 }) {
+        if (!this.pickerAllProviders && (this.pickerCurrentProvider()?.options[0]?.providerId === 'openai'
+          || this.pickerCurrentProvider()?.options[0]?.providerId === 'anthropic')) {
+          Image(this.pickerCurrentProvider()?.options[0]?.providerId === 'openai' ? $r('app.media.usage_provider_openai')
+            : $r('app.media.usage_provider_anthropic'))
+            .width(16).height(16).objectFit(ImageFit.Contain).fillColor($r('app.color.text_secondary'))
+        } else {
+          SymbolGlyph($r('sys.symbol.square_grid_2x2')).fontSize(15).fontColor([$r('app.color.text_secondary')])
+        }
         Text(this.pickerAllProviders ? '全部模型' : this.pickerCurrentProvider()?.name ?? '全部模型')
-          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+        }.width('100%')
       }
-      .type(ButtonType.Normal).height(44).constraintSize({ maxWidth: '48%' })
-      .backgroundColor($r('app.color.bg_chip'))
+      .type(ButtonType.Normal).height(44).constraintSize({ maxWidth: 164 })
+      .width('41%').backgroundColor(Color.Transparent)
       .onClick(() => {
         this.pickerAllProviders = !this.pickerAllProviders;
         this.modelPickerScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false });
@@ -8329,8 +8340,11 @@ export struct TaskPageContent {
         agentPopupContent: (): void => {
           this.agentContextView();
         },
-        modelPopupContent: (): void => {
-          this.modelContextView();
+        modelPanelScroller: this.modelPickerScroller,
+        modelPickerTitle: this.pickerDetails?.label ?? '',
+        onModelPickerBack: (): void => { this.pickerDetails = null; },
+        modelPopupContent: (enabled: boolean): void => {
+          this.modelContextView(enabled);
         },
         onPlanToggle: (): void => {
           void this.togglePlanMode();
@@ -8644,36 +8658,35 @@ export struct TaskPageContent {
     Column({ space: 2 }) {
       ComposerModelProviderHeader({ name: group.name })
 
-      ForEach(group.options, (option: ComposerModelOption) => {
-        Row() {
-          Column() {
-            if (option.pickerConfigurationId || (option.pickerHarness && option.pickerHarness !== this.composerAgentKind())) {
-              Button(option.label + ' · ' + modelAgentLabel(option.pickerHarness)
-                + (option.pickerEffort ? ' · ' + option.pickerEffort : '') + (option.pickerFast ? ' · Fast' : ''))
-                .height(44).width('100%').fontColor($r('app.color.text_primary'))
-                .backgroundColor($r('app.color.bg_chip')).enabled(!option.suspended && option.availability !== 'requires_payment')
-                .onClick(() => { void this.pickOtherHarnessModel(option); })
-            } else {
-          this.modelOptionRow(option)
-            }
-          }.layoutWeight(1)
-          Button() {
-            SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(17)
-              .fontColor([$r('app.color.text_secondary')])
-          }.type(ButtonType.Circle).width(44).height(44).backgroundColor(Color.Transparent)
-            .accessibilityText('模型设置').enabled(!option.suspended && option.availability !== 'requires_payment'
-              && (!option.pickerHarness || option.pickerHarness === this.composerAgentKind()))
-            .onClick(() => { this.pickerDetails = option; })
-        }.width('100%')
-
+      Column() {
+      ForEach(group.options, (option: ComposerModelOption, index: number) => {
+        if (index > 0) {
+          Divider().color($r('app.color.border')).margin({ left: 16, right: 16 })
+        }
+        ModelPickerListRow({
+          modelName: option.label, providerName: option.providerName, providerKind: modelProviderKind(option),
+          harness: option.pickerHarness || this.composerAgentKind(),
+          effort: this.effortOptionLabel(option.pickerEffort || this.modelEffortForRow(option), option.pickerEffort || this.modelEffortForRow(option)),
+          quota: modelQuotaLine(option, this.deviceId, this.modelQuotaValues),
+          selected: this.modelOptionIsCurrent(option) && (!option.pickerHarness || option.pickerHarness === this.composerAgentKind())
+            && (!option.pickerConfigurationId || (option.pickerEffort === this.modelEffortForRow(option)
+              && option.pickerFast === this.modelFastForRow(option))),
+          available: !(this.contextRpcBusy || this.runtimeRouteLocked()) && (!option.suspended || this.modelOptionIsCurrent(option))
+            && (option.availability !== 'requires_payment' || this.modelOptionIsCurrent(option)),
+          canConfigure: !(this.contextRpcBusy || this.runtimeRouteLocked()) && !option.suspended && option.availability !== 'requires_payment'
+            && (!option.pickerHarness || option.pickerHarness === this.composerAgentKind()),
+          onPick: (): void => { void this.pickOtherHarnessModel(option); },
+          onConfigure: (): void => {
+            this.pickerDetails = option;
+            this.modelPickerScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false });
+          },
+        }).onAreaChange((_old: Area, area: Area) => {
+          if (this.modelOptionIsCurrent(option) && !option.pickerConfigurationId) this.positionSelectedModel(area);
+        })
       }, (option: ComposerModelOption) => composerModelKey(option) + ':' + option.pickerHarness + ':' + option.pickerConfigurationId)
 
-      Divider()
-        .strokeWidth(0.5)
-        .color($r('app.color.border'))
-        .margin({ left: 12, right: 12, top: 4, bottom: 4 })
-    }
-    .width('100%')
+      }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(12).clip(true)
+    }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
   }
 
   @Builder
@@ -8753,12 +8766,13 @@ export struct TaskPageContent {
         }
         ForEach(pluginPickerModels(engine, this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''), (model: PluginEngineModel) => {
           Button(model.label).width('100%').height(44).fontColor($r('app.color.text_primary'))
-            .backgroundColor($r('app.color.bg_chip'))
+            .backgroundColor(Color.Transparent)
             .enabled(engine.availability === 'available' && this.canSwitchSessionAgent() && this.currentAgentDeviceId() === null)
             .accessibilitySelected(model.id === (this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''))
             .onClick(() => { void this.pickTaskPlugin(engine, model); })
         }, (model: PluginEngineModel) => model.id)
-      }.width('100%').padding({ left: 12, right: 12 })
+      }.width('100%').padding(10).backgroundColor($r('app.color.bg_page'))
+        .borderRadius(12).opacity(engine.availability === 'available' ? 1 : 0.6)
     }, (engine: PluginEngine) => engine.providerId)
   }
 
@@ -8784,28 +8798,38 @@ export struct TaskPageContent {
   @Builder
   pickerDetailsView(option: ComposerModelOption) {
     Column({ space: 8 }) {
-      Button('‹  ' + option.label).height(44).fontColor($r('app.color.text_primary'))
-        .backgroundColor($r('app.color.bg_chip')).onClick(() => { this.pickerDetails = null; })
-      Text([option.providerName, option.agentDeviceName, option.contextWindow > 0
+      Text([option.label, option.providerName, option.agentDeviceName, option.contextWindow > 0
         ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
         .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
         .width('100%').padding(12).backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
       Column() {
-      Text('Harness · ' + modelAgentLabel(this.composerAgentKind()))
-        .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+      Row({ space: 8 }) {
+        Text('✣').width(24).fontColor($r('app.color.text_secondary'))
+        Column({ space: 3 }) {
+          Text('Harness').fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+          Text(modelAgentLabel(this.composerAgentKind())).fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+        }.alignItems(HorizontalAlign.Start)
+      }.height(44).width('100%')
       ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
         Button('切换到 ' + modelAgentLabel(compatible.pickerHarness))
           .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
           .onClick(() => { void this.pickOtherHarnessModel(compatible); })
       }, (compatible: ComposerModelOption) => compatible.pickerHarness)
         Divider().color($r('app.color.border'))
-        Button('推理强度 · ' + this.modelEffortForRow(option)).height(44).width('100%')
+        Button() {
+          Row({ space: 6 }) {
+            Text('推理强度').layoutWeight(1).textAlign(TextAlign.Start).fontSize(uiFontSize(14))
+              .fontColor($r('app.color.text_primary'))
+            Text(this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option))).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+            SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(12).fontColor([$r('app.color.text_secondary')])
+          }.width('100%')
+        }.type(ButtonType.Normal).padding(0).height(44).width('100%')
           .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
           .enabled(option.efforts.length > 0)
           .onClick(() => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : composerModelKey(option); })
         if (this.modelEffortPickerKey === composerModelKey(option)) {
           ForEach(option.efforts, (level: string) => {
-            Button(level).height(44).width('100%').fontColor($r('app.color.text_primary'))
+            Button(this.effortOptionLabel(level, level)).height(44).width('100%').fontColor($r('app.color.text_primary'))
               .backgroundColor(Color.Transparent).accessibilitySelected(level === this.modelEffortForRow(option))
               .onClick(() => {
                 this.setModelRowEffortById(option, level)
@@ -8816,6 +8840,7 @@ export struct TaskPageContent {
         if (option.supportsFastMode) {
           Divider().color($r('app.color.border'))
           Row() {
+            SymbolGlyph($r('sys.symbol.bolt')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
             Text('快速模式').layoutWeight(1).fontColor($r('app.color.text_primary'))
             Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
               .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
@@ -8829,19 +8854,26 @@ export struct TaskPageContent {
           void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option),
             this.currentAgentTab()));
         })
+      Divider().color($r('app.color.border')).margin({ top: 4, bottom: 8 })
       Text('恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。').fontSize(uiFontSize(12))
         .fontColor($r('app.color.text_secondary'))
       }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
         .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
       Text('目前设定').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
       Column() {
+      Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.star')).fontSize(16).width(24).fontColor([$r('app.color.text_secondary')])
+      Column() {
       Button(modelFavoriteMutation(option, this.composerAgentKind(), this.modelEffortForRow(option), this.modelFastForRow(option),
         this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定')
         .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
         .enabled(this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId)
         .onClick(() => { void this.togglePickerFavorite(option); })
-      Text(this.modelEffortForRow(option) + (this.modelFastForRow(option) ? ' · Fast' : ''))
+      Text(modelAgentLabel(this.composerAgentKind()) + ' · ' + this.effortOptionLabel(this.modelEffortForRow(option), this.modelEffortForRow(option)) + (this.modelFastForRow(option) ? ' · Fast' : ''))
         .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+      }.alignItems(HorizontalAlign.Start)
+      }.width('100%')
+      Divider().color($r('app.color.border')).margin({ top: 8, bottom: 8 })
       Text('储存这组参数，方便下次从收藏清单直接使用。').fontSize(uiFontSize(12))
         .fontColor($r('app.color.text_secondary'))
       }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
@@ -8850,7 +8882,7 @@ export struct TaskPageContent {
   }
 
   @Builder
-  modelContextView() {
+  modelContextView(scrollEnabled: boolean = true) {
     Column() {
       if (this.pickerDetails === null) { this.pickerSearchHeader() }
       Scroll(this.modelPickerScroller) {
@@ -8859,17 +8891,9 @@ export struct TaskPageContent {
             this.pickerDetailsView(this.pickerDetails)
           } else {
           if (this.pickerAllProviders) { this.pickerPluginSections() }
-          if (this.pickerAllProviders && this.canSwitchSessionAgent() && !this.pickerModelSearch.trim()) {
-            Row({ space: 6 }) {
-              ForEach(MODEL_AGENT_KINDS, (kind: string) => {
-                Button(modelAgentLabel(kind)).height(44).fontSize(uiFontSize(12))
-                  .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
-                  .accessibilitySelected(this.modelAgentIsActive(kind)).enabled(!this.contextRpcBusy)
-                  .onClick(() => { void this.browseModelAgent(kind); })
-              }, (kind: string) => kind)
-            }.width('100%').padding({ left: 12, right: 12 })
-          }
-          if (this.pickerAllProviders && !this.pickerModelSearch.trim()) {
+          if (this.pickerAllProviders && !this.pickerModelSearch.trim()
+            && ((this.routingSnapshot.catalog?.routes.length ?? 0) + (this.routingSnapshot.catalog?.expandedRoutes.length ?? 0) > 0)) {
+          Column() {
           ModelRoutingPanel({
             snapshot: this.routingSnapshot,
             binding: this.routingSession.binding,
@@ -8883,6 +8907,7 @@ export struct TaskPageContent {
             onUnbind: (): void => { void this.stopRouting(); },
             onOrdinary: (): void => { void this.stopRouting(); },
           })
+          }.width('calc(100% - 24vp)').backgroundColor($r('app.color.bg_page')).borderRadius(12)
           }
           if (this.pendingAgentSwitchIntent !== null) {
             Row({ space: 9 }) {
@@ -8959,6 +8984,7 @@ export struct TaskPageContent {
       }
       .width('100%')
       .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
+      .enableScrollInteraction(scrollEnabled)
       .scrollBar(BarState.Auto)
       .onTouch((event: TouchEvent) => {
         if (event.type === TouchType.Down) this.modelPickerUserMoved = true;

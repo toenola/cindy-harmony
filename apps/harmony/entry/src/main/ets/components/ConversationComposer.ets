@@ -126,7 +126,20 @@ export struct ConversationComposer {
   }
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
-  @BuilderParam modelPopupContent: () => void = this.emptyPopupContent;
+  @BuilderParam modelPopupContent: (enabled: boolean) => void = this.emptyModelPickerContent;
+  @Builder
+  emptyModelPickerContent(_enabled: boolean) {}
+  @Prop modelPickerTitle: string = '';
+  modelPanelScroller: Scroller = new Scroller();
+  onModelPickerBack: () => void = () => {};
+  private commonPickerScroller: Scroller = new Scroller();
+  @State private fullPicker: boolean = false;
+  @State private pickerDragHeight: number = 0;
+  private pickerStartHeight: number = 0;
+  private pickerMeasuredHeight: number = 0;
+  private pickerDragAtTop: boolean = false;
+  private pickerCanResize: boolean = false;
+  @State private editorDragHeight: number = 0;
   @Prop @Watch('syncPicker') externalPickerTitle: string = '';
   @BuilderParam externalPickerContent: (title: string) => void = this.emptyExternalPickerContent;
   onExternalPickerDismiss: () => void = () => {};
@@ -149,7 +162,6 @@ export struct ConversationComposer {
     });
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
-  private resizeStartY: number = 0;
   private resizeStartHeight: number = 120;
 
   aboutToAppear(): void {
@@ -168,6 +180,9 @@ export struct ConversationComposer {
       this.getUIContext().animateTo({
         duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE, onFinish: (): void => {
           if (generation !== this.pickerGeneration) return;
+          this.fullPicker = false;
+          this.pickerMeasuredHeight = 0;
+          this.pickerDragHeight = 0;
           this.pickerPage = next;
           this.getUIContext().animateTo({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE },
             (): void => { this.pickerVisible = true; });
@@ -196,7 +211,7 @@ export struct ConversationComposer {
 
   private pickerTitle(): ResourceStr {
     if (this.pickerPage === 'permission') return $r('app.string.composer_picker_permission');
-    if (this.pickerPage === 'model') return $r('app.string.v138_models');
+    if (this.pickerPage === 'model') return this.modelPickerTitle || $r('app.string.v138_models');
     return this.pickerPage === 'agent' ? $r('app.string.v12_search_agent') : this.pickerPage;
   }
 
@@ -204,23 +219,50 @@ export struct ConversationComposer {
     return TransitionEffect.translate({ y: 40 }).combine(TransitionEffect.OPACITY);
   }
 
-  private resizeInput(event: TouchEvent): void {
-    if (event.type === TouchType.Cancel) {
-      this.resizing = false;
-      return;
-    }
-    if (event.changedTouches.length === 0) return;
-    const y = event.changedTouches[0].displayY;
-    if (event.type === TouchType.Down) {
-      this.resizeStartY = y;
-      this.resizeStartHeight = this.inputMaxHeight;
-      this.resizing = true;
-    } else if (event.type === TouchType.Move) {
-      // 向上拖高；跟手阶段不用缓动。
-      this.inputMaxHeight = Math.max(96, Math.min(280, this.resizeStartHeight + this.resizeStartY - y));
-    } else if (event.type === TouchType.Up) {
-      this.resizing = false;
-    }
+  private beginEditorDrag(): void {
+    this.resizeStartHeight = this.editorDragHeight || (this.expanded() ? 52 : 0);
+    this.resizing = true;
+  }
+
+  private updateEditorDrag(delta: number): void {
+    if (!this.resizing) return;
+    const target = this.resizeStartHeight - delta;
+    this.editorDragHeight = target > 24 ? Math.max(52, Math.min(this.pickerWindowHeight * 0.65, target)) : 0;
+  }
+
+  private endEditorDrag(cancelled: boolean): void {
+    this.resizing = false;
+    if (cancelled) this.editorDragHeight = this.resizeStartHeight > 52 ? this.resizeStartHeight : 0;
+    if (this.editorDragHeight <= 52) this.editorDragHeight = 0;
+  }
+
+  private pickerHeightLimit(): number {
+    const height = Math.max(160, this.pickerWindowHeight);
+    return this.pickerDragHeight || (this.fullPicker ? height : height * 0.5);
+  }
+
+  private beginPickerDrag(): void {
+    this.pickerStartHeight = this.pickerMeasuredHeight || this.pickerHeightLimit();
+    this.pickerCanResize = true;
+    const scroller = this.pickerPage === 'model' ? this.modelPanelScroller : this.commonPickerScroller;
+    this.pickerDragAtTop = (scroller.currentOffset()?.yOffset ?? 0) <= 1;
+  }
+
+  private updatePickerDrag(delta: number): void {
+    if (!this.pickerCanResize || (this.fullPicker && (!this.pickerDragAtTop || delta < 0))) return;
+    this.pickerDragHeight = Math.min(this.pickerWindowHeight, Math.max(72, this.pickerStartHeight - delta));
+  }
+
+  private endPickerDrag(delta: number, cancelled: boolean): void {
+    this.getUIContext().animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, (): void => {
+      if (!cancelled && this.pickerDragHeight > 0) {
+        if (delta < -30) this.fullPicker = true;
+        else if (delta > 30 && this.fullPicker) this.fullPicker = false;
+        else if (delta > 42) this.dismissPicker();
+      }
+      this.pickerDragHeight = 0;
+      this.pickerCanResize = false;
+    });
   }
 
   private hasModelChip(): boolean {
@@ -232,7 +274,7 @@ export struct ConversationComposer {
   }
 
   private expanded(): boolean {
-    return this.surfaceExpanded || this.focused
+    return this.surfaceExpanded || this.focused || this.editorDragHeight > 0
       || this.images.length > 0 || this.files.length > 0 || this.atoms.length > 0;
   }
 
@@ -516,24 +558,31 @@ export struct ConversationComposer {
   @Builder
   composerPickerPanel() {
     Column() {
-      Text(this.pickerTitle())
-        .fontSize(uiFontSize(14))
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-        .textAlign(TextAlign.Center)
-        .width('100%')
-        .height(44)
-        .gesture(PanGesture({ direction: PanDirection.Down }).onActionEnd((event: GestureEvent) => {
-          if (event.offsetY > 24) this.dismissPicker();
-        }))
+      Row() {
+        Row().width(36).height(4).borderRadius(UI_RADIUS_PILL).backgroundColor($r('app.color.text_tertiary'))
+      }.height(12).width('100%').justifyContent(FlexAlign.Center).accessibilityLevel('no')
+      Row() {
+        if (this.pickerPage === 'model' && this.modelPickerTitle) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(16).fontColor([$r('app.color.text_primary')])
+          }.type(ButtonType.Circle).width(44).height(44).backgroundColor(Color.Transparent)
+            .accessibilityText('返回模型').onClick(() => this.onModelPickerBack())
+        } else {
+          Blank().width(44)
+        }
+        Text(this.pickerTitle()).fontSize(uiFontSize(15)).fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_primary')).textAlign(TextAlign.Center).layoutWeight(1)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Blank().width(44)
+      }.width('100%').height(44)
       if (this.pickerPage === 'model') {
         Column() {
-          this.modelPopupContent()
+          this.modelPopupContent(this.fullPicker && this.pickerDragHeight === 0)
         }
         .width('100%')
-        .constraintSize({ maxHeight: Math.max(1, this.pickerWindowHeight * 0.5 - 44) })
+        .constraintSize({ maxHeight: Math.max(1, this.pickerHeightLimit() - 56) })
       } else {
-        Scroll() {
+        Scroll(this.commonPickerScroller) {
           Column() {
             if (this.pickerPage === 'permission') {
               this.permissionPopupContent()
@@ -545,11 +594,19 @@ export struct ConversationComposer {
           }.width('100%')
         }
         .width('100%')
-        .constraintSize({ maxHeight: Math.max(1, this.pickerWindowHeight * 0.5 - 44) })
+        .constraintSize({ maxHeight: Math.max(1, this.pickerHeightLimit() - 56) })
+        .enableScrollInteraction(this.fullPicker && this.pickerDragHeight === 0)
         .scrollBar(BarState.Off)
       }
     }
     .width('100%')
+    .height(this.fullPicker || this.pickerDragHeight > 0 ? this.pickerHeightLimit() : undefined)
+    .onAreaChange((_old: Area, next: Area) => { this.pickerMeasuredHeight = Number(next.height); })
+    .parallelGesture(PanGesture({ direction: PanDirection.Vertical })
+      .onActionStart(() => this.beginPickerDrag())
+      .onActionUpdate((event: GestureEvent) => this.updatePickerDrag(event.offsetY))
+      .onActionEnd((event: GestureEvent) => this.endPickerDrag(event.offsetY, false))
+      .onActionCancel(() => this.endPickerDrag(0, true)))
     .backgroundColor($r('app.color.bg_card'))
     .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
@@ -730,21 +787,14 @@ export struct ConversationComposer {
       // 当设备或嵌套详情栏无法合成 ImmersiveMaterial 时，输入区仍然保持可见。
       Stack({ alignContent: Alignment.TopStart }) {
         Column({ space: 6 }) {
-        if (this.images.length > 0) {
-          Row() {
-            Row()
-              .width(24)
-              .height(2)
-              .backgroundColor(this.resizing
-                ? $r('app.color.accent') : $r('app.color.border'))
-              .borderRadius(UI_RADIUS_PILL)
-          }
-          .width('100%')
-          // 保留 12vp 拖拽热区，仅收细可见光轨，避免视觉变轻后牺牲调高输入区的手感。
-          .height(12)
-          .justifyContent(FlexAlign.Center)
-          .onTouch((event: TouchEvent) => this.resizeInput(event))
-        }
+        Row() {
+          Row().width(36).height(4).borderRadius(UI_RADIUS_PILL).backgroundColor($r('app.color.text_tertiary'))
+        }.width('100%').height(14).justifyContent(FlexAlign.Center)
+          .gesture(PanGesture({ direction: PanDirection.Vertical })
+            .onActionStart(() => this.beginEditorDrag())
+            .onActionUpdate((event: GestureEvent) => this.updateEditorDrag(event.offsetY))
+            .onActionEnd(() => this.endEditorDrag(false))
+            .onActionCancel(() => this.endEditorDrag(true)))
         if (this.images.length > 0) {
           List({ space: 0 }) {
             ForEach(this.images, (image: ComposerImage) => {
@@ -804,7 +854,7 @@ export struct ConversationComposer {
                 .textAlign(TextAlign.Start)
                 .padding({ left: 8, right: 8, top: 6, bottom: 6 })
                 .width('100%')
-                .constraintSize({ minHeight: 52, maxHeight: this.inputMaxHeight })
+                .constraintSize({ minHeight: Math.max(52, this.editorDragHeight), maxHeight: Math.max(this.inputMaxHeight, this.editorDragHeight) })
                 .onAppear(() => this.focusInputAfterAppear())
                 .onFocus(() => this.onFocusChange(true))
                 .onBlur(() => this.onFocusChange(false))
