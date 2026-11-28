@@ -86,7 +86,10 @@ export struct UsageDashboardPanel {
         AppServices.instance.tasks.deviceList, this.scopeDeviceId, current);
       if (!current()) return;
       this.issue = result.issue;
-      if (result.snapshot !== null) { this.snapshot = result.snapshot; this.deviceName = result.deviceName; }
+      if (result.snapshot !== null) {
+        this.snapshot = result.snapshot; this.deviceName = result.deviceName;
+        void AppServices.instance.syncUsageCards(result.snapshot, result.deviceId, result.deviceName, epoch).catch((): void => {});
+      }
       this.now = Date.now();
     } catch (_error) {
       if (current()) this.issue = 'unavailable';

@@ -125,13 +125,16 @@ export function mergeMessageEditDraft(stored: ComposerDocument | null, stash: Co
   replacement: ComposerDocument | null): ComposerDocument {
   const kept = stored !== null && !sameDocument(stored, stash) ? stored : null;
   const nodes: ComposerNode[] = [];
+  const receipts: string[] = [];
   const parts: (ComposerDocument | null)[] = [replacement, kept, stash];
   for (const part of parts) {
-    if (part === null || !composerDocumentHasContent(part)) continue;
+    if (part === null) continue;
+    for (const receipt of part.incomingShareBatchIds) if (!receipts.includes(receipt)) receipts.push(receipt);
+    if (!composerDocumentHasContent(part)) continue;
     if (nodes.length > 0) nodes.push(textNode('\n\n'));
-    for (const node of part.nodes) nodes.push(node);
+    for (const node of part.nodes) nodes.push(JSON.parse(JSON.stringify(node)) as ComposerNode);
   }
   const merged = new ComposerDocument();
-  merged.nodes = nodes;
+  merged.nodes = nodes; merged.incomingShareBatchIds = receipts.slice(-256);
   return normalizeComposerDocument(merged);
 }

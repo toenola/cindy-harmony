@@ -1,4 +1,5 @@
 import { RemoteReadRetries } from '../messages/RemoteReadRetries';
+import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 /**
  * 交互确认 Store（Permission / Ask User / Plan Review）。
  *
@@ -381,7 +382,7 @@ export class InteractionStore {
       this.notify();
     } catch (e) {
       this.readRetries.schedule(scope, (): boolean => stateGeneration === this.stateGeneration
-        && this.activeTargets.has(scope) && client.getStatus() === 'online',
+        && this.activeTargets.has(scope) && client.getStatus(deviceId) === 'online',
         (): void => { void this.refreshPending(deviceId, sessionId); });
     }
   }
@@ -406,13 +407,50 @@ export class InteractionStore {
   }
 
   /** Relay 重连后只补拉当前打开任务的 pending interactions。 */
-  async resyncActiveSessions(): Promise<void> {
-    this.readRetries.clear();
+  async resyncActiveSessions(ownerOnly: boolean = false): Promise<void> {
+    if (!ownerOnly) this.readRetries.clear();
     const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInteractionTarget) => {
+      if (ownerOnly && invokePhysicalPeerId(target.deviceId) !== target.deviceId) return;
+      if (ownerOnly) this.readRetries.cancel(interactionScopeKey(target.deviceId, target.sessionId));
       pending.push(this.refreshPending(target.deviceId, target.sessionId));
     });
     await Promise.all(pending);
+  }
+
+  /** A revoked sharing scope cannot retain approval cards or late decision drafts. */
+  invalidateSession(deviceId: string, sessionId: string): void {
+    const scope = interactionScopeKey(deviceId, sessionId), prefix = scope + '\u0000';
+    this.bumpMutationGeneration(deviceId, sessionId);
+    this.refreshSequences.set(scope, ++this.nextRefreshSequence); this.readRetries.cancel(scope);
+    this.pendingByScope.delete(scope); this.protectedQuestions.delete(scope); this.activeTargets.delete(scope);
+    const requestKeys: Set<string> = new Set();
+    this.resolvingRequestIds.forEach((_value: number, key: string): void => { if (key.startsWith(prefix)) requestKeys.add(key); });
+    this.resolveErrors.forEach((_value: string, key: string): void => { if (key.startsWith(prefix)) requestKeys.add(key); });
+    this.askDrafts.forEach((_value: AskUserDraft, key: string): void => { if (key.startsWith(prefix)) requestKeys.add(key); });
+    this.planDrafts.forEach((_value: PlanReviewDraft, key: string): void => { if (key.startsWith(prefix)) requestKeys.add(key); });
+    this.issueDrafts.forEach((_value: IssueConfirmDraft, key: string): void => { if (key.startsWith(prefix)) requestKeys.add(key); });
+    for (const key of requestKeys) {
+      this.resolvingRequestIds.delete(key); this.resolveErrors.delete(key); this.askDrafts.delete(key);
+      this.planDrafts.delete(key); this.issueDrafts.delete(key); this.questionsInProgress.delete(key);
+    }
+    this.notify();
+  }
+
+  invalidateOwnerSessions(): void {
+    const targets: Map<string, ActiveInteractionTarget> = new Map();
+    this.activeTargets.forEach((target: ActiveInteractionTarget, scope: string): void => {
+      if (invokePhysicalPeerId(target.deviceId) === target.deviceId) targets.set(scope, target);
+    });
+    const sources: Map<string, PendingInteraction[]>[] = [this.pendingByScope, this.protectedQuestions];
+    for (const source of sources) source.forEach((items: PendingInteraction[], scope: string): void => {
+        for (const item of items) {
+          if (invokePhysicalPeerId(item.deviceId) !== item.deviceId) continue;
+          const target = new ActiveInteractionTarget(); target.deviceId = item.deviceId; target.sessionId = item.sessionId;
+          targets.set(scope, target); break;
+        }
+      });
+    targets.forEach((target: ActiveInteractionTarget): void => this.invalidateSession(target.deviceId, target.sessionId));
   }
 
   /** 登出/连接显式停止时清理账号级交互状态。 */

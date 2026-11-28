@@ -23,7 +23,8 @@ import {
 } from './DlProtocol';
 import { safeErrorMessage } from '../tasks/TaskModels';
 import { ConnectionAttemptState } from './ConnectionAttemptState';
-import { InvokeScheduler, isBackgroundInvoke, bypassInvokeScheduling } from './InvokeScheduler';
+import { resolveInvokeTimeoutMs } from './InvokePolicy';
+import { InvokeScheduler, isBackgroundInvoke, bypassInvokeScheduling, invokePhysicalPeerId } from './InvokeScheduler';
 
 export { DlError } from './DlProtocol';
 
@@ -104,6 +105,18 @@ export class DlOpenLinkOptions {
   capabilities: string[] = [];
 }
 
+/** Registered only by the authenticated shared-task composition root, never by message text. */
+export interface ScopedPeerPort {
+  current(): boolean;
+  identity(): string;
+  status(): string;
+  invoke(channel: string, args: Object[], timeoutMs: number, preSend?: () => void): Promise<Object | undefined>;
+  subscribe(topics: string[]): Promise<void>;
+  unsubscribe(topics: string[]): Promise<void>;
+  close(): void;
+  supportsHistoryView(): boolean;
+}
+
 /** 事件回调集合（host 注入）。 */
 export class DlEvents {
   /** 'stopped' | 'connecting' | 'online' */
@@ -171,6 +184,8 @@ export class DlClient {
   private peerEpochs: Map<string, number> = new Map();
 
   connectionIdentity(deviceId: string): string {
+    const scoped = this.scopedPeers.get(deviceId);
+    if (scoped !== undefined) return 'scoped:' + scoped.identity();
     return `${this.transportEpoch}:${this.peerEpochs.get(deviceId) ?? 0}`;
   }
 
@@ -188,8 +203,51 @@ export class DlClient {
   }
 
   private peerCapabilities: Map<string, string[]> = new Map();
+  private scopedPeers: Map<string, ScopedPeerPort> = new Map();
+
+  hasScopedPeers(): boolean { return this.scopedPeers.size > 0; }
+  hasScopedPeer(peer: string): boolean { return this.scopedPeers.get(peer)?.current() === true; }
+
+  registerScopedPeer(peer: string, port: ScopedPeerPort): void {
+    if (invokePhysicalPeerId(peer) === peer || !port.current()) throw new DlError('INVALID_SCOPE', 'invalid shared peer');
+    const previous = this.scopedPeers.get(peer);
+    if (previous !== undefined && previous !== port) previous.close();
+    this.invalidatePeer(peer);
+    this.scopedPeers.set(peer, port);
+  }
+
+  removeScopedPeer(peer: string): void {
+    const port = this.scopedPeers.get(peer);
+    this.scopedPeers.delete(peer);
+    this.invalidatePeer(peer);
+    port?.close();
+  }
+
+  clearScopedPeers(): void {
+    const peers: string[] = [];
+    this.scopedPeers.forEach((_port: ScopedPeerPort, peer: string): void => { peers.push(peer); });
+    for (const peer of peers) this.removeScopedPeer(peer);
+  }
+
+  private scopedPort(peer: string): ScopedPeerPort | undefined {
+    const port = this.scopedPeers.get(peer);
+    if (port !== undefined && !port.current()) throw new DlError('ACCESS_REVOKED', 'shared task access ended');
+    if (peer.length > 128 && port === undefined) throw new DlError('ACCESS_REVOKED', 'shared task access is not registered');
+    return port;
+  }
+
+  private scopedResponse(result: Object | undefined): Envelope {
+    const envelope = new Envelope();
+    envelope.kind = EnvelopeKind.INVOKE_RESULT;
+    const payload: Record<string, Object> = { 'ok': true };
+    if (result !== undefined) payload['result'] = result;
+    envelope.payload = payload;
+    return envelope;
+  }
 
   supportsHistoryView(deviceId: string): boolean {
+    const port = this.scopedPeers.get(deviceId);
+    if (port !== undefined) return port.current() && port.supportsHistoryView();
     return (this.peerCapabilities.get(deviceId) ?? []).indexOf('history-view-v1') >= 0;
   }
   private stopped = true;
@@ -216,7 +274,11 @@ export class DlClient {
     this.opts = opts;
   }
 
-  getStatus(): string {
+  getStatus(deviceId: string = ''): string {
+    if (deviceId.length > 128) {
+      const port = this.scopedPeers.get(deviceId);
+      return port !== undefined && port.current() ? port.status() : 'stopped';
+    }
     return this.status;
   }
 
@@ -414,6 +476,12 @@ export class DlClient {
       hilog.warn(DOMAIN, TAG, 'drop invalid frame');
       return;
     }
+    // Canonical scoped peers are local registry keys, never identities supplied by a wire.
+    // Private guest sockets validate their scope and restore physical addresses before this point.
+    if (env.src.length > 128 || env.dst.length > 128) {
+      hilog.warn(DOMAIN, TAG, 'drop non-physical wire identity');
+      return;
+    }
     switch (env.kind) {
       case EnvelopeKind.HELLO_ACK:
         this.handleHelloAck(env);
@@ -453,6 +521,11 @@ export class DlClient {
     if (ack.serverProtocolVersion !== PROTOCOL_VERSION) {
       hilog.error(DOMAIN, TAG, 'protocol version mismatch server=%{public}d client=%{public}d',
         ack.serverProtocolVersion, PROTOCOL_VERSION);
+      this.ws?.terminate();
+      return;
+    }
+    if (ack.deviceId.length === 0 || ack.deviceId.length > 128) {
+      hilog.warn(DOMAIN, TAG, 'drop non-physical hello identity');
       this.ws?.terminate();
       return;
     }
@@ -499,7 +572,7 @@ export class DlClient {
     snap.lastSeenAt = this.readNum(p, 'lastSeenAt', 0);
     snap.remoteControlEnabled = this.readBool(p, 'remoteControlEnabled', false);
     snap.busy = this.readBool(p, 'busy', false);
-    if (snap.deviceId.length === 0) return;
+    if (snap.deviceId.length === 0 || snap.deviceId.length > 128) return;
     this.opts.events.onPresence(snap);
   }
 
@@ -556,9 +629,27 @@ export class DlClient {
 
   /** 向目标设备发 invoke，返回原始响应帧（调用方解析 invoke-result payload）。 */
   async invoke(deviceId: string, options: DlInvokeOptions): Promise<Envelope> {
-    const timeout = options.timeoutMs !== undefined && options.timeoutMs > 0
-      ? options.timeoutMs
-      : REQUEST_TIMEOUT_MS;
+    const timeout = resolveInvokeTimeoutMs(options.channel, options.timeoutMs);
+    const scoped = this.scopedPort(deviceId);
+    if (scoped !== undefined) {
+      const identity = scoped.identity();
+      const send = async (): Promise<Envelope> => {
+        if (this.scopedPort(deviceId) !== scoped || identity !== scoped.identity()) {
+          throw new DlError('ACCESS_REVOKED', 'shared task identity changed');
+        }
+        const preSend = (): void => {
+          if (this.scopedPort(deviceId) !== scoped || identity !== scoped.identity()) throw new DlError('ACCESS_REVOKED', 'shared task identity changed');
+          options.preSend?.();
+        };
+        preSend();
+        const result = await scoped.invoke(options.channel, options.args, timeout, preSend);
+        if (this.scopedPort(deviceId) !== scoped || identity !== scoped.identity()) {
+          throw new DlError('ACCESS_REVOKED', 'shared task identity changed');
+        }
+        return this.scopedResponse(result);
+      };
+      return this.invokeScheduler.run<Envelope>(deviceId, isBackgroundInvoke(options.channel), Math.min(timeout, 30_000), send);
+    }
     const lifecycle = this.lifecycleEpoch;
     const account = this.userId;
     options.preSend?.();
@@ -588,6 +679,8 @@ export class DlClient {
 
   /** 建立控制链路（link-open → 等 link-accept）。 */
   openLink(deviceId: string, options: DlOpenLinkOptions): Promise<Envelope> {
+    const scoped = this.scopedPort(deviceId);
+    if (scoped !== undefined) return Promise.resolve(this.scopedResponse(undefined));
     const payload = new LinkOpenPayload();
     payload.controllerName = options.controllerName;
     payload.protocolVersion = PROTOCOL_VERSION;
@@ -599,6 +692,7 @@ export class DlClient {
 
   /** 显式关闭控制链路。 */
   closeLink(deviceId: string, reason: string): void {
+    if (deviceId.length > 128) { this.removeScopedPeer(deviceId); return; }
     this.invalidatePeer(deviceId);
     const close = new LinkClosePayload();
     close.reason = reason;
@@ -611,6 +705,13 @@ export class DlClient {
 
   /** 订阅推送 topic（device-link:subscribe 控制帧）。 */
   async subscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
+    const scoped = this.scopedPort(deviceId);
+    if (scoped !== undefined) {
+      const identity = scoped.identity();
+      await scoped.subscribe(topics);
+      if (this.scopedPort(deviceId) !== scoped || identity !== scoped.identity()) throw new DlError('ACCESS_REVOKED', 'shared task identity changed');
+      return this.scopedResponse(undefined);
+    }
     const arg = new SubscribeArgs();
     arg.topics = topics;
     arg.controllerName = this.opts.getHello().deviceName;
@@ -627,6 +728,11 @@ export class DlClient {
 
   /** 注销推送 topic。 */
   async unsubscribe(deviceId: string, topics: string[], timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Envelope> {
+    const scoped = this.scopedPort(deviceId);
+    if (scoped !== undefined) {
+      await scoped.unsubscribe(topics);
+      return this.scopedResponse(undefined);
+    }
     const arg = new SubscribeArgs();
     arg.topics = topics;
     const args: Object[] = [arg];
@@ -737,7 +843,7 @@ export class DlClient {
   }
 
   private failAllPending(err: DlError): void {
-    this.invokeScheduler.clear(err);
+    this.invokeScheduler.clearPhysical(err);
     this.pending.forEach((req: PendingRequest, id: string) => {
       this.clearTimer(req.timer);
       req.reject(new DlError(err.code, err.message, err.inFlight || req.inFlight));

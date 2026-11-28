@@ -1,3 +1,5 @@
+import { scopedAttachments, rememberScopedUpload, deleteScopedUpload } from './ScopedAttachmentRoutes';
+import { requiresScopedMediaCleanup } from '../shared-tasks/SharedTaskMediaKey';
 import { RelayRoute } from '../device-link/RelayRoute';
 /**
  * 附件上传（ArkTS 移植 mobileAttachmentUpload.ts 语义）。
@@ -13,7 +15,7 @@ import {
   AttachmentPresignResult, ImageAttachmentCandidate, RemoteImageRef,
   RemoteSerializedAttachment, MAX_ATTACHMENT_BYTES,
 } from './AttachmentModels';
-import { AttachmentOssRef, buildAttachmentOssRef } from './AttachmentOssRef';
+import { AttachmentOssRef, buildAttachmentOssRef, parseAttachmentOssRef } from './AttachmentOssRef';
 import { preprocessImage, readFileBytes } from './ImagePreprocess';
 
 export class AttachmentUploadError extends Error {
@@ -190,6 +192,7 @@ export async function deleteUpload(
   ossKey: string,
   token: string,
 ): Promise<void> {
+  if (requiresScopedMediaCleanup(ossKey)) return deleteScopedUpload(ossKey);
   if (ossKey.startsWith('agent-net-v3/')) {
     const socket = RelayRoute.instance.socket;
     if (!socket) throw new AttachmentUploadError('AGENT_NET_NOT_CONNECTED');
@@ -234,6 +237,16 @@ export async function uploadImage(
   token: string,
   deviceId: string = '',
 ): Promise<RemoteImageRef> {
+  const scoped = scopedAttachments(deviceId);
+  if (scoped !== null) {
+    const value = await scoped.upload(candidate.uri, candidate.name, candidate.mimeType);
+    if (!scoped.current()) throw new AttachmentUploadError('ACCESS_REVOKED');
+    const parsed = parseAttachmentOssRef(value);
+    if (!parsed) throw new AttachmentUploadError('SHARED_TASK_MEDIA_INVALID');
+    rememberScopedUpload(deviceId, parsed.ossKey);
+    const ref = new RemoteImageRef(); ref.url = value; ref.originalName = parsed.originalName;
+    ref.mimeType = parsed.mimeType; ref.size = parsed.size; ref.sha256 = parsed.sha256; return ref;
+  }
   const generation = RelayRoute.instance.generation;
   if (candidate.size > MAX_ATTACHMENT_BYTES) {
     throw new AttachmentUploadError('图片超过大小限制');
@@ -342,6 +355,18 @@ export async function uploadDocument(
   token: string,
   deviceId: string = '',
 ): Promise<RemoteSerializedAttachment> {
+  const scoped = scopedAttachments(deviceId);
+  if (scoped !== null) {
+    const value = await scoped.upload(uri, name, attachmentMimeType(name, attachmentCategoryForName(name)));
+    if (!scoped.current()) throw new AttachmentUploadError('ACCESS_REVOKED');
+    const parsed = parseAttachmentOssRef(value);
+    if (!parsed) throw new AttachmentUploadError('SHARED_TASK_MEDIA_INVALID');
+    const ref = new RemoteSerializedAttachment(); ref.id = 'shared-upload:' + parsed.ossKey;
+    rememberScopedUpload(deviceId, parsed.ossKey);
+    ref.path = value; ref.name = name; ref.originalName = name; ref.mimeType = parsed.mimeType;
+    ref.ext = uploadExtForName(name); ref.category = attachmentCategoryForName(name);
+    ref.size = parsed.size; ref.sha256 = parsed.sha256; return ref;
+  }
   const generation = RelayRoute.instance.generation;
   const category = attachmentCategoryForName(name);
   if (category.length === 0) throw new AttachmentUploadError('不支持这种文件类型');

@@ -1,3 +1,4 @@
+import { restoreIncomingNewSessionDraft } from '../core/incoming-share/IncomingNewSessionDrafts';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { MODEL_SPEED_ULTRAFAST, fastModeWireValue, ultrafastRestorable } from '../core/tasks/ModelSpeed';
 import { providerCatalogUnavailable } from '../core/ComposerCatalog';
@@ -30,7 +31,15 @@ import {
   photoAccessHelper, PhotoPickerComponent, PickerController, PickerOptions,
   SelectMode, PickerOrientation, SingleLineConfig, DataType,
 } from '@kit.MediaLibraryKit';
+import { IncomingComposerPagePort } from '../core/IncomingComposerPagePort';
+import { IncomingShareDestination } from '../core/incoming-share/IncomingShareStore';
+import { IncomingComposerDelivery, IncomingComposerFile, incomingComposerReceipts } from '../core/incoming-share/IncomingComposerDraftBridge';
+import { ModelRoute, ModelRouteRow, buildModelRoutingNote } from '../core/model-routing/ModelRoutingModels';
+import { routedCreationRuntime } from '../core/model-routing/ModelRoutingCreation';
 import { AppServices } from '../core/AppServices';
+import { ModelRoutingContext, ModelRoutingSnapshot, ModelRoutingTicket } from '../core/model-routing/ModelRoutingStore';
+import { ModelRoutingPanel } from '../components/model-routing/ModelRoutingPanel';
+import { modelRoutingLabels } from '../components/ModelRoutingCopy';
 import { remoteModelPreferenceKey } from '../core/tasks/RemoteModelPreferenceStore';
 import {
   ComposerChoiceOption as RuntimeChoiceOption,
@@ -70,7 +79,7 @@ import { DlInvokeOptions } from '../core/device-link/DlClient';
 import { ModelPickerQuota, modelQuotaKey, modelQuotaLine, readModelPickerQuotas } from '../core/messages/ModelPickerQuota';
 import { DlChannels, PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { unwrapInvokeResult } from '../core/tasks/TaskStore';
-import { RemoteSession, readBool, readObj, readStr, sessionProjectDirectory } from '../core/tasks/TaskModels';
+import { RemoteSession, readBool, readObj, readStr, recordOrEmpty, sessionProjectDirectory } from '../core/tasks/TaskModels';
 import { normalizeTaskProjectPath } from '../core/tasks/TaskProjectOrderStore';
 import {
   NewSessionDirectoryDrive,
@@ -97,9 +106,11 @@ import {
 } from '../components/ComposerModelOptionRow';
 import {
   ComposerDocument,
-  SerializedComposerDocument,
+  serializeComposerDocument,
   composerDocumentProjectedText,
-  textComposerDocument,
+  composerDocumentToStorage,
+  reconcileComposerProjectedText,
+  emptyComposerDocument,
 } from '../core/messages/ComposerDocument';
 import {
   UI_CLICK_EFFECT,
@@ -192,10 +203,22 @@ export struct NewSessionPageContent {
   @State devices: PresenceSnapshot[] = [];
   @State projectAliasRevision: number = 0;
   @State selectedDeviceId: string = '';
+  @State private selectedRouteId: string = '';
+  @State private selectedRouteDevice: string = '';
+  @State private routingSnapshot: ModelRoutingSnapshot = new ModelRoutingSnapshot();
   @State selectedAgentKind: NewAgentKind = 'claude-code';
   @State workspaceKind: WorkspaceKind = 'dialogue';
   @State workingDir: string = '';
   @State input: string = '';
+  private newSessionDocument: ComposerDocument = new ComposerDocument();
+  private newSessionDraftDevice: string = '';
+  private newSessionDraftOwner: string = '';
+  @State private incomingBusy: boolean = false;
+  @State private incomingBlocked: boolean = false;
+  @State private incomingRestored: boolean = false;
+  private incomingGeneration: number = 0;
+  private incomingDelivery: IncomingComposerDelivery | null = null;
+  private incomingConsumedKey: string = '';
   @State composerFocused: boolean = false;
   /** 模型选择等临时清焦期间仍保留与任务详情一致的完整输入卡片。 */
   @State composerSurfaceVisible: boolean = false;
@@ -310,7 +333,20 @@ export struct NewSessionPageContent {
   private newSessionInputRevision: number = 0;
   private newSessionDraftCheckpointTimer: number = -1;
   aboutToAppear(): void {
+    this.unsubs.push(AppServices.instance.modelRouting.onChanged((): void => {
+      this.routingSnapshot = AppServices.instance.modelRouting.snapshot(this.selectedDeviceId);
+    }));
     this.pageActive = true;
+    this.incomingRestored = false;
+    this.newSessionDocument = emptyComposerDocument(); this.input = '';
+    this.newSessionDraftDevice = '';
+    this.newSessionDraftOwner = AppServices.instance.usageCardOwner;
+    this.incomingGeneration++;
+    this.incomingConsumedKey = '';
+    this.incomingDelivery = null;
+    this.incomingBlocked = false;
+    const incoming = AppServices.instance.incomingComposer;
+    if (incoming !== null) this.unsubs.push(incoming.onChanged((): void => { void this.consumeIncomingDraft(); }));
     // 页面实例可能被展开屏导航复用；上一轮已交接的附件不属于新草稿。
     this.attachmentsHandedOff = false;
     this.attachmentsDisposed = false;
@@ -349,8 +385,7 @@ export struct NewSessionPageContent {
         this.error = `有 ${missingAttachments} 个附件因数量上限未恢复`;
       }
       this.resolveEditDraftImagePreviews();
-    } else {
-      this.restoreNewSessionDraft();
+      this.incomingRestored = true;
     }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
@@ -360,17 +395,24 @@ export struct NewSessionPageContent {
       this.projectAliasRevision += 1;
     }));
     this.unsubs.push(AppServices.instance.auth.onChanged(() => {
+      this.incomingGeneration++; this.incomingConsumedKey = ''; this.incomingDelivery = null;
+      void this.consumeIncomingDraft();
       if (this.runtimeCatalogScope !== this.currentRuntimeScope()) {
         void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
       }
     }));
     this.refreshDevices();
+    if (editDraft === null) {
+      void this.restoreNewSessionDraft().catch((): void => { this.error = harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed'); });
+    }
     void this.restoreWorkspacePreference();
     this.applyPendingEditRuntime(this.routeDeviceId, this.selectedAgentKind, false);
+    if (this.incomingRestored) void this.consumeIncomingDraft();
   }
 
   aboutToDisappear(): void {
     this.pageActive = false;
+    this.incomingGeneration++;
     this.cancelImagePicking();
     this.fileQueue.cancelPicking();
     this.getUIContext().getFocusController().clearFocus();
@@ -381,7 +423,7 @@ export struct NewSessionPageContent {
     this.restoreComposerFocusOnSheetDisappear = false;
     this.newSessionDraftGeneration += 1;
     this.cancelNewSessionDraftCheckpoint();
-    void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
+    void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice).catch(() => {});
     this.runtimeLoadGeneration += 1;
     this.browseGeneration += 1;
     this.browseLoading = false;
@@ -400,25 +442,153 @@ export struct NewSessionPageContent {
     this.pickingImages = false;
   }
 
-  private restoreNewSessionDraft(): void {
-    const generation = ++this.newSessionDraftGeneration;
-    const inputRevision = this.newSessionInputRevision;
-    void AppServices.instance.composerDrafts.read(NEW_SESSION_COMPOSER_DRAFT_ID)
-      .then((document: ComposerDocument | null) => {
-        if (!this.pageActive || generation !== this.newSessionDraftGeneration
-          || inputRevision !== this.newSessionInputRevision || document === null) return;
-        this.input = composerDocumentProjectedText(document);
-      });
+  private async restoreNewSessionDraft(): Promise<void> {
+    const candidate = this.routeDeviceId || this.selectedDeviceId;
+    const owner = AppServices.instance.usageCardOwner;
+    this.newSessionDraftOwner = owner;
+    const incoming = AppServices.instance.incomingComposer;
+    const hasPending = incoming !== null && incoming.pendingTargets().some((pending: IncomingShareDestination): boolean =>
+      pending.ownerKey === owner && pending.deviceId === candidate && pending.sessionId === '');
+    const generation = ++this.newSessionDraftGeneration, inputRevision = this.newSessionInputRevision;
+    const isCurrent = (): boolean => this.pageActive && generation === this.newSessionDraftGeneration
+      && inputRevision === this.newSessionInputRevision && owner === AppServices.instance.usageCardOwner;
+    try {
+      const restored = await restoreIncomingNewSessionDraft(AppServices.instance.composerDrafts,
+        NEW_SESSION_COMPOSER_DRAFT_ID, candidate, hasPending, isCurrent);
+      if (!isCurrent()) return;
+      this.newSessionDraftDevice = restored.deviceId;
+      if (restored.document !== null) { this.newSessionDocument = restored.document; this.input = composerDocumentProjectedText(restored.document); }
+      this.incomingRestored = true; void this.consumeIncomingDraft();
+    } catch {
+      if (isCurrent()) {
+        this.incomingRestored = false; this.incomingBlocked = true;
+        this.error = harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed');
+      }
+    }
   }
 
   private applyNewSessionInput(value: string): void {
-    this.input = value;
-    this.newSessionInputRevision += 1;
-    AppServices.instance.composerDrafts.save(
-      NEW_SESSION_COMPOSER_DRAFT_ID,
-      textComposerDocument(value),
-    );
+    this.newSessionDocument = reconcileComposerProjectedText(this.newSessionDocument, value);
+    this.input = composerDocumentProjectedText(this.newSessionDocument);
+    this.newSessionInputRevision++;
+    AppServices.instance.composerDrafts.save(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDocument, this.newSessionDraftDevice);
     this.scheduleNewSessionDraftCheckpoint();
+  }
+
+  private incomingTarget(): IncomingShareDestination {
+    const target = new IncomingShareDestination(); target.ownerKey = AppServices.instance.usageCardOwner;
+    target.deviceId = this.selectedDeviceId; target.sessionId = ''; return target;
+  }
+  private incomingUriSet(): string[] {
+    return this.composerImages.map((image: ComposerImage): string => image.uri)
+      .concat(this.fileQueue.files.map((file: ComposerFile): string => file.uri));
+  }
+  private incomingDraftMatchesTarget(): boolean {
+    return incomingComposerReceipts(this.newSessionDocument).length === 0
+      || (this.newSessionDraftDevice === this.selectedDeviceId && this.newSessionDraftOwner === AppServices.instance.usageCardOwner);
+  }
+  private async consumeIncomingDraft(): Promise<void> {
+    const bridge = AppServices.instance.incomingComposer;
+    if (bridge === null || !this.pageActive || !this.incomingRestored || this.incomingBusy || this.creating
+      || !this.selectedDeviceId || !AppServices.instance.usageCardOwner) return;
+    const target = this.incomingTarget();
+    const committed = bridge.committedInputs(target, incomingComposerReceipts(this.newSessionDocument));
+    if (!bridge.pendingTargets().some((pending: IncomingShareDestination): boolean => pending.ownerKey === target.ownerKey
+      && pending.deviceId === target.deviceId && pending.sessionId === '') && committed.length === 0) return;
+    const generation = this.incomingGeneration, ownerEpoch = AppServices.instance.auth.sessionEpoch;
+    const isCurrent = (): boolean => this.pageActive && generation === this.incomingGeneration
+      && target.ownerKey === AppServices.instance.usageCardOwner && target.deviceId === this.selectedDeviceId
+      && ownerEpoch === AppServices.instance.auth.sessionEpoch;
+    this.incomingBusy = true;
+    try {
+      if (committed.length > 0) {
+        // Ownership was already durable before the crash. An absent/pruned outbox is not
+        // permission to send again; the existing session/input recovery remains authoritative.
+        const recovered = committed[0];
+        if (!recovered.sessionId) throw new Error('INCOMING_COMPOSER_INPUT_UNRESOLVED');
+        if (!recovered.documentStorage || recovered.documentStorage !== composerDocumentToStorage(this.newSessionDocument)) {
+          this.incomingBlocked = true;
+          this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_delivery_unknown'); return;
+        }
+        AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice);
+        this.newSessionDocument = emptyComposerDocument(); this.input = '';
+        this.onSessionStarted(target.deviceId, recovered.sessionId); return;
+      }
+      for (const pending of bridge.pendingInputs(target)) {
+        if (!pending.sessionId) { this.incomingBlocked = true; this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_delivery_unknown'); return; }
+        if (AppServices.instance.inputQueue.hasPersistedDocument(target.deviceId, pending.sessionId, pending.clientId)) {
+          await bridge.reconcileInput(target, pending.clientId, 'owned');
+          if (!isCurrent()) return;
+          if (incomingComposerReceipts(this.newSessionDocument).some((id: string): boolean => pending.batchIds.includes(id))) {
+            const owned = bridge.committedInputs(target, incomingComposerReceipts(this.newSessionDocument))
+              .find((input): boolean => input.clientId === pending.clientId);
+            if (!owned || !owned.documentStorage || owned.documentStorage !== composerDocumentToStorage(this.newSessionDocument)) {
+              this.incomingBlocked = true;
+              this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_delivery_unknown'); return;
+            }
+            AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice);
+            this.newSessionDocument = emptyComposerDocument(); this.input = '';
+          }
+          this.onSessionStarted(target.deviceId, pending.sessionId); return;
+        }
+        // This new-task pipeline never dispatches before the owned ledger transition.
+        // A still-queued bridge entry plus no exact reserved record is proven pre-dispatch absence.
+        await bridge.reconcileInput(target, pending.clientId, 'absent');
+        if (!isCurrent()) return;
+      }
+      this.incomingBlocked = false;
+      if (this.newSessionDraftDevice !== target.deviceId) {
+        if (!this.incomingDraftMatchesTarget()) throw new Error('INCOMING_COMPOSER_TARGET_MISMATCH');
+        this.newSessionDraftDevice = target.deviceId;
+        this.newSessionDraftOwner = target.ownerKey;
+        AppServices.instance.composerDrafts.save(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDocument, this.newSessionDraftDevice);
+        await AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice);
+        if (!isCurrent()) return;
+      }
+      const port = new IncomingComposerPagePort(
+        async (_target: IncomingShareDestination): Promise<ComposerDocument> => {
+          if (!isCurrent()) throw new Error('INCOMING_COMPOSER_STALE'); return this.newSessionDocument;
+        },
+        async (_target: IncomingShareDestination, expected: string, document: ComposerDocument): Promise<boolean> => {
+          if (!isCurrent() || composerDocumentToStorage(this.newSessionDocument) !== expected) return false;
+          this.newSessionDocument = document; this.input = composerDocumentProjectedText(document); this.newSessionInputRevision++;
+          AppServices.instance.composerDrafts.save(NEW_SESSION_COMPOSER_DRAFT_ID, document, this.newSessionDraftDevice);
+          await AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice);
+          if (!isCurrent()) throw new Error('INCOMING_COMPOSER_STALE'); return true;
+        });
+      const delivery = await bridge.consume(target, port);
+      if (!isCurrent()) return;
+      const key = JSON.stringify([target.ownerKey, target.deviceId, delivery.batchIds]);
+      if (key === this.incomingConsumedKey) { this.incomingBlocked = false; return; }
+      this.incomingDelivery = delivery;
+      const existing = this.incomingUriSet(), missing = delivery.files.filter((file: IncomingComposerFile): boolean => !existing.includes(file.uri));
+      if (missing.length > this.remainingImageSlots()) throw new Error('INCOMING_COMPOSER_QUEUE_FULL');
+      for (const file of missing) {
+        if (file.mime.startsWith('image/')) {
+          const image = new ComposerImage(); image.uri = file.uri; image.name = file.name;
+          this.composerImages = this.composerImages.concat([image]); this.startComposerImageUpload(image, this.composerImages.length - 1, true);
+        } else this.fileQueue.enqueue([file.uri]);
+      }
+      bridge.ack(delivery, this.incomingUriSet()); this.incomingConsumedKey = key; this.incomingBlocked = false;
+      this.composerSurfaceVisible = true;
+    } catch (_error) {
+      if (isCurrent()) { this.incomingBlocked = true; this.error = harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed'); }
+    } finally {
+      this.incomingBusy = false;
+      if (this.pageActive && generation !== this.incomingGeneration) void this.consumeIncomingDraft();
+    }
+  }
+
+  private forgetIncomingFile(uri: string): boolean {
+    const bridge = AppServices.instance.incomingComposer, delivery = this.incomingDelivery;
+    const file = delivery?.files.find((file: IncomingComposerFile): boolean => file.uri === uri);
+    if (bridge === null || delivery === null || !file) return true;
+    try {
+      void bridge.removeFile(delivery.target, file.id); return true;
+    } catch {
+      if (this.pageActive) this.error = harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed');
+      return false;
+    }
   }
 
   /** trailing debounce 之外再做固定间隔检查点，持续输入时也不会一直没有落盘版本。 */
@@ -427,7 +597,7 @@ export struct NewSessionPageContent {
     this.newSessionDraftCheckpointTimer = setTimeout(() => {
       this.newSessionDraftCheckpointTimer = -1;
       if (!this.pageActive) return;
-      void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID).catch(() => {});
+      void AppServices.instance.composerDrafts.flush(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice).catch(() => {});
     }, NEW_SESSION_DRAFT_CHECKPOINT_MS);
   }
 
@@ -533,10 +703,16 @@ export struct NewSessionPageContent {
     this.devices = AppServices.instance.tasks.deviceList;
     this.taskRevision += 1;
     let nextDeviceId = this.selectedDeviceId;
+    if (this.routeDeviceId && AppServices.instance.incomingComposer?.pendingTargets().some((target: IncomingShareDestination): boolean =>
+      target.ownerKey === AppServices.instance.usageCardOwner && target.deviceId === this.routeDeviceId && target.sessionId === '') === true) {
+      nextDeviceId = this.routeDeviceId;
+    }
     if (nextDeviceId.length === 0 && this.routeDeviceId.length > 0) {
       nextDeviceId = this.routeDeviceId;
     }
-    if (!this.canCreateOnDevice(nextDeviceId)) {
+    const incomingPinned = AppServices.instance.incomingComposer?.pendingTargets().some((target: IncomingShareDestination): boolean =>
+      target.ownerKey === AppServices.instance.usageCardOwner && target.deviceId === nextDeviceId && target.sessionId === '') === true;
+    if (!this.canCreateOnDevice(nextDeviceId) && !incomingPinned) {
       nextDeviceId = '';
       for (let i = 0; i < this.devices.length; i++) {
         if (this.canCreateOnDevice(this.devices[i].deviceId)) {
@@ -547,6 +723,7 @@ export struct NewSessionPageContent {
     }
     if (nextDeviceId !== this.selectedDeviceId) {
       this.selectedDeviceId = nextDeviceId;
+      this.incomingGeneration++; this.incomingConsumedKey = ''; this.incomingDelivery = null;
       if (this.pendingEditDraft === null && !this.preserveWorkspaceDraft) {
         const preferences = AppServices.instance.newSessionPreferences.read();
         if (preferences.workspaceKind.length > 0) {
@@ -561,6 +738,8 @@ export struct NewSessionPageContent {
         }
       }
       void this.loadRuntimeDefaults(nextDeviceId, this.selectedAgentKind);
+      void this.loadRouting();
+      void this.consumeIncomingDraft();
     } else if (nextDeviceId.length > 0
       && !this.composerToolbarReady && !this.runtimeToolbarLoadActive) {
       // 返回栈可能复用页面实例；离页时已失效旧请求，再进入后需要为同一设备重新加载。
@@ -644,6 +823,8 @@ export struct NewSessionPageContent {
     const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
     const nextFastMode = this.modelFastForRow(option);
     const nextFastTier = this.modelFastTierForRow(option);
+    this.selectedRouteId = '';
+    this.selectedRouteDevice = '';
     this.model = option.id;
     this.providerId = option.providerId;
     this.agentDeviceId = option.agentDeviceId;
@@ -699,9 +880,21 @@ export struct NewSessionPageContent {
     this.showHiddenDirectories = false;
   }
 
+  private async loadRouting(force: boolean = false): Promise<void> {
+    const device = this.selectedDeviceId;
+    const store = AppServices.instance.modelRouting;
+    this.routingSnapshot = store.snapshot(device);
+    try {
+      const snapshot = await store.load(device, force);
+      if (this.pageActive && this.selectedDeviceId === device) this.routingSnapshot = snapshot;
+    } catch (_error) {
+      if (this.pageActive && this.selectedDeviceId === device) this.routingSnapshot = store.snapshot(device);
+    }
+  }
+
   /** Composer 的上下文 Sheet 与详情页同层级：图片、计划和运行时设置都从这里进入。 */
   private openContextSheet(page: string = 'main'): void {
-    if (this.creating || this.pickingImages || this.pickingFiles) return;
+    if (this.creating || this.incomingBusy || this.incomingBlocked || this.pickingImages || this.pickingFiles) return;
     this.contextSheetPage = page;
     this.contextSelectedUris = [];
     try {
@@ -709,7 +902,10 @@ export struct NewSessionPageContent {
     } catch (e) {
       // Picker 尚未挂载时无需清理；下一次打开仍从空选择开始。
     }
-    if (page === 'model') this.composerSurfaceVisible = true;
+    if (page === 'model') {
+      this.composerSurfaceVisible = true;
+      void this.loadRouting();
+    }
     if (page === 'model') {
       this.modelPickerPositionPending = true;
       this.modelPickerUserMoved = false;
@@ -725,6 +921,7 @@ export struct NewSessionPageContent {
   private openComposerControlPopup(page: string): void {
     if (this.creating || this.pickingImages || this.pickingFiles) return;
     this.contextSheetPage = page;
+    if (page === 'model') void this.loadRouting();
     this.composerBlurGeneration += 1;
     this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
@@ -1090,9 +1287,10 @@ export struct NewSessionPageContent {
   }
 
   private removeComposerImage(localId: string): void {
-    if (this.creating) return;
+    if (this.creating || this.incomingBusy) return;
     const image = this.composerImages.find((item: ComposerImage) => item.localId === localId);
     if (image === undefined) return;
+    if (!this.forgetIncomingFile(image.uri)) return;
     image.uploadRevision += 1;
     image.removed = true;
     this.composerImages = this.composerImages.filter(
@@ -1144,10 +1342,11 @@ export struct NewSessionPageContent {
   }
 
   private canSend(): boolean {
-    if (this.creating || this.pickingImages || this.pickingFiles) return false;
-    if (this.runtimeCatalogScope !== this.currentRuntimeScope()
-      || !newSessionRuntimeCanCreate(this.runtimeDefaultsSettled, this.runtimeCatalogReady,
-        this.selectedAgentKind, this.currentRuntimeChoice(), this.modelVisibilityOverrides)) return false;
+    if (this.creating || !this.incomingRestored || this.incomingBusy || this.incomingBlocked || !this.incomingDraftMatchesTarget() || this.pickingImages || this.pickingFiles) return false;
+    const routeChosen = this.selectedRouteId.length > 0 && this.selectedRouteDevice === this.selectedDeviceId;
+    if (!this.canCreateOnDevice(this.selectedDeviceId) || this.runtimeCatalogScope !== this.currentRuntimeScope()
+      || !this.runtimeDefaultsSettled || (!routeChosen && !newSessionRuntimeCanCreate(this.runtimeDefaultsSettled, this.runtimeCatalogReady,
+        this.selectedAgentKind, this.currentRuntimeChoice(), this.modelVisibilityOverrides))) return false;
     let readyCount = 0;
     for (let i = 0; i < this.composerImages.length; i++) {
       const image = this.composerImages[i];
@@ -1163,6 +1362,9 @@ export struct NewSessionPageContent {
   }
 
   private removeComposerFile(localId: string): void {
+    if (this.creating || this.incomingBusy) return;
+    const file = this.fileQueue.files.find((item: ComposerFile): boolean => item.localId === localId);
+    if (file && !this.forgetIncomingFile(file.uri)) return;
     this.fileQueue.remove(localId);
   }
 
@@ -1944,9 +2146,67 @@ export struct NewSessionPageContent {
     return session;
   }
 
+  /** Resolve runtime permissions/plan/speed against the final target engine without changing
+   * the user's underlying draft, preferences or selected model. */
+  private async applyRoutingCreation(params: NewSessionCreationParams, route: ModelRoute, isCurrent: () => boolean): Promise<void> {
+    const kind: NewAgentKind = route.agentKind === 'codex' ? 'codex' : route.agentKind === 'pi' ? 'pi' : 'claude-code';
+    const capabilitiesRequest = new DlInvokeOptions(); capabilitiesRequest.channel = 'maker:get-capabilities'; capabilitiesRequest.args = [kind];
+    const rawCapabilities = unwrapInvokeResult(await AppServices.instance.client.invoke(params.deviceId, capabilitiesRequest));
+    if (!isCurrent()) throw new Error('MODEL_ROUTING_STALE');
+    const capabilities = recordOrEmpty(rawCapabilities);
+    if (!Array.isArray(capabilities['permissionModes'])) throw new Error('MODEL_ROUTING_CAPABILITIES_UNAVAILABLE');
+    let row: RuntimeModelOption | undefined = undefined;
+    if (!route.agentDeviceId) {
+      const providerRequest = new DlInvokeOptions(); providerRequest.channel = 'maker:provider:list';
+      const providerOptions = new ProviderListOptions(); providerOptions.capabilities = ['provider-logo-kinds-v2']; providerRequest.args = [providerOptions];
+      try {
+        const payload = unwrapInvokeResult(await AppServices.instance.client.invoke(params.deviceId, providerRequest));
+        if (!isCurrent()) throw new Error('MODEL_ROUTING_STALE');
+        if (!hasProviderCatalog(payload)) throw new Error('MODEL_ROUTING_CATALOG_INVALID');
+        const rows = parseComposerProviderModelOptions(payload, kind, parseModelVisibilityOverrides(payload), undefined);
+        row = rows.find((option: RuntimeModelOption): boolean => option.id === route.model && option.providerId === route.providerId);
+        if (!row || row.suspended || row.availability === 'requires_payment') throw new Error('MODEL_ROUTING_SOURCE_UNAVAILABLE');
+      } catch (error) {
+        if (!providerCatalogUnavailable(String(error))) {
+          if (error instanceof Error) throw error; throw new Error('MODEL_ROUTING_CATALOG_UNAVAILABLE');
+        }
+        // An older host may resolve routes but lack the provider catalogue. Trust its concrete
+        // resolution, never a same-name provider from another computer or the old draft.
+      }
+    } else {
+      const hint: ModelSelectionHint = { model: route.model, providerId: route.providerId };
+      row = remoteAgentModelOptions(this.remoteAgentCatalogList, kind, hint, route.agentDeviceId).find((option: RuntimeModelOption): boolean =>
+        option.agentDeviceId === route.agentDeviceId && option.providerId === route.providerId && option.id === route.model);
+    }
+    if (!isCurrent()) throw new Error('MODEL_ROUTING_STALE');
+    const runtime = routedCreationRuntime(route, capabilities, row,
+      this.permissionMode === 'plan' ? this.permissionModeBeforePlan : this.permissionMode, this.planModeEnabled);
+    const options: Record<string, Object> = {};
+    for (const key of Object.keys(params.createOptions)) {
+      if (key !== 'agentDeviceId' && key !== 'effort') options[key] = params.createOptions[key];
+    }
+    params.createOptions = options;
+    params.createOptions['agentKind'] = kind; params.createOptions['model'] = route.model;
+    params.createOptions['providerId'] = route.providerId;
+    if (route.agentDeviceId) params.createOptions['agentDeviceId'] = route.agentDeviceId;
+    if (runtime.effort) params.createOptions['effort'] = runtime.effort;
+    params.createOptions['permissionMode'] = runtime.permissionMode; params.createOptions['planMode'] = runtime.planMode;
+    params.createOptions['fastMode'] = runtime.fastMode;
+    params.planModeArm = runtime.planModeArm; params.legacyPlanRestore = runtime.legacyPlanRestore;
+    params.session.agentKind = kind === 'claude-code' ? 'cc' : kind;
+    params.session.model = route.model; params.session.providerId = route.providerId; params.session.agentDeviceId = route.agentDeviceId;
+    params.session.effort = runtime.effort; params.session.permissionMode = runtime.permissionMode;
+    params.session.planModeEnabled = runtime.planModeEnabled;
+    params.session.fastMode = runtime.fastMode === true || runtime.fastMode === MODEL_SPEED_ULTRAFAST;
+    params.session.fastModeTier = runtime.fastMode === MODEL_SPEED_ULTRAFAST ? MODEL_SPEED_ULTRAFAST : '';
+  }
+
   private async send(): Promise<void> {
     const text = this.input.trim();
-    if (this.creating || this.pickingImages || this.pickingFiles) return;
+    if (this.creating || !this.incomingRestored || this.incomingBusy || this.incomingBlocked || this.pickingImages || this.pickingFiles) return;
+    if (!this.incomingDraftMatchesTarget()) {
+      this.error = harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed'); return;
+    }
     let uploading = false;
     let failed = false;
     for (let i = 0; i < this.composerImages.length; i++) {
@@ -1980,7 +2240,8 @@ export struct NewSessionPageContent {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_defaults_loading');
       return;
     }
-    if (!this.runtimeCatalogReady) {
+    const routeChosen = this.selectedRouteId.length > 0 && this.selectedRouteDevice === this.selectedDeviceId;
+    if (!routeChosen && !this.runtimeCatalogReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       if (!this.runtimeToolbarLoadActive) void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
       return;
@@ -1988,24 +2249,29 @@ export struct NewSessionPageContent {
     const generation = this.runtimeLoadGeneration;
     const deviceId = this.selectedDeviceId;
     const agent = this.selectedAgentKind;
+    const ownerEpoch = AppServices.instance.auth.sessionEpoch;
+    const isCurrent = (): boolean => this.runtimeRequestIsCurrent(deviceId, agent, generation)
+      && ownerEpoch === AppServices.instance.auth.sessionEpoch && AppServices.instance.auth.isLoggedIn;
     this.creating = true;
-    await this.loadProviderModelOptions(agent, deviceId, generation);
-    if (!this.runtimeRequestIsCurrent(deviceId, agent, generation)) {
+    if (!routeChosen) await this.loadProviderModelOptions(agent, deviceId, generation);
+    if (!isCurrent()) {
       this.creating = false;
       return;
     }
     this.creating = false;
-    if (!this.runtimeCatalogReady) {
+    if (!routeChosen && !this.runtimeCatalogReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       return;
     }
-    if (this.hostModelNeedsReselection(agent)) {
+    if (!routeChosen && this.hostModelNeedsReselection(agent)) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
       return;
     }
     const selectedModel = this.findModelOption(this.model, this.providerId);
-    if (this.model.trim().length === 0 || selectedModel === undefined
-      || selectedModel.suspended || selectedModel.availability === 'requires_payment') {
+    const ordinaryModelReady = this.model.trim().length > 0 && selectedModel !== undefined
+      && !selectedModel.suspended && selectedModel.availability !== 'requires_payment'
+      && !this.hostModelNeedsReselection(agent);
+    if (!routeChosen && !ordinaryModelReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_required');
       return;
     }
@@ -2017,7 +2283,7 @@ export struct NewSessionPageContent {
     this.creating = true;
     this.error = '';
     const sessionId = util.generateRandomUUID();
-    const firstMessageClientId = util.generateRandomUUID();
+    const firstMessageClientId = AppServices.instance.inputQueue.createDocumentClientId();
     const params = new NewSessionCreationParams();
     params.deviceId = this.selectedDeviceId;
     params.session = this.buildOptimisticSession(sessionId, text, readyImages, readyFiles);
@@ -2029,24 +2295,103 @@ export struct NewSessionPageContent {
     params.planModeArm = this.planModeNative && this.planModeEnabled;
     params.legacyPlanRestore = !this.planModeNative && this.planModeEnabled
       ? (this.permissionModeBeforePlan || this.permissionMode) : '';
+    let routeTicket: ModelRoutingTicket | null = null;
+    if (this.selectedRouteId && this.selectedRouteDevice === deviceId) {
+      const routing = AppServices.instance.modelRouting;
+      const context = new ModelRoutingContext();
+      context.hasImages = readyImages.length > 0;
+      if (this.routingSnapshot.catalog?.expandedRoutes.some((row: ModelRouteRow): boolean => row.id === this.selectedRouteId) === true) {
+        context.effort = this.effort;
+        context.fastMode = fastModeWireValue(this.fastMode, this.fastModeTier);
+      }
+      try {
+        routeTicket = await routing.prepare(deviceId, this.selectedRouteId, context);
+        if (!this.pageActive || deviceId !== this.selectedDeviceId
+          || generation !== this.runtimeLoadGeneration) {
+          routing.cancel(routeTicket);
+          this.creating = false;
+          return;
+        }
+        const route = routing.routeFor(routeTicket);
+        if (route !== null) {
+          await this.applyRoutingCreation(params, route, isCurrent);
+        } else {
+          // A routed send does not depend on the underlying catalog. A kept-model result
+          // does: refresh it on this branch before applying the ordinary creation gate.
+          await this.loadProviderModelOptions(agent, deviceId, generation);
+          const fallback = this.findModelOption(this.model, this.providerId);
+          if (!isCurrent()) { routing.cancel(routeTicket); this.creating = false; return; }
+          if (!this.runtimeCatalogReady || !fallback || fallback.suspended || fallback.availability === 'requires_payment'
+            || this.hostModelNeedsReselection(agent)) {
+            routing.release(routeTicket); this.creating = false;
+            this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v139_route_unavailable'); return;
+          }
+        }
+        if (!isCurrent()) { routing.cancel(routeTicket); this.creating = false; return; }
+        const ticket = routeTicket;
+        const note = buildModelRoutingNote(ticket.result, this.currentModelLabel(), '', (id: string): string =>
+          this.devices.find((device: PresenceSnapshot): boolean => device.deviceId === id)?.deviceName || id);
+        params.beforeFirstInput = (): Promise<void> => routing.bindBeforeFirstInput(ticket, sessionId);
+        params.onFirstInputAccepted = (): Promise<void> => routing.accepted(ticket, sessionId, note)
+          .finally((): void => routing.release(ticket));
+      } catch (failure) {
+        if (routeTicket !== null) routing.cancel(routeTicket);
+        this.creating = false;
+        const unsupported = failure instanceof Error
+          && failure.message.indexOf('MODEL_ROUTING_ENGINE_UNSUPPORTED') >= 0;
+        this.error = harmonyV12String(this.getUIContext().getHostContext(),
+          unsupported ? 'v139_route_engine' : 'v139_route_unavailable');
+        return;
+      }
+    }
     for (const image of this.composerImages) {
       if (image.status === 'ready' && image.ref !== null) {
         AppServices.instance.localAttachmentPreviews.remember(this.selectedDeviceId, image.ref.url, image.uri);
       }
     }
+    const bridge = AppServices.instance.incomingComposer, delivery = this.incomingDelivery;
+    let incomingPrepared = false;
+    let reservationAttempted = false;
     try {
-      const firstDocument = new SerializedComposerDocument();
-      firstDocument.text = text;
-      AppServices.instance.inputQueue.reserveDocument(
-        params.deviceId, params.session, firstDocument, readyImages, readyFiles, firstMessageClientId);
-    } catch (e) {
+      if (!isCurrent()) throw new Error('NEW_SESSION_STALE');
+      if (bridge !== null && delivery !== null && delivery.batchIds.length > 0) {
+        if (delivery.target.ownerKey !== AppServices.instance.usageCardOwner || delivery.target.deviceId !== params.deviceId) throw new Error('INCOMING_COMPOSER_STALE');
+        delivery.document = this.newSessionDocument;
+        bridge.prepareInput(delivery, firstMessageClientId, sessionId); incomingPrepared = true;
+      }
+      const firstDocument = serializeComposerDocument(this.newSessionDocument);
+      params.firstMessageText = firstDocument.text;
+      reservationAttempted = true;
+      AppServices.instance.inputQueue.reserveDocument(params.deviceId, params.session, firstDocument, readyImages, readyFiles, firstMessageClientId);
+      if (incomingPrepared && bridge !== null && delivery !== null) {
+        if (!AppServices.instance.inputQueue.hasPersistedDocument(params.deviceId, sessionId, firstMessageClientId)) throw new Error('INCOMING_COMPOSER_RESERVATION_MISSING');
+        // Commit owned synchronously before start() can dispatch. Garbage cleanup is independent.
+        void bridge.reconcileInput(delivery.target, firstMessageClientId, 'owned');
+      }
+    } catch (error) {
+      // No remote creation/dispatch has started. Remove only this exact reservation before
+      // restoring absence; another tap must never leave the earlier copy queued as well.
+      let reservationRemoved = !reservationAttempted;
+      if (reservationAttempted) {
+        try {
+          AppServices.instance.inputQueue.discardReserved(params.deviceId, sessionId, firstMessageClientId);
+          reservationRemoved = true;
+        } catch { this.incomingBlocked = true; }
+      }
+      if (incomingPrepared && reservationRemoved && bridge !== null && delivery !== null) {
+        try { void bridge.reconcileInput(delivery.target, firstMessageClientId, 'absent'); }
+        catch { this.incomingBlocked = true; }
+      }
+      if (routeTicket !== null) AppServices.instance.modelRouting.cancel(routeTicket);
       this.creating = false;
-      this.error = `消息未保存：${e instanceof Error ? e.message : String(e)}`;
-      return;
+      this.error = incomingPrepared ? harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_failed')
+        : `消息未保存：${error instanceof Error ? error.message : String(error)}`; return;
     }
     AppServices.instance.newSessionCreations.start(params);
     this.cancelNewSessionDraftCheckpoint();
-    AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID);
+    AppServices.instance.composerDrafts.clear(NEW_SESSION_COMPOSER_DRAFT_ID, this.newSessionDraftDevice);
+    this.newSessionDocument = emptyComposerDocument(); this.input = '';
+    this.incomingDelivery = null; this.incomingConsumedKey = ''; this.incomingBlocked = false;
     this.attachmentsHandedOff = true;
     // creation store 已持有首条附件的独立引用；从页面镜像移除但不调用回收，
     // 这样页面复用或创建失败回详情时不会显示/回收同一批已交接资源。
@@ -2876,6 +3221,20 @@ export struct NewSessionPageContent {
     Column() {
       Scroll(this.modelPickerScroller) {
         Column() {
+          ModelRoutingPanel({
+            snapshot: this.routingSnapshot,
+            labels: modelRoutingLabels(this.getUIContext().getHostContext()),
+            activeId: this.selectedRouteDevice === this.selectedDeviceId ? this.selectedRouteId : '',
+            busy: this.creating,
+            onSelect: (id: string): void => {
+              this.selectedRouteId = id;
+              this.selectedRouteDevice = this.selectedDeviceId;
+              if (this.composerModelPopupOpen) this.dismissComposerControlPopup('model');
+              else this.returnToComposerAfterModelSheet();
+            },
+            onOrdinary: (): void => { this.selectedRouteId = ''; this.selectedRouteDevice = ''; },
+            onRefresh: (): void => { void this.loadRouting(true); },
+          })
           if (this.groupedModelOptions().length === 0) {
             Text('当前电脑未提供模型列表')
               .fontSize(uiFontSize(14))
@@ -2982,6 +3341,12 @@ export struct NewSessionPageContent {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .padding({ left: 12, right: 12 })
       }
+      if (this.incomingBlocked && !this.incomingBusy && !this.creating) {
+        Button(harmonyV12String(this.getUIContext().getHostContext(), 'incoming_share_resume'))
+          .height(44).fontSize(uiFontSize(12)).fontColor($r('app.color.text_primary'))
+          .backgroundColor(Color.Transparent).borderRadius(UI_RADIUS_CONTROL)
+          .onClick((): void => { if (!this.incomingRestored) void this.restoreNewSessionDraft(); else void this.consumeIncomingDraft(); })
+      }
       if (this.runtimeDefaultsSettled && !this.runtimeCatalogReady && !this.runtimeToolbarLoadActive
         && !this.creating && this.canCreateOnDevice(this.selectedDeviceId)) {
         Button(harmonyV12String(this.getUIContext().getHostContext(), 'v132_defaults_retry'))
@@ -3009,12 +3374,13 @@ export struct NewSessionPageContent {
         streaming: false,
         hasContent: this.hasComposerContent(),
         canSend: this.canSend(),
-        composerEnabled: !this.creating,
-        contextBusy: this.creating,
+        composerEnabled: !this.creating && !this.incomingBusy,
+        contextBusy: this.creating || this.incomingBusy,
         toolbarReady: this.composerToolbarReady,
         hasPermissionOptions: this.permissionOptions.length > 0,
         hasAgentOptions: NEW_AGENT_OPTIONS.length > 1,
-        hasModelOptions: this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0,
+        hasModelOptions: (this.visibleModelOptions().length > 0 && this.currentModelLabel().length > 0)
+          || (this.routingSnapshot.catalog?.routes.length ?? 0) > 0 || (this.routingSnapshot.catalog?.expandedRoutes.length ?? 0) > 0,
         permissionMode: this.permissionMode,
         permissionLabel: this.currentPermissionModeLabel(),
         planModeEnabled: this.planModeEnabled,

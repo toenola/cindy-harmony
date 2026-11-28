@@ -1,14 +1,16 @@
 import { describe, expect, it } from '@ohos/hypium';
 import { isRemoteBusyError, isRemoteBusyMessage } from '../main/ets/core/device-link/RemoteInvokePresentation';
 import { ConnectionAttemptState } from '../main/ets/core/device-link/ConnectionAttemptState';
+import { resolveInvokeTimeoutMs } from '../main/ets/core/device-link/InvokePolicy';
+import { NewSessionCreationStore, NewSessionCreationParams } from '../main/ets/core/tasks/NewSessionCreationStore';
 import {
   InvokeScheduler, isBackgroundInvoke, bypassInvokeScheduling, invokePhysicalPeerId,
 } from '../main/ets/core/device-link/InvokeScheduler';
 import {
-  DlClient, DlClientOptions, DlInvokeOptions, DlError, assertInvokeSucceeded,
+  DlClient, DlClientOptions, DlInvokeOptions, DlError, ScopedPeerPort, assertInvokeSucceeded,
 } from '../main/ets/core/device-link/DlClient';
 import {
-  Envelope, EnvelopeKind, PROTOCOL_VERSION, encodeEnvelope, decodeEnvelope,
+  Envelope, EnvelopeKind, PresenceSnapshot, PROTOCOL_VERSION, encodeEnvelope, decodeEnvelope,
 } from '../main/ets/core/device-link/DlProtocol';
 import { WsAdapter, WsCallbacks, WsMessage } from '../main/ets/network/WsAdapter';
 
@@ -67,19 +69,20 @@ class TestSocket implements WsAdapter {
     this.callbacks.onClose(1000, 'terminated');
   }
   setCallbacks(callbacks: WsCallbacks): void { this.callbacks = callbacks; }
-  receive(kind: string, payload: Object, requestId: string = '', source: string = ''): void {
+  receive(kind: string, payload: Object, requestId: string = '', source: string = '', destination: string = ''): void {
     const envelope = new Envelope();
     envelope.kind = kind;
     envelope.payload = payload;
     envelope.id = requestId;
     envelope.src = source;
+    envelope.dst = destination;
     this.callbacks.onMessage(new TestWsMessage(encodeEnvelope(envelope)));
   }
-  hello(userId: string = 'account-a'): void {
+  hello(userId: string = 'account-a', deviceId: string = 'controller'): void {
     this.callbacks.onOpen();
     const payload: Record<string, Object> = {};
     payload['serverProtocolVersion'] = PROTOCOL_VERSION;
-    payload['deviceId'] = 'controller';
+    payload['deviceId'] = deviceId;
     payload['userId'] = userId;
     this.receive(EnvelopeKind.HELLO_ACK, payload);
   }
@@ -121,6 +124,22 @@ function invokeOptions(channel: string = 'maker:send'): DlInvokeOptions {
   return options;
 }
 
+class SharedScopeTestPort implements ScopedPeerPort {
+  authorized: boolean = true;
+  version: string = 'membership-1';
+  calls: number = 0;
+  closed: number = 0;
+  result: Promise<Object | undefined> = Promise.resolve('scoped result');
+  current(): boolean { return this.authorized; }
+  identity(): string { return this.version; }
+  status(): string { return 'online'; }
+  supportsHistoryView(): boolean { return false; }
+  async invoke(_channel: string, _args: Object[], _timeout: number): Promise<Object | undefined> { this.calls++; return this.result; }
+  async subscribe(_topics: string[]): Promise<void> {}
+  async unsubscribe(_topics: string[]): Promise<void> {}
+  close(): void { this.closed++; this.authorized = false; }
+}
+
 function clientSlots(client: DlClient, peerId: string): Promise<DlError>[] {
   const pending: Promise<DlError>[] = [];
   for (let index = 0; index < 12; index += 1) pending.push(failure(client.invoke(peerId, invokeOptions())));
@@ -129,6 +148,153 @@ function clientSlots(client: DlClient, peerId: string): Promise<DlError>[] {
 
 export default function v132LinkTests(): void {
   describe('v132LinkAlignment', () => {
+    /**
+     * 生产入口：DlClient 注册式共享路由；官方 sharedTaskPeer 的本地键不能成为owner地址。
+     * 缺口：既有断链测试只覆盖同账号peer。最小输入：未注册的canonical长peer与撤权中迟到返回。
+     * tier=unit，注入业务端口，不连接外网、不调用真实模型。
+     */
+    it('routes_only_registered_shared_peers_without_an_owner_connection', 0, async () => {
+      const client = new DlClient(new DlClientOptions());
+      const peer = '["shared-1","host",null,"host-a"]'.padEnd(129, '~');
+      expect((await failure(client.invoke(peer, invokeOptions()))).code).assertEqual('ACCESS_REVOKED');
+      const port = new SharedScopeTestPort(); client.registerScopedPeer(peer, port);
+      const result = await client.invoke(peer, invokeOptions());
+      expect((result.payload as Record<string, Object>)['result']).assertEqual('scoped result');
+      expect(port.calls).assertEqual(1);
+      expect(client.getStatus(peer)).assertEqual('online');
+      expect(client.getStatus()).assertEqual('stopped');
+      client.clearScopedPeers();
+      expect(port.closed).assertEqual(1);
+      expect(client.getStatus(peer)).assertEqual('stopped');
+      expect((await failure(client.invoke(peer, invokeOptions()))).code).assertEqual('ACCESS_REVOKED');
+    });
+    /**
+     * Production raw-socket ingress and shared invoke scheduler, unit tier. Existing outbound
+     * registry tests cannot detect owner-relay spoofed local keys or owner disconnect clearing
+     * the independent transport queue. Minimum: one forged frame, or 12 held jobs + one waiter.
+     * Uses native socket ports/held Promises only; no network, model, long waits or source reads.
+     */
+    it('raw_owner_frames_cannot_spoof_canonical_shared_sources_destinations_or_presence', 0, async () => {
+      const harness = new LinkHarness(), pushes: string[] = [], presences: string[] = [], closed: string[] = [];
+      harness.options.events.onPush = (peer: string): void => { pushes.push(peer); };
+      harness.options.events.onPresence = (presence: PresenceSnapshot): void => { presences.push(presence.deviceId); };
+      harness.options.events.onLinkClosed = (peer: string): void => { closed.push(peer); };
+      const socket = await harness.online(), peer = '["shared-1","host",null,"host-a"]'.padEnd(129, '~');
+      const port = new SharedScopeTestPort(); harness.client.registerScopedPeer(peer, port);
+      const push = JSON.parse('{"channel":"maker:event","payload":{"sessionId":"task"}}') as Record<string, Object>;
+      const close = JSON.parse('{"reason":"revoked"}') as Record<string, Object>;
+      for (const forged of [peer, 'x'.repeat(129)]) {
+        socket.receive(EnvelopeKind.PUSH, push, '', forged);
+        socket.receive(EnvelopeKind.LINK_CLOSE, close, '', forged);
+        const presence: Record<string, Object> = {}; presence['deviceId'] = forged; presence['online'] = false;
+        socket.receive(EnvelopeKind.PRESENCE_CHANGED, presence);
+      }
+      socket.receive(EnvelopeKind.PUSH, push, '', 'host-a', peer);
+      socket.receive(EnvelopeKind.LINK_CLOSE, close, '', 'host-a', peer);
+      expect(pushes.length).assertEqual(0); expect(presences.length).assertEqual(0); expect(closed.length).assertEqual(0);
+      expect(harness.client.hasScopedPeer(peer)).assertTrue(); expect(port.closed).assertEqual(0);
+      const physical = 'p'.repeat(128), presence: Record<string, Object> = {}; presence['deviceId'] = physical; presence['online'] = true;
+      socket.receive(EnvelopeKind.PUSH, push, '', physical, 'controller');
+      socket.receive(EnvelopeKind.PRESENCE_CHANGED, presence);
+      socket.receive(EnvelopeKind.LINK_CLOSE, close, '', physical, 'controller');
+      expect(pushes[0]).assertEqual(physical); expect(presences[0]).assertEqual(physical); expect(closed[0]).assertEqual(physical);
+      const result = await harness.client.invoke(peer, invokeOptions());
+      expect((result.payload as Record<string, Object>)['result']).assertEqual('scoped result');
+      expect(socket.invocations().length).assertEqual(0); harness.client.clearScopedPeers(); harness.client.stop();
+    });
+    it('canonical_hello_device_claim_never_becomes_an_online_physical_identity', 0, async () => {
+      const harness = new LinkHarness(); harness.client.start(); await flushPromises();
+      const peer = '["shared-1","host",null,"host-a"]'.padEnd(129, '~');
+      harness.sockets[0].hello('account-a', peer);
+      expect(harness.client.getStatus() === 'online').assertFalse(); expect(harness.client.getDeviceId() === peer).assertFalse();
+      expect(harness.sockets[0].terminated).assertEqual(1); harness.client.stop();
+    });
+    it('owner_socket_loss_and_stop_cancel_owner_jobs_but_preserve_twelve_plus_one_guest_jobs', 0, async () => {
+      const harness = new LinkHarness(), socket = await harness.online();
+      const peer = '["shared-1","host",null,"a"]'.padEnd(129, '~'), port = new SharedScopeTestPort(), held = new Deferred<Object | undefined>();
+      port.result = held.promise; harness.client.registerScopedPeer(peer, port);
+      const guestActive = clientSlots(harness.client, peer), guestQueued = failure(harness.client.invoke(peer, invokeOptions()));
+      const samePhysicalOwnerQueued = failure(harness.client.invoke('a', invokeOptions()));
+      const ownerActive = clientSlots(harness.client, 'b'), ownerQueued = failure(harness.client.invoke('b', invokeOptions()));
+      expect(port.calls).assertEqual(12); expect(socket.invocations().length).assertEqual(12);
+      socket.close(1006, 'owner link lost'); harness.client.stop();
+      expect((await samePhysicalOwnerQueued).code).assertEqual('NOT_CONNECTED'); expect((await ownerQueued).inFlight).assertFalse();
+      expect((await Promise.all(ownerActive)).every((error: DlError) => error.inFlight)).assertTrue();
+      expect(harness.client.getStatus(peer)).assertEqual('online'); expect(port.closed).assertEqual(0);
+      held.resolve('guest data');
+      expect((await Promise.all(guestActive)).every((error: DlError) => error.code === 'NONE')).assertTrue();
+      expect((await guestQueued).code).assertEqual('NONE'); expect(port.calls).assertEqual(13);
+      expect(socket.invocations().length).assertEqual(12); harness.client.clearScopedPeers();
+    });
+    it('removing_one_scope_cancels_its_waiter_without_cancelling_another_scope_on_same_host', 0, async () => {
+      const harness = new LinkHarness(), socket = await harness.online(), held = new Deferred<Object | undefined>();
+      const peerA = '["shared-a","host",null,"a"]'.padEnd(129, '~'), peerB = '["shared-b","host",null,"a"]'.padEnd(129, '~');
+      const portA = new SharedScopeTestPort(), portB = new SharedScopeTestPort(); portA.result = held.promise;
+      harness.client.registerScopedPeer(peerA, portA); harness.client.registerScopedPeer(peerB, portB);
+      const activeA = clientSlots(harness.client, peerA), queuedA = failure(harness.client.invoke(peerA, invokeOptions()));
+      const queuedB = failure(harness.client.invoke(peerB, invokeOptions()));
+      expect(portA.calls).assertEqual(12); expect(portB.calls).assertEqual(0);
+      harness.client.removeScopedPeer(peerA); expect((await queuedA).code).assertEqual('LINK_NOT_OPEN');
+      held.resolve('late retired data');
+      expect((await Promise.all(activeA)).every((error: DlError) => error.code === 'ACCESS_REVOKED')).assertTrue();
+      expect((await queuedB).code).assertEqual('NONE'); expect(portB.calls).assertEqual(1); expect(portB.closed).assertEqual(0);
+      expect(socket.invocations().length).assertEqual(0); harness.client.clearScopedPeers(); harness.client.stop();
+    });
+    it('discards_in_flight_shared_results_after_membership_changes', 0, async () => {
+      const client = new DlClient(new DlClientOptions());
+      const peer = '["shared-1","host",null,"host-a"]'.padEnd(129, '~');
+      const port = new SharedScopeTestPort(); const pending = new Deferred<Object | undefined>();
+      port.result = pending.promise; client.registerScopedPeer(peer, port);
+      const request = failure(client.invoke(peer, invokeOptions()));
+      await flushPromises();
+      port.authorized = false; pending.resolve('must not surface');
+      expect((await request).code).assertEqual('ACCESS_REVOKED');
+      client.clearScopedPeers();
+    });
+    /**
+     * 生产入口：创建 Store 的精确输入回执，绑定路由 commit 的唯一触发点。
+     * 缺口：既有测试没有首条输入与后续输入/异设备回执的区分。
+     * 最小失败输入：正确 session、错误 clientId；tier=unit，无网络或计时等待。
+     */
+    it('commits_only_the_exact_first_input_once_even_when_route_commit_fails', 0, () => {
+      const store = new NewSessionCreationStore();
+      const params = new NewSessionCreationParams();
+      params.deviceId = 'host-a'; params.session.id = 'new-task'; params.firstMessageClientId = 'first';
+      let commits = 0;
+      params.onFirstInputAccepted = async (): Promise<void> => {
+        commits++;
+        throw new Error('simulated routing receipt failure');
+      };
+      store.start(params);
+      store.noteInputAccepted('host-b', 'new-task', 'first');
+      store.noteInputAccepted('host-a', 'new-task', 'follow-up');
+      expect(commits).assertEqual(0);
+      store.noteInputAccepted('host-a', 'new-task', 'first');
+      store.noteInputAccepted('host-a', 'new-task', 'first');
+      expect(commits).assertEqual(1);
+      store.clearAll(false);
+      store.noteInputAccepted('host-a', 'new-task', 'first');
+      expect(commits).assertEqual(1);
+    });
+    /**
+     * 生产入口：DlClient.invoke 使用的预算解析；慢创建不应被默认 30 秒截断。
+     * 依据：官方 allowlist.ts@91179cedad 的跨端调用预算；现有测试只覆盖排队/断链。
+     * 最小输入：create-session 无显式预算；tier=unit，无外网或长时间真实等待。
+     * 这里断言跨端执行预算契约，不扫描源码，不测试内部实现副本。
+     */
+    it('uses_host_slow_operation_budgets_without_extending_other_invokes', 0, () => {
+      expect(resolveInvokeTimeoutMs('maker:create-session', undefined)).assertEqual(120_000);
+      expect(resolveInvokeTimeoutMs('maker:compact-session', undefined)).assertEqual(660_000);
+      expect(resolveInvokeTimeoutMs('maker:predict-prompt', undefined)).assertEqual(45_000);
+      expect(resolveInvokeTimeoutMs('maker:send', undefined)).assertEqual(30_000);
+      expect(resolveInvokeTimeoutMs('unknown:new-channel', undefined)).assertEqual(30_000);
+    });
+    it('honors_finite_caller_budgets_and_rejects_invalid_timer_values', 0, () => {
+      expect(resolveInvokeTimeoutMs('maker:create-session', 8000)).assertEqual(8000);
+      expect(resolveInvokeTimeoutMs('maker:create-session', 0)).assertEqual(120_000);
+      expect(resolveInvokeTimeoutMs('maker:send', Number.NaN)).assertEqual(30_000);
+      expect(resolveInvokeTimeoutMs('maker:send', Number.POSITIVE_INFINITY)).assertEqual(30_000);
+    });
     it('recognizes_busy_admission_without_relabeling_arbitrary_failures', 0, () => {
       expect(isRemoteBusyError(new DlError('BACKPRESSURE', 'queue full'))).assertTrue();
       expect(isRemoteBusyMessage('local remote invoke queue is full')).assertTrue();

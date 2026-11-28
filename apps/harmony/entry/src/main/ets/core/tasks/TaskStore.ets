@@ -1,3 +1,4 @@
+import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 /**
  * 任务（会话）Store：设备列表 + 每设备的会话列表。
  *
@@ -578,6 +579,11 @@ export class TaskStore {
     next.updatedAt = new Date().toISOString();
     if (next.status === 'deleted') this.removeSession(deviceId, next.id);
     else this.upsertSession(deviceId, next);
+  }
+
+  /** A closed independent sharing scope cannot retain an owner-looking task. */
+  forgetScopedSession(deviceId: string, sessionId: string): void {
+    if (invokePhysicalPeerId(deviceId) !== deviceId) this.removeSession(deviceId, sessionId);
   }
 
   private removeSession(deviceId: string, sessionId: string): void {

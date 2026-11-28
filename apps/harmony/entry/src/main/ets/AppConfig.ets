@@ -17,6 +17,8 @@ export class AppConfig {
 
   /** Official account-private relay directory, from config/endpoint.json. */
   static readonly chatApiBaseUrl: string = 'https://chat.cindy.app';
+  static readonly shareBaseUrl: string = 'https://share.cindy.com.cn';
+  static readonly ossApiBaseUrl: string = 'https://oss.cindy.com.cn';
 
   /** Device Link relay REST base（设备列表 / media presign）。 */
   static readonly deviceLinkApiBaseUrl: string = 'https://device-link.cindy.com.cn';
@@ -43,7 +45,7 @@ export class AppConfig {
    * 必须与 `AppScope/app.json5` 的 `versionName` 保持一致：设置页展示与
    * Device Link 上报共用这一个值，漂移会让被控端看到错误的客户端版本。
    */
-  static readonly appVersion: string = '1.3.1';
+  static readonly appVersion: string = '1.3.9';
 }
 
 /** Global 区域端点（换区时把上面的 region/authApiBaseUrl/... 换成这些值）。 */

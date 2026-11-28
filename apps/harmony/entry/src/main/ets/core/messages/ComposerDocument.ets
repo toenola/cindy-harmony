@@ -32,6 +32,8 @@ export class ComposerNode {
 export class ComposerDocument {
   version: number = 1;
   nodes: ComposerNode[] = [];
+  /** Local draft receipts only; never serialized into model/message wire. */
+  incomingShareBatchIds: string[] = [];
 }
 
 export class SerializedComposerDocument {
@@ -197,6 +199,7 @@ export function composerDocumentHasContent(document: ComposerDocument): boolean 
 
 export function normalizeComposerDocument(document: ComposerDocument): ComposerDocument {
   const out = new ComposerDocument();
+  out.incomingShareBatchIds = document.incomingShareBatchIds.slice();
   for (let i = 0; i < document.nodes.length; i++) {
     const node = document.nodes[i];
     if (!validNode(node)) continue;
@@ -221,7 +224,11 @@ function validNode(node: ComposerNode): boolean {
 
 /** TextArea 的普通文本变化只替换变化区；区外原子节点继续保留。 */
 export function reconcileComposerProjectedText(document: ComposerDocument, nextText: string): ComposerDocument {
-  if (nextText.length === 0) return emptyComposerDocument();
+  if (nextText.length === 0) {
+    const empty = emptyComposerDocument();
+    empty.incomingShareBatchIds = document.incomingShareBatchIds.slice();
+    return empty;
+  }
   const previousText = composerDocumentProjectedText(document);
   if (previousText === nextText) return document;
   let prefix = 0;
@@ -265,6 +272,7 @@ export function replaceComposerTextRange(document: ComposerDocument, from: numbe
     }
   }
   const out = new ComposerDocument();
+  out.incomingShareBatchIds = document.incomingShareBatchIds.slice();
   out.nodes = before.concat(replacement).concat(after);
   return normalizeComposerDocument(out);
 }
@@ -272,6 +280,7 @@ export function replaceComposerTextRange(document: ComposerDocument, from: numbe
 export function removeComposerNode(document: ComposerDocument, index: number): ComposerDocument {
   if (index < 0 || index >= document.nodes.length) return document;
   const out = new ComposerDocument();
+  out.incomingShareBatchIds = document.incomingShareBatchIds.slice();
   out.nodes = document.nodes.filter((_node: ComposerNode, nodeIndex: number) => nodeIndex !== index);
   return normalizeComposerDocument(out);
 }
@@ -591,6 +600,7 @@ export function composerDocumentToStorage(document: ComposerDocument): string {
   const raw: Record<string, Object> = {};
   raw['version'] = 1;
   raw['nodes'] = nodes;
+  raw['incomingShareBatchIds'] = document.incomingShareBatchIds.slice(-256);
   return JSON.stringify(raw);
 }
 
@@ -600,6 +610,13 @@ export function parseStoredComposerDocument(value: string): ComposerDocument | n
     if (raw['version'] !== 1 || !Array.isArray(raw['nodes'])) return null;
     const source = raw['nodes'] as Object[];
     const document = new ComposerDocument();
+    const receipts = raw['incomingShareBatchIds'];
+    if (Array.isArray(receipts)) {
+      for (const receipt of (receipts as Object[]).slice(-256)) {
+        if (typeof receipt === 'string' && receipt.length > 0 && receipt.length <= 128
+          && !document.incomingShareBatchIds.includes(receipt)) document.incomingShareBatchIds.push(receipt);
+      }
+    }
     for (let i = 0; i < source.length; i++) {
       const item = source[i];
       if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;

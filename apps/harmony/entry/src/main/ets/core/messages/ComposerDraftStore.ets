@@ -83,13 +83,67 @@ export class ComposerDraftStore {
     return this.claimLegacyDraft(sessionId, deviceId, scope);
   }
 
+  /** Explicit scoped reads for incoming recovery never claim/delete the ordinary global draft. */
+  async readScopedOnly(sessionId: string, deviceId: string): Promise<ComposerDocument | null> {
+    if (!sessionId || !deviceId) return null;
+    const scope = composerDraftScopeKey(sessionId, deviceId);
+    if (this.cleared.has(scope)) return null;
+    const cached = this.memory.get(scope); if (cached !== undefined) return cached;
+    const generation = this.generations.get(scope) ?? 0;
+    const stored = await this.store.get(composerDraftStorageKey(sessionId, deviceId), '');
+    const newer = this.memory.get(scope); if (newer !== undefined) return newer;
+    if (this.cleared.has(scope) || generation !== (this.generations.get(scope) ?? 0)) return null;
+    const parsed = stored ? parseStoredComposerDocument(stored) : null;
+    if (parsed !== null) this.memory.set(scope, parsed);
+    return parsed;
+  }
+
+  /** Compare the actual global revision, persist it, and never replace a concurrent new edit.
+   * A false result leaves the scoped source recoverable; no legacy-claim path participates. */
+  async compareAndFlushGlobal(sessionId: string, expectedStorage: string | null, document: ComposerDocument,
+    isCurrent: () => boolean = (): boolean => true): Promise<boolean> {
+    const scope = composerDraftScopeKey(sessionId), generation = this.generations.get(scope) ?? 0;
+    let saved = false;
+    await this.enqueueOperation(scope, async (): Promise<void> => {
+      const current = await this.read(sessionId);
+      const storage = current === null ? null : composerDocumentToStorage(current);
+      if (!isCurrent() || generation !== (this.generations.get(scope) ?? 0) || storage !== expectedStorage) return;
+      await this.store.set(composerDraftStorageKey(sessionId), composerDocumentToStorage(document));
+      if (!isCurrent() || generation !== (this.generations.get(scope) ?? 0)) return;
+      this.cancelTimer(scope); this.generations.set(scope, generation + 1);
+      this.cleared.delete(scope); this.memory.set(scope, document); saved = true;
+    });
+    // If a user saved while native persistence was in flight, flush that newer revision after
+    // our queued write. Do this outside enqueueOperation to avoid awaiting our own operation.
+    if (!saved && generation !== (this.generations.get(scope) ?? 0)) await this.flush(sessionId);
+    return saved;
+  }
+
+  /** Explicit migration cleanup only; unlike clear(), this never removes a legacy/global key. */
+  async clearScopedOnly(sessionId: string, deviceId: string, expectedStorage: string): Promise<boolean> {
+    if (!sessionId || !deviceId) return false;
+    const scope = composerDraftScopeKey(sessionId, deviceId), generation = this.generations.get(scope) ?? 0;
+    let removed = false;
+    await this.enqueueOperation(scope, async (): Promise<void> => {
+      const current = await this.readScopedOnly(sessionId, deviceId);
+      if (generation !== (this.generations.get(scope) ?? 0) || current === null
+        || composerDocumentToStorage(current) !== expectedStorage) return;
+      await this.store.remove(composerDraftStorageKey(sessionId, deviceId));
+      if (generation !== (this.generations.get(scope) ?? 0)) return;
+      this.cancelTimer(scope); this.generations.set(scope, generation + 1);
+      this.memory.delete(scope); this.cleared.add(scope); removed = true;
+    });
+    if (!removed && generation !== (this.generations.get(scope) ?? 0)) await this.flush(sessionId, deviceId);
+    return removed;
+  }
+
   save(sessionId: string, document: ComposerDocument, deviceId: string = ''): void {
     const scope = composerDraftScopeKey(sessionId, deviceId);
     if (sessionId.length === 0) return;
     this.cancelTimer(scope);
     const generation = (this.generations.get(scope) ?? 0) + 1;
     this.generations.set(scope, generation);
-    if (document.nodes.length === 0) {
+    if (document.nodes.length === 0 && document.incomingShareBatchIds.length === 0) {
       this.memory.delete(scope);
       this.cleared.add(scope);
       void this.enqueueOperation(scope, (): Promise<void> =>

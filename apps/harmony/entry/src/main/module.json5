@@ -26,6 +26,7 @@
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
         "skills": [
+          {"actions": ["ohos.want.action.sendData"], "uris": [{"scheme": "file", "utd": "general.text", "maxFileSupported": 20}, {"scheme": "file", "utd": "general.hyperlink", "maxFileSupported": 20}, {"scheme": "file", "utd": "general.image", "maxFileSupported": 20}, {"scheme": "file", "utd": "general.file", "maxFileSupported": 20}]},
           {
             "entities": [
               "entity.system.home"
@@ -48,13 +49,29 @@
               },
               { "scheme": "cindy", "host": "relay" },
               { "scheme": "cindycn", "host": "relay" },
-              { "scheme": "cindydev", "host": "relay" }
+              { "scheme": "cindydev", "host": "relay" },
+              { "scheme": "cindy", "host": "chat-invite" },
+              { "scheme": "cindycn", "host": "chat-invite" },
+              { "scheme": "cindydev", "host": "chat-invite" },
+              { "scheme": "cindy", "host": "shared-task" },
+              { "scheme": "cindycn", "host": "shared-task" },
+              { "scheme": "cindydev", "host": "shared-task" },
+              { "scheme": "cindy", "host": "shared-session" },
+              { "scheme": "cindycn", "host": "shared-session" },
+              { "scheme": "cindydev", "host": "shared-session" }
             ]
           }
         ]
       }
     ],
     "extensionAbilities": [
+      {
+        "name": "UsageFormExtensionAbility",
+        "srcEntry": "./ets/usageformextension/UsageFormExtensionAbility.ets",
+        "type": "form",
+        "exported": true,
+        "metadata": [{ "name": "ohos.extension.form", "resource": "$profile:usage_form_config" }]
+      },
       {
         "name": "EntryBackupAbility",
         "srcEntry": "./ets/entrybackupability/EntryBackupAbility.ets",

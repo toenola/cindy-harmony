@@ -1,3 +1,10 @@
+import { IncomingComposerIdleGate } from '../core/incoming-share/IncomingComposerIdleGate';
+import { HomeModulePanel, HomeModuleRequest } from '../components/HomeModulePanel';
+import { readFileBytes } from '../core/attachments/ImagePreprocess';
+import { IncomingComposerDelivery, IncomingComposerFile, incomingComposerReceipts } from '../core/incoming-share/IncomingComposerDraftBridge';
+import { IncomingShareDestination } from '../core/incoming-share/IncomingShareStore';
+import { IncomingComposerPagePort } from '../core/IncomingComposerPagePort';
+import { composerDocumentToStorage } from '../core/messages/ComposerDocument';
 import { PromptRecommendationPanel } from '../components/PromptRecommendationPanel';
 import { PromptRecommendationInput } from '../core/messages/PromptRecommendation';
 import { RelayRoute } from '../core/device-link/RelayRoute';
@@ -45,6 +52,10 @@ import { ModelPickerQuota, modelQuotaKey, modelQuotaLine, readModelPickerQuotas 
 import { HistoryWorkPresentation } from '../core/messages/HistoryWorkPresentation';
 import { formatHistoryWorkLine } from '../core/messages/HistoryLinePresentation';
 import { harmonyV12String } from '../core/HarmonyStrings';
+import { ModelRoutingContext, ModelRoutingSnapshot, ModelRoutingSession, ModelRoutingTicket } from '../core/model-routing/ModelRoutingStore';
+import { ModelRoutingOffer, buildModelRoutingNote } from '../core/model-routing/ModelRoutingModels';
+import { ModelRoutingPanel } from '../components/model-routing/ModelRoutingPanel';
+import { modelRoutingLabels } from '../components/ModelRoutingCopy';
 import { HarmonyHttp } from '../network/HarmonyHttp';
 import { isTextFileReference, splitFileReferenceLocation } from '../core/files/FileReference';
 import { RemoteFileService } from '../core/files/RemoteFileService';
@@ -586,6 +597,11 @@ export struct TaskPageContent {
   @State input: string = '';
   /** TextArea 只是这一语义文档的投影。 */
   private composerDocument: ComposerDocument = new ComposerDocument();
+  private incomingDelivery: IncomingComposerDelivery | null = null;
+  private incomingHandoff: boolean = false;
+  @State private incomingBlocked: boolean = false;
+  @State private incomingDraftRestored: boolean = false;
+  @State private incomingImportBusy: boolean = false;
   private composerDraftGeneration: number = 0;
   /** 返回动作跨一帧提交 Composer 收起态时，防止连续点击重复 pop 路由。 */
   private leavingDetailPage: boolean = false;
@@ -595,7 +611,7 @@ export struct TaskPageContent {
   private paneResumePending: boolean = false;
   /** 本实例 Composer 输入框的唯一组件 ID，在 aboutToAppear 确定任务后生成。 */
   private composerInputId: string = 'task-composer-input';
-  @State sending: boolean = false;
+  @State @Watch('onIncomingBusyChanged') sending: boolean = false;
   /** Desktop 输入投影产生的排队/派发/失败气泡。 */
   @State queueBubbles: PendingQueueBubble[] = [];
   @State queuePaused: boolean = false;
@@ -605,7 +621,7 @@ export struct TaskPageContent {
   @State queueCredentialBlockedCount: number = 0;
   @State queueAbortPending: boolean = false;
   @State queueInteractionLocked: boolean = false;
-  @State queueBusy: boolean = false;
+  @State @Watch('onIncomingBusyChanged') queueBusy: boolean = false;
   private interactionSessionActivated: boolean = false;
   /** 新任务后台创建态；running/create-failed 期间详情页不得发普通 session RPC。 */
   @State newSessionCreationStatus: string = '';
@@ -778,10 +794,10 @@ export struct TaskPageContent {
   private taskPlanBackfillPending: boolean = false;
   /** 待发送图片（上传状态，由共享队列同步镜像）。 */
   @State composerImages: ComposerImage[] = [];
-  @State pickingImages: boolean = false;
+  @State @Watch('onIncomingBusyChanged') pickingImages: boolean = false;
   private imageQueue: ComposerImageQueue = new ComposerImageQueue();
   @State composerFiles: ComposerFile[] = [];
-  @State pickingFiles: boolean = false;
+  @State @Watch('onIncomingBusyChanged') pickingFiles: boolean = false;
   private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 发送开始后的输入变更不会被旧请求的成功回调清空。 */
   @State private composerInputRevision: number = 0;
@@ -828,6 +844,7 @@ export struct TaskPageContent {
   private accountUsageRefreshTimer: number = -1;
   /** 主操作与低频会话信息分层展示，避免展开屏菜单被元信息撑成近全屏面板。 */
   @State sessionActionInfoMode: boolean = false;
+  @State private sharedManagementOpen: boolean = false;
   @State sessionActionProjectMode: boolean = false;
   @State sessionActionProjects: string[] = [];
   @State sessionActionProjectPath: string = '';
@@ -861,6 +878,10 @@ export struct TaskPageContent {
   @State composerToolbarReady: boolean = false;
   @State permissionOptions: ComposerChoiceOption[] = [];
   @State modelOptions: ComposerModelOption[] = [];
+  @State private routingSnapshot: ModelRoutingSnapshot = new ModelRoutingSnapshot();
+  @State private routingSession: ModelRoutingSession = new ModelRoutingSession();
+  @State private routingBusy: boolean = false;
+  private routingTicket: ModelRoutingTicket | null = null;
   /** 被控端 provider:list 的真实目录；为空时才回退 capabilities.availableModels。 */
   /** 提问卡按服务端约束校验失败的提示（requestId → 文案）。 */
   @State askValidationErrors: Map<string, string> = new Map();
@@ -959,9 +980,12 @@ export struct TaskPageContent {
   private onPaneActiveChanged(): void {
     if (!this.detailMounted || this.leavingDetailPage) return;
     this.paneActivationRevision += 1;
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) AppServices.instance.sharedTasks?.setTaskVisible(this.paneActive);
     if (this.paneActive) {
       this.paneResumePending = this.initialLoadResolved;
       this.refreshNewSessionCreation();
+      this.incomingHandoff = false; this.incomingImportBusy = false;
+      if (!this.incomingDraftRestored) this.restoreComposerDraft(); else void this.consumeIncomingShare();
       this.refreshGitBranch(true);
       this.startGitBranchRefresh();
       return;
@@ -1065,6 +1089,10 @@ export struct TaskPageContent {
 
   aboutToAppear(): void {
     this.pageLifecycleGeneration += 1;
+    this.unsubs.push(AppServices.instance.modelRouting.onChanged((): void => {
+      this.routingSnapshot = AppServices.instance.modelRouting.snapshot(this.deviceId);
+      this.routingSession = AppServices.instance.modelRouting.sessionSnapshot(this.deviceId, this.sessionId);
+    }));
     this.leavingDetailPage = false;
     this.sending = false;
     this.queueBusy = false;
@@ -1255,7 +1283,11 @@ export struct TaskPageContent {
     }));
     this.unsubs.push(AppServices.instance.remoteAgentCatalogs.onChanged(() => this.syncRemoteAgentCatalogs()));
     this.goalState = AppServices.instance.goals.getState(this.sessionId, this.deviceId);
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) AppServices.instance.sharedTasks?.setTaskVisible(this.paneActive);
     this.restoreComposerDraft();
+    if (AppServices.instance.incomingComposer) this.unsubs.push(AppServices.instance.incomingComposer.onChanged((): void => {
+      if (!this.incomingImportBusy) void this.consumeIncomingShare();
+    }));
 
     this.unsubs.push(AppServices.instance.newSessionCreations.onChanged(() => {
       this.refreshNewSessionCreation();
@@ -1267,6 +1299,9 @@ export struct TaskPageContent {
 
   aboutToDisappear(): void {
     this.detailMounted = false;
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) AppServices.instance.sharedTasks?.setTaskVisible(false);
+    if (this.routingTicket !== null) AppServices.instance.modelRouting.cancel(this.routingTicket);
+    this.routingTicket = null;
     if (this.accountUsageRefreshTimer >= 0) clearTimeout(this.accountUsageRefreshTimer);
     this.accountUsageRefreshTimer = -1;
     this.pageLifecycleGeneration += 1;
@@ -1544,6 +1579,9 @@ export struct TaskPageContent {
 
   /** 判断当前设备是否关闭远程控制（撤权只读）。 */
   private checkDeviceDisabled(): boolean {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) {
+      return !AppServices.instance.client.hasScopedPeer(this.deviceId);
+    }
     const devices = AppServices.instance.tasks.deviceList;
     for (let i = 0; i < devices.length; i++) {
       if (devices[i].deviceId === this.deviceId) {
@@ -1762,6 +1800,7 @@ export struct TaskPageContent {
    * 否则保持 v1.3.2 的只读防护，不能静默改回本机。SSH 与 Orca 不支持换位置，仍只读。
    */
   private runtimeRouteLocked(): boolean {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return true;
     return runtimeRouteNeedsRemoteCatalog(this.session(), this.pendingAgentSwitchIntent)
       && !this.agentLocationMovable();
   }
@@ -2357,6 +2396,7 @@ export struct TaskPageContent {
   }
 
   private openComposerControlPopup(page: string): void {
+    if (page === 'model') void this.loadRouting();
     if ((page === 'model' || page === 'agent') && this.runtimeRouteLocked()) {
       promptAction.showToast({ message: this.v12String('v132_remote_runtime_read_only') });
       return;
@@ -2590,8 +2630,109 @@ export struct TaskPageContent {
     }
   }
 
+  private async loadRouting(force: boolean = false): Promise<void> {
+    const device = this.deviceId;
+    const session = this.sessionId;
+    const lifecycle = this.pageLifecycleGeneration;
+    const store = AppServices.instance.modelRouting;
+    this.routingSnapshot = store.snapshot(device);
+    this.routingSession = store.sessionSnapshot(device, session);
+    try {
+      await store.load(device, force);
+      if (!this.isCurrentPageLifecycle(lifecycle) || this.sessionId !== session) return;
+      await store.refreshSession(device, session, this.queueErrorRetryText.length > 0 && !this.queueActionBlocked());
+    } catch (_error) {
+      // The module exposes unsupported/error separately; keep the ordinary picker usable.
+    }
+    if (!this.isCurrentPageLifecycle(lifecycle) || this.sessionId !== session) return;
+    this.routingSnapshot = store.snapshot(device);
+    this.routingSession = store.sessionSnapshot(device, session);
+  }
+
+  private async stopRouting(): Promise<void> {
+    if (this.routingBusy || this.routingSession.binding === null) return;
+    this.routingBusy = true;
+    try { await AppServices.instance.modelRouting.unbind(this.deviceId, this.sessionId); }
+    catch (_error) { promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    finally { this.routingBusy = false; }
+  }
+
+  private async completeRoutingSelection(ticket: ModelRoutingTicket): Promise<void> {
+    const store = AppServices.instance.modelRouting;
+    try { await store.accepted(ticket, this.sessionId, buildModelRoutingNote(ticket.result, this.session()?.model ?? '', '', (id: string): string => AppServices.instance.tasks.deviceList.find((device): boolean => device.deviceId === id)?.deviceName || id)); }
+    catch (_error) { promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    finally {
+      store.release(ticket);
+      if (this.routingTicket === ticket) this.routingTicket = null;
+    }
+    await this.loadRouting();
+  }
+
+  private async acceptRoutingOffer(): Promise<void> {
+    const offer = this.routingSession.offer;
+    if (offer === null || this.queueActionBlocked() || !this.queueErrorRetryText || this.contextRpcBusy || this.routingBusy || this.runtimeRouteLocked()) return;
+    const lifecycle = this.pageLifecycleGeneration, session = this.sessionId;
+    if (offer.route.agentKind === 'acp' || (offer.route.agentDeviceId || null) !== this.nextAgentDeviceId()) {
+      promptAction.showToast({ message: this.v12String('v139_route_engine') }); return;
+    }
+    this.modelAgentTab = offer.route.agentKind === 'cc' ? 'claude-code' : offer.route.agentKind;
+    this.routingBusy = true;
+    try {
+      await this.loadProviderModelOptions(this.modelAgentTab, this.composerCapabilitiesGeneration);
+      if (!this.isCurrentPageLifecycle(lifecycle) || session !== this.sessionId) return;
+      const option = this.visibleModelOptions().find((row: ComposerModelOption): boolean => row.id === offer.route.model
+        && row.providerId === offer.route.providerId && row.agentDeviceId === offer.route.agentDeviceId);
+      if (!option) throw new Error('MODEL_ROUTING_UNAVAILABLE');
+      await this.selectComposerModel(option, false, false, null, offer);
+    } catch { if (this.isCurrentPageLifecycle(lifecycle)) promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); }
+    finally { if (this.isCurrentPageLifecycle(lifecycle)) this.routingBusy = false; }
+  }
+
+  private async selectRouting(id: string): Promise<void> {
+    const session = this.session();
+    if (session === undefined || this.routingBusy || this.contextRpcBusy || this.runtimeRouteLocked()) return;
+    const lifecycle = this.pageLifecycleGeneration;
+    const store = AppServices.instance.modelRouting;
+    if (this.routingTicket !== null) store.cancel(this.routingTicket);
+    this.routingTicket = null;
+    this.routingBusy = true;
+    const context = new ModelRoutingContext();
+    context.hasImages = this.composerImages.length > 0;
+    context.sshHostId = session.remoteHostId;
+    context.agentDeviceId = session.remoteHostId ? null : this.nextAgentDeviceId();
+    try {
+      const ticket = await store.prepare(this.deviceId, id, context);
+      this.routingTicket = ticket;
+      if (!this.isCurrentPageLifecycle(lifecycle) || this.sessionId !== session.id) {
+        store.cancel(ticket); return;
+      }
+      const route = store.routeFor(ticket);
+      if (route === null) throw new Error('MODEL_ROUTING_UNAVAILABLE');
+      const kind = route.agentKind === 'cc' ? 'claude-code' : route.agentKind;
+      this.modelAgentTab = kind;
+      await this.loadProviderModelOptions(kind, this.composerCapabilitiesGeneration);
+      if (!this.isCurrentPageLifecycle(lifecycle) || this.sessionId !== session.id) {
+        store.cancel(ticket); return;
+      }
+      const option = this.visibleModelOptions().find((row: ComposerModelOption): boolean =>
+        row.id === route.model && row.providerId === route.providerId
+          && row.agentDeviceId === route.agentDeviceId);
+      if (option === undefined) throw new Error('MODEL_ROUTING_UNAVAILABLE');
+      this.routingBusy = false;
+      await this.selectComposerModel(option, false, false, ticket);
+    } catch (failure) {
+      if (this.routingTicket !== null) store.cancel(this.routingTicket);
+      this.routingTicket = null;
+      const unsupported = failure instanceof Error
+        && failure.message.indexOf('MODEL_ROUTING_ENGINE_UNSUPPORTED') >= 0;
+      if (this.isCurrentPageLifecycle(lifecycle)) promptAction.showToast({
+        message: this.v12String(unsupported ? 'v139_route_engine' : 'v139_route_unavailable'),
+      });
+    } finally { if (this.isCurrentPageLifecycle(lifecycle)) this.routingBusy = false; }
+  }
+
   private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false,
-    locationConfirmed: boolean = false): Promise<void> {
+    locationConfirmed: boolean = false, ticket: ModelRoutingTicket | null = null, offer: ModelRoutingOffer | null = null): Promise<void> {
     if (this.runtimeRouteLocked()) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
@@ -2600,6 +2741,11 @@ export struct TaskPageContent {
     if (option.availability === 'requires_payment' && !this.modelOptionIsCurrent(option)) {
       promptAction.showToast({ message: '该模型需要付费后才能使用' });
       return;
+    }
+    const resolvedRoute = ticket !== null ? AppServices.instance.modelRouting.routeFor(ticket) : offer?.route ?? null;
+    if (resolvedRoute !== null && (resolvedRoute.agentDeviceId || null) !== (session.remoteHostId ? null : this.nextAgentDeviceId())) {
+      if (ticket !== null) AppServices.instance.modelRouting.cancel(ticket);
+      promptAction.showToast({ message: this.v12String('v139_route_unavailable') }); return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const targetAgent = this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
@@ -2615,7 +2761,7 @@ export struct TaskPageContent {
     if (pick.needsConfirm && !locationConfirmed) {
       this.confirmAgentRelocation(pick.relocateTo, option.agentDeviceName, currentAgent === targetAgent, () => {
         if (!this.isCurrentPageLifecycle(lifecycleGeneration) || this.sessionId !== session.id) return;
-        void this.selectComposerModel(option, windowConfirmed, true);
+        void this.selectComposerModel(option, windowConfirmed, true, ticket, offer);
       });
       return;
     }
@@ -2638,13 +2784,14 @@ export struct TaskPageContent {
           action: () => {
             if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
             this.agentSwitchConfirmed = true;
-            void this.selectComposerModel(option, windowConfirmed, locationConfirmed);
+            void this.selectComposerModel(option, windowConfirmed, locationConfirmed, ticket, offer);
           },
         },
       });
       return;
     }
-    if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent) {
+    if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent && ticket === null && offer === null) {
+      if (this.routingSession.binding !== null) await this.stopRouting();
       this.returnToComposerAfterModelSheet();
       return;
     }
@@ -2662,16 +2809,19 @@ export struct TaskPageContent {
           action: (): void => {
             if (windowDecision === 'blocked' || !this.isCurrentPageLifecycle(lifecycleGeneration)
               || this.sessionId !== session.id) return;
-            void this.selectComposerModel(option, true, locationConfirmed);
+            void this.selectComposerModel(option, true, locationConfirmed, ticket, offer);
           },
         },
       });
       return;
     }
-    const nextEffort = reconcileModelEffort(option, this.modelEffortForRow(option));
-    const nextFastMode = this.modelFastForRow(option);
-    const nextFastTier = this.modelFastTierForRow(option);
-    const nextFastWire = fastModeWireValue(nextFastMode, nextFastTier);
+    const route = ticket !== null ? AppServices.instance.modelRouting.routeFor(ticket) : offer?.route ?? null;
+    const nextEffort = route !== null ? (option.efforts.includes(route.effort) ? route.effort : '') : reconcileModelEffort(option, this.modelEffortForRow(option));
+    const nextFastWire = route !== null ? (this.visibleFastModeCapability() && option.supportsFastMode
+      && (route.fastMode !== 'ultrafast' || (targetAgent === 'codex' && option.supportsUltrafastMode)) ? route.fastMode : false)
+      : fastModeWireValue(this.modelFastForRow(option), this.modelFastTierForRow(option));
+    const nextFastMode = nextFastWire === true || nextFastWire === 'ultrafast';
+    const nextFastTier = nextFastWire === 'ultrafast' ? 'ultrafast' : '';
     const selectionKey = this.modelRuntimeKey(option);
     this.pendingModelSelectionKey = selectionKey;
     this.returnToComposerAfterModelSheet();
@@ -2701,7 +2851,7 @@ export struct TaskPageContent {
           : [session.id, option.id];
         result = await this.invokeContextRpc('maker:set-model', args);
         let runtimeSettingsFailed = false;
-        if (nextEffort.length > 0 && nextEffort !== session.effort) {
+        if (nextEffort !== session.effort && (route !== null || nextEffort.length > 0)) {
           try {
             await this.invokeContextRpc('maker:set-effort', [session.id, nextEffort]);
           } catch (e) {
@@ -2718,9 +2868,15 @@ export struct TaskPageContent {
         }
         if (runtimeSettingsFailed && this.isCurrentPageLifecycle(lifecycleGeneration)) {
           promptAction.showToast({ message: '模型已切换，部分运行设置更新失败' });
+          if (ticket !== null || offer !== null) throw new Error('MODEL_ROUTING_RUNTIME_INCOMPLETE');
         }
       }
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+      if (ticket !== null) await this.completeRoutingSelection(ticket);
+      else if (offer !== null) {
+        await AppServices.instance.modelRouting.bindOfferAfterSwitch(this.deviceId, this.sessionId, offer);
+        this.retryQueueError();
+      } else if (this.routingSession.binding !== null) await this.stopRouting();
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)
         && readBool(result as Record<string, Object>, 'deferred', false)) {
         promptAction.showToast({ message: '将在当前运行结束后切换模型' });
@@ -2734,6 +2890,10 @@ export struct TaskPageContent {
     } catch (e) {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         this.pendingModelSelectionKey = '';
+        if (ticket !== null) {
+          AppServices.instance.modelRouting.cancel(ticket);
+          if (this.routingTicket === ticket) this.routingTicket = null;
+        }
         promptAction.showToast({ message: this.invokeFailureText(e, '模型切换失败，请重试') });
       }
     } finally {
@@ -2801,6 +2961,7 @@ export struct TaskPageContent {
   }
 
   private async startGoal(): Promise<void> {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
     const objective = this.goalObjective.trim();
     if (objective.length === 0 || this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       if (objective.length === 0) {
@@ -2845,6 +3006,7 @@ export struct TaskPageContent {
   }
 
   private async pauseOrResumeGoal(): Promise<void> {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
     if (this.goalState === null || this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       return;
     }
@@ -2868,6 +3030,7 @@ export struct TaskPageContent {
   }
 
   private confirmClearGoal(): void {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
     if (this.goalActionBusy || this.isCreationBlockingRemoteOps()) {
       return;
     }
@@ -2886,6 +3049,7 @@ export struct TaskPageContent {
   }
 
   private async clearGoal(): Promise<void> {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
     if (this.isCreationBlockingRemoteOps()) return;
     const lifecycleGeneration = this.pageLifecycleGeneration;
     this.goalActionBusy = true;
@@ -2916,7 +3080,7 @@ export struct TaskPageContent {
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const serialized: SerializedComposerDocument = serializeComposerDocument(this.composerDocument);
     const text = serialized.text;
-    if (this.sending || this.pickingImages || this.pickingFiles) return;
+    if (this.sending || this.incomingImportBusy || this.pickingImages || this.pickingFiles) return;
     if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
       promptAction.showToast({ message: '请先处理待确认请求' });
       return;
@@ -2929,8 +3093,9 @@ export struct TaskPageContent {
       void this.submitMessageEdit();
       return;
     }
+    if (!this.incomingDraftRestored || this.incomingBlocked || !this.incomingDocumentReady()) { void this.consumeIncomingShare(); return; }
     const learn = parseLearnCommand(text, this.selectedLearnRoute === 'agent-skill');
-    if (learn.matched) {
+    if (learn.matched && !AppServices.instance.isSharedTaskPeer(this.deviceId)) {
       this.sendLearnCommand(learn);
       return;
     }
@@ -2983,19 +3148,43 @@ export struct TaskPageContent {
     const deferForCreation = this.isCreationBlockingRemoteOps()
       || AppServices.instance.inputQueue.shouldDeferNewInput(this.sessionId);
     let reservedClientId = '';
+    let incomingClientId = '';
+    const incoming = this.incomingDelivery;
+    const bridge = AppServices.instance.incomingComposer;
+    this.incomingHandoff = true;
     try {
+      if (incoming !== null && bridge !== null) {
+        reservedClientId = AppServices.instance.inputQueue.createDocumentClientId();
+        incomingClientId = reservedClientId;
+        if (!this.incomingDocumentReady()) throw new Error('INCOMING_COMPOSER_STALE');
+        incoming.document = this.composerDocument;
+        bridge.prepareInput(incoming, reservedClientId);
+      }
       if (deferForCreation) {
         reservedClientId = AppServices.instance.inputQueue.deferDocument(
-          this.deviceId, s, serialized, readyImages, readyFiles);
+          this.deviceId, s, serialized, readyImages, readyFiles, reservedClientId);
       } else {
         reservedClientId = AppServices.instance.inputQueue.reserveDocument(
-          this.deviceId, s, serialized, readyImages, readyFiles);
+          this.deviceId, s, serialized, readyImages, readyFiles, reservedClientId);
       }
       if (!reservedClientId) throw new Error('任务输入队列未就绪');
+      if (incoming !== null && bridge !== null) {
+        // Both attachment queues contain sealed remote refs at this boundary. The
+        // existing durable outbox now owns them; local imported files are no longer required.
+        if (!AppServices.instance.inputQueue.hasPersistedDocument(this.deviceId, this.sessionId, reservedClientId)) throw new Error('INCOMING_COMPOSER_RESERVATION_MISSING');
+        void bridge.reconcileInput(incoming.target, reservedClientId, 'owned');
+        this.incomingDelivery = null;
+      }
     } catch (e) {
+      if (incoming !== null && bridge !== null && incomingClientId) {
+        try {
+          AppServices.instance.inputQueue.discardReserved(this.deviceId, this.sessionId, incomingClientId);
+          void bridge.reconcileInput(incoming.target, incomingClientId, 'absent');
+        } catch { this.incomingBlocked = true; }
+      }
       this.error = `消息未保存：${e instanceof Error ? e.message : String(e)}`;
       return;
-    }
+    } finally { this.incomingHandoff = false; }
     // 点发送后当帧清空 composer；同一个 clientId 的 pending 气泡立即进入消息流。
     this.composerDocument = emptyComposerDocument();
     this.input = '';
@@ -3031,7 +3220,7 @@ export struct TaskPageContent {
   }
 
   private async sendRichMessage(text: string, clientId: string): Promise<boolean> {
-    if (!this.canSendRichMessage() || AppServices.instance.client.getStatus() !== 'online') return false;
+    if (!this.canSendRichMessage() || AppServices.instance.client.getStatus(this.deviceId) !== 'online') return false;
     const session = this.session();
     if (session === undefined) return false;
     if (!this.composerModelReselectionExempt(text, false)
@@ -3064,46 +3253,62 @@ export struct TaskPageContent {
   }
 
   private sendLearnCommand(command: LearnCommandMatch): void {
-    if (this.sending || this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
+    if (this.sending || this.incomingImportBusy || this.incomingBlocked || !this.incomingDraftRestored
+      || this.deviceDisabled || this.isCreationBlockingRemoteOps()) return;
     if (this.composerImages.length > 0 || this.composerFiles.length > 0) {
-      promptAction.showToast({ message: '技能学习命令不能同时发送附件' });
-      return;
+      promptAction.showToast({ message: '技能学习命令不能同时发送附件' }); return;
     }
-    const lifecycleGeneration = this.pageLifecycleGeneration;
-    const deviceId = this.deviceId;
-    const sessionId = this.sessionId;
-    this.sending = true;
+    const lifecycleGeneration = this.pageLifecycleGeneration, epoch = AppServices.instance.auth.sessionEpoch;
+    const deviceId = this.deviceId, sessionId = this.sessionId;
+    const incoming = this.incomingDelivery, bridge = AppServices.instance.incomingComposer;
+    let actionId = '';
+    try {
+      if (incoming !== null && bridge !== null) {
+        actionId = AppServices.instance.inputQueue.createDocumentClientId(); incoming.document = this.composerDocument; bridge.prepareCommand(incoming, actionId);
+        this.incomingBlocked = true;
+      }
+    } catch { this.error = this.v12String('incoming_share_failed'); return; }
+    this.sending = true; this.incomingHandoff = incoming !== null;
     const request = buildLearnStartRequest(command, sessionId);
     this.invokeContextRpc('learn:start', [request]).then((result: Object | undefined) => {
+      if (epoch !== AppServices.instance.auth.sessionEpoch) return;
       const data: Record<string, Object> = {};
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)) {
         const record = result as Record<string, Object>;
-        data['runId'] = readStr(record, 'runId');
-        data['detail'] = readStr(record, 'detail');
+        data['runId'] = readStr(record, 'runId'); data['detail'] = readStr(record, 'detail');
+      }
+      if (incoming !== null && bridge !== null) {
+        // Only the actual learn run receipt may commit this action. No input outbox is forged.
+        void bridge.completeCommand(incoming.target, actionId, readStr(data, 'runId'));
       }
       data['input'] = command.input;
       AppServices.instance.messages.appendLocalSystemCard(sessionId, 'learn', data, deviceId);
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+      this.incomingDelivery = null; this.incomingBlocked = false;
       this.setComposerDocument(emptyComposerDocument(), false);
       AppServices.instance.composerDrafts.clear(sessionId, deviceId);
-      this.selectedLearnRoute = '';
-      this.takeOverTailAfterSend();
+      this.selectedLearnRoute = ''; this.takeOverTailAfterSend();
     }).catch((e: Error) => {
+      if (epoch !== AppServices.instance.auth.sessionEpoch) return;
       const data: Record<string, Object> = {};
       data['error'] = e.message.indexOf('learn-busy') >= 0 ? 'learn-busy' : 'learn-failed';
-      data['detail'] = e.message;
-      data['input'] = command.input;
+      data['detail'] = e.message; data['input'] = command.input;
       AppServices.instance.messages.appendLocalSystemCard(sessionId, 'learn', data, deviceId);
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
-        promptAction.showToast({ message: '技能学习未启动，草稿已保留' });
+        if (incoming !== null) { this.incomingBlocked = true; this.error = this.v12String('v132_delivery_unknown'); }
+        else promptAction.showToast({ message: '技能学习未启动，草稿已保留' });
       }
     }).finally(() => {
-      if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.sending = false;
+      if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
+        this.sending = false; this.incomingHandoff = false; void this.consumeIncomingShare();
+      }
     });
   }
 
   /** 最后一条用户消息可以编辑重发（首条同样可编辑；被控端会权威核对是否仍是最新）。 */
   private canEditMessage(item: RenderMessageItem): boolean {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return false;
     if (item.kind !== 'user' || item.message === undefined || this.deviceDisabled
       || this.isCreationBlockingRemoteOps() || this.session() === undefined) return false;
     const clientId = item.message.clientId.length > 0 ? item.message.clientId : item.message.id;
@@ -3116,7 +3321,7 @@ export struct TaskPageContent {
    */
   private beginMessageEdit(item: RenderMessageItem): void {
     const message = item.message;
-    if (message === undefined || this.messageEditSubmitting || this.sending) return;
+    if (message === undefined || this.messageEditSubmitting || this.sending || this.incomingImportBusy || !this.incomingDraftRestored) return;
     const clientId = message.clientId.length > 0 ? message.clientId : message.id;
     if (clientId.length === 0 || this.editingMessageClientId === clientId) return;
     // 排队消息是针对回退前的旧上下文写的，重发会排到它们后面，先让用户处理队列。
@@ -3177,7 +3382,7 @@ export struct TaskPageContent {
     const stash = this.messageEditStash;
     this.finishMessageEdit();
     this.messageEditStash = new ComposerDocument();
-    this.setComposerDocument(stash);
+    this.setComposerDocument(stash); void this.consumeIncomingShare();
   }
 
   /** 编辑期间出现了更新的用户消息或排队内容：本条不再能编辑，退出编辑（对齐 Mobile）。 */
@@ -3289,7 +3494,7 @@ export struct TaskPageContent {
     } finally {
       if (this.isCurrentPageLifecycle(lifecycle)) {
         this.messageEditSubmitting = false;
-        this.sending = false;
+        this.sending = false; void this.consumeIncomingShare();
       }
     }
   }
@@ -3303,8 +3508,13 @@ export struct TaskPageContent {
     return null;
   }
 
+  private ownsSharedInput(clientId: string): boolean {
+    return !AppServices.instance.isSharedTaskPeer(this.deviceId)
+      || AppServices.instance.inputQueue.isLocallyOwnedInput(this.deviceId, this.sessionId, clientId);
+  }
   private beginQueueEdit(clientId: string): void {
-    if (this.queueActionBlocked() || this.editingQueueClientId === clientId) return;
+    if (!this.ownsSharedInput(clientId)) return;
+    if (this.queueActionBlocked() || this.editingQueueClientId === clientId || this.incomingImportBusy || !this.incomingDraftRestored) return;
     // 两种编辑共用输入框，不能并存。
     if (this.editingMessageClientId.length > 0) return;
     const item = this.queueItem(clientId);
@@ -3314,7 +3524,7 @@ export struct TaskPageContent {
     const sessionId = this.sessionId;
     const previous = this.editingQueueClientId;
     const start = (): void => {
-      if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return;
+      if (!this.isCurrentPageLifecycle(lifecycleGeneration) || this.incomingImportBusy) return;
       const currentItem = this.queueItem(clientId);
       if (currentItem === null) return;
       this.stashedComposerInput = previous.length > 0 ? this.stashedComposerInput : this.input;
@@ -3367,6 +3577,7 @@ export struct TaskPageContent {
       this.stashedComposerDocument = emptyComposerDocument();
       this.editingQueueOriginalText = '';
       this.composerInputRevision += 1;
+      void this.consumeIncomingShare();
     }).catch(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         promptAction.showToast({ message: '队列消息未保存，请重试' });
@@ -3374,7 +3585,7 @@ export struct TaskPageContent {
     }).finally(() => {
       if (this.isCurrentPageLifecycle(lifecycleGeneration)) {
         this.queueBusy = false;
-        this.sending = false;
+        this.sending = false; void this.consumeIncomingShare();
       }
     });
   }
@@ -3388,12 +3599,14 @@ export struct TaskPageContent {
     this.stashedComposerDocument = emptyComposerDocument();
     this.editingQueueOriginalText = '';
     this.composerInputRevision += 1;
+    void this.consumeIncomingShare();
     void AppServices.instance.inputQueue.setEditLock(
       this.deviceId, this.sessionId, clientId, false).catch(() => {
     });
   }
 
   private removeQueueItem(clientId: string): void {
+    if (!this.ownsSharedInput(clientId)) return;
     if (this.queueActionBlocked()) return;
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const deviceId = this.deviceId;
@@ -3411,6 +3624,7 @@ export struct TaskPageContent {
   }
 
   private moveQueueItem(clientId: string, direction: number): void {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
     if (this.queueActionBlocked()) return;
     const queue = AppServices.instance.inputQueue.getProjection(
       this.sessionId, this.deviceId).pendingQueue;
@@ -5643,7 +5857,8 @@ export struct TaskPageContent {
   }
 
   private canSend(): boolean {
-    if (this.sending || this.deviceDisabled || this.pickingImages || this.pickingFiles) return false;
+    if (this.sending || this.incomingImportBusy || this.deviceDisabled || this.pickingImages || this.pickingFiles) return false;
+    if (!this.incomingDraftRestored || ((this.incomingBlocked || !this.incomingDocumentReady()) && !this.editingQueueClientId && !this.editingMessageClientId)) return false;
     if (pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) return false;
     if (!this.imageQueue.allSettled() || !this.fileQueue.allSettled()) return false;
     if (this.composerNeedsModelReselection()) return false;
@@ -5663,13 +5878,125 @@ export struct TaskPageContent {
       && sessionSendNeedsModelReselection(this.modelVisibilityOverrides, session, this.pendingAgentSwitchIntent);
   }
 
+  private incomingIdleGate: IncomingComposerIdleGate = new IncomingComposerIdleGate();
+  private onIncomingBusyChanged(): void {
+    if (this.sending || this.queueBusy || this.pickingImages || this.pickingFiles) return;
+    const lifecycle = this.pageLifecycleGeneration;
+    this.incomingIdleGate.request(lifecycle,
+      (): boolean => this.isCurrentPageLifecycle(lifecycle)
+        && !this.sending && !this.queueBusy && !this.pickingImages && !this.pickingFiles,
+      (): void => { void this.consumeIncomingShare().catch((): void => {
+        if (this.isCurrentPageLifecycle(lifecycle)) { this.incomingBlocked = true; this.error = this.v12String('incoming_share_failed'); }
+      }); });
+  }
+
+  private incomingDocumentReady(): boolean {
+    const receipts = incomingComposerReceipts(this.composerDocument);
+    if (receipts.length === 0) return this.incomingDelivery === null;
+    const delivery = this.incomingDelivery;
+    return AppServices.instance.incomingComposer !== null && delivery !== null && delivery.target.ownerKey === AppServices.instance.usageCardOwner
+      && delivery.target.deviceId === this.deviceId && delivery.target.sessionId === this.sessionId
+      && receipts.every((id: string): boolean => delivery.batchIds.includes(id));
+  }
+
+  private removeIncomingAttachment(localId: string, image: boolean): void {
+    if (this.incomingImportBusy || this.incomingHandoff || this.sending) return;
+    const uri = image ? this.imageQueue.images.find((row: ComposerImage): boolean => row.localId === localId)?.uri
+      : this.fileQueue.files.find((row: ComposerFile): boolean => row.localId === localId)?.uri;
+    const delivery = this.incomingDelivery;
+    const file = delivery?.files.find((row: IncomingComposerFile): boolean => row.uri === uri);
+    try {
+      if (file && delivery) void AppServices.instance.incomingComposer?.removeFile(delivery.target, file.id);
+      if (image) this.imageQueue.remove(localId); else this.fileQueue.remove(localId);
+    } catch { this.error = this.v12String('incoming_share_failed'); return; }
+    void this.consumeIncomingShare();
+  }
+
+  private incomingTarget(): IncomingShareDestination {
+    const target = new IncomingShareDestination(); target.ownerKey = AppServices.instance.usageCardOwner;
+    target.deviceId = this.deviceId; target.sessionId = this.sessionId; return target;
+  }
+
+  private async consumeIncomingShare(): Promise<void> {
+    const services = AppServices.instance, bridge = services.incomingComposer;
+    if (bridge === null || this.incomingImportBusy || this.incomingHandoff || !this.incomingDraftRestored
+      || this.sending || this.messageEditSubmitting || this.pickingImages || this.pickingFiles || this.queueBusy
+      || !this.paneActive || this.leavingDetailPage || this.paneAccountEpoch !== services.auth.sessionEpoch
+      || this.editingQueueClientId || this.editingMessageClientId || this.deviceDisabled) return;
+    const target = this.incomingTarget(), generation = this.pageLifecycleGeneration;
+    if (!target.ownerKey) return;
+    const current = (): boolean => this.isCurrentPageLifecycle(generation) && target.ownerKey === services.usageCardOwner
+      && this.paneAccountEpoch === services.auth.sessionEpoch && target.deviceId === this.deviceId && target.sessionId === this.sessionId
+      && !this.editingQueueClientId && !this.editingMessageClientId && !this.messageEditSubmitting && !this.sending;
+    this.incomingImportBusy = true;
+    try {
+      const committed = bridge.committedInputs(target, incomingComposerReceipts(this.composerDocument));
+      if (committed.length > 0) {
+        if (!committed[0].documentStorage || committed[0].documentStorage !== composerDocumentToStorage(this.composerDocument)) {
+          this.incomingBlocked = true; this.error = this.v12String('v132_delivery_unknown'); return;
+        }
+        this.setComposerDocument(emptyComposerDocument()); this.incomingDelivery = null;
+        await services.composerDrafts.flush(target.sessionId, target.deviceId);
+        if (!current()) return;
+      }
+      if (!bridge.pendingTargets().some((row: IncomingShareDestination): boolean => row.ownerKey === target.ownerKey
+        && row.deviceId === target.deviceId && row.sessionId === target.sessionId)) { this.incomingBlocked = false; return; }
+      if (bridge.pendingCommands(target).length > 0) {
+        this.incomingBlocked = true; this.error = this.v12String('v132_delivery_unknown'); return;
+      }
+      for (const id of bridge.pendingInputIds(target)) {
+        const owned = services.inputQueue.hasPersistedDocument(target.deviceId, target.sessionId, id);
+        if (!owned) services.inputQueue.discardReserved(target.deviceId, target.sessionId, id);
+        await bridge.reconcileInput(target, id, owned ? 'owned' : 'absent');
+        if (!current()) return;
+        if (owned && bridge.committedInputs(target, incomingComposerReceipts(this.composerDocument)).length > 0) {
+          const ownedInputs = bridge.committedInputs(target, incomingComposerReceipts(this.composerDocument));
+          if (!ownedInputs[0].documentStorage || ownedInputs[0].documentStorage !== composerDocumentToStorage(this.composerDocument)) {
+            this.incomingBlocked = true; this.error = this.v12String('v132_delivery_unknown'); return;
+          }
+          this.setComposerDocument(emptyComposerDocument()); this.incomingDelivery = null;
+          await services.composerDrafts.flush(target.sessionId, target.deviceId);
+          if (!current()) return;
+        }
+      }
+      const queued = this.imageQueue.images.map((row: ComposerImage): string => row.uri)
+        .concat(this.fileQueue.files.map((row: ComposerFile): string => row.uri));
+      if (queued.length + bridge.previewFiles(target).filter((file: IncomingComposerFile): boolean => !queued.includes(file.uri)).length > 20)
+        throw new Error('INCOMING_COMPOSER_LIMIT');
+      const documents = new IncomingComposerPagePort(
+        async (_target: IncomingShareDestination): Promise<ComposerDocument> => {
+          if (!current()) throw new Error('INCOMING_COMPOSER_STALE'); return this.composerDocument;
+        },
+        async (_target: IncomingShareDestination, expected: string, value: ComposerDocument): Promise<boolean> => {
+          if (!current() || composerDocumentToStorage(this.composerDocument) !== expected) return false;
+          this.setComposerDocument(value); const revision = this.composerInputRevision;
+          await services.composerDrafts.flush(target.sessionId, target.deviceId);
+          if (!current() || revision !== this.composerInputRevision) throw new Error('INCOMING_COMPOSER_STALE'); return true;
+        });
+      const delivery = await bridge.consume(target, documents);
+      if (!current()) return;
+      const files = delivery.files.filter((file: IncomingComposerFile): boolean => !queued.includes(file.uri));
+      this.imageQueue.enqueue(files.filter((file: IncomingComposerFile): boolean => file.mime.startsWith('image/')).map((file: IncomingComposerFile): string => file.uri));
+      this.fileQueue.enqueue(files.filter((file: IncomingComposerFile): boolean => !file.mime.startsWith('image/')).map((file: IncomingComposerFile): string => file.uri));
+      bridge.ack(delivery, this.imageQueue.images.map((row: ComposerImage): string => row.uri)
+        .concat(this.fileQueue.files.map((row: ComposerFile): string => row.uri)));
+      this.incomingDelivery = delivery.batchIds.length > 0 ? delivery : null;
+      this.incomingBlocked = false; this.expandComposerForEditing(false);
+    } catch (_error) {
+      if (current()) { this.incomingBlocked = true; this.error = this.v12String('incoming_share_failed'); }
+    } finally { if (generation === this.pageLifecycleGeneration) this.incomingImportBusy = false; }
+  }
+
   private restoreComposerDraft(): void {
+    this.incomingDraftRestored = false; this.incomingDelivery = null; this.incomingBlocked = false;
+    this.incomingHandoff = false; this.incomingImportBusy = false;
+    const lifecycle = this.pageLifecycleGeneration;
     const sessionId = this.sessionId;
     const deviceId = this.deviceId;
     const generation = ++this.composerDraftGeneration;
     const inputRevision = this.composerInputRevision;
     void AppServices.instance.composerDrafts.read(sessionId, deviceId).then((document: ComposerDocument | null) => {
-      if (document === null || !shouldApplyComposerDraftRead(
+      if (!this.isCurrentPageLifecycle(lifecycle) || document === null || !shouldApplyComposerDraftRead(
         sessionId,
         this.sessionId,
         generation,
@@ -5679,6 +6006,11 @@ export struct TaskPageContent {
         this.creationDraftHandoffDone,
       )) return;
       this.setComposerDocument(document, false);
+    }).then((): Promise<void> => {
+      if (!this.isCurrentPageLifecycle(lifecycle)) return Promise.resolve();
+      this.incomingDraftRestored = true; return this.consumeIncomingShare();
+    }).catch((): void => {
+      if (this.isCurrentPageLifecycle(lifecycle)) { this.incomingBlocked = true; this.error = this.v12String('incoming_share_failed'); }
     });
   }
 
@@ -6201,6 +6533,14 @@ export struct TaskPageContent {
   build() {
     Stack() {
       this.taskPageBody()
+      if (this.sharedManagementOpen) {
+        HomeModulePanel({ request: this.sharedManagementRequest(),
+          onClose: (): void => { this.sharedManagementOpen = false; },
+          onOpenTask: (device: string, session: string): void => {
+            this.sharedManagementOpen = false;
+            if (device !== this.deviceId || session !== this.sessionId) this.leaveDetailPage();
+          } })
+      }
       if (this.mermaidViewerSource.length > 0) {
         this.mermaidViewer()
       }
@@ -6417,7 +6757,7 @@ export struct TaskPageContent {
                 && this.sessionActionProjectPath.trim().length > 0)
               .onClick(() => void this.moveSessionProject(this.sessionActionProjectPath.trim()))
           } else if (this.sessionActionInfoMode) {
-            if ((this.session()?.workingDir ?? '').length > 0) {
+            if (!AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0) {
               this.sessionMetadataRow('工作目录', this.session()?.workingDir ?? '', () => {
                 this.copyPlainText(this.session()?.workingDir ?? '', '已复制工作目录');
               })
@@ -6475,6 +6815,8 @@ export struct TaskPageContent {
                 .onClick(() => this.saveSessionRename())
             }
           } else {
+            this.sessionActionOption(this.v12String('v139_home_shared'), $r('sys.symbol.person_2'), false,
+              () => { this.closeSessionActions(); this.sharedManagementOpen = true; })
             this.sessionActionOption('重命名', $r('sys.symbol.doc_text'), false,
               () => this.sessionRenameMode = true)
             this.sessionActionOption('AI 起名', $r('sys.symbol.wand_and_stars'), false,
@@ -6821,7 +7163,7 @@ export struct TaskPageContent {
             this.gitBranchBadge()
           }
 
-          if ((this.session()?.workingDir ?? '').length > 0) {
+          if (!AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0) {
             this.taskIconButton($r('sys.symbol.folder'), 40, false,
               !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
           }
@@ -7655,6 +7997,10 @@ export struct TaskPageContent {
         }
         .width('100%').padding({ left: 12, right: 12, top: 4, bottom: 4 })
       }
+      if (this.incomingBlocked && !this.incomingImportBusy && !this.sending) {
+        Button(this.v12String('incoming_share_resume')).height(44)
+          .onClick((): void => { if (!this.incomingDraftRestored) this.restoreComposerDraft(); else void this.consumeIncomingShare(); })
+      }
       ConversationComposer({
         input: this.input,
         focused: this.composerFocused,
@@ -7667,7 +8013,7 @@ export struct TaskPageContent {
         streamingElapsedText: this.sessionActivityElapsedText(),
         hasContent: this.hasComposerContent(),
         canSend: this.canSend(),
-        composerEnabled: !this.deviceDisabled && !this.leavingForCreationEdit
+        composerEnabled: this.incomingDraftRestored && !this.incomingImportBusy && !this.incomingHandoff && !this.deviceDisabled && !this.leavingForCreationEdit
           && !pendingInteractionsBlockRemoteComposer(this.pendingInteractions),
         pickingImages: this.pickingImages,
         pickingFiles: this.pickingFiles,
@@ -7735,9 +8081,9 @@ export struct TaskPageContent {
             this.previewImageUrl = image.uri;
           });
         },
-        onRemoveImage: (localId: string): void => this.imageQueue.remove(localId),
+        onRemoveImage: (localId: string): void => this.removeIncomingAttachment(localId, true),
         onRetryImage: (localId: string): void => this.imageQueue.retry(localId),
-        onRemoveFile: (localId: string): void => this.fileQueue.remove(localId),
+        onRemoveFile: (localId: string): void => this.removeIncomingAttachment(localId, false),
         onRetryFile: (localId: string): void => this.fileQueue.retry(localId),
         onRemoveAtom: (atom: ComposerAtomPresentation): void => {
           this.setComposerDocument(removeComposerNode(this.composerDocument, atom.index));
@@ -7920,6 +8266,7 @@ export struct TaskPageContent {
             if (this.goalState === null && this.goalObjective.trim().length === 0) {
               this.goalObjective = this.input;
             }
+            if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return;
             this.contextSheetPage = 'goal';
             void AppServices.instance.goals.refresh(this.deviceId, this.sessionId);
           },
@@ -8140,6 +8487,19 @@ export struct TaskPageContent {
     Column() {
       Scroll(this.modelPickerScroller) {
         Column({ space: 12 }) {
+          ModelRoutingPanel({
+            snapshot: this.routingSnapshot,
+            binding: this.routingSession.binding,
+            sessionError: this.routingSession.error ? this.v12String('v139_route_unavailable') : '',
+            offer: this.queueErrorRetryText && !this.queueActionBlocked() ? this.routingSession.offer : null,
+            onFallback: (): void => { void this.acceptRoutingOffer(); },
+            labels: modelRoutingLabels(this.getUIContext().getHostContext()),
+            busy: this.routingBusy || this.contextRpcBusy || this.runtimeRouteLocked(),
+            onSelect: (id: string): void => { void this.selectRouting(id); },
+            onRefresh: (): void => { void this.loadRouting(true); },
+            onUnbind: (): void => { void this.stopRouting(); },
+            onOrdinary: (): void => { void this.stopRouting(); },
+          })
           if (this.pendingAgentSwitchIntent !== null) {
             Row({ space: 9 }) {
               SymbolGlyph($r('sys.symbol.clock'))
@@ -10433,7 +10793,7 @@ export struct TaskPageContent {
     if (!textPreviewable) return;
 
     const session = this.session();
-    const canUseDirectTextRead = remotePath.length > 0
+    const canUseDirectTextRead = !AppServices.instance.isSharedTaskPeer(deviceId) && remotePath.length > 0
       && (session?.remoteHostId ?? '').length === 0;
     try {
       if (canUseDirectTextRead) {
@@ -10460,7 +10820,7 @@ export struct TaskPageContent {
       if (generation !== this.filePreviewGeneration
         || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (url.length === 0) throw new Error('文件暂时无法读取');
-      const bytes = await new HarmonyHttp().downloadBytes(url);
+      const bytes = url.startsWith('file://') ? await readFileBytes(url) : await new HarmonyHttp().downloadBytes(url);
       if (generation !== this.filePreviewGeneration
         || !this.isCurrentPageLifecycle(lifecycleGeneration)) return;
       if (bytes.byteLength > 4 * 1024 * 1024) throw new Error('文件超过 4MB，请使用分享打开');
@@ -10543,6 +10903,11 @@ export struct TaskPageContent {
   private async resolveDownloadableUrl(raw: string, mimeType: string, skipCache: boolean): Promise<string> {
     const deviceId = this.deviceId;
     const url = normalizeImageUrlScheme(raw.trim());
+    if (AppServices.instance.isSharedTaskPeer(deviceId)) {
+      const guest = AppServices.instance.sharedGuest(deviceId);
+      if (!guest) throw new Error('ACCESS_REVOKED');
+      const result = recordOrEmpty(await guest.fetch(url)); return readStr(result, 'getUrl');
+    }
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
     const parsed = parseAttachmentOssRef(url);
     if (parsed !== null) {
@@ -12586,7 +12951,7 @@ export struct TaskPageContent {
     const services = AppServices.instance;
     const current = this.paneAccountEpoch === services.auth.sessionEpoch;
     this.teammate = current ? services.teammateRoster.findConversation(this.deviceId, this.sessionId) : undefined;
-    this.teammateOnline = current && services.client.getStatus() === 'online'
+    this.teammateOnline = current && services.client.getStatus(this.deviceId) === 'online'
       && services.tasks.deviceList.some((device: PresenceSnapshot) =>
         device.deviceId === this.deviceId && device.online && device.remoteControlEnabled);
   }
@@ -12595,7 +12960,13 @@ export struct TaskPageContent {
     return this.teammate !== undefined;
   }
 
+  private sharedManagementRequest(): HomeModuleRequest {
+    const request = new HomeModuleRequest(); request.kind = 'shared';
+    if (!AppServices.instance.isSharedTaskPeer(this.deviceId)) { request.deviceId = this.deviceId; request.sessionId = this.sessionId; }
+    return request;
+  }
   private showSessionActions(): void {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) { this.sharedManagementOpen = true; return; }
     if (this.isCreationBlockingRemoteOps()) return;
     this.sessionRenameDraft = this.sessionTitle();
     this.sessionActionInfoMode = false;
@@ -13406,6 +13777,11 @@ export struct TaskPageContent {
   ): Promise<string> {
     const deviceId = this.deviceId;
     const url = normalizeImageUrlScheme(ref.url.trim());
+    if (AppServices.instance.isSharedTaskPeer(deviceId)) {
+      const guest = AppServices.instance.sharedGuest(deviceId);
+      if (!guest) return Promise.reject(new Error('ACCESS_REVOKED'));
+      return guest.fetch(url).then((value: Object | undefined): string => readStr(recordOrEmpty(value), 'getUrl'));
+    }
     if (url.startsWith('http://') || url.startsWith('https://')) {
       return Promise.resolve(url);
     }
@@ -13540,6 +13916,13 @@ export struct TaskPageContent {
     const lifecycleGeneration = this.pageLifecycleGeneration;
     const deviceId = this.deviceId;
     if (!this.isCurrentPageLifecycle(lifecycleGeneration) || item.sessionId !== this.sessionId) return;
+    if (AppServices.instance.isSharedTaskPeer(deviceId)) {
+      const generic = ['permission', 'ask_user_question', 'plan_review'].indexOf(item.kind) >= 0;
+      const tool = readStr(item.raw, 'toolName');
+      if (!generic || readBool(item.raw, 'hostOwnedConfirmation', false)
+        || ['cindy.app.update', 'cindy.app.auto_update', 'ghost_contribution_submit', 'ghost_cancel_plugin_review'].indexOf(tool) >= 0
+        || decision['updatedInput'] !== undefined) return;
+    }
     this.clearArmedPermission();
     AppServices.instance.interactions.resolve(
       deviceId, item.sessionId, item.requestId, decision).catch(() => {
@@ -13550,6 +13933,12 @@ export struct TaskPageContent {
   }
 
   private interactionBusy(item: PendingInteraction): boolean {
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) {
+      const tool = readStr(item.raw, 'toolName');
+      if (!['permission', 'ask_user_question', 'plan_review'].includes(item.kind)
+        || readBool(item.raw, 'hostOwnedConfirmation', false)
+        || ['cindy.app.update', 'cindy.app.auto_update', 'ghost_contribution_submit', 'ghost_cancel_plugin_review'].includes(tool)) return true;
+    }
     return AppServices.instance.interactions.isResolving(item.requestId, this.deviceId, item.sessionId);
   }
 

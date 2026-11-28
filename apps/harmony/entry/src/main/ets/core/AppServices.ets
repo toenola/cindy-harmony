@@ -1,9 +1,19 @@
+import { parseOfficialSharedTaskInvitation } from './shared-tasks/SharedTaskInvitation';
+import { parseChatInviteReference } from './chat/ChatInvitationStore';
+import { SharedTaskRuntime, parseSharedTaskLink } from './SharedTaskRuntime';
+import { SharedTasksStore } from './shared-tasks/SharedTasksStore';
+import { SharedTaskDetail, SharedTaskSessionTarget } from './shared-tasks/SharedTaskModels';
+import { SharedTaskReadyTransport } from './shared-tasks/SharedTaskGuestClient';
+import { parseSession } from './tasks/TaskModels';
+import { IncomingComposerDraftBridge } from './incoming-share/IncomingComposerDraftBridge';
+import { createHarmonyIncomingComposerBridge } from './incoming-share/HarmonyIncomingComposer';
 import { PromptRecommendationPreference } from './messages/PromptRecommendationPreference';
 import { parseRelayJoinLink } from './device-link/RelayJoinLink';
 import { AgentNetSocket } from './device-link/AgentNetSocket';
 import { RelayRoute } from './device-link/RelayRoute';
 import { LegacyRelaySocket } from './device-link/LegacyRelaySocket';
-import { presignGet } from './attachments/AttachmentUpload';
+import { presignGet, deleteUpload } from './attachments/AttachmentUpload';
+import { OwnedHostMedia } from './attachments/OwnedHostMedia';
 import { OrcaCollaboration } from './tasks/OrcaCollaboration';
 import { TeammateRoster } from './tasks/TeammateRoster';
 import { LocalAttachmentPreviews } from './attachments/LocalAttachmentPreviews';
@@ -19,7 +29,7 @@ import { LocalAttachmentPreviews } from './attachments/LocalAttachmentPreviews';
  * 页面（EntryAbility onCreate）先调 init(context) 再使用。
  */
 
-import { common } from '@kit.AbilityKit';
+import { common, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AppConfig } from '../AppConfig';
 import { HarmonyWsAdapter } from '../network/HarmonyWsAdapter';
@@ -54,10 +64,31 @@ import { TaskCompletionPushPreferenceStore } from './notifications/TaskCompletio
 import { TaskCompletionPushService } from './notifications/TaskCompletionPushService';
 import { VoiceDictionaryStore, parseVoiceDictionarySnapshot } from './messages/VoiceDictionaryStore';
 import { SecureStore } from './storage/SecureStore';
+import { ModelRoutingPort, ModelRoutingStore } from './model-routing/ModelRoutingStore';
+import { CloudChatRuntime } from './CloudChatRuntime';
+import { createHarmonyUsageCardStore } from './usage-card/HarmonyUsageCards';
+import { UsageCardStore } from './usage-card/UsageCardStore';
+import { UsageSnapshot } from './usage/UsageDashboard';
+import { invokePhysicalPeerId } from './device-link/InvokeScheduler';
+import { IncomingShareStore } from './incoming-share/IncomingShareStore';
+import { HarmonyIncomingShareStorage, HarmonyIncomingShareStaging, HarmonyIncomingShareReceiver } from './incoming-share/HarmonyIncomingShare';
+
+export class AppModuleInvitation { kind: string = ''; invitation: string = ''; }
 
 const DOMAIN = 0x0000;
 const TAG = 'CindyApp';
 const KEY_SELF_DEVICE_NAME = 'settings.selfDeviceName';
+
+class AppModelRoutingPort implements ModelRoutingPort {
+  invoke: (deviceId: string, channel: string, args: Object[]) => Promise<Object | undefined> =
+    async (): Promise<Object | undefined> => undefined;
+  isOwner: (deviceId: string) => boolean = (): boolean => false;
+}
+
+export class UsageCardTarget {
+  formId: string = '';
+  deviceId: string = '';
+}
 
 /** 简单延时。 */
 function delay(ms: number): Promise<void> {
@@ -109,13 +140,32 @@ export class AppServices {
   private backgroundReleaseHandlers: Array<() => void> = [];
   readonly newSessionCreations: NewSessionCreationStore = new NewSessionCreationStore();
   readonly client: DlClient;
+  private readonly routingStore: ModelRoutingStore;
   readonly orca: OrcaCollaboration;
   readonly teammateRoster: TeammateRoster;
   private readonly teammateAvatarRequests: Map<string, Promise<string>> = new Map();
   private readonly http: HarmonyHttp = new HarmonyHttp();
   private readonly settingsStore: SecureStore = new SecureStore();
+  readonly cloudChat: CloudChatRuntime = new CloudChatRuntime(this.auth, this.settingsStore);
+  usageCards: UsageCardStore | null = null;
+  incomingShare: IncomingShareStore | null = null;
+  incomingComposer: IncomingComposerDraftBridge | null = null;
+  incomingShareError: boolean = false;
+  private incomingReceiver: HarmonyIncomingShareReceiver | null = null;
+  private incomingReady: Promise<void> | null = null;
+  private accountClientsRestored: boolean = false;
+  private pendingUsageCard: string = '';
   private selfDeviceName: string = '';
+  private sharedRuntime: SharedTaskRuntime | null = null;
+  private sharedPreparing: Promise<SharedTasksStore> | null = null;
+  private sharedContext: common.UIAbilityContext | null = null;
+  private pendingSharedOpen: SharedTaskSessionTarget | null = null;
+  private pendingSharedInvitation: string = '';
+  private pendingModuleInvitation: AppModuleInvitation | null = null;
+  private moduleInvitationOwner: string = '';
+  private moduleInvitationExpires: number = 0;
   private statusListeners: Array<(status: string) => void> = [];
+  private modulePushListeners: Set<(device: string, channel: string, payload: Object | undefined) => void> = new Set();
   private deepLinkListeners: Array<() => void> = [];
   private pendingDeepLink: SessionDeepLinkIntent | null = null;
   /** 已建立控制链路的设备（openLink 幂等去重）。 */
@@ -167,6 +217,45 @@ export class AppServices {
     };
     opts.events = this.buildEvents();
     this.client = new DlClient(opts);
+    const routingPort = new AppModelRoutingPort();
+    routingPort.invoke = async (deviceId: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+        const epoch = this.auth.sessionEpoch;
+        const route = RelayRoute.instance.generation;
+        const link = this.linkGeneration;
+        await this.openLink(deviceId);
+        if (epoch !== this.auth.sessionEpoch || route !== RelayRoute.instance.generation
+          || link !== this.linkGeneration) {
+          throw new Error('MODEL_ROUTING_STALE');
+        }
+        const invoke = new DlInvokeOptions();
+        invoke.channel = channel;
+        invoke.args = args;
+        const result = await this.client.invoke(deviceId, invoke);
+        if (epoch !== this.auth.sessionEpoch || route !== RelayRoute.instance.generation
+          || link !== this.linkGeneration) {
+          throw new Error('MODEL_ROUTING_STALE');
+        }
+        return unwrapInvokeResult(result);
+      };
+    routingPort.isOwner = (deviceId: string): boolean => this.auth.isLoggedIn
+        && this.tasks.deviceList.some((device: PresenceSnapshot): boolean =>
+          device.deviceId === deviceId && device.remoteControlEnabled);
+    this.routingStore = new ModelRoutingStore(routingPort);
+    this.auth.onChanged((): void => {
+      this.cloudChat.syncIdentity();
+      if (this.moduleInvitationOwner && this.moduleInvitationOwner !== this.usageCardOwner) this.pendingModuleInvitation = null;
+      else if (this.pendingModuleInvitation && this.usageCardOwner) this.moduleInvitationOwner = this.usageCardOwner;
+      if (this.sharedRuntime && !this.sharedRuntime.current()) {
+        this.sharedRuntime.dispose(); this.sharedRuntime = null; this.sharedPreparing = null;
+        this.pendingSharedOpen = null; this.pendingSharedInvitation = '';
+      }
+      if (this.auth.isLoggedIn) this.accountClientsRestored = true;
+      if (this.accountClientsRestored) {
+        void this.syncUsageCardOwner().catch((): void => {});
+        void this.incomingShare?.setOwner(this.usageCardOwner).catch((): void => { this.incomingShareError = true; });
+        void this.incomingComposer?.setOwner(this.usageCardOwner, this.auth.sessionEpoch).catch((): void => { this.incomingShareError = true; });
+      }
+    });
     this.orca = new OrcaCollaboration(this.client, (device: string): Promise<void> => this.openLink(device));
     this.teammateRoster = new TeammateRoster(this.client, (device: string): Promise<void> => this.openLink(device));
     this.tasks.attach(this.client);
@@ -188,8 +277,17 @@ export class AppServices {
       ));
     });
     this.auth.setLogoutCleanup(async (): Promise<void> => {
+      this.accountClientsRestored = true;
+      this.sharedRuntime?.dispose(); this.sharedRuntime = null; this.sharedPreparing = null;
+      this.pendingSharedOpen = null; this.pendingSharedInvitation = ''; this.pendingModuleInvitation = null;
+      this.client.clearScopedPeers();
+      await this.cloudChat.shutdown();
+      await this.usageCards?.setOwner('', this.auth.sessionEpoch);
+      await this.incomingShare?.setOwner('');
+      await this.incomingComposer?.setOwner('', this.auth.sessionEpoch);
       const accountEpoch = this.auth.sessionEpoch;
       this.taskAccountTransition.begin(accountEpoch);
+      this.routingStore.setScope('', accountEpoch);
       this.resetSessionSubscriptions();
       this.tasks.clearAll();
       // 登出**开始**即清空观测身份，避免强杀 / 崩溃上报误归到上一个账号。
@@ -230,8 +328,10 @@ export class AppServices {
     this.messages.setSessionSnapshotResolver(
       (sessionId: string, deviceId: string) => this.tasks.findSessionById(sessionId, deviceId));
     this.inputQueue.setLinkOpener((deviceId: string) => this.openLink(deviceId));
-    this.inputQueue.onInputAccepted((deviceId: string, sessionId: string): void =>
-      this.unarchiveAfterSend(deviceId, sessionId));
+    this.inputQueue.onInputAccepted((deviceId: string, sessionId: string, clientId: string): void => {
+      this.unarchiveAfterSend(deviceId, sessionId);
+      this.newSessionCreations.noteInputAccepted(deviceId, sessionId, clientId);
+    });
     this.interactions.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.goals.setLinkOpener((deviceId: string) => this.openLink(deviceId));
     this.newSessionCreations.attach(
@@ -257,11 +357,44 @@ export class AppServices {
       this.deepLinkListeners.forEach((listener: () => void) => listener());
       return true;
     }
+    if (this.acceptModuleInvitation(uri)) return true;
     const intent = parseSessionDeepLink(uri);
     if (intent === null) return false;
     this.pendingDeepLink = intent;
     for (let i = 0; i < this.deepLinkListeners.length; i++) this.deepLinkListeners[i]();
     return true;
+  }
+
+  moduleInvitationKind(text: string): string {
+    try {
+      if (text.includes('/chat-invite/') || /^(?:cindy|cindycn|cindydev):\/\/chat-invite\//.test(text)) {
+        parseChatInviteReference(text); return 'chat';
+      }
+      if (parseSharedTaskLink(text)) return 'shared';
+      if (parseOfficialSharedTaskInvitation(text, AppConfig.deviceLinkApiBaseUrl)) return 'shared';
+    } catch (_error) {}
+    return '';
+  }
+  private acceptModuleInvitation(text: string): boolean {
+    const kind = this.moduleInvitationKind(text); if (!kind) return false;
+    const intent = new AppModuleInvitation(); intent.kind = kind; intent.invitation = text;
+    this.pendingModuleInvitation = intent; this.moduleInvitationOwner = this.usageCardOwner;
+    this.moduleInvitationExpires = Date.now() + 15 * 60000;
+    this.deepLinkListeners.forEach((listener: () => void): void => listener()); return true;
+  }
+  openSharedManagement(): void {
+    if (!this.auth.isLoggedIn) return;
+    const intent = new AppModuleInvitation(); intent.kind = 'shared';
+    this.pendingModuleInvitation = intent; this.moduleInvitationOwner = this.usageCardOwner;
+    this.moduleInvitationExpires = Date.now() + 15 * 60000;
+    this.deepLinkListeners.forEach((listener: () => void): void => listener());
+  }
+
+  consumeModuleInvitation(): AppModuleInvitation | null {
+    const intent = this.pendingModuleInvitation;
+    if (!intent || !this.usageCardOwner) return null;
+    this.pendingModuleInvitation = null;
+    return this.moduleInvitationExpires > Date.now() && (!this.moduleInvitationOwner || this.moduleInvitationOwner === this.usageCardOwner) ? intent : null;
   }
 
   peekPendingDeepLink(): SessionDeepLinkIntent | null {
@@ -293,6 +426,7 @@ export class AppServices {
    * 失败不影响已送达的消息，任务保持已归档、不弹错误（对齐 Mobile unarchiveAfterSend）。
    */
   private unarchiveAfterSend(deviceId: string, sessionId: string): void {
+    if (this.isSharedTaskPeer(deviceId)) return;
     const key = `${deviceId}:${sessionId}`;
     const run = (this.unarchiveRuns.get(key) ?? Promise.resolve()).then(async (): Promise<void> => {
       const session = this.tasks.findSessionById(sessionId, deviceId);
@@ -343,6 +477,12 @@ export class AppServices {
   }
 
   async openLink(deviceId: string): Promise<void> {
+    if (deviceId.length > 128) {
+      if (!this.client.hasScopedPeer(deviceId) || this.client.getStatus(deviceId) !== 'online') {
+        throw new Error('ACCESS_REVOKED');
+      }
+      return;
+    }
     if (this.linkedDevices.has(deviceId)) {
       return;
     }
@@ -389,6 +529,9 @@ export class AppServices {
   }
 
   async init(context: common.Context): Promise<void> {
+    this.sharedContext = context as common.UIAbilityContext;
+    if (this.usageCards === null) this.usageCards = createHarmonyUsageCardStore(context);
+    await this.ensureIncomingShare(context);
     this.inputQueue.initPersistence(context);
     await Promise.all([
       this.auth.init(context),
@@ -422,7 +565,7 @@ export class AppServices {
     const routeScope = RelayRoute.instance.cacheScope(accountId);
     this.taskListSnapshot.setAccountScope(routeScope);
     this.messages.setCacheAccountScope(routeScope);
-    this.inputQueue.setAccountScope(routeScope);
+    this.inputQueue.setAccountScope(routeScope, this.usageCardOwner);
     this.voiceDictionary.setAccountScope(accountId);
     this.tasks.hydrateTaskListSnapshot(this.taskListSnapshot.restore());
   }
@@ -430,6 +573,7 @@ export class AppServices {
   async activateRelay(expectCustom: boolean = false): Promise<void> {
     const epoch = this.auth.sessionEpoch;
     this.client.stop();
+    this.routingStore.setScope('', this.auth.sessionEpoch);
     this.deviceLoadInFlight = undefined;
     RelayRoute.instance.reset();
     this.taskListSnapshot.setAccountScope('');
@@ -447,7 +591,15 @@ export class AppServices {
     const scope = RelayRoute.instance.cacheScope(this.auth.cacheAccountId);
     this.taskListSnapshot.setAccountScope(scope);
     this.messages.setCacheAccountScope(scope);
-    this.inputQueue.setAccountScope(scope);
+    this.inputQueue.setAccountScope(scope, this.usageCardOwner);
+    if (this.sharedRuntime?.current()) {
+      const access = this.sharedRuntime.store.access;
+      const guest = access ? this.sharedRuntime.guest(access.target.peer) : null;
+      if (guest) {
+        this.tasks.upsertSession(guest.target.peer, parseSession(recordOrEmpty(guest.session)));
+        void this.messages.openSession(guest.target.peer, guest.target.sessionId);
+      }
+    }
     this.client.start();
   }
 
@@ -455,6 +607,197 @@ export class AppServices {
     await RelayRoute.instance.official(this.auth.cacheAccountId);
     await this.activateRelay();
   }
+
+  /** Scope is refreshed before every public access; no page owns a parallel routing client. */
+  get modelRouting(): ModelRoutingStore {
+    this.routingStore.setScope(JSON.stringify([
+      RelayRoute.instance.cacheScope(this.auth.cacheAccountId), this.auth.sessionEpoch]), this.linkGeneration);
+    return this.routingStore;
+  }
+
+  get moduleScope(): string {
+    return this.auth.isLoggedIn ? JSON.stringify([RelayRoute.instance.cacheScope(this.auth.cacheAccountId),
+      this.auth.sessionEpoch, this.linkGeneration]) : '';
+  }
+
+  isSharedTaskPeer(deviceId: string): boolean { return invokePhysicalPeerId(deviceId) !== deviceId; }
+
+  get usageCardOwner(): string {
+    return this.auth.isLoggedIn && this.auth.cacheAccountId
+      ? JSON.stringify([AppConfig.region, this.auth.cacheAccountId]) : '';
+  }
+
+  private ensureIncomingShare(context: common.Context): Promise<void> {
+    if (this.incomingReady !== null) return this.incomingReady;
+    const inbox = new IncomingShareStore(new HarmonyIncomingShareStorage(context), new HarmonyIncomingShareStaging(context));
+    this.incomingShare = inbox;
+    this.incomingComposer = createHarmonyIncomingComposerBridge(context);
+    this.incomingReceiver = new HarmonyIncomingShareReceiver(inbox);
+    // Do not bind the empty pre-restore identity: it would discard valid pending
+    // shares from the account whose credentials Index restores next.
+    this.incomingReady = inbox.expire();
+    return this.incomingReady;
+  }
+
+  async accountClientsReady(): Promise<void> {
+    this.accountClientsRestored = true;
+    await this.syncUsageCardOwner();
+    await this.incomingShare?.setOwner(this.usageCardOwner);
+    await this.incomingComposer?.setOwner(this.usageCardOwner, this.auth.sessionEpoch);
+  }
+
+  async receiveSystemShare(context: common.Context, want: Want): Promise<boolean> {
+    if (want.action !== 'ohos.want.action.sendData') return false;
+    try {
+      await this.ensureIncomingShare(context);
+      const received = await this.incomingReceiver?.receive(want) ?? false;
+      this.incomingShareError = false;
+      this.deepLinkListeners.forEach((listener: () => void): void => listener());
+      return received;
+    } catch (_error) {
+      this.incomingShareError = true;
+      this.deepLinkListeners.forEach((listener: () => void): void => listener());
+      return false;
+    }
+  }
+
+  private async syncUsageCardOwner(): Promise<void> {
+    await this.usageCards?.setOwner(this.usageCardOwner, this.auth.sessionEpoch);
+  }
+
+  async syncUsageCards(snapshot: UsageSnapshot, device: string, name: string, epoch: number): Promise<void> {
+    if (epoch !== this.auth.sessionEpoch || !this.usageCardOwner) return;
+    await this.usageCards?.sync(this.usageCardOwner, epoch, snapshot, device, name);
+  }
+
+  acceptUsageCard(formId: string): boolean {
+    if (!formId || formId.length > 128 || /[\u0000-\u001f]/.test(formId)) return false;
+    this.pendingUsageCard = formId;
+    this.deepLinkListeners.forEach((listener: () => void): void => listener());
+    return true;
+  }
+
+  consumeUsageCardTarget(): UsageCardTarget | null {
+    if (!this.pendingUsageCard || !this.usageCards || !this.usageCardOwner) return null;
+    const id = this.pendingUsageCard;
+    this.pendingUsageCard = '';
+    const device = this.usageCards.target(id, this.usageCardOwner);
+    if (device === null) return null;
+    const target = new UsageCardTarget(); target.formId = id; target.deviceId = device;
+    return target;
+  }
+
+  onModulePush(listener: (device: string, channel: string, payload: Object | undefined) => void): () => void {
+    this.modulePushListeners.add(listener);
+    return (): void => { this.modulePushListeners.delete(listener); };
+  }
+
+  async invokeOwnedModule(device: string, channel: string, args: Object[], timeoutMs?: number): Promise<Object | undefined> {
+    const allowed = ['sidebar-settings:get-project-aliases', 'sidebar-settings:set-project-info',
+      'sidebar-settings:get-project-icon-image', 'sidebar-settings:get-project-auto-icon',
+      'maker:remote-resources:manifest', 'maker:remote-resources:list',
+      'maker:remote-resources:get', 'maker:remote-resources:invoke', 'fs:list-dir', 'maker:shared-task'];
+    const scope = this.moduleScope;
+    const authorized = (): boolean => scope.length > 0 && this.moduleScope === scope
+      && this.tasks.deviceList.some((row: PresenceSnapshot): boolean =>
+        row.deviceId === device && row.remoteControlEnabled);
+    if (allowed.indexOf(channel) < 0 || !authorized()) throw new Error('REMOTE_DISABLED');
+    await this.openLink(device);
+    if (!authorized()) throw new Error('OWNER_CHANGED');
+    const options = new DlInvokeOptions();
+    options.channel = channel; options.args = args; options.timeoutMs = timeoutMs;
+    options.preSend = (): void => { if (!authorized()) throw new Error('OWNER_CHANGED'); };
+    const response = await this.client.invoke(device, options);
+    if (!authorized()) throw new Error('OWNER_CHANGED');
+    return unwrapInvokeResult(response);
+  }
+
+  createOwnedHostMedia(): OwnedHostMedia {
+    const scope = this.moduleScope;
+    const current = (device: string): boolean => !!scope && scope === this.moduleScope && device.length <= 128
+      && this.tasks.deviceList.some((row: PresenceSnapshot): boolean => row.deviceId === device && row.remoteControlEnabled);
+    return new OwnedHostMedia({ current,
+      fetch: async (device, reference, thumbnail, guard, skipCache) => {
+        guard(); await this.openLink(device); guard();
+        return this.messages.fetchRemoteMedia(device, reference, thumbnail, skipCache, guard);
+      },
+      presign: async (key: string): Promise<string> => {
+        const token = await this.auth.getAccessToken();
+        if (!token || scope !== this.moduleScope) throw new Error('OWNER_CHANGED');
+        const value = await presignGet(key, token);
+        if (scope !== this.moduleScope) throw new Error('OWNER_CHANGED'); return value;
+      },
+      remove: async (key: string): Promise<void> => {
+        const token = await this.auth.getAccessToken();
+        if (token && scope === this.moduleScope) await deleteUpload(key, token);
+      },
+    });
+  }
+
+  get sharedTasks(): SharedTasksStore | null { return this.sharedRuntime?.store ?? null; }
+  sharedGuest(peer: string): SharedTaskReadyTransport | null { return this.sharedRuntime?.guest(peer) ?? null; }
+
+  prepareSharedTasks(): Promise<SharedTasksStore> {
+    if (this.sharedRuntime?.current()) return Promise.resolve(this.sharedRuntime.store);
+    if (this.sharedPreparing) return this.sharedPreparing;
+    const epoch = this.auth.sessionEpoch;
+    const run = this.createSharedTasks(epoch).finally((): void => { if (this.sharedPreparing === run) this.sharedPreparing = null; });
+    this.sharedPreparing = run; return run;
+  }
+  private async createSharedTasks(epoch: number): Promise<SharedTasksStore> {
+    const device = await this.auth.ensureDeviceId();
+    if (epoch !== this.auth.sessionEpoch || !this.auth.isLoggedIn || !this.sharedContext) throw new Error('OWNER_CHANGED');
+    this.sharedRuntime?.dispose();
+    const runtime = new SharedTaskRuntime({ auth: this.auth, storage: this.settingsStore, client: this.client,
+      context: this.sharedContext, getHello: (): HelloPayload => this.buildHello(),
+      ownerInvoke: (peer: string, channel: string, args: Object[]): Promise<Object | undefined> => this.invokeOwnedModule(peer, channel, args),
+      openOwner: async (detail: SharedTaskDetail): Promise<void> => {
+        if (!this.tasks.deviceList.some((row: PresenceSnapshot): boolean => row.deviceId === detail.hostDeviceId && row.remoteControlEnabled)) throw new Error('REMOTE_DISABLED');
+        const target: SharedTaskSessionTarget = { sharedTaskId: detail.sharedTaskId, peer: detail.hostDeviceId, sessionId: detail.sessionId,
+          hostDeviceId: detail.hostDeviceId, ownerAccountId: detail.ownerAccountId, title: detail.title, guest: false, transport: 'owner' };
+        this.pendingSharedOpen = target; this.deepLinkListeners.forEach((listener: () => void): void => listener());
+      },
+      ready: (guest: SharedTaskReadyTransport): void => {
+        this.tasks.upsertSession(guest.target.peer, parseSession(recordOrEmpty(guest.session)));
+        const off = guest.subscribe((channel: string, payload: Object): void => {
+          if (this.client.hasScopedPeer(guest.target.peer)) this.dispatchPush(guest.target.peer, channel, payload);
+        });
+        const statusOff = guest.routing.onStatus((): void => {
+          if (!this.client.hasScopedPeer(guest.target.peer)) return;
+          this.statusListeners.forEach((listener: (status: string) => void): void => listener(this.client.getStatus()));
+          if (guest.routing.getStatus() === 'online') {
+            void this.interactions.refreshPending(guest.target.peer, guest.target.sessionId);
+            void this.inputQueue.resyncDevice(guest.target.peer);
+            this.messages.resubscribePeer(guest.target.peer);
+          } else {
+            this.messages.invalidatePeerLiveTailTrust(guest.target.peer);
+            this.inputQueue.invalidateAuthority(guest.target.sessionId, guest.target.peer);
+          }
+        });
+        guest.onClosed((): void => { off(); statusOff(); });
+        void this.interactions.refreshPending(guest.target.peer, guest.target.sessionId);
+      },
+      closed: (target: SharedTaskSessionTarget): void => {
+        this.inputQueue.invalidateDevice(target.peer);
+        this.interactions.invalidateSession(target.peer, target.sessionId);
+        this.tasks.forgetScopedSession(target.peer, target.sessionId);
+        this.messages.forgetScopedSession(target.peer, target.sessionId);
+        this.modulePushListeners.forEach((listener): void => listener(target.peer, 'link-closed', 'ACCESS_REVOKED'));
+      },
+    }, device);
+    if (epoch !== this.auth.sessionEpoch) { runtime.dispose(); throw new Error('OWNER_CHANGED'); }
+    this.sharedRuntime = runtime; return runtime.store;
+  }
+  openSharedTask(target: SharedTaskSessionTarget): void {
+    if (target.guest && !this.client.hasScopedPeer(target.peer)) return;
+    this.pendingSharedOpen = target; this.deepLinkListeners.forEach((listener: () => void): void => listener());
+  }
+  consumeSharedTaskOpen(): SharedTaskSessionTarget | null {
+    const target = this.pendingSharedOpen; this.pendingSharedOpen = null;
+    return target && (!target.guest || this.client.hasScopedPeer(target.peer)) ? target : null;
+  }
+
+  get privateClientStorage(): SecureStore { return this.settingsStore; }
 
   getSelfDeviceName(): string {
     return this.selfDeviceName;
@@ -567,6 +910,11 @@ export class AppServices {
 
   /** App 回到前台：已登录才立即重连（未登录不启动网络重试循环）。 */
   onAppForeground(): void {
+    this.sharedRuntime?.setForeground(true);
+    this.cloudChat.setForeground(true);
+    void this.usageCards?.publishAll().catch((): void => {});
+    void this.incomingShare?.expire().catch((): void => { this.incomingShareError = true; });
+    this.modulePushListeners.forEach((listener): void => listener('', 'app-foreground', true));
     if (this.auth.isLoggedIn) {
       this.client.connectNow('foreground', true, true);
       this.sessionSubscribedDevices.forEach((deviceId: string): void => this.taskProjectAliases.refresh(deviceId));
@@ -580,6 +928,9 @@ export class AppServices {
    * 由页面注册回调，避免 core 反向依赖页面。
    */
   onAppBackground(): void {
+    this.sharedRuntime?.setForeground(false);
+    this.cloudChat.setForeground(false);
+    this.modulePushListeners.forEach((listener): void => listener('', 'app-foreground', false));
     for (let i = 0; i < this.backgroundReleaseHandlers.length; i++) {
       this.backgroundReleaseHandlers[i]();
     }
@@ -656,29 +1007,34 @@ export class AppServices {
       if (status === 'online') {
         // 重连成功：重新订阅已打开会话并 gap healing，刷新设备快照。
         this.newSessionCreations.onRelayOnline();
-        this.messages.resubscribeAll();
-        void this.inputQueue.resyncActiveSessions();
-        void this.interactions.resyncActiveSessions();
+        this.messages.resubscribeAll(true);
+        void this.inputQueue.resyncActiveSessions(true);
+        void this.interactions.resyncActiveSessions(true);
         void this.loadDevices();
       } else {
         // relay 重连后旧 topic registry 已失效；让下一次 online 重新订阅。
         // link-open 也是连接级状态，不能沿用旧 socket 上的已建立标记。
         this.linkGeneration += 1;
+        this.routingStore.setScope('', this.linkGeneration);
         this.linkedDevices.clear();
         this.taskProjectOrder.resetConnectionFence();
         this.taskProjectAliases.resetConnection();
         this.remoteAgentCatalogs.resetConnection();
         this.resetSessionSubscriptions();
-        this.messages.invalidateLiveTailTrust();
-        if (status === 'stopped') {
+        this.messages.invalidateOwnerLiveTailTrust();
+        if (status === 'stopped' && !this.client.hasScopedPeers()) {
           this.orca.clear();
           this.teammateRoster.clear();
           this.teammateAvatarRequests.clear();
-          this.newSessionCreations.clearAll();
+          this.newSessionCreations.clearAll(false);
           this.localAttachmentPreviews.clear();
           this.inputQueue.clearAll();
           this.interactions.clearAll();
           this.goals.clearAll();
+        } else if (status === 'stopped') {
+          this.newSessionCreations.clearAll(false);
+          this.inputQueue.invalidateOwnerDevices();
+          this.interactions.invalidateOwnerSessions();
         } else {
           this.inputQueue.invalidateActiveAuthorities();
         }
@@ -688,7 +1044,10 @@ export class AppServices {
       }
     };
     events.onLinkClosed = (deviceId: string, reason: string) => {
+      this.routingStore.invalidateDevice(deviceId);
+      this.modulePushListeners.forEach((listener): void => listener(deviceId, 'link-closed', reason));
       if (reason === 'revoked') {
+        void this.usageCards?.invalidateDevice(deviceId).catch((): void => {});
         hilog.warn(DOMAIN, TAG, 'access revoked by device %{public}s', deviceId.slice(0, 8));
         this.inputQueue.invalidateDevice(deviceId);
       }
@@ -926,7 +1285,7 @@ export class AppServices {
     const routeScope = RelayRoute.instance.cacheScope(accountId);
     this.taskListSnapshot.setAccountScope(routeScope);
     this.messages.setCacheAccountScope(routeScope);
-    this.inputQueue.setAccountScope(routeScope);
+    this.inputQueue.setAccountScope(routeScope, this.usageCardOwner);
     this.voiceDictionary.setAccountScope(accountId);
     // 换号后立即重绑观测身份，避免后续崩溃上报归到上一个账号。
     this.securityObservability.bindUser(accountId);
@@ -946,6 +1305,9 @@ export class AppServices {
     payload: Object | undefined,
     ownerStamp: Object | undefined = undefined,
   ): void {
+    if (channel === 'maker:remote-resources:changed' || channel === PROJECT_ALIASES_CHANGED) {
+      this.modulePushListeners.forEach((listener): void => listener(deviceId, channel, payload));
+    }
     switch (channel) {
       case 'maker:orca:worker-changed':
         this.orca.changed(deviceId, payload);

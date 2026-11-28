@@ -1,3 +1,4 @@
+import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 import { RemoteReadRetries } from './RemoteReadRetries';
 import { common } from '@kit.AbilityKit';
 import { PersistentInputOutbox } from './PersistentInputOutbox';
@@ -11,7 +12,7 @@ import { PersistentInputOutbox } from './PersistentInputOutbox';
 import { fastModeWireValue } from '../tasks/ModelSpeed';
 import { DlClient, DlError, DlInvokeOptions, isSafeUnsentDlError } from '../device-link/DlClient';
 import { RemoteImageRef, RemoteSerializedAttachment } from '../attachments/AttachmentModels';
-import { RemoteSession, readBool, readObj, readStr, safeErrorMessage } from '../tasks/TaskModels';
+import { RemoteSession, readBool, readObj, readStr, recordOrEmpty, safeErrorMessage } from '../tasks/TaskModels';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { buildPersistedUserContent } from './MessageStore';
 import { SerializedComposerDocument } from './ComposerDocument';
@@ -343,22 +344,33 @@ export function parseInputProjection(
 
 export class InputQueueStore {
   private readonly persistentOutbox: PersistentInputOutbox = new PersistentInputOutbox();
+  private readonly sharedPersistentOutbox: PersistentInputOutbox = new PersistentInputOutbox();
+  private outbox(device: string): PersistentInputOutbox { return invokePhysicalPeerId(device) !== device ? this.sharedPersistentOutbox : this.persistentOutbox; }
 
   initPersistence(context: common.Context): void {
-    this.persistentOutbox.init(context);
+    this.persistentOutbox.init(context); this.sharedPersistentOutbox.init(context);
   }
 
-  setAccountScope(accountId: string): void {
+  setAccountScope(accountId: string, sharedAccountId: string = accountId): void {
     this.persistentOutbox.setAccountScope(accountId);
+    this.sharedPersistentOutbox.setAccountScope(sharedAccountId);
   }
 
   clearPersistent(): void {
-    this.persistentOutbox.clear();
+    this.persistentOutbox.clear(); this.sharedPersistentOutbox.clear();
+  }
+
+  /** Allocate on the existing input-ID path before transferring an imported draft. */
+  createDocumentClientId(): string { return this.nextClientId(); }
+
+  hasPersistedDocument(deviceId: string, sessionId: string, clientId: string): boolean {
+    return this.outbox(deviceId).forSession(deviceId, sessionId).some((record): boolean =>
+      record.item['clientId'] === clientId);
   }
 
   private recoveredInputs(deviceId: string, sessionId: string): QueuedInputItem[] {
     const rows: QueuedInputItem[] = [];
-    for (const record of this.persistentOutbox.forSession(deviceId, sessionId)) {
+    for (const record of this.outbox(deviceId).forSession(deviceId, sessionId)) {
       const item = parseQueuedInputItem(record.item);
       if (item === null) continue;
       this.ownInputDelivery(deviceId, sessionId, item.clientId);
@@ -378,9 +390,9 @@ export class InputQueueStore {
     for (const receipt of projection.deliveryReceipts) {
       if (receipt.state !== 'unknown') owned.add(receipt.clientId);
     }
-    for (const item of this.persistentOutbox.forSession(deviceId, sessionId)) {
+    for (const item of this.outbox(deviceId).forSession(deviceId, sessionId)) {
       const clientId = readStr(item.item, 'clientId');
-      if (owned.has(clientId)) this.persistentOutbox.remove(deviceId, sessionId, clientId);
+      if (owned.has(clientId)) this.outbox(deviceId).remove(deviceId, sessionId, clientId);
     }
   }
   private readRetries: RemoteReadRetries = new RemoteReadRetries();
@@ -441,10 +453,10 @@ export class InputQueueStore {
   /** 同一任务的恢复拉取 single-flight；authority epoch 负责隔离清理后的旧结果。 */
   private refreshOperations: Map<string, Promise<boolean>> = new Map();
   private sendSequence: number = 0;
-  private acceptedListeners: Array<(deviceId: string, sessionId: string) => void> = [];
+  private acceptedListeners: Array<(deviceId: string, sessionId: string, clientId: string) => void> = [];
 
   /** 电脑已接收一条用户输入（离线时是重连后才送达）。 */
-  onInputAccepted(listener: (deviceId: string, sessionId: string) => void): () => void {
+  onInputAccepted(listener: (deviceId: string, sessionId: string, clientId: string) => void): () => void {
     this.acceptedListeners.push(listener);
     return (): void => {
       const index = this.acceptedListeners.indexOf(listener);
@@ -452,8 +464,8 @@ export class InputQueueStore {
     };
   }
 
-  private emitInputAccepted(deviceId: string, sessionId: string): void {
-    for (const listener of this.acceptedListeners.slice()) listener(deviceId, sessionId);
+  private emitInputAccepted(deviceId: string, sessionId: string, clientId: string): void {
+    for (const listener of this.acceptedListeners.slice()) listener(deviceId, sessionId, clientId);
   }
   private usageLimitScopeGeneration: number = 0;
   private usageLimitCancelUnsupportedScopes: Map<string, string> = new Map();
@@ -523,6 +535,11 @@ export class InputQueueStore {
     }
     state.canCancel = state.visible && state.cancelSupported && !state.cancelling;
     return state;
+  }
+
+  isLocallyOwnedInput(deviceId: string, sessionId: string, clientId: string): boolean {
+    return this.localDeliveries.get(sessionId)?.get(clientId)?.deviceId === deviceId
+      || this.hasPersistedDocument(deviceId, sessionId, clientId);
   }
 
   getInputDeliveryState(sessionId: string, clientId: string, deviceId: string): InputDeliveryState {
@@ -750,6 +767,20 @@ export class InputQueueStore {
     }
     const serialized = new SerializedComposerDocument();
     serialized.text = text.trim();
+    const reserved = this.outbox(deviceId).forSession(deviceId, session.id).find((row): boolean => row.item['clientId'] === stableClientId);
+    const source = existing?.raw ?? reserved?.item;
+    if (source !== undefined && typeof source['persistedContent'] === 'string') {
+      try {
+        const content = recordOrEmpty(JSON.parse(source['persistedContent'] as string) as Object);
+        // These ranges refer to the exact reserved text, never to a newly edited draft.
+        if (content['text'] === serialized.text) {
+          serialized.quotesEncoded = content['quotesEncoded'] === true;
+          if (Array.isArray(content['agentReferences'])) serialized.agentReferences = content['agentReferences'] as Object[];
+          if (Array.isArray(content['pastedTextRanges'])) serialized.pastedTextRanges = content['pastedTextRanges'] as Object[];
+          if (Array.isArray(content['slashCommandRanges'])) serialized.slashCommandRanges = content['slashCommandRanges'] as Object[];
+        }
+      } catch (_error) { /* Invalid persisted records are already excluded by the outbox loader. */ }
+    }
     const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
     this.ownInputDelivery(deviceId, session.id, item.clientId);
     const projection = this.getProjection(session.id, deviceId);
@@ -784,7 +815,7 @@ export class InputQueueStore {
     if (stableClientId.length > 0 && current.some((item: QueuedInputItem): boolean =>
       item.clientId === stableClientId)) return stableClientId;
     const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
-    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
+    this.outbox(deviceId).put(deviceId, session.id, item.raw, false);
     this.ownInputDelivery(deviceId, session.id, item.clientId);
     this.deferredBySession.set(session.id, current.concat([item]));
     this.notify();
@@ -797,7 +828,7 @@ export class InputQueueStore {
     this.deferredBySession.delete(sessionId);
     this.deferredDispatchTargets.delete(sessionId);
     const deviceId = this.sessionDevices.get(sessionId) ?? '';
-    for (const item of items) this.persistentOutbox.remove(deviceId, sessionId, item.clientId);
+    for (const item of items) this.outbox(deviceId).remove(deviceId, sessionId, item.clientId);
     if (items.length > 0) this.notify();
     return items;
   }
@@ -926,7 +957,7 @@ export class InputQueueStore {
     if (sessionId.length === 0 || clientIds.size === 0) return;
     if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
     this.recoveredInputs(deviceId, sessionId);
-    clientIds.forEach((clientId: string) => this.persistentOutbox.remove(deviceId, sessionId, clientId));
+    clientIds.forEach((clientId: string) => this.outbox(deviceId).remove(deviceId, sessionId, clientId));
     const tracked = new Set<string>();
     this.localDeliveries.get(sessionId)?.forEach((delivery: LocalInputDelivery) => {
       if (!delivery.historyConfirmed && clientIds.has(delivery.clientId)) tracked.add(delivery.clientId);
@@ -1213,7 +1244,7 @@ export class InputQueueStore {
       }
       return accepted;
     } catch (e) {
-      this.readRetries.schedule(sessionId, (): boolean => this.client?.getStatus() === 'online'
+      this.readRetries.schedule(sessionId, (): boolean => this.client?.getStatus(deviceId) === 'online'
         && this.activeTargets.get(sessionId)?.deviceId === deviceId
         && this.captureAuthorityEpoch(sessionId) === expectedEpoch,
         (): void => { void this.refreshThenPumpConnection(deviceId, sessionId); });
@@ -1276,10 +1307,12 @@ export class InputQueueStore {
   }
 
   /** Relay 重连后补拉当前打开任务的输入投影。 */
-  async resyncActiveSessions(): Promise<void> {
-    this.readRetries.clear();
+  async resyncActiveSessions(ownerOnly: boolean = false): Promise<void> {
+    if (!ownerOnly) this.readRetries.clear();
     const pending: Promise<void>[] = [];
     this.activeTargets.forEach((target: ActiveInputTarget, sessionId: string) => {
+      if (ownerOnly && invokePhysicalPeerId(target.deviceId) !== target.deviceId) return;
+      if (ownerOnly) this.readRetries.cancel(sessionId);
       pending.push(this.refreshThenPumpConnection(target.deviceId, sessionId));
     });
     await Promise.all(pending);
@@ -1327,11 +1360,19 @@ export class InputQueueStore {
     if (changed) this.notify();
   }
 
+  /** Explicitly stopping/replacing the owner relay cannot transfer its in-memory
+   * deferred inputs to a different route. Durable records stay in their old scope. */
+  invalidateOwnerDevices(): void {
+    const devices: Set<string> = new Set();
+    this.sessionDevices.forEach((device: string): void => { if (invokePhysicalPeerId(device) === device) devices.add(device); });
+    devices.forEach((device: string): void => this.invalidateDevice(device));
+  }
+
   /** REST 设备列表是全量快照；缺席设备与明确不可用设备都按移除处理。 */
   reconcileDeviceSnapshot(seenDeviceIds: Set<string>, availableDeviceIds: Set<string>): void {
     const invalidDevices = new Set<string>();
     this.sessionDevices.forEach((deviceId: string) => {
-      if (!seenDeviceIds.has(deviceId) || !availableDeviceIds.has(deviceId)) {
+      if (invokePhysicalPeerId(deviceId) === deviceId && (!seenDeviceIds.has(deviceId) || !availableDeviceIds.has(deviceId))) {
         invalidDevices.add(deviceId);
       }
     });
@@ -1344,6 +1385,7 @@ export class InputQueueStore {
   /** socket 断开使所有在途快照失权，但保留最后投影供离线 UI 平滑展示。 */
   invalidateActiveAuthorities(): void {
     this.activeTargets.forEach((_target: ActiveInputTarget, sessionId: string) => {
+      if (invokePhysicalPeerId(_target.deviceId) !== _target.deviceId) return;
       this.bumpAuthorityEpoch(sessionId);
       this.bumpDispatchEpoch(sessionId);
     });
@@ -1434,12 +1476,26 @@ export class InputQueueStore {
   reserveDocument(deviceId: string, session: RemoteSession, serialized: SerializedComposerDocument,
     images: RemoteImageRef[], files: RemoteSerializedAttachment[], stableClientId: string = ''): string {
     const item = this.buildQueuedMessage(session, serialized, images, files, stableClientId);
-    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
+    this.outbox(deviceId).put(deviceId, session.id, item.raw, false);
     return item.clientId;
   }
 
   discardReserved(deviceId: string, sessionId: string, clientId: string): void {
-    this.persistentOutbox.remove(deviceId, sessionId, clientId);
+    const delivery = this.localDeliveries.get(sessionId)?.get(clientId);
+    const record = this.outbox(deviceId).forSession(deviceId, sessionId).find((record): boolean => record.item['clientId'] === clientId);
+    if (record?.sendStarted || this.enqueueingClientIds.has(clientId) || this.deferredDispatchClientIds.has(clientId)
+      || (delivery !== undefined && (delivery.deviceId !== deviceId || delivery.sendingAttempts > 0 || delivery.hostObserved))) {
+      throw new Error('INPUT_RESERVATION_DISPATCH_UNKNOWN');
+    }
+    // Disk first: a failed deletion must leave all in-memory ownership intact.
+    this.outbox(deviceId).removeReservedStrict(deviceId, sessionId, clientId);
+    if (!this.sessionDeviceMatches(sessionId, deviceId)) return;
+    this.deferredBySession.set(sessionId, (this.deferredBySession.get(sessionId) ?? []).filter((item: QueuedInputItem): boolean => item.clientId !== clientId));
+    this.connectionWaitingBySession.set(sessionId, (this.connectionWaitingBySession.get(sessionId) ?? []).filter((item: QueuedInputItem): boolean => item.clientId !== clientId));
+    const projection = this.projections.get(sessionId);
+    if (projection !== undefined) projection.pendingQueue = projection.pendingQueue.filter((item: QueuedInputItem): boolean => item.clientId !== clientId);
+    this.localDeliveries.get(sessionId)?.delete(clientId);
+    this.clearTransientClient(clientId); this.bumpAuthorityEpoch(sessionId); this.notify();
   }
 
   async enqueueDocument(
@@ -1462,12 +1518,12 @@ export class InputQueueStore {
     }
     const item = this.buildQueuedMessage(
       session, serialized, images, files, stableClientId, planModeOverride);
-    this.persistentOutbox.put(deviceId, session.id, item.raw, false);
+    this.outbox(deviceId).put(deviceId, session.id, item.raw, false);
     this.ownInputDelivery(deviceId, session.id, item.clientId);
     if (!this.canSendInputDelivery(deviceId, session.id, item.clientId)) return item.clientId;
     const remoteEvidenceAtRequestStart = this.captureRemoteEvidenceEpoch(session.id);
     const dispatchEpoch = this.captureDispatchEpoch(session.id);
-    if (this.client?.getStatus() !== 'online'
+    if (this.client?.getStatus(deviceId) !== 'online'
       || (this.connectionWaitingBySession.get(session.id)?.length ?? 0) > 0
       || this.connectionPumps.has(session.id)) {
       this.parkForConnection(deviceId, session, item);
@@ -1485,7 +1541,7 @@ export class InputQueueStore {
     const sendOptions: Record<string, Object> = {};
     sendOptions['sendAtMs'] = Date.now();
     try {
-      this.persistentOutbox.put(deviceId, session.id, item.raw, true);
+      this.outbox(deviceId).put(deviceId, session.id, item.raw, true);
       const expectedEpoch = this.captureAuthorityEpoch(session.id);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [session.id, item.raw, sendOptions]);
       if (!this.dispatchEpochIsCurrent(session.id, dispatchEpoch)) {
@@ -1496,9 +1552,9 @@ export class InputQueueStore {
         session.id, result, expectedEpoch, item.clientId, deviceId);
       this.enqueueingClientIds.delete(item.clientId);
       this.failedByClientId.delete(item.clientId);
-      this.persistentOutbox.remove(deviceId, session.id, item.clientId);
+      this.outbox(deviceId).remove(deviceId, session.id, item.clientId);
       this.notify();
-      this.emitInputAccepted(deviceId, session.id);
+      this.emitInputAccepted(deviceId, session.id, item.clientId);
       return item.clientId;
     } catch (e) {
       if (isSafeUnsentDlError(e)) {
@@ -1575,7 +1631,7 @@ export class InputQueueStore {
     const sendOptions: Record<string, Object> = {};
     sendOptions['sendAtMs'] = Date.now();
     try {
-      this.persistentOutbox.put(deviceId, sessionId, item.raw, true);
+      this.outbox(deviceId).put(deviceId, sessionId, item.raw, true);
       const expectedEpoch = this.captureAuthorityEpoch(sessionId);
       const result = await this.invoke(deviceId, 'maker:input:enqueue', [sessionId, item.raw, sendOptions]);
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) {
@@ -1585,9 +1641,9 @@ export class InputQueueStore {
       this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, clientId, deviceId);
       this.enqueueingClientIds.delete(clientId);
       this.deferredDispatchClientIds.delete(clientId);
-      this.persistentOutbox.remove(deviceId, sessionId, clientId);
+      this.outbox(deviceId).remove(deviceId, sessionId, clientId);
       this.notify();
-      this.emitInputAccepted(deviceId, sessionId);
+      this.emitInputAccepted(deviceId, sessionId, clientId);
       void this.pumpDeferred(sessionId);
       void this.pumpConnectionWaiting(sessionId);
     } catch (e) {
@@ -1640,7 +1696,7 @@ export class InputQueueStore {
         this.connectionDispatchTargets.delete(sessionId);
       }
       if (!this.enqueueingClientIds.has(clientId)) {
-        this.persistentOutbox.remove(deviceId, sessionId, clientId);
+        this.outbox(deviceId).remove(deviceId, sessionId, clientId);
         this.clearTransientClient(clientId);
         this.notify();
         return;
@@ -1657,7 +1713,7 @@ export class InputQueueStore {
         this.deferredPumpRestartSessions.add(sessionId);
       }
       this.clearTransientClient(clientId);
-      this.persistentOutbox.remove(deviceId, sessionId, clientId);
+      this.outbox(deviceId).remove(deviceId, sessionId, clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
       return;
@@ -1683,7 +1739,7 @@ export class InputQueueStore {
       const result = await this.invoke(deviceId, 'maker:input:remove', [sessionId, clientId]);
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       this.applyProjectionResultIfCurrent(sessionId, result, expectedEpoch, '', deviceId);
-      this.persistentOutbox.remove(deviceId, sessionId, clientId);
+      this.outbox(deviceId).remove(deviceId, sessionId, clientId);
       this.deferredDispatchClientIds.delete(clientId);
       this.notify();
       void this.pumpDeferred(sessionId);
@@ -1691,7 +1747,7 @@ export class InputQueueStore {
       if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)) return;
       if ((e instanceof DlError && e.code === 'NOT_FOUND')
         || (e instanceof Error && e.message.indexOf('[NOT_FOUND]') >= 0)) {
-        this.persistentOutbox.remove(deviceId, sessionId, clientId);
+        this.outbox(deviceId).remove(deviceId, sessionId, clientId);
         this.clearTransientClient(clientId);
         this.notify();
         void this.pumpDeferred(sessionId);
@@ -2205,7 +2261,7 @@ export class InputQueueStore {
           this.enqueueingClientIds.delete(item.clientId);
           this.failedByClientId.delete(item.clientId);
           this.notify();
-          this.emitInputAccepted(currentTarget.deviceId, sessionId);
+          this.emitInputAccepted(currentTarget.deviceId, sessionId, item.clientId);
         } catch (e) {
           if (!this.dispatchEpochIsCurrent(sessionId, dispatchEpoch)
             || this.connectionPumps.get(sessionId) !== pumpToken) {
@@ -2319,7 +2375,9 @@ export class InputQueueStore {
     raw['effort'] = session.effort;
     raw['permissionMode'] = session.permissionMode.length > 0 ? session.permissionMode : 'ask';
     raw['workingDir'] = session.workingDir;
-    const createOpts = readObj(raw, 'createOpts');
+    const previousCreateOpts = readObj(raw, 'createOpts');
+    const createOpts: Record<string, Object> = {};
+    for (const key of Object.keys(previousCreateOpts)) if (key !== 'agentDeviceId') createOpts[key] = previousCreateOpts[key];
     createOpts['agentKind'] = session.agentKind === 'codex' || session.agentKind === 'pi'
       ? session.agentKind : 'claude-code';
     createOpts['workingDir'] = session.workingDir;
@@ -2327,6 +2385,7 @@ export class InputQueueStore {
     createOpts['effort'] = session.effort;
     createOpts['permissionMode'] = session.permissionMode.length > 0 ? session.permissionMode : 'ask';
     createOpts['fastMode'] = fastModeWireValue(session.fastMode, session.fastModeTier);
+    if (session.agentDeviceId.length > 0) createOpts['agentDeviceId'] = session.agentDeviceId;
     if (session.providerId.length > 0) createOpts['providerId'] = session.providerId;
     if (session.remoteHostId.length > 0) createOpts['remoteHostId'] = session.remoteHostId;
     if (session.sdkSessionId.length > 0) createOpts['resumeSessionId'] = session.sdkSessionId;
@@ -2522,6 +2581,7 @@ export class InputQueueStore {
       ? session.planModeEnabled : planModeOverride;
     createOpts['fastMode'] = fastModeWireValue(session.fastMode, session.fastModeTier);
     createOpts['displayReasoning'] = 'summarized';
+    if (session.agentDeviceId.length > 0) createOpts['agentDeviceId'] = session.agentDeviceId;
     if (session.providerId.length > 0) createOpts['providerId'] = session.providerId;
     if (session.remoteHostId.length > 0) createOpts['remoteHostId'] = session.remoteHostId;
     if (session.sdkSessionId.length > 0) createOpts['resumeSessionId'] = session.sdkSessionId;

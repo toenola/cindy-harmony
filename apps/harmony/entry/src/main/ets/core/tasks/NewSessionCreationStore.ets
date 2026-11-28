@@ -93,6 +93,9 @@ export class NewSessionCreationParams {
   firstMessageFiles: RemoteSerializedAttachment[] = [];
   planModeArm: boolean = false;
   legacyPlanRestore: string = '';
+  /** In-memory route binding; never serialized with message payload or credentials. */
+  beforeFirstInput: (() => Promise<void>) | undefined = undefined;
+  onFirstInputAccepted: (() => Promise<void>) | undefined = undefined;
 }
 
 export class NewSessionCreationTask {
@@ -110,6 +113,7 @@ export class NewSessionCreationTask {
   temporaryTopicHandedOff: boolean = false;
   /** 任务被全局清理后，旧订阅 Promise 不能再为新账号/新页面排队退订。 */
   lifecycleGeneration: number = 0;
+  firstInputAcceptanceStarted: boolean = false;
 }
 
 class NewSessionExactProbeResult {
@@ -152,6 +156,18 @@ export class NewSessionCreationStore {
   private topicRemovalRetryTimers: Map<string, number> = new Map();
   /** 账号切换/停止清理会推进此代次，围住所有临时 topic 异步回调。 */
   private lifecycleGeneration: number = 0;
+
+  /** Only the exact first-input receipt may commit a prepared routing decision. */
+  noteInputAccepted(deviceId: string, sessionId: string, clientId: string): void {
+    const task = this.tasks.get(sessionId);
+    if (task === undefined || task.deviceId !== deviceId || task.firstMessageClientId !== clientId
+      || !this.isCurrent(task) || task.firstInputAcceptanceStarted) return;
+    const accepted = task.params.onFirstInputAccepted;
+    if (accepted === undefined) return;
+    task.firstInputAcceptanceStarted = true;
+    // A routing-note/commit failure cannot turn an accepted user message into a resend.
+    void accepted().catch((): void => {});
+  }
 
   attach(
     client: DlClient,
@@ -397,6 +413,8 @@ export class NewSessionCreationStore {
       if (!this.isCurrent(task)) return;
       await this.adoptCreatedSession(task, created, confirmedSession);
       if (!this.isCurrent(task)) return;
+      if (task.params.beforeFirstInput !== undefined) await task.params.beforeFirstInput();
+      if (!this.isCurrent(task)) return;
 
       if (task.params.planModeArm) {
         try {
@@ -424,9 +442,11 @@ export class NewSessionCreationStore {
         if (!this.isCurrent(task)) return;
         if (verdict === 'queued') {
           this.inputQueue?.clearLocalFailure(task.firstMessageClientId);
+          this.noteInputAccepted(task.deviceId, task.sessionId, task.firstMessageClientId);
         } else if (verdict === 'applied') {
           this.inputQueue?.resolveAppliedDelivery(
             task.sessionId, task.firstMessageClientId, task.deviceId);
+          this.noteInputAccepted(task.deviceId, task.sessionId, task.firstMessageClientId);
         } else {
           await this.failEnqueue(task, verdict === 'missing'
             ? '首条消息尚未送达，请先核对任务内容后再重新发送'
@@ -754,6 +774,7 @@ export class NewSessionCreationStore {
     const options = new DlInvokeOptions();
     options.channel = channel;
     options.args = args;
+    options.preSend = (): void => { if (!this.isCurrent(task)) throw new Error('新任务创建已取消'); };
     const envelope = await this.client.invoke(task.deviceId, options);
     if (!this.isCurrent(task)) throw new Error('新任务创建已取消');
     return unwrapInvokeResult(envelope);

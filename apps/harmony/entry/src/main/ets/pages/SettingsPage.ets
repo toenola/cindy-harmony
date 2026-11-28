@@ -1,3 +1,4 @@
+import { harmonyV12String } from '../core/HarmonyStrings';
 import { PromptRecommendationSettings } from '../components/PromptRecommendationPanel';
 import { HarmonySettingsGroup, HarmonySettingsRow } from '../components/SettingsRows';
 import { RelaySettingsPanel } from '../components/RelaySettingsPanel';
@@ -612,6 +613,15 @@ struct SettingsPage {
             RelaySettingsPanel()
 
             PromptRecommendationSettings()
+
+            HarmonySettingsGroup({ title: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared') }) {
+              HarmonySettingsRow({ label: harmonyV12String(this.getUIContext().getHostContext(), 'v139_home_shared'),
+                showChevron: true, onRowClick: (): void => {
+                  AppServices.instance.openSharedManagement();
+                  try { router.back({ url: 'pages/TaskListPage' }); }
+                  catch (_error) { void router.replaceUrl({ url: 'pages/TaskListPage' }); }
+                } })
+            }
 
             HarmonySettingsGroup({ title: '版本' }) {
               HarmonySettingsRow({ label: '当前版本', value: `整包版本 ${AppConfig.appVersion}` })

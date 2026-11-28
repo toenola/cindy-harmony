@@ -19,6 +19,7 @@ struct Index {
     try {
       await AppServices.instance.init(getContext(this));
       const restored = await AppServices.instance.auth.restoreSession();
+      await AppServices.instance.accountClientsReady();
       if (restored) {
         // 先画 last-known 列表，再连 relay 用远端权威快照对账。
         await AppServices.instance.restoreTaskListSnapshot();

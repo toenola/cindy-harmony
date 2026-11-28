@@ -7,6 +7,9 @@ const MAX_BACKGROUND_QUEUED = 96;
 
 const BACKGROUND_INVOKE_CHANNELS: string[] = [
   'local-db:project-aliases:list',
+  'sidebar-settings:get-project-aliases',
+  'sidebar-settings:get-project-icon-image',
+  'sidebar-settings:get-project-auto-icon',
   'git-context:pr-refs:list',
   'git-context:pr-status',
   'maker:schedule:list-sidebar-index-runs',
@@ -139,6 +142,16 @@ export class InvokeScheduler {
     this.peers.forEach((state: PeerQueue, peerId: string) => {
       for (const job of state.jobs.splice(0)) job.cancel(error);
       this.drain(peerId, state);
+    });
+  }
+
+  /** The owner socket has no authority over jobs dispatched by registered scoped transports. */
+  clearPhysical(error: DlError): void {
+    this.peers.forEach((state: PeerQueue, deviceId: string) => {
+      const cancelled = state.jobs.filter((job: InvokeJob) => invokePhysicalPeerId(job.peerId) === job.peerId);
+      state.jobs = state.jobs.filter((job: InvokeJob) => invokePhysicalPeerId(job.peerId) !== job.peerId);
+      for (const job of cancelled) job.cancel(error);
+      this.drain(deviceId, state);
     });
   }
 

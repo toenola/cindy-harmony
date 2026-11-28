@@ -1,3 +1,6 @@
+import { ProjectSymbol } from '../components/projects/ProjectSymbol';
+import { IncomingShareSurface } from '../components/IncomingShareSurface';
+import { IncomingShareDestination } from '../core/incoming-share/IncomingShareStore';
 import { UsageDashboardPanel } from '../components/UsageDashboardPanel';
 import { TeammateAvatar } from '../components/TeammateAvatar';
 import { TeammateRosterEntry } from '../core/tasks/TeammateRoster';
@@ -38,6 +41,7 @@ import { AppServices } from '../core/AppServices';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { PresenceSnapshot } from '../core/device-link/DlProtocol';
 import { RemoteSession, readStr, sessionProjectDirectory } from '../core/tasks/TaskModels';
+import { HomeModulePanel, HomeModuleRequest } from '../components/HomeModulePanel';
 import { SessionLiveActivity, SessionMetaPatch } from '../core/tasks/TaskStore';
 import {
   listTaskSearchProjects,
@@ -160,7 +164,9 @@ class TaskProjectGroup {
 struct TaskListPage {
   @State devices: PresenceSnapshot[] = [];
   @State entries: TaskListEntry[] = [];
-  @State selectedDeviceId: string = '';
+  @State @Watch('usageCardScopeChanged') selectedDeviceId: string = '';
+  @State private activeUsageCardId: string = '';
+  @State private moduleRequest: HomeModuleRequest | null = null;
   @State selectedSessionDeviceId: string = '';
   @State selectedSessionId: string = '';
   @State selectedMessageClientId: string = '';
@@ -426,6 +432,7 @@ struct TaskListPage {
   }
 
   onBackPress(): boolean {
+    if (this.moduleRequest !== null) { this.moduleRequest = null; return true; }
     if (this.taskSearchFilterOpen) {
       this.closeTaskSearchFilter();
       return true;
@@ -585,6 +592,7 @@ struct TaskListPage {
     if (AppServices.instance.taskAccountTransition.active) return;
     if (!this.splitLayoutEnabled()) return;
     if (this.newSessionDraftOpen) return;
+    if (AppServices.instance.client.hasScopedPeer(this.selectedSessionDeviceId)) return;
     if (this.taskSearchActive()) {
       // 搜索请求尚未完成时保留当前详情，避免每次输入一个字符右栏闪空；
       // 结果落地后再按当前 Tab 选择首条搜索结果。
@@ -860,6 +868,7 @@ struct TaskListPage {
     const epoch = AppServices.instance.auth.sessionEpoch;
     if (epoch === this.residentAccountEpoch) return;
     this.residentAccountEpoch = epoch;
+    this.moduleRequest = null;
     this.teammateRoster = [];
     this.clearRosterTimers();
     this.residentPanes = [];
@@ -880,6 +889,7 @@ struct TaskListPage {
 
   private setSelectedTask(deviceId: string, sessionId: string, messageClientId: string): void {
     if (AppServices.instance.taskAccountTransition.active) return;
+    this.moduleRequest = null;
     this.selectedSessionDeviceId = deviceId;
     this.selectedSessionId = sessionId;
     this.selectedMessageClientId = messageClientId;
@@ -888,7 +898,7 @@ struct TaskListPage {
   }
 
   private paneSelected(pane: ResidentTaskPane): boolean {
-    return !this.newSessionDraftOpen && pane.deviceId === this.selectedSessionDeviceId
+    return this.moduleRequest === null && !this.newSessionDraftOpen && pane.deviceId === this.selectedSessionDeviceId
       && pane.sessionId === this.selectedSessionId;
   }
 
@@ -905,7 +915,38 @@ struct TaskListPage {
     this.setSelectedTask(entry.deviceId, entry.session.id, '');
   }
 
+  private tryOpenUsageCard(): void {
+    const target = AppServices.instance.consumeUsageCardTarget();
+    if (target === null) return;
+    this.moduleRequest = null;
+    this.newSessionDraftOpen = false;
+    this.activeUsageCardId = target.formId;
+    this.selectedDeviceId = target.deviceId;
+    this.setActiveListTab('usage');
+  }
+
+  private usageCardScopeChanged(): void {
+    if (!this.activeUsageCardId || this.activeListTab !== 'usage') return;
+    const device = this.selectedDeviceId;
+    if (device && !AppServices.instance.tasks.deviceList.some((row: PresenceSnapshot): boolean =>
+      row.deviceId === device && row.remoteControlEnabled)) return;
+    void AppServices.instance.usageCards?.configure(this.activeUsageCardId, device).catch((): void => {});
+  }
+
   private tryOpenPendingDeepLink(): void {
+    const shared = AppServices.instance.consumeSharedTaskOpen();
+    if (shared !== null) {
+      this.moduleRequest = null; this.newSessionDraftOpen = false;
+      this.setSelectedTask(shared.peer, shared.sessionId, '');
+      if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage', params: { deviceId: shared.peer, sessionId: shared.sessionId } });
+      return;
+    }
+    const invitation = AppServices.instance.consumeModuleInvitation();
+    if (invitation !== null) {
+      const request = new HomeModuleRequest(); request.kind = invitation.kind; request.invitation = invitation.invitation;
+      request.deviceId = this.moduleDevice(); this.newSessionDraftOpen = false; this.moduleRequest = request; return;
+    }
+    this.tryOpenUsageCard();
     if (AppServices.instance.hasPendingRelayLink()) {
       void router.pushUrl({ url: 'pages/SettingsPage' });
       return;
@@ -962,6 +1003,8 @@ struct TaskListPage {
   }
 
   private setActiveListTab(tab: TaskListCategory): void {
+    this.moduleRequest = null;
+    if (tab !== 'usage') this.activeUsageCardId = '';
     this.rememberUsageSidebar(tab);
     const index = this.listTabIndex(tab);
     if (this.activeListTab !== tab) {
@@ -1173,7 +1216,57 @@ struct TaskListPage {
     router.pushUrl({ url: 'pages/SettingsPage' });
   }
 
+  private moduleDevice(): string {
+    if (this.selectedDeviceId) return this.selectedDeviceId;
+    const available = this.devices.filter((device: PresenceSnapshot): boolean => this.deviceCanOpen(device));
+    return available.length === 1 ? available[0].deviceId : '';
+  }
+
+  private openModule(kind: string): void {
+    const request = new HomeModuleRequest();
+    request.kind = kind;
+    request.deviceId = this.moduleDevice();
+    request.create = kind === 'project';
+    if (kind !== 'chat' && kind !== 'shared' && !request.deviceId) {
+      this.getUIContext().getPromptAction().showToast({ message: this.v12String('v139_home_choose_computer') });
+      return;
+    }
+    this.newSessionDraftOpen = false;
+    this.moduleRequest = request;
+  }
+
+  private openProjectSettings(group: TaskProjectGroup): void {
+    const request = new HomeModuleRequest();
+    request.kind = 'project'; request.deviceId = group.deviceId; request.title = group.title;
+    const remoteHost = group.entries[0]?.session.remoteHostId ?? '';
+    request.projectKey = remoteHost
+      ? 'remote:' + encodeURIComponent(remoteHost) + ':' + group.workingDir : 'local:' + group.workingDir;
+    this.newSessionDraftOpen = false; this.moduleRequest = request;
+  }
+
+  @Builder
+  private moduleShortcuts(category: TaskListCategory) {
+    Row({ space: 8 }) {
+      if (category === 'projects') {
+        Button(this.v12String('v139_home_create_project')).height(44).fontSize(13)
+          .fontColor($r('app.color.text_secondary')).backgroundColor(Color.Transparent)
+          .onClick((): void => this.openModule('project'))
+        Button(this.v12String('v139_home_resources')).height(44).fontSize(13)
+          .fontColor($r('app.color.text_secondary')).backgroundColor(Color.Transparent)
+          .onClick((): void => this.openModule('resources'))
+      } else if (category === 'dialogues') {
+        Button(this.v12String('v139_home_shared')).height(44).fontSize(13)
+          .fontColor($r('app.color.text_secondary')).backgroundColor(Color.Transparent)
+          .onClick((): void => this.openModule('shared'))
+        Button(this.v12String('v139_home_chat')).height(44).fontSize(13)
+          .fontColor($r('app.color.text_secondary')).backgroundColor(Color.Transparent)
+          .onClick((): void => this.openModule('chat'))
+      }
+    }.width('100%').padding({ left: LIST_INSET, right: LIST_INSET })
+  }
+
   private openNewSession(): void {
+    this.moduleRequest = null;
     this.newSessionDraftDeviceId = this.selectedDeviceId;
     this.newSessionDraftOpen = true;
     this.updateKeyboardAvoidance();
@@ -1456,6 +1549,9 @@ struct TaskListPage {
   private selectDevice(deviceId: string): void {
     this.animateMenu(() => {
       this.selectedDeviceId = deviceId;
+      if (this.moduleRequest?.kind === 'chat') {
+        const request = new HomeModuleRequest(); request.kind = 'chat'; request.deviceId = deviceId; this.moduleRequest = request;
+      }
       this.reconcileTaskSearchProjectKeys();
       this.scopeMenuOpen = false;
     });
@@ -2303,6 +2399,29 @@ struct TaskListPage {
       .width('100%')
       .height('100%')
 
+      if (this.moduleRequest !== null) {
+        HomeModulePanel({ request: this.moduleRequest, localCompanions: this.scopedTeammates(),
+          onClose: (): void => { this.moduleRequest = null; },
+          onLocalCompanion: (entry: TeammateRosterEntry): void => this.openTeammate(entry),
+          onChooseComputer: (): void => this.openDeviceScopeMenu(),
+          onOpenTask: (device: string, session: string, message?: string): void => {
+            this.setSelectedTask(device, session, message ?? '');
+            if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage', params: { deviceId: device, sessionId: session, messageClientId: message ?? '' } });
+          },
+          onProjectSaved: (device: string, key: string): void => {
+            const created = this.moduleRequest?.create === true;
+            this.moduleRequest = null;
+            AppServices.instance.taskProjectAliases.refresh(device);
+            if (created && key.startsWith('local:')) {
+              this.selectedDeviceId = device;
+              AppServices.instance.newSessionPreferences.save(device, 'project', key.slice(6));
+              this.openNewSession();
+            }
+          },
+        }).width(this.splitLayoutEnabled() ? this.detailPaneWidth() : '100%').height('100%')
+          .position({ x: this.splitLayoutEnabled() ? this.listPaneWidth() : 0, y: 0 })
+      }
+
       // 新任务草稿始终由同一个节点持有：窄屏覆盖整页，宽屏只覆盖详情栏。
       // 旋转或折叠只更新尺寸，避免组件重建时释放尚未发送的附件。
       if (this.newSessionDraftOpen) {
@@ -2338,6 +2457,23 @@ struct TaskListPage {
       if (this.splitLayoutEnabled() && (this.listPaneShown() || this.activeListTab === 'usage')) {
         this.splitDivider()
       }
+
+      IncomingShareSurface({
+        activeDeviceId: this.newSessionDraftOpen ? this.newSessionDraftDeviceId
+          : this.splitLayoutEnabled() && this.moduleRequest === null && this.activeListTab !== 'usage' ? this.selectedSessionDeviceId : '',
+        activeSessionId: this.newSessionDraftOpen ? '' : this.selectedSessionId,
+        onOpen: (target: IncomingShareDestination): void => {
+        if (target.ownerKey !== AppServices.instance.usageCardOwner) return;
+        this.moduleRequest = null;
+        this.selectedDeviceId = target.deviceId;
+        if (target.sessionId.length === 0) this.openNewSession();
+        else {
+          this.newSessionDraftOpen = false;
+          this.setSelectedTask(target.deviceId, target.sessionId, '');
+          if (!this.splitLayoutEnabled()) void router.pushUrl({ url: 'pages/TaskPage',
+            params: { deviceId: target.deviceId, sessionId: target.sessionId } });
+        }
+      } })
 
       if (this.scopeMenuOpen) {
         this.scopeMenuLayer()
@@ -2626,6 +2762,7 @@ struct TaskListPage {
   @Builder
   taskListTabPage(category: TaskListCategory, scrollCategory: TaskListCategory = category) {
     Column() {
+      if (!this.taskSearchActive()) { this.moduleShortcuts(category) }
       if (this.taskSearchActive()) {
         if (this.taskSearchStatus === 'searching') {
           this.buildTaskSearchLoading()
@@ -3558,13 +3695,30 @@ struct TaskListPage {
       harmonyV12String(this.getUIContext().getHostContext(), 'v131_offline'), this.v12String('v134_unnamed_computer'));
   }
 
+  private projectNativeKey(group: TaskProjectGroup): string {
+    const remote = group.entries[0]?.session.remoteHostId ?? '';
+    return remote ? 'remote:' + encodeURIComponent(remote) + ':' + group.workingDir : 'local:' + group.workingDir;
+  }
+  private projectIcon(group: TaskProjectGroup): string {
+    return AppServices.instance.taskProjectAliases.icon(group.deviceId, this.projectNativeKey(group));
+  }
+  private projectIconImage(group: TaskProjectGroup): string {
+    return AppServices.instance.taskProjectAliases.image(group.deviceId, this.projectNativeKey(group));
+  }
+
   @Builder
   projectGroupHeader(group: TaskProjectGroup) {
     Row({ space: 8 }) {
-      SymbolGlyph($r('sys.symbol.folder'))
-        .fontSize(17)
-        .fontColor([$r('app.color.text_secondary')])
-      Text(group.title)
+      if (this.projectIconImage(group)) {
+        Image(this.projectIconImage(group)).width(24).height(24).objectFit(ImageFit.Contain).borderRadius(6)
+      } else if (this.projectIcon(group).startsWith('symbol:')) {
+        ProjectSymbol({ name: this.projectIcon(group).split(':')[1] }).width(24).height(24)
+      } else if (this.projectIcon(group).startsWith('text:')) {
+        Text(this.projectIcon(group).split(':')[1]).width(24).fontSize(19).textAlign(TextAlign.Center)
+      } else {
+        SymbolGlyph($r('sys.symbol.folder')).fontSize(20).fontColor([$r('app.color.text_secondary')]).width(24)
+      }
+      Text(AppServices.instance.taskProjectAliases.alias(group.deviceId, this.projectNativeKey(group)) || group.title)
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
@@ -3582,6 +3736,11 @@ struct TaskListPage {
       Text(`${group.entries.length}`)
         .fontSize(12)
         .fontColor($r('app.color.text_tertiary'))
+      Button({ type: ButtonType.Circle }) {
+        SymbolGlyph($r('sys.symbol.gearshape')).fontSize(16).fontColor([$r('app.color.text_secondary')])
+      }.width(44).height(44).backgroundColor(Color.Transparent)
+        .accessibilityText(this.v12String('v139_home_project'))
+        .onClick((): void => this.openProjectSettings(group))
       if (this.displayedProjectOrderMode() === 'custom') {
         SymbolGlyph($r('sys.symbol.slider_horizontal_2'))
           .fontSize(16)

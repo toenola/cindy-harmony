@@ -1,3 +1,4 @@
+import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 import { RemoteReadRetries } from './RemoteReadRetries';
 import { fastModeWireValue } from '../tasks/ModelSpeed';
 import { projectedHistoryPrefix } from './HistoryViewAdapter';
@@ -810,6 +811,12 @@ export class MessageStore {
     return owner.length === 0 || owner === deviceId;
   }
 
+  forgetScopedSession(deviceId: string, sessionId: string): void {
+    if (invokePhysicalPeerId(deviceId) === deviceId || !this.sessionReadAllowed(sessionId, deviceId)) return;
+    this.clearSessionProjectionForDeviceSwitch(sessionId);
+    this.evictMemorySession(sessionId); this.notify();
+  }
+
   private clearSessionProjectionForDeviceSwitch(sessionId: string): void {
     const previousSubscribedDeviceId = this.subscribed.get(sessionId);
     this.nextSessionLease(sessionId);
@@ -870,6 +877,7 @@ export class MessageStore {
   private persistSessionMessages(sessionId: string): void {
     const deviceId = this.cachedDeviceBySession.get(sessionId) ?? '';
     if (deviceId.length === 0) return;
+    if (invokePhysicalPeerId(deviceId) !== deviceId) return;
     this.sessionMessageCache.save(deviceId, sessionId, (this.messagesBySession.get(sessionId) ?? [])
       .filter((row: RemoteMessage) => !row.id.startsWith(HISTORY_PLACEHOLDER_PREFIX)),
       this.hasMoreBySession.get(sessionId) ?? false);
@@ -946,6 +954,7 @@ export class MessageStore {
 
   /** 只在内存仍为空时种入冷启动快照，网络先返回时绝不让慢缓存反向覆盖。 */
   private hydrateCachedMessagesIfEmpty(deviceId: string, sessionId: string): boolean {
+    if (invokePhysicalPeerId(deviceId) !== deviceId) return false;
     if ((this.messagesBySession.get(sessionId)?.length ?? 0) > 0) return false;
     const history = this.sessionMessageCache.readHistory(deviceId, sessionId);
     const cached = history.messages.length > 0 ? history.messages : this.sessionMessageCache.read(deviceId, sessionId);
@@ -1642,15 +1651,47 @@ export class MessageStore {
   }
 
   /** 重连 online 后，对所有已打开会话做恢复（AppServices 调用）。 */
-  resubscribeAll(): void {
+  resubscribeAll(ownerOnly: boolean = false): void {
     const devices = new Set<string>();
     this.subscribed.forEach((deviceId: string, sessionId: string) => {
+      if (ownerOnly && invokePhysicalPeerId(deviceId) !== deviceId) return;
       devices.add(deviceId);
       void this.resubscribeAndHeal(deviceId, sessionId);
     });
     devices.forEach((deviceId: string) => {
       void this.hydrateActiveSessions(deviceId);
     });
+  }
+
+  resubscribePeer(peer: string): void {
+    this.subscribed.forEach((device: string, session: string): void => {
+      if (device === peer) void this.resubscribeAndHeal(peer, session);
+    });
+    void this.hydrateActiveSessions(peer);
+  }
+
+  /** Only the failed transport loses its lease and subscription trust. Independent
+   * shared sockets retain their acknowledged window when the owner relay reconnects. */
+  invalidatePeerLiveTailTrust(peer: string): void {
+    const ids: string[] = [];
+    this.cachedDeviceBySession.forEach((device: string, id: string): void => { if (device === peer) ids.push(id); });
+    this.subscribed.forEach((device: string, id: string): void => { if (device === peer && !ids.includes(id)) ids.push(id); });
+    this.activeHydrationOperations.delete(peer);
+    for (const id of ids) {
+      this.nextSessionLease(id); this.historyRetries.cancel(id);
+      this.resubscribeOperations.delete(id); this.runningStateOperations.delete(id); this.subscriptionAckedSessions.delete(id);
+      const coverage = this.historyCoverageBySession.get(id); if (coverage) coverage.liveTailTrusted = false;
+      const status = this.generationStatusBySession.get(id);
+      if (status) { status.outputTokens = 0; status.generationDurationMs = 0; status.generationActive = false; status.generationReliable = true; }
+    }
+    if (ids.length) this.notify();
+  }
+
+  invalidateOwnerLiveTailTrust(): void {
+    const peers: Set<string> = new Set();
+    this.cachedDeviceBySession.forEach((peer: string): void => { if (invokePhysicalPeerId(peer) === peer) peers.add(peer); });
+    this.subscribed.forEach((peer: string): void => { if (invokePhysicalPeerId(peer) === peer) peers.add(peer); });
+    peers.forEach((peer: string): void => this.invalidatePeerLiveTailTrust(peer));
   }
 
   /** socket 断线会同时撤销实时尾部背书与订阅 ACK。 */
@@ -2525,7 +2566,7 @@ export class MessageStore {
   private retrySubscription(deviceId: string, sessionId: string, lease: number): void {
     const recovery = this.recoveryGeneration;
     this.historyRetries.schedule(sessionId + ':subscription',
-      (): boolean => this.client?.getStatus() === 'online' && recovery === this.recoveryGeneration
+      (): boolean => this.client?.getStatus(deviceId) === 'online' && recovery === this.recoveryGeneration
         && this.sessionLeaseCurrent(sessionId, deviceId, lease),
       (): void => { void this.restoreSubscription(deviceId, sessionId, lease, recovery); });
   }
@@ -2547,7 +2588,7 @@ export class MessageStore {
   private retryHistory(deviceId: string, sessionId: string, lease: number): void {
     const fence = this.snapshotIdentity(deviceId, sessionId);
     this.historyRetries.schedule(sessionId,
-      (): boolean => this.client?.getStatus() === 'online' && this.sessionLeaseCurrent(sessionId, deviceId, lease)
+      (): boolean => this.client?.getStatus(deviceId) === 'online' && this.sessionLeaseCurrent(sessionId, deviceId, lease)
         && this.snapshotIdentity(deviceId, sessionId) === fence,
       (): void => { void this.loadInitial(deviceId, sessionId, lease); });
   }
@@ -2994,6 +3035,7 @@ export class MessageStore {
     url: string,
     thumbnail: boolean = true,
     skipCache: boolean = false,
+    assertCurrent?: () => void,
   ): Promise<RemoteMediaFetchResult> {
     const client = this.client;
     if (!client) {
@@ -3010,8 +3052,11 @@ export class MessageStore {
     const opts = new DlInvokeOptions();
     opts.channel = DlChannels.MEDIA_FETCH;
     opts.args = [request];
+    opts.preSend = assertCurrent;
     try {
+      assertCurrent?.();
       const env = await client.invoke(deviceId, opts);
+      assertCurrent?.();
       const result = unwrapInvokeResult(env);
       if (result === undefined || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error('media:fetch returned an invalid result');

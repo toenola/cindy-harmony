@@ -8,6 +8,7 @@ import {
 } from '../core/notifications/TaskCompletionPushModels';
 import { safeErrorMessage } from '../core/tasks/TaskModels';
 import { UI_COLOR_MODE_STORAGE_KEY, setSystemFontSizeScale } from '../components/UiKit';
+import { formInfo } from '@kit.FormKit';
 
 const DOMAIN = 0x0000;
 
@@ -15,6 +16,8 @@ export default class EntryAbility extends UIAbility {
   private mainWindowStage: window.WindowStage | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    void AppServices.instance.receiveSystemShare(this.context, want);
+    this.acceptUsageCardWant(want);
     this.acceptDeepLinkWant(want);
     AppServices.instance.taskCompletionPush.attachAbility(this);
     try {
@@ -28,7 +31,13 @@ export default class EntryAbility extends UIAbility {
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    if (this.acceptDeepLinkWant(want)) {
+    if (want.action === 'ohos.want.action.sendData') {
+      void AppServices.instance.receiveSystemShare(this.context, want).then((): void => {
+        router.replaceUrl({ url: AppServices.instance.auth.isLoggedIn ? 'pages/TaskListPage' : 'pages/LoginPage' });
+      });
+      return;
+    }
+    if (this.acceptUsageCardWant(want) || this.acceptDeepLinkWant(want)) {
       router.replaceUrl({ url: AppServices.instance.auth.isLoggedIn
         ? (AppServices.instance.hasPendingRelayLink() ? 'pages/SettingsPage' : 'pages/TaskListPage')
         : 'pages/LoginPage' });
@@ -38,6 +47,11 @@ export default class EntryAbility extends UIAbility {
   onDestroy(): void {
     AppServices.instance.taskCompletionPush.detachAbility();
     hilog.info(DOMAIN, 'CindyHarmony', '%{public}s', 'Ability onDestroy');
+  }
+
+  private acceptUsageCardWant(want: Want): boolean {
+    const raw = want.parameters?.['usageCardId'] ?? want.parameters?.[formInfo.FormParam.IDENTITY_KEY];
+    return typeof raw === 'string' && AppServices.instance.acceptUsageCard(raw);
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

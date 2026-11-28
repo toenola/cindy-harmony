@@ -132,6 +132,21 @@ export class PersistentInputOutbox {
     }
   }
 
+  /** Only for a reservation proven not dispatched. Unlike accepted-input GC, failure is fatal.
+   * API26 @ohos.file.fs unlinkSync: 13900002 is precisely ENOENT. */
+  removeReservedStrict(deviceId: string, sessionId: string, clientId: string): void {
+    if (!this.directory) return; // Existing pure-logic tests have no native disk configured.
+    if (!this.accountId || !deviceId || !sessionId || !clientId) throw new Error('INPUT_OUTBOX_NOT_READY');
+    const name = recordName(this.accountId, deviceId, sessionId, clientId);
+    if (this.records.get(name)?.sendStarted) throw new Error('INPUT_RESERVATION_DISPATCH_UNKNOWN');
+    try { fileIo.unlinkSync(`${this.directory}/${name}`); }
+    catch (error) {
+      const raw = error as Record<string, Object>;
+      if (raw === null || typeof raw !== 'object' || raw['code'] !== 13900002) throw new Error('INPUT_RESERVATION_DELETE_FAILED');
+    }
+    this.records.delete(name);
+  }
+
   remove(deviceId: string, sessionId: string, clientId: string): void {
     if (!this.accountId || !this.directory) return;
     const name = recordName(this.accountId, deviceId, sessionId, clientId);
