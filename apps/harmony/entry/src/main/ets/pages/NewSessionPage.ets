@@ -1914,11 +1914,11 @@ export struct NewSessionPageContent {
           SymbolGlyph($r('sys.symbol.square_grid_2x2')).fontSize(15).fontColor([$r('app.color.text_secondary')])
         }
         Text(this.pickerAllProviders ? '全部模型' : this.pickerCurrentProvider()?.name ?? '全部模型')
-          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
-        }.width('100%')
+          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).constraintSize({ maxWidth: 119 }).textAlign(TextAlign.End)
+        }.justifyContent(FlexAlign.End)
       }
-      .type(ButtonType.Normal).height(44).constraintSize({ maxWidth: 164 })
-      .width('41%').backgroundColor(Color.Transparent)
+      .type(ButtonType.Normal).height(44).constraintSize({ minWidth: 44, maxWidth: 164 })
+      .padding({ left: 0, right: 0 }).backgroundColor(Color.Transparent)
       .onClick(() => {
         this.pickerAllProviders = !this.pickerAllProviders;
         this.modelPickerScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false });
@@ -3701,7 +3701,8 @@ export struct NewSessionPageContent {
   }
 
   @Builder
-  modelContextView(scrollEnabled: boolean = true, bodyHeight: number = 0) {
+  modelContextView(bodyHeight: number = 0,
+    frame?: OnScrollFrameBeginCallback, settle?: () => void, metrics?: (viewport: number, content: number) => void) {
     Column() {
       if (this.pickerDetails === null) { this.pickerSearchHeader() }
       Scroll(this.modelPickerScroller) {
@@ -3744,11 +3745,17 @@ export struct NewSessionPageContent {
           }
         }
         .width('100%')
-        .padding({ top: 2, bottom: 12 })
+        .padding({ top: 2, bottom: 24 })
+        .onAreaChange((_old: Area, next: Area) => { metrics?.(-1, Number(next.height)); })
       }
       .width('100%')
-      .layoutWeight(bodyHeight > 0 || !this.composerModelPopupOpen ? 1 : 0)
-      .enableScrollInteraction(scrollEnabled)
+      .height(bodyHeight > 0 ? Math.max(1, bodyHeight - (this.pickerDetails === null ? 48 : 0)) : undefined)
+      .layoutWeight(bodyHeight > 0 ? 0 : 1)
+      .edgeEffect(EdgeEffect.None, { alwaysEnabled: bodyHeight > 0 })
+      .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST })
+      .onScrollFrameBegin((offset: number, state: ScrollState): OnScrollFrameBeginHandlerResult =>
+        frame ? frame(offset, state) : { offsetRemain: offset })
+      .onScrollStop(() => { settle?.(); })
       .scrollBar(BarState.Auto)
       .onTouch((event: TouchEvent) => {
         if (event.type === TouchType.Down) this.modelPickerUserMoved = true;
@@ -3756,6 +3763,7 @@ export struct NewSessionPageContent {
       .onAreaChange((_old: Area, next: Area) => {
         this.modelPickerTop = Number(next.globalPosition.y);
         this.modelPickerHeight = Number(next.height);
+        metrics?.(this.modelPickerHeight, -1);
         if (this.selectedModelArea !== null) this.positionSelectedModel(this.selectedModelArea);
       })
     }
@@ -3925,8 +3933,9 @@ export struct NewSessionPageContent {
         modelPanelScroller: this.modelPickerScroller,
         modelPickerTitle: this.pickerDetails?.label ?? '',
         onModelPickerBack: (): void => { this.pickerDetails = null; },
-        modelPopupContent: (enabled: boolean, bodyHeight: number): void => {
-          this.modelContextView(enabled, bodyHeight);
+        modelPopupContent: (bodyHeight: number, frame: OnScrollFrameBeginCallback, settle: () => void,
+          metrics: (viewport: number, content: number) => void): void => {
+          this.modelContextView(bodyHeight, frame, settle, metrics);
         },
         onPlanToggle: (): void => this.togglePlanMode(),
         onExpand: (): void => this.expandComposerForEditing(),

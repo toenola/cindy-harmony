@@ -1,23 +1,27 @@
-/**
- * 鸿蒙端共享 UI 规范：字号缩放、圆角、间距与动效常量。
- *
- * 视觉口径以 docs/design-rules/DESIGN.md 为准：
- * - 圆角只有三档：8（内部控件）/ 12（容器）/ 胶囊（交互元素）；
- * - 动效只做功能性过渡，时长分 80/150/200/250ms 四档，曲线统一；
- * - 列表行、卡片等可点区域统一使用系统 clickEffect 弹性按压反馈。
- */
+/** 共享 UI 角色与兼容桥接，见 apps/harmony/docs/harmony-ui-design.md。 */
 
-/** 会话域字号缩放：对齐 iOS 详情页信息密度，全局唯一来源。 */
-const UI_FONT_SCALE = 0.84;
-const UI_MIN_FONT_SIZE = 8;
-const UI_MIN_LINE_HEIGHT = 10;
+// ArkUI 的 fontSize 使用 fp，正文随系统字号，不在此另外乘 fontSizeScale。
+export const UI_FONT_TITLE_L = '30fp';
+export const UI_FONT_TITLE_M = '24fp';
+export const UI_FONT_TITLE_S = '20fp';
+export const UI_FONT_LIST_TITLE = '18fp';
+export const UI_FONT_ACTION = '16fp';
+export const UI_FONT_ACTION_SMALL = '14fp';
+export const UI_FONT_BODY = '16fp';
+export const UI_FONT_SECONDARY = '14fp';
+export const UI_FONT_HINT = '12fp';
+export const UI_FONT_CAPTION = '12fp';
+export const UI_FONT_CAPTION_SMALL = '10fp';
+export const UI_FONT_CHART_LABEL = '8fp';
 
+/** @deprecated 旧页面兼容。新文本直接用对应角色的 fp Token，不按裸数字推断语义。 */
 export function uiFontSize(base: number): number {
-  return Math.max(UI_MIN_FONT_SIZE, Math.round(base * UI_FONT_SCALE));
+  return Math.max(8, Math.round(base));
 }
 
+/** @deprecated 旧调用方保留数值接口。新文本优先使用 ArkUI 默认行高。 */
 export function uiLineHeight(base: number): number {
-  return Math.max(UI_MIN_LINE_HEIGHT, Math.round(base * UI_FONT_SCALE));
+  return Math.max(10, Math.round(base));
 }
 
 /**
@@ -47,20 +51,37 @@ export function uiScaledMaxWidth(base: number, cap: number): number {
   return Math.round(Math.min(cap, Math.max(base, base * systemFontSizeScale)));
 }
 
-/** 三档圆角（DESIGN.md §5）：内部控件 / 容器 / 胶囊。 */
-/** EntryAbility 写入当前深浅色；Canvas 绘制内容据此重绘（资源色不会自动刷新画布）。 */
+/** EntryAbility 写入当前深浅色，Canvas 绘制内容据此重绘。 */
 export const UI_COLOR_MODE_STORAGE_KEY = 'cindyColorMode';
 
-export const UI_RADIUS_CONTROL = 8;
-export const UI_RADIUS_CONTAINER = 12;
-export const UI_RADIUS_PILL = 999;
+export const UI_SPACE_TIGHT = 4;
+export const UI_SPACE_INLINE = 8;
+export const UI_SPACE_GROUP = 12;
+export const UI_SPACE_PAGE = 16;
+export const UI_SPACE_SECTION = 24;
 
-/** 动效时长档位（DESIGN.md §14.4）。 */
-export const UI_MOTION_INSTANT = 80;
-export const UI_MOTION_FAST = 150;
-export const UI_MOTION_BASE = 200;
-/** 功能性加载圆环完整旋转一周的语义周期（DESIGN.md §14.4）。 */
-export const UI_MOTION_SPINNER_CYCLE = 1000;
+export const UI_RADIUS_SMALL_CONTROL = 8;
+export const UI_RADIUS_CONTENT = 12;
+export const UI_RADIUS_CARD = 20;
+export const UI_RADIUS_CAPSULE = 999; // 由实际控件尺寸限制为半高
+export const UI_RADIUS_CONTROL = UI_RADIUS_SMALL_CONTROL;
+export const UI_RADIUS_CONTAINER = UI_RADIUS_CONTENT;
+export const UI_RADIUS_PILL = UI_RADIUS_CAPSULE;
+
+export const UI_ICON_SIZE_STANDARD = 24;
+export const UI_ICON_SIZE_COMPACT = 20;
+export const UI_ICON_CUSTOM_STROKE = 2; // 24vp 自绘操作图标的基线，不用于 HMSymbol
+export const UI_TOUCH_TARGET_MIN = 44;
+
+/** ArkUI 默认转场优先，这些档位仅供应用自绘的局部场景使用。 */
+export const UI_MOTION_FEEDBACK_MS = 80;
+export const UI_MOTION_REVEAL_MS = 150;
+export const UI_MOTION_LAYOUT_MS = 200;
+export const UI_MOTION_BUSY_CYCLE_MS = 1000;
+export const UI_MOTION_INSTANT = UI_MOTION_FEEDBACK_MS;
+export const UI_MOTION_FAST = UI_MOTION_REVEAL_MS;
+export const UI_MOTION_BASE = UI_MOTION_LAYOUT_MS;
+export const UI_MOTION_SPINNER_CYCLE = UI_MOTION_BUSY_CYCLE_MS;
 
 /** 进入/展开使用的 ease-out 曲线；收起用 EaseIn，位移/尺寸用 EaseInOut。 */
 export const UI_CURVE_ENTER: Curve = Curve.EaseOut;

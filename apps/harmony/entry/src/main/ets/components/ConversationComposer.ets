@@ -1,3 +1,4 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   RemoteImageRef,
   composerAttachmentRenderKey,
@@ -126,9 +127,11 @@ export struct ConversationComposer {
   }
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
-  @BuilderParam modelPopupContent: (enabled: boolean, bodyHeight: number) => void = this.emptyModelPickerContent;
+  @BuilderParam modelPopupContent: (bodyHeight: number, frame: OnScrollFrameBeginCallback,
+    settle: () => void, metrics: (viewport: number, content: number) => void) => void = this.emptyModelPickerContent;
   @Builder
-  emptyModelPickerContent(_enabled: boolean, _bodyHeight: number) {}
+  emptyModelPickerContent(_bodyHeight: number, _frame: OnScrollFrameBeginCallback,
+    _settle: () => void, _metrics: (viewport: number, content: number) => void) {}
   @Prop modelPickerTitle: string = '';
   modelPanelScroller: Scroller = new Scroller();
   onModelPickerBack: () => void = () => {};
@@ -137,9 +140,11 @@ export struct ConversationComposer {
   @State private pickerDragHeight: number = 0;
   private pickerStartHeight: number = 0;
   private pickerMeasuredHeight: number = 0;
-  private pickerDragAtTop: boolean = false;
-  private pickerCanResize: boolean = false;
-  private pickerDragDirectionLocked: boolean = false;
+  private pickerScrollFromFull: boolean = false;
+  private pickerScrollResizing: boolean = false;
+  private pickerFrameCount: number = 0;
+  private pickerViewport: number = 0;
+  private pickerContent: number = 0;
   @State private editorDragHeight: number = 0;
   @Prop @Watch('syncPicker') externalPickerTitle: string = '';
   @BuilderParam externalPickerContent: (title: string) => void = this.emptyExternalPickerContent;
@@ -183,6 +188,10 @@ export struct ConversationComposer {
           if (generation !== this.pickerGeneration) return;
           this.fullPicker = false;
           this.pickerMeasuredHeight = 0;
+          this.pickerScrollResizing = false;
+          this.pickerFrameCount = 0;
+          this.pickerViewport = 0;
+          this.pickerContent = 0;
           this.pickerDragHeight = 0;
           this.pickerPage = next;
           this.getUIContext().animateTo({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE },
@@ -250,33 +259,80 @@ export struct ConversationComposer {
     return this.pickerDragHeight || (this.fullPicker ? height : height * 0.5);
   }
 
+  private logPickerScroll(viewport: number, content: number): void {
+    if (viewport >= 0) this.pickerViewport = viewport;
+    if (content >= 0) this.pickerContent = content;
+    hilog.debug(0, 'CindyComposerPanel', 'layout full=%{public}s panel=%{public}.1f limit=%{public}.1f list=%{public}.1f content=%{public}.1f',
+      String(this.fullPicker), this.pickerMeasuredHeight, this.pickerHeightLimit(), this.pickerViewport, this.pickerContent);
+  }
+
   private beginPickerDrag(): void {
     this.pickerStartHeight = this.pickerMeasuredHeight || this.pickerHeightLimit();
-    this.pickerCanResize = true;
-    this.pickerDragDirectionLocked = false;
-    const scroller = this.pickerPage === 'model' ? this.modelPanelScroller : this.commonPickerScroller;
-    this.pickerDragAtTop = (scroller.currentOffset()?.yOffset ?? 0) <= 1;
   }
 
   private updatePickerDrag(delta: number): void {
-    if (!this.pickerDragDirectionLocked && Math.abs(delta) >= 4) {
-      this.pickerDragDirectionLocked = true;
-      this.pickerCanResize = !this.fullPicker || (this.pickerDragAtTop && delta > 0);
-    }
-    if (!this.pickerDragDirectionLocked || !this.pickerCanResize) return;
     this.pickerDragHeight = Math.min(this.pickerUsableHeight(), Math.max(72, this.pickerStartHeight - delta));
   }
 
-  private endPickerDrag(delta: number, cancelled: boolean): void {
-    if (this.pickerDragHeight === 0) return;
+  private settlePickerScroll(): void {
+    if (!this.pickerScrollResizing) return;
+    const fromFull = this.pickerScrollFromFull;
+    this.pickerScrollResizing = false;
+    const height = this.pickerDragHeight;
+    const half = this.pickerUsableHeight() * 0.5;
     this.getUIContext().animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, (): void => {
-      if (!cancelled && this.pickerDragHeight > 0) {
+      if (height < half - 42 && !fromFull) this.dismissPicker();
+      else this.fullPicker = height > half + (this.pickerUsableHeight() - half) * 0.5;
+      this.pickerDragHeight = 0;
+    });
+    this.logPickerScroll(-1, -1);
+  }
+
+  private handlePickerFrame(offset: number, state: ScrollState): OnScrollFrameBeginHandlerResult {
+    let remaining = offset;
+    const scroller = this.pickerPage === 'model' ? this.modelPanelScroller : this.commonPickerScroller;
+    const maximum = this.pickerUsableHeight();
+    const position = this.pickerDragHeight || (this.fullPicker ? maximum : this.pickerMeasuredHeight || maximum / 2);
+    if (state !== ScrollState.Fling && offset > 0 && position < maximum - 0.5) {
+      if (!this.pickerScrollResizing) this.pickerScrollFromFull = this.fullPicker;
+      this.pickerScrollResizing = true;
+      const consumed = Math.min(maximum - position, offset);
+      this.pickerDragHeight = position + consumed;
+      remaining = offset - consumed;
+      if (this.pickerDragHeight >= maximum - 0.5) {
+        this.fullPicker = true;
+        this.pickerDragHeight = 0;
+        this.pickerScrollResizing = false;
+      }
+    } else if (state !== ScrollState.Fling && offset < 0) {
+      // Give the child enough to reach the top before passing only the unconsumed part to the panel.
+      const scrollTop = Math.max(0, scroller.currentOffset()?.yOffset ?? 0);
+      const toTop = Math.min(-offset, scrollTop);
+      const pull = -offset - toTop;
+      if (pull > 0.5) {
+        if (!this.pickerScrollResizing) this.pickerScrollFromFull = this.fullPicker;
+        this.pickerScrollResizing = true;
+        const floor = this.pickerScrollFromFull ? maximum / 2 : 72;
+        this.pickerDragHeight = Math.max(floor, position - pull);
+        remaining = -toTop;
+      }
+    }
+    if (++this.pickerFrameCount % 12 === 1) {
+      hilog.debug(0, 'CindyComposerPanel', 'frame full=%{public}s panel=%{public}.1f limit=%{public}.1f list=%{public}.1f content=%{public}.1f offset=%{public}.1f remain=%{public}.1f',
+        String(this.fullPicker), this.pickerMeasuredHeight, this.pickerHeightLimit(), this.pickerViewport, this.pickerContent, offset, remaining);
+    }
+    return { offsetRemain: remaining };
+  }
+
+  private endPickerDrag(delta: number, cancelled: boolean): void {
+    if (!this.pickerDragHeight) return;
+    this.getUIContext().animateTo({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE }, (): void => {
+      if (!cancelled) {
         if (delta < -30) this.fullPicker = true;
         else if (delta > 30 && this.fullPicker) this.fullPicker = false;
         else if (delta > 42) this.dismissPicker();
       }
       this.pickerDragHeight = 0;
-      this.pickerCanResize = false;
     });
   }
 
@@ -573,6 +629,7 @@ export struct ConversationComposer {
   @Builder
   composerPickerPanel() {
     Column() {
+      Column() {
       Row() {
         Row().width(36).height(4).borderRadius(UI_RADIUS_PILL).backgroundColor($r('app.color.text_tertiary'))
       }.height(12).width('100%').justifyContent(FlexAlign.Center).accessibilityLevel('no')
@@ -590,10 +647,18 @@ export struct ConversationComposer {
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         Blank().width(44)
       }.width('100%').height(44)
+      }.width('100%')
+      .gesture(PanGesture({ direction: PanDirection.Vertical })
+        .onActionStart(() => this.beginPickerDrag())
+        .onActionUpdate((event: GestureEvent) => this.updatePickerDrag(event.offsetY))
+        .onActionEnd((event: GestureEvent) => this.endPickerDrag(event.offsetY, false))
+        .onActionCancel(() => this.endPickerDrag(0, true)))
       if (this.pickerPage === 'model') {
         Column() {
-          this.modelPopupContent(this.fullPicker && this.pickerDragHeight === 0,
-            this.fullPicker || this.pickerDragHeight > 0 ? this.pickerBodyHeight() : 0)
+          this.modelPopupContent(this.pickerBodyHeight(),
+            (offset: number, state: ScrollState): OnScrollFrameBeginHandlerResult => this.handlePickerFrame(offset, state),
+            (): void => this.settlePickerScroll(),
+            (viewport: number, content: number): void => this.logPickerScroll(viewport, content))
         }
         .width('100%')
         .constraintSize({ maxHeight: this.pickerBodyHeight() })
@@ -607,23 +672,24 @@ export struct ConversationComposer {
             } else {
               this.externalPickerContent(this.pickerPage)
             }
-          }.width('100%').padding({ bottom: this.fullPicker ? 24 : 0 })
+          }.width('100%').padding({ bottom: 24 })
+            .onAreaChange((_old: Area, next: Area) => this.logPickerScroll(-1, Number(next.height)))
         }
         .width('100%')
         .height(this.fullPicker || this.pickerDragHeight > 0 ? this.pickerBodyHeight() : undefined)
         .constraintSize({ maxHeight: this.pickerBodyHeight() })
-        .enableScrollInteraction(this.fullPicker && this.pickerDragHeight === 0)
+        .edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
+        .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST })
+        .onScrollFrameBegin((offset: number, state: ScrollState): OnScrollFrameBeginHandlerResult =>
+          this.handlePickerFrame(offset, state))
+        .onScrollStop(() => this.settlePickerScroll())
+        .onAreaChange((_old: Area, next: Area) => this.logPickerScroll(Number(next.height), -1))
         .scrollBar(BarState.Off)
       }
     }
     .width('100%')
     .height(this.fullPicker || this.pickerDragHeight > 0 ? this.pickerHeightLimit() : undefined)
     .onAreaChange((_old: Area, next: Area) => { this.pickerMeasuredHeight = Number(next.height); })
-    .parallelGesture(PanGesture({ direction: PanDirection.Vertical })
-      .onActionStart(() => this.beginPickerDrag())
-      .onActionUpdate((event: GestureEvent) => this.updatePickerDrag(event.offsetY))
-      .onActionEnd((event: GestureEvent) => this.endPickerDrag(event.offsetY, false))
-      .onActionCancel(() => this.endPickerDrag(0, true)))
     .backgroundColor($r('app.color.bg_card'))
     .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
