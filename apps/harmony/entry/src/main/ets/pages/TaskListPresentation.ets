@@ -15,7 +15,7 @@ const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
 
-export type TaskListCategory = 'projects' | 'dialogues' | 'usage';
+export type TaskListCategory = 'projects' | 'dialogues' | 'automations';
 export type TaskListSortMode = 'default' | 'recency' | 'alphabetic';
 export type TaskRightStatusKind = 'error' | 'waiting' | 'running' | 'done' | 'time';
 
@@ -96,9 +96,9 @@ export function taskIsAutomation(session: RemoteSession): boolean {
   return session.source === 'scheduler' || session.title.startsWith('[Schedule]');
 }
 
-/** 自动化对话统一归入沟通，即使它有项目工作目录；用量页不承载会话。 */
+/** 自动化有独立的首页标签，即使会话有项目工作目录。 */
 export function taskListCategory(session: RemoteSession): TaskListCategory {
-  if (taskIsAutomation(session)) return 'dialogues';
+  if (taskIsAutomation(session)) return 'automations';
   if (session.workspaceKind === 'dialogue' || session.workingDir.length === 0) return 'dialogues';
   return 'projects';
 }

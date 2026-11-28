@@ -1,3 +1,4 @@
+import { uiToast } from '../common/UiOverlay';
 import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { resourceIssueText } from '../../core/resources/ResourceIssueStrings';
 import { ResourceStore } from '../../core/resources/ResourceStore';
@@ -45,6 +46,21 @@ export struct ResourcesPanel {
         .onClick((): void => this.action(action))
     }, (action: ResourceAction): string => action.id)
   }
+  @State private pullRefreshing: boolean = false;
+
+  private async pullRefresh(): Promise<void> {
+    if (this.pullRefreshing) return;
+    this.pullRefreshing = true;
+    try {
+      await this.store.refresh();
+      if (this.store.issue) uiToast(this.getUIContext(), this.labels.status(this.store.issue));
+    } catch (_error) {
+      uiToast(this.getUIContext(), this.labels.status('failed'));
+    } finally {
+      this.pullRefreshing = false;
+    }
+  }
+
   build() {
     Column({ space: 12 }) {
       if (this.revision >= 0) {
@@ -83,6 +99,7 @@ export struct ResourcesPanel {
               .onChange((value: string): void => { this.search = value; })
             Button(this.labels.search).height(44).onClick((): void => this.store.selectCollection(this.store.collectionId, this.search))
           }
+          Refresh({ refreshing: this.pullRefreshing }) {
           List({ space: 8 }) {
             ForEach(this.store.items, (item: ResourceItem) => {
               ListItem() {
@@ -97,8 +114,11 @@ export struct ResourcesPanel {
             if (!this.store.items.length && !this.store.busy) { ListItem() { Text(this.labels.empty).fontColor($r('app.color.text_secondary')) } }
             if (this.store.nextCursor) { ListItem() { Button(this.labels.more).height(44).enabled(!this.store.busy).onClick((): void => { void this.store.loadMore(); }) } }
           }.layoutWeight(1).width('100%')
+          }
+          .onRefreshing((): void => { void this.pullRefresh(); }).layoutWeight(1).width('100%')
           this.actions(this.store.collections.find((row: ResourceCollection): boolean => row.id === this.store.collectionId)?.actions ?? [])
         } else {
+          Refresh({ refreshing: this.pullRefreshing }) {
           List({ space: 8 }) {
             ForEach(this.store.collections, (collection: ResourceCollection) => {
               ListItem() {
@@ -108,6 +128,8 @@ export struct ResourcesPanel {
             }, (collection: ResourceCollection): string => collection.id)
             if (!this.store.collections.length && !this.store.busy) { ListItem() { Text(this.labels.empty).fontColor($r('app.color.text_secondary')) } }
           }.layoutWeight(1).width('100%')
+          }
+          .onRefreshing((): void => { void this.pullRefresh(); }).layoutWeight(1).width('100%')
         }
       }
     }.width('100%').height('100%').padding(16).backgroundColor($r('app.color.bg_page'))

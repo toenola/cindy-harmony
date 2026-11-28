@@ -4,7 +4,9 @@ import {
   orcaCollabExpansionKey, projectOrcaDispatchCard, projectOrcaPersistedMessage,
   RenderItem, RenderMessageItem, RenderWorkGroupItem, turnFinalAssistantIds,
 } from '../main/ets/core/messages/MessageRender';
-import { formatSessionActivityElapsed, sessionActivityElapsedMs } from '../main/ets/core/messages/SessionActivityPresentation';
+import {
+  formatSessionActivityElapsed, formatSessionActivityTokens, sessionActivityElapsedMs, sessionActivityRetry,
+} from '../main/ets/core/messages/SessionActivityPresentation';
 import { sentSessionMessageChipLabel } from '../main/ets/core/messages/SentQuotePresentation';
 import { freezeShareProjection } from '../main/ets/core/sharing/ConversationShareProjection';
 import { CONTINUE_AFTER_APP_EXIT_PROMPT, CONTINUE_AFTER_ERROR_PROMPT } from '../main/ets/core/messages/SessionTailPresentation';
@@ -450,6 +452,27 @@ export default function v132RenderingTests() {
       expect(sessionActivityElapsedMs(10999, 10000)).assertEqual(999);
       expect(sessionActivityElapsedMs(9000, 10000)).assertEqual(0);
       expect(sessionActivityElapsedMs(10000, 0)).assertEqual(0);
+    });
+
+    // Unit · Mobile alignment: previous elapsed-only coverage does not exercise the visible
+    // token badge or the three distinct retry labels. 1000 tokens and 1/2 are minimal branches.
+    it('composer_activity_compacts_turn_tokens_and_omits_missing_usage', 0, () => {
+      expect(formatSessionActivityTokens(0)).assertEqual('');
+      expect(formatSessionActivityTokens(NaN)).assertEqual('');
+      expect(formatSessionActivityTokens(999)).assertEqual('999');
+      expect(formatSessionActivityTokens(1000)).assertEqual('1.0k');
+      expect(formatSessionActivityTokens(115300)).assertEqual('115.3k');
+      expect(formatSessionActivityTokens(1000000)).assertEqual('1000.0k');
+    });
+
+    it('composer_activity_distinguishes_retry_causes_without_guessing_tool_phases', 0, () => {
+      expect(sessionActivityRetry('Reconnecting… 1/2', '').phase).assertEqual('reconnect');
+      expect(sessionActivityRetry('Busy (auto-retry 1/2)', '').phase).assertEqual('overload');
+      const rateLimit = sessionActivityRetry('Retry (rate-limit-retry 1/2)', 'terminal-rate-limit-retry');
+      expect(rateLimit.phase).assertEqual('rate_limit');
+      expect(rateLimit.progress).assertEqual('1/2');
+      expect(sessionActivityRetry('Reconnecting… 3/2', '').phase).assertEqual('');
+      expect(sessionActivityRetry('Running command', '').phase).assertEqual('');
     });
 
     it('sent_quote_chips_show_short_readable_markdown_not_media_ids', 0, () => {

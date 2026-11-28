@@ -1,5 +1,16 @@
 {
   "string": [
+    {"name": "image_viewer_previous", "value": "前の画像"},
+    {"name": "image_viewer_next", "value": "次の画像"},
+    {"name": "turn_status_thinking", "value": "考えています…"},
+    {"name": "turn_status_reconnect", "value": "再接続中…"},
+    {"name": "turn_status_overload", "value": "モデルサービスが混雑、再試行中…"},
+    {"name": "turn_status_rate_limit", "value": "リクエストがレート制限されました。再試行中…"},
+    {"name": "turn_status_seconds", "value": "%d秒"},
+    {"name": "turn_status_minutes", "value": "%d分%d秒"},
+    {"name": "turn_status_hours", "value": "%d時間%d分"},
+    {"name": "turn_status_days", "value": "%d日%d時間%d分"},
+    {"name": "turn_status_tokens", "value": "%s tok"},
     {"name": "v139_home_back", "value": "戻る"},
     {"name": "v139_home_cancel", "value": "キャンセル"},
     {"name": "v139_home_confirm", "value": "操作を続ける"},
@@ -400,6 +411,12 @@
     {"name": "v140_companion_create_loading", "value": "読み込み中…"},
     {"name": "v140_project_create", "value": "新規プロジェクト"},
     {"name": "workdir_show_ignored_dirs", "value": "無視されるディレクトリを表示"},
-    {"name": "workdir_show_ignored_dirs_unsupported", "value": "リモートデバイスの Cindy のバージョンが古く、無視されるディレクトリを表示できません"}
+    {"name": "workdir_show_ignored_dirs_unsupported", "value": "リモートデバイスの Cindy のバージョンが古く、無視されるディレクトリを表示できません"},
+    {"name": "v138_collaboration_mode", "value": "協同モード"},
+    {"name": "home_companion_expand", "value": "パートナー一覧を展開"},
+    {"name": "home_companion_compact", "value": "コンパクト表示に切り替え"},
+    {"name": "home_companion_show_all", "value": "すべて表示（%d）"},
+    {"name": "home_companion_show_less", "value": "折りたたむ"},
+    {"name": "composer_picker_permission", "value": "権限"}
   ]
 }

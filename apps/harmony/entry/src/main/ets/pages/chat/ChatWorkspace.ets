@@ -1,3 +1,4 @@
+import { uiToast } from '../../components/common/UiOverlay';
 import { ChatInvitationStore } from '../../core/chat/ChatInvitationStore';
 import { ChatInvitePanel } from '../../components/chat/ChatInvitePanel';
 import { TeammateRosterEntry } from '../../core/tasks/TeammateRoster';
@@ -111,6 +112,24 @@ export struct ChatWorkspace {
     if (this.reading || !this.foreground || !atEnd) return;
     this.reading = true; try { await this.store?.markRead(ids, atEnd, this.foreground); } catch (_) {} finally { this.reading = false; }
   }
+  @State private pullRefreshing: boolean = false;
+
+  private async pullRefresh(): Promise<void> {
+    const store = this.store;
+    if (!store || this.pullRefreshing) return;
+    this.pullRefreshing = true;
+    try {
+      await store.loadConversations();
+      if (this.alive && store === this.store && store.error) {
+        uiToast(this.getUIContext(), chatErrorText(this.locale, store.error));
+      }
+    } catch (_error) {
+      if (this.alive && store === this.store) uiToast(this.getUIContext(), chatErrorText(this.locale, 'CHAT_UNAVAILABLE'));
+    } finally {
+      this.pullRefreshing = false;
+    }
+  }
+
   build() {
     Column({ space: 8 }) {
       if (this.version >= 0 && this.store?.page) {
@@ -223,11 +242,14 @@ export struct ChatWorkspace {
             acceptLabel:chatActionStrings(this.locale).join,openLabel:chatStrings(this.locale).groups,retryLabel:chatStrings(this.locale).retry,
             uncertainLabel:chatStrings(this.locale).unknown,onJoined:(id:string):void=>{this.run(async():Promise<void>=>{await this.store?.loadConversations();await this.store?.open(id);this.menu='';});}})
         }
+        Refresh({ refreshing: this.pullRefreshing }) {
         ChatConversationList({ localCompanions: this.localCompanions, onLocalCompanion: this.onLocalCompanion, deviceName: this.deviceName, summaries: this.store?.summaries ?? [],
           onVisibleGroups: (ids: string[]): void => { this.run(async (): Promise<void> => { await this.store?.loadSummaries(ids); }); }, rooms: (this.store?.rooms ?? []).slice(), actors: this.store?.me?.capabilities?.['companionHome'] === true ? this.store.actors : [], labels: chatStrings(this.locale),
           onOpenCompanion: (actor: ChatActor): void => { if (this.onCompanion) this.onCompanion(actor); else this.run(async (): Promise<void> => { await this.store?.openCompanion(actor); }); },
           onOpenGroup: (id: string): void => { this.run(async (): Promise<void> => { await this.store?.open(id); }); },
         }).layoutWeight(1)
+        }
+        .onRefreshing((): void => { void this.pullRefresh(); }).layoutWeight(1).width('100%')
       }
     }.width('100%').height('100%').padding(this.version >= 0 && !!this.store?.page ? 12 : 0).backgroundColor($r('app.color.bg_page'))
   }

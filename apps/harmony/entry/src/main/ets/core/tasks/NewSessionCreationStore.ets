@@ -1,3 +1,4 @@
+import { worktreeCreateOptions } from './NewSessionWorktree';
 /**
  * 新任务乐观创建管线。
  *
@@ -93,6 +94,8 @@ export class NewSessionCreationParams {
   firstMessageFiles: RemoteSerializedAttachment[] = [];
   planModeArm: boolean = false;
   legacyPlanRestore: string = '';
+  prepareWorktree: ((current: () => boolean) => Promise<string>) | undefined = undefined;
+  finishWorktree: ((claimed: boolean) => Promise<void>) | undefined = undefined;
   /** In-memory route binding; never serialized with message payload or credentials. */
   beforeFirstInput: (() => Promise<void>) | undefined = undefined;
   onFirstInputAccepted: (() => Promise<void>) | undefined = undefined;
@@ -404,12 +407,27 @@ export class NewSessionCreationStore {
     task: NewSessionCreationTask,
     confirmedSession: Record<string, Object> | undefined = undefined,
   ): Promise<void> {
+    let worktreeStarted = false;
+    let sessionClaimed = confirmedSession !== undefined;
     try {
       if (this.linkOpener !== undefined) await this.linkOpener(task.deviceId);
       if (!this.isCurrent(task)) return;
       // 会话页尚处于 sync guard 时先登记 topic，避免首 turn 事件落在订阅空窗。
       this.subscribeTemporaryTopic(task);
+      if (!sessionClaimed && task.params.prepareWorktree !== undefined) {
+        worktreeStarted = true;
+        const path = await task.params.prepareWorktree((): boolean => this.isCurrent(task));
+        if (!this.isCurrent(task)) return;
+        task.params.createOptions = worktreeCreateOptions(task.params.createOptions, path);
+      }
       const created = confirmedSession ?? await this.createSessionIdempotent(task);
+      sessionClaimed = true;
+      if (worktreeStarted && task.params.finishWorktree !== undefined) {
+        worktreeStarted = false;
+        try { await task.params.finishWorktree(true); } catch (_) {
+          // The host owns this worktree after session creation, regardless of local ledger availability.
+        }
+      }
       if (!this.isCurrent(task)) return;
       await this.adoptCreatedSession(task, created, confirmedSession);
       if (!this.isCurrent(task)) return;
@@ -483,6 +501,12 @@ export class NewSessionCreationStore {
       this.inputQueue?.markLocalFailure(
         task.sessionId, task.firstMessageClientId, task.error, task.deviceId);
       this.notify();
+    } finally {
+      if (worktreeStarted && task.params.finishWorktree !== undefined) {
+        try { await task.params.finishWorktree(sessionClaimed); } catch (_error) {
+          // 未收到电脑确认时保留磁盘记录，下一次同设备 worktree 创建前继续恢复。
+        }
+      }
     }
   }
 

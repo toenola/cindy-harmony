@@ -178,7 +178,7 @@ export struct WorkdirBrowser {
       if (!this.current()) { this.close(); return; }
       this.resetWatch(status === 'online' && this.foreground);
       if (status === 'online' && this.foreground) {
-        if (this.showIgnoredDirs) void this.resolveIgnoredCapability().then((): void => this.reload());
+        if (this.showIgnoredDirs) void this.resolveIgnoredCapability().then((): void => { void this.reload(); });
         else this.reload();
       }
     });
@@ -297,7 +297,20 @@ export struct WorkdirBrowser {
     this.reload();
   }
 
-  private reload(): void {
+  @State private pullRefreshing: boolean = false;
+
+  private async pullRefresh(): Promise<void> {
+    if (!this.current() || !this.foreground || this.loading || this.pullRefreshing) return;
+    this.pullRefreshing = true;
+    try {
+      await this.reload();
+      if (this.current() && this.error) uiToast(this.getUIContext(), this.error);
+    } finally {
+      this.pullRefreshing = false;
+    }
+  }
+
+  private async reload(): Promise<void> {
     if (!this.current() || !this.foreground || !this.ignoredReady) return;
     if (this.loading) { this.watchDirty = true; return; }
     const path = this.path;
@@ -309,7 +322,7 @@ export struct WorkdirBrowser {
       (): boolean => this.current() && this.showIgnoredDirs === preference);
     this.loading = true;
     this.error = '';
-    void this.call(request, current)
+    await this.call(request, current)
       .then((value: Object | undefined): void => {
         if (!current() || !this.current()) return;
         this.entries = workdirEntries(value);
@@ -333,7 +346,7 @@ export struct WorkdirBrowser {
       })
       .finally((): void => {
         this.loading = false;
-        if (this.watchDirty && this.current()) { this.watchDirty = false; this.reload(); }
+        if (this.watchDirty && this.current()) { this.watchDirty = false; void this.reload(); }
       });
   }
 
@@ -732,7 +745,7 @@ export struct WorkdirBrowser {
             .onClick((): void => { if (this.current()) this.reference?.(this.path, true); })
         }
         MenuItem({ symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_clockwise')), content: '重新同步' })
-          .onClick((): void => this.reload())
+          .onClick((): void => { void this.reload(); })
       }
     }
     .id(uiOverlayBuildId('workdir-more'))
@@ -1155,11 +1168,14 @@ export struct WorkdirBrowser {
           Text(this.searchSummary).fontSize(12).fontColor($r('app.color.text_secondary'))
         }
         if (this.error) {
-          Text(this.error).fontColor($r('app.color.text_secondary')).onClick((): void => this.reload())
+          Text(this.error).fontColor($r('app.color.text_secondary')).onClick((): void => { void this.reload(); })
         }
+        Refresh({ refreshing: this.pullRefreshing }) {
         if (this.loading && this.entries.length === 0) {
-          LoadingProgress().width(28).height(28)
-          Blank()
+          Column() {
+            LoadingProgress().width(28).height(28)
+            Blank()
+          }.width('100%').height('100%')
         } else if (this.listMode || this.searching) {
           List() {
             ForEach(this.rows(), (row: WorkdirEntry) => {
@@ -1177,6 +1193,8 @@ export struct WorkdirBrowser {
             }, (row: WorkdirEntry): string => row.path + ':' + row.modified)
           }.columnsTemplate('1fr '.repeat(this.columns).trim()).rowsGap(8).width('100%').layoutWeight(1).cachedCount(5)
         }
+        }.layoutWeight(1).width('100%')
+          .onRefreshing((): void => { void this.pullRefresh(); })
         if (!this.searching) {
           Text(this.entries.filter((row: WorkdirEntry): boolean => row.folder).length + ' 个文件夹、' +
             this.entries.filter((row: WorkdirEntry): boolean => !row.folder).length + ' 个文件')

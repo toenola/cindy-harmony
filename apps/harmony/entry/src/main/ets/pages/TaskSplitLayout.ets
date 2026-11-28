@@ -9,7 +9,7 @@
 export const WIDE_TASK_LAYOUT_MIN_WIDTH = 600;
 export const WIDE_TASK_LAYOUT_MIN_SAFE_WIDTH = 760;
 export const WIDE_TASK_LAYOUT_MIN_SAFE_HEIGHT = 480;
-export const TASK_SPLIT_DIVIDER_WIDTH = 20;
+export const TASK_SPLIT_DIVIDER_WIDTH = 24;
 /** 容纳设备下拉、四个头部操作按钮和底部导航，不允许控件彼此覆盖。 */
 export const TASK_SPLIT_MIN_LIST_WIDTH = 300;
 export const TASK_SPLIT_MIN_DETAIL_WIDTH = 400;
@@ -127,6 +127,29 @@ export function taskSplitWidthForDrag(
   deltaX: number,
 ): number {
   return taskListPaneWidth(viewportWidth, Math.max(1, taskListPaneWidth(viewportWidth, startWidth) + deltaX));
+}
+
+export type TaskSplitDragTarget = 'none' | 'detail' | 'list';
+const TASK_SPLIT_EDGE_THRESHOLD = 44;
+
+export class TaskSplitDrag {
+  width: number = 0;
+  overrun: number = 0;
+  target: TaskSplitDragTarget = 'none';
+}
+
+export function taskSplitDrag(viewportWidth: number, startWidth: number, deltaX: number): TaskSplitDrag {
+  const result = new TaskSplitDrag();
+  result.width = taskSplitWidthForDrag(viewportWidth, startWidth, deltaX);
+  if (!Number.isFinite(deltaX)) return result;
+  const raw = taskListPaneWidth(viewportWidth, startWidth) + deltaX;
+  const minimum = taskListPaneWidth(viewportWidth, 1);
+  const maximum = taskListPaneWidth(viewportWidth, TASK_SPLIT_MAX_LIST_WIDTH);
+  const overshoot = raw < minimum ? raw - minimum : (raw > maximum ? raw - maximum : 0);
+  result.overrun = overshoot;
+  if (overshoot <= -TASK_SPLIT_EDGE_THRESHOLD) result.target = 'detail';
+  if (overshoot >= TASK_SPLIT_EDGE_THRESHOLD) result.target = 'list';
+  return result;
 }
 
 /**

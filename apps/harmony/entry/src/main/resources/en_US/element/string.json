@@ -1,5 +1,16 @@
 {
   "string": [
+    {"name": "image_viewer_previous", "value": "Previous"},
+    {"name": "image_viewer_next", "value": "Next"},
+    {"name": "turn_status_thinking", "value": "Thinking…"},
+    {"name": "turn_status_reconnect", "value": "Reconnecting…"},
+    {"name": "turn_status_overload", "value": "Model service busy — retrying…"},
+    {"name": "turn_status_rate_limit", "value": "Request rate limited — retrying…"},
+    {"name": "turn_status_seconds", "value": "%ds"},
+    {"name": "turn_status_minutes", "value": "%dm %ds"},
+    {"name": "turn_status_hours", "value": "%dh %dm"},
+    {"name": "turn_status_days", "value": "%dd %dh %dm"},
+    {"name": "turn_status_tokens", "value": "%s tok"},
     {"name": "v139_home_back", "value": "Back"},
     {"name": "v139_home_cancel", "value": "Cancel"},
     {"name": "v139_home_confirm", "value": "Continue"},
@@ -400,6 +411,12 @@
     {"name": "v140_companion_create_loading", "value": "Loading…"},
     {"name": "v140_project_create", "value": "New project"},
     {"name": "workdir_show_ignored_dirs", "value": "Show ignored directories"},
-    {"name": "workdir_show_ignored_dirs_unsupported", "value": "The remote device is running an older Cindy version that cannot show ignored directories"}
+    {"name": "workdir_show_ignored_dirs_unsupported", "value": "The remote device is running an older Cindy version that cannot show ignored directories"},
+    {"name": "v138_collaboration_mode", "value": "Collaboration mode"},
+    {"name": "home_companion_expand", "value": "Expand companion list"},
+    {"name": "home_companion_compact", "value": "Switch to compact view"},
+    {"name": "home_companion_show_all", "value": "Show all %d"},
+    {"name": "home_companion_show_less", "value": "Show less"},
+    {"name": "composer_picker_permission", "value": "Permissions"}
   ]
 }

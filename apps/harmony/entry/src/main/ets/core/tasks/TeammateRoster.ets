@@ -55,6 +55,7 @@ export function parseTeammateRoster(value: Object | undefined, device: string): 
     entry.id = id;
     entry.deviceId = device;
     entry.session.id = sessionId;
+    entry.session.source = 'bot';
     entry.name = readStr(display, 'title') || id;
     entry.session.title = entry.name;
     const avatar = readObj(display, 'avatar');

@@ -318,8 +318,10 @@ export struct HomeModulePanel {
   build() {
     Stack() {
       Column() {
-        // Chat owns its own title bar once ready (one bar, one back); every other state keeps the module bar.
-        if (!(this.request.kind === 'chat' && this.chatReady && !this.choosingDirectory)) {
+        // Project settings owns its title bar, including discard confirmation.
+        // Chat also owns its title bar once ready.
+        if (this.request.kind !== 'project' &&
+          !(this.request.kind === 'chat' && this.chatReady && !this.choosingDirectory)) {
           Row({ space: 4 }) {
             Button({ type: ButtonType.Circle }) {
               SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).fontColor([$r('app.color.text_primary')])

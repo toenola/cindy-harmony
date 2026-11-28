@@ -1,4 +1,4 @@
-import { parseUsageSnapshot, usageSeries, usageSum, usageResetLabel, usageCandidates, UsageDay, UsageSeries } from '../main/ets/core/usage/UsageDashboard';
+import { parseUsageSnapshot, usageSeries, usageSum, usageResetLabel, usageCandidates, usageRangeStart, usageTotals, UsageDay, UsageSeries } from '../main/ets/core/usage/UsageDashboard';
 import { PresenceSnapshot } from '../main/ets/core/device-link/DlProtocol';
 import { describe, expect, it } from '@ohos/hypium';
 import {
@@ -71,7 +71,7 @@ export default function v133PresentationTest(): void {
   describe('V133Presentation', () => {
     // Unit tier, real dashboard projection: Mobile's legacy/model bucket contract was not
     // covered by message rendering tests. Minimal inputs exercise zero vs unavailable,
-    // top-three/other consistency, and explicit device-scope/offline selection.
+    // raw model consistency, and explicit device-scope/offline selection.
     it('usage_snapshot_distinguishes_unavailable_from_zero_and_keeps_legacy_harnesses', 0, () => {
       expect(parseUsageSnapshot(presentationRecord('{"version":2}')) === null).assertTrue();
       const raw = presentationRecord('{"version":1,"sources":[],"usage":{"days":["2026-11-26"],"daily":[{"tokens":[10,20,0],"money":[1,2,0],"paid":0}]}}');
@@ -85,14 +85,15 @@ export default function v133PresentationTest(): void {
       expect(series[1].name).assertEqual('Claude Code');
       expect(series[1].total).assertEqual(10);
     });
-    it('usage_chart_and_legend_share_the_same_top_three_and_other_totals', 0, () => {
+    it('usage_chart_and_legend_keep_all_named_buckets_and_other', 0, () => {
       const raw = presentationRecord('{"version":1,"sources":[{"id":"a","kind":"subscription","fill":2,"value":"80","resetsAtMs":3600000,"when":"old"}],"strings":{"durationShort.hours":"{{h}}h","resetsIn":"Resets in {{duration}}"},"usage":{"days":["2026-11-26"],"models":[{"name":"A"},{"name":"B"},{"name":"C"},{"name":"D"}],"daily":[{"tokens":[100,50,0],"models":[0,0,0,0,0],"modelTokens":[50,40,30,20,10]}]}}');
       const snapshot = parseUsageSnapshot(raw);
       if (snapshot === null) { expect(false).assertTrue(); return; }
       const series = usageSeries(snapshot, 'Other');
-      expect(series.length).assertEqual(4);
-      expect(series[3].name).assertEqual('Other');
-      expect(series[3].total).assertEqual(30);
+      expect(series.length).assertEqual(5);
+      expect(series[3].name).assertEqual('D');
+      expect(series[4].name).assertEqual('Other');
+      expect(series[4].total).assertEqual(10);
       expect(usageSum(series.map((s: UsageSeries): number => s.total))).assertEqual(usageSum(snapshot.days[0].tokens));
       expect(snapshot.sources[0].fill).assertEqual(1);
       expect(usageResetLabel(snapshot.sources[0], snapshot.strings, 0, 'Reset pending')).assertEqual('Resets in 1h');
@@ -101,6 +102,72 @@ export default function v133PresentationTest(): void {
       snapshot.days.push(new UsageDay());
       expect(usageSeries(snapshot, 'Other')[0].name).assertEqual('Codex');
       expect(usageSeries(snapshot, 'Other')[0].total).assertEqual(50);
+    });
+    // Unit: the last seven buckets include the last day and do not mix estimated and paid.
+    it('usage_range_and_model_totals_keep_money_at_its_reported_scope', 0, () => {
+      const snapshot = parseUsageSnapshot(presentationRecord(
+        '{"version":1,"sources":[],"usage":{"days":[],"daily":[],"models":[{"name":"A","harness":"codex"}]}}'));
+      if (snapshot === null) { expect(false).assertTrue(); return; }
+      for (let i = 0; i < 30; i++) {
+        const day = new UsageDay();
+        day.tokens = [i + 1]; day.money = [4]; day.paid = 1;
+        day.modelTokens = [1, i]; day.modelMoney = [2, 2];
+        snapshot.days.push(day);
+      }
+      const start = usageRangeStart(snapshot, 7);
+      expect(start).assertEqual(23);
+      expect(usageTotals(snapshot, start, 30).tokens).assertEqual(189);
+      expect(usageTotals(snapshot, usageRangeStart(snapshot, 30), 30).tokens).assertEqual(465);
+      const model = usageSeries(snapshot, 'Other', start, 30)[0];
+      expect(model.harness).assertEqual('codex');
+      const filtered = usageTotals(snapshot, start, 30, model);
+      expect(filtered.tokens).assertEqual(7);
+      expect(filtered.estimated).assertEqual(14);
+      expect(filtered.paid).assertEqual(null);
+      snapshot.days[29].modelMoney = [];
+      expect(usageSeries(snapshot, 'Other', start, 30)[0].estimated).assertEqual(12);
+    });
+
+    // Unit: two days distinguish all-zero/missing and partial data through the production projection.
+    it('usage_money_hides_all_zero_or_missing_buckets_per_selection', 0, () => {
+      const snapshot = parseUsageSnapshot(presentationRecord(
+        '{"version":1,"sources":[],"usage":{"days":["2026-11-27","2026-11-28"],"models":[{"name":"A"}],"daily":['
+        + '{"tokens":[1],"money":[0],"paid":0,"modelTokens":[1,0],"models":[0,0]},'
+        + '{"tokens":[1],"modelTokens":[1,0]}]}}'));
+      if (snapshot === null) { expect(false).assertTrue(); return; }
+      expect(usageTotals(snapshot, 0, 2).estimated).assertEqual(null);
+      expect(usageTotals(snapshot, 0, 2).paid).assertEqual(null);
+      expect(usageSeries(snapshot, 'Other')[0].hasEstimate).assertFalse();
+      snapshot.days[0].money = [4, 0];
+      snapshot.days[0].paid = 2;
+      snapshot.days[0].modelMoney = [4, 0];
+      const series = usageSeries(snapshot, 'Other');
+      expect(usageTotals(snapshot, 0, 2).estimated).assertEqual(4);
+      expect(usageTotals(snapshot, 0, 2).paid).assertEqual(2);
+      expect(usageTotals(snapshot, 1, 2).estimated).assertEqual(null);
+      expect(usageTotals(snapshot, 1, 2).paid).assertEqual(null);
+      expect(usageTotals(snapshot, 0, 2, series[0]).estimated).assertEqual(4);
+      expect(usageTotals(snapshot, 0, 2, series[1]).estimated).assertEqual(null);
+      expect(series[1].estimated).assertEqual(0);
+      snapshot.days[1].money = [-4, 0];
+      expect(usageTotals(snapshot, 0, 2).estimated).assertEqual(0);
+    });
+
+    // Unit: structured ratios stay separate from display labels and from absent detail.
+    it('usage_detail_accepts_optional_rings_and_legend', 0, () => {
+      const snapshot = parseUsageSnapshot(presentationRecord(
+        '{"version":1,"locale":"en","usage":{"days":[],"daily":[]},"sources":['
+        + '{"kind":"subscription","unusedAtReset":true,"detail":{"title":"A","rings":[{"fraction":0.75,"color":"codex"}],"legend":[{"label":"Week"}]}},'
+        + '{"kind":"subscription","detail":{"plan":"Plus","bigCaption":"Period","rings":[{"fraction":0,"color":"ink"}]}},'
+        + '{"kind":"subscription","detail":{"plan":"Pro"}},{"kind":"subscription"}]}'));
+      if (snapshot === null) { expect(false).assertTrue(); return; }
+      expect(snapshot.locale).assertEqual('en');
+      expect(snapshot.sources[0].unusedAtReset).assertTrue();
+      expect(snapshot.sources[0].detail?.windows[0].label).assertEqual('Week');
+      expect(snapshot.sources[0].detail?.windows[0].fraction).assertEqual(0.75);
+      expect(snapshot.sources[1].detail?.windows[0].label).assertEqual('Period');
+      expect(snapshot.sources[2].detail?.windows.length).assertEqual(0);
+      expect(snapshot.sources[3].detail).assertEqual(null);
     });
     // Unit: one Mac and the last responding PC distinguish automatic order from pinned filtering.
     it('usage_candidates_rank_last_answer_then_mac_and_keep_card_scope_strict', 0, () => {

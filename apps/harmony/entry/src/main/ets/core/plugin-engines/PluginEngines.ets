@@ -3,11 +3,19 @@ import { readNum, readObj, readStr, recordOrEmpty } from '../tasks/TaskModels';
 const PREFIX = 'acp-plugin:';
 export const MAX_PLUGIN_ENGINES = 32;
 
+export class PluginEngineModel {
+  id: string = 'default';
+  label: string = '默认模型';
+  efforts: string[] = [];
+}
+
 export class PluginEngine {
   providerId: string = '';
   name: string = '';
   iconDataUrl: string = '';
   availability: string = 'unknown';
+  availabilityMessage: string = '';
+  models: PluginEngineModel[] = [];
   reportsUsage: boolean = false;
 }
 
@@ -41,6 +49,26 @@ export function normalizePluginEngines(value: Object | undefined): PluginEngine[
     engine.name = name;
     const state = readStr(readObj(raw, 'availability'), 'state');
     if (state === 'available' || state === 'unavailable') engine.availability = state;
+    engine.availabilityMessage = readStr(readObj(raw, 'availability'), 'message').trim().slice(0, 200);
+    const models = raw['models'];
+    if (Array.isArray(models)) {
+      const ids = new Set<string>();
+      for (const entry of (models as Object[]).slice(0, 200)) {
+        const row = recordOrEmpty(entry);
+        const id = readStr(row, 'id');
+        if (!id.trim() || id.length > 256 || ids.has(id)) continue;
+        ids.add(id);
+        const model = new PluginEngineModel();
+        model.id = id;
+        model.label = (readStr(row, 'displayName').trim() || readStr(row, 'label').trim() || id).slice(0, 200);
+        const efforts = row['efforts'];
+        if (Array.isArray(efforts)) {
+          model.efforts = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+            .filter((level: string): boolean => (efforts as Object[]).includes(level));
+        }
+        engine.models.push(model);
+      }
+    }
     engine.reportsUsage = raw['reportsUsage'] === true;
     const icon = readStr(raw, 'iconDataUrl');
     if (icon.startsWith('data:image/') && icon.length <= 64 * 1024 && icon.length <= remainingIconChars) {
@@ -108,4 +136,12 @@ export function normalizePluginUsage(value: Object | undefined): PluginUsage | n
     }
   }
   return usage.windows.length || usage.balances.length ? usage : null;
+}
+
+export function pluginPickerModels(engine: PluginEngine, activeModel: string): PluginEngineModel[] {
+  if (engine.models.length === 0) return [new PluginEngineModel()];
+  if (activeModel === 'default' && !engine.models.some((model: PluginEngineModel): boolean => model.id === 'default')) {
+    return [new PluginEngineModel()].concat(engine.models);
+  }
+  return engine.models;
 }

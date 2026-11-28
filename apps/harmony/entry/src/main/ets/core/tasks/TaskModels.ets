@@ -186,6 +186,7 @@ export class RemoteSession {
   agentKind: string = '';
   source: string = '';
   orcaRole: string = '';
+  orcaRemoteLead: boolean = false;
   parentSessionId: string = '';
   pinnedAt: string = '';
   userSendAt: string = '';
@@ -268,6 +269,9 @@ export function parseSession(raw: Record<string, Object>): RemoteSession {
   s.agentKind = readStr(raw, 'agentKind');
   s.source = readStr(raw, 'source');
   s.orcaRole = readStr(raw, 'orcaRole');
+  const remoteLead = readObj(raw, 'orcaRemoteLead');
+  s.orcaRemoteLead = raw['orcaRemoteLead'] === true
+    || (readStr(remoteLead, 'leadDeviceId').length > 0 && readStr(remoteLead, 'leadSessionId').length > 0);
   s.parentSessionId = readStr(raw, 'parentSessionId');
   s.pinnedAt = readStr(raw, 'pinnedAt');
   s.userSendAt = readStr(raw, 'userSendAt');

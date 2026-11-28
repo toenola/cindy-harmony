@@ -1,5 +1,16 @@
 {
   "string": [
+    {"name": "image_viewer_previous", "value": "이전 이미지"},
+    {"name": "image_viewer_next", "value": "다음 이미지"},
+    {"name": "turn_status_thinking", "value": "생각 중…"},
+    {"name": "turn_status_reconnect", "value": "다시 연결하는 중…"},
+    {"name": "turn_status_overload", "value": "모델 서비스 혼잡, 다시 시도 중…"},
+    {"name": "turn_status_rate_limit", "value": "요청이 속도 제한에 걸렸습니다. 다시 시도 중…"},
+    {"name": "turn_status_seconds", "value": "%d초"},
+    {"name": "turn_status_minutes", "value": "%d분 %d초"},
+    {"name": "turn_status_hours", "value": "%d시간 %d분"},
+    {"name": "turn_status_days", "value": "%d일 %d시간 %d분"},
+    {"name": "turn_status_tokens", "value": "%s tok"},
     {"name": "v139_home_back", "value": "뒤로"},
     {"name": "v139_home_cancel", "value": "취소"},
     {"name": "v139_home_confirm", "value": "계속"},
@@ -400,6 +411,12 @@
     {"name": "v140_companion_create_loading", "value": "불러오는 중…"},
     {"name": "v140_project_create", "value": "새 프로젝트"},
     {"name": "workdir_show_ignored_dirs", "value": "무시된 디렉터리 표시"},
-    {"name": "workdir_show_ignored_dirs_unsupported", "value": "상대 기기의 Cindy 버전이 오래되어 무시된 디렉터리를 표시할 수 없습니다"}
+    {"name": "workdir_show_ignored_dirs_unsupported", "value": "상대 기기의 Cindy 버전이 오래되어 무시된 디렉터리를 표시할 수 없습니다"},
+    {"name": "v138_collaboration_mode", "value": "협업 모드"},
+    {"name": "home_companion_expand", "value": "파트너 목록 펼치기"},
+    {"name": "home_companion_compact", "value": "간결한 보기로 전환"},
+    {"name": "home_companion_show_all", "value": "전체 %d개 표시"},
+    {"name": "home_companion_show_less", "value": "접기"},
+    {"name": "composer_picker_permission", "value": "권한"}
   ]
 }

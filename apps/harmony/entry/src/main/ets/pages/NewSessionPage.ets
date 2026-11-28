@@ -1,3 +1,7 @@
+import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
+import { ComposerModelOption, pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption, pickerConfiguredOption } from '../core/ComposerCatalog';
+import { NewSessionWorktreeTarget, WorktreePreparation, parseWorktreeTarget,
+  worktreeReservation } from '../core/tasks/NewSessionWorktree';
 import { restoreIncomingNewSessionDraft } from '../core/incoming-share/IncomingNewSessionDrafts';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import { MODEL_SPEED_ULTRAFAST, fastModeWireValue, ultrafastRestorable } from '../core/tasks/ModelSpeed';
@@ -97,7 +101,7 @@ import {
   NewSessionEditDraft,
 } from '../core/tasks/NewSessionCreationStore';
 import { deriveOptimisticSessionTitle } from './TaskListPresentation';
-import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import { ComposerImage, ConversationComposer, composerPermissionSymbol, composerPermissionTint } from '../components/ConversationComposer';
 import {
   ComposerModelOptionRow,
   ComposerModelProviderHeader,
@@ -121,7 +125,7 @@ import {
   uiOverlayTransition,
 } from '../components/UiKit';
 import {
-  uiConfirm, uiConfirmCopy, uiMenuOptions, uiOverlayBuildId, uiOverlayTrace, uiToast,
+  uiConfirm, uiConfirmCopy, uiToast,
 } from '../components/common/UiOverlay';
 
 type NewAgentKind = 'claude-code' | 'codex' | 'pi';
@@ -206,13 +210,26 @@ export struct NewSessionPageContent {
   @Prop @Watch('applyCreatedProject') createdProject: string = '';
   @State devices: PresenceSnapshot[] = [];
   @State projectAliasRevision: number = 0;
-  @State selectedDeviceId: string = '';
+  @State @Watch('scheduleWorktreeTarget') selectedDeviceId: string = '';
+  @State private worktreeEnabled: boolean = false;
+  @State private worktreeTarget: NewSessionWorktreeTarget = new NewSessionWorktreeTarget();
+  @State private worktreeLoading: boolean = false;
+  @State private worktreeBranches: string[] = [];
+  @State private worktreeBranchOpen: boolean = false;
+  @State private deviceMenuOpen: boolean = false;
+  @State private worktreeBranchQuery: string = '';
+  @State private worktreeBranch: string = 'HEAD';
+  private worktreeGeneration: number = 0;
+  private worktreeKey: string = '';
+  private worktreeOwner: string = '';
+  private worktreeBranchCache: Map<string, string[]> = new Map();
+  private worktreeDeviceChoices: Map<string, boolean> = new Map();
   @State private selectedRouteId: string = '';
   @State private selectedRouteDevice: string = '';
   @State private routingSnapshot: ModelRoutingSnapshot = new ModelRoutingSnapshot();
   @State selectedAgentKind: NewAgentKind = 'claude-code';
-  @State workspaceKind: WorkspaceKind = 'dialogue';
-  @State workingDir: string = '';
+  @State @Watch('scheduleWorktreeTarget') workspaceKind: WorkspaceKind = 'dialogue';
+  @State @Watch('scheduleWorktreeTarget') workingDir: string = '';
   @State input: string = '';
   private newSessionDocument: ComposerDocument = new ComposerDocument();
   private newSessionDraftDevice: string = '';
@@ -235,6 +252,8 @@ export struct NewSessionPageContent {
   private fileQueue: ComposerFileQueue = new ComposerFileQueue();
   /** 新建页待发送图片的全屏预览 URL（空 = 无预览）。 */
   @State previewImageUrl: string = '';
+  @State private composerPickerViewport: number = 0;
+  registerComposerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
   @State contextSheetOpen: boolean = false;
   @State workspacePopupOpen: boolean = false;
   @State composerPermissionPopupOpen: boolean = false;
@@ -250,7 +269,6 @@ export struct NewSessionPageContent {
   private modelPickerUserMoved: boolean = false;
   private selectedModelArea: Area | null = null;
   /** 仅恢复打开模型 Popup 前已经存在的输入焦点。 */
-  private composerPopupRestoreFocus: boolean = false;
   /** 模型 Popup 关闭时暂存目标选项，由统一收口路径提交模型并销毁锚点。 */
   private pendingPopupModelSelection: RuntimeModelOption | null = null;
   @State contextSheetPage: string = 'main';
@@ -337,6 +355,11 @@ export struct NewSessionPageContent {
   private newSessionInputRevision: number = 0;
   private newSessionDraftCheckpointTimer: number = -1;
   aboutToAppear(): void {
+    this.pickerFavoriteUnsubscribe = AppServices.instance.onModulePush((device: string, channel: string): void => {
+      if (channel === 'maker:model-favorites:changed' && this.composerModelPopupOpen && !this.pickerFavoritesBusy
+        && device === this.selectedDeviceId) void this.refreshPickerFavorites();
+    });
+    this.registerComposerBack?.((): boolean => this.dismissActiveComposerPicker());
     this.unsubs.push(AppServices.instance.modelRouting.onChanged((): void => {
       this.routingSnapshot = AppServices.instance.modelRouting.snapshot(this.selectedDeviceId);
     }));
@@ -393,6 +416,7 @@ export struct NewSessionPageContent {
     }
     this.unsubs.push(AppServices.instance.tasks.onChanged(() => {
       this.refreshDevices();
+    this.scheduleWorktreeTarget();
     }));
     this.unsubs.push(AppServices.instance.remoteAgentCatalogs.onChanged(() => this.syncRemoteAgentCatalogs()));
     this.unsubs.push(AppServices.instance.taskProjectAliases.onChanged(() => {
@@ -415,6 +439,11 @@ export struct NewSessionPageContent {
   }
 
   aboutToDisappear(): void {
+    this.pickerFavoriteUnsubscribe?.();
+    this.pickerFavoriteUnsubscribe = undefined;
+    this.pickerRefreshRevision += 1;
+    this.registerComposerBack?.(undefined);
+    this.worktreeKey = '';
     this.pageActive = false;
     this.incomingGeneration++;
     this.cancelImagePicking();
@@ -703,10 +732,10 @@ export struct NewSessionPageContent {
     this.workingDir = preferences.workingDirByDevice[this.selectedDeviceId] ?? '';
   }
 
-  private refreshDevices(): void {
+  private refreshDevices(requested: string = this.selectedDeviceId): void {
     this.devices = AppServices.instance.tasks.deviceList;
     this.taskRevision += 1;
-    let nextDeviceId = this.selectedDeviceId;
+    let nextDeviceId = requested;
     if (this.routeDeviceId && AppServices.instance.incomingComposer?.pendingTargets().some((target: IncomingShareDestination): boolean =>
       target.ownerKey === AppServices.instance.usageCardOwner && target.deviceId === this.routeDeviceId && target.sessionId === '') === true) {
       nextDeviceId = this.routeDeviceId;
@@ -820,6 +849,7 @@ export struct NewSessionPageContent {
       }
       return;
     }
+    this.pickerPluginProvider = '';
     this.runtimeModelTouchedGeneration = this.runtimeLoadGeneration;
     // 选模型时会一起 reconcile effort / Fast，后续异步目录回包也不能把它们改回默认值。
     this.runtimeEffortTouchedGeneration = this.runtimeLoadGeneration;
@@ -855,6 +885,122 @@ export struct NewSessionPageContent {
     this.fastMode = !this.fastMode;
     this.fastModeTier = '';
     this.writeRuntimeChoice(false);
+  }
+
+  private scheduleWorktreeTarget(): void {
+    const generation = ++this.worktreeGeneration;
+    Promise.resolve().then((): void => {
+      if (generation === this.worktreeGeneration && this.pageActive) void this.loadWorktreeTarget();
+    });
+  }
+
+  private async loadWorktreeTarget(): Promise<void> {
+    const app = AppServices.instance;
+    const device = this.selectedDeviceId;
+    const cwd = this.workspaceKind === 'project' ? this.workingDir.trim() : '';
+    const key = JSON.stringify([app.moduleScope, device, cwd]);
+    if (key === this.worktreeKey) return;
+    this.worktreeKey = key;
+    if (this.worktreeOwner !== app.moduleScope) {
+      this.worktreeOwner = app.moduleScope;
+      this.worktreeBranchCache.clear();
+      this.worktreeDeviceChoices.clear();
+    }
+    this.worktreeTarget = new NewSessionWorktreeTarget();
+    this.worktreeBranch = 'HEAD';
+    this.worktreeBranchOpen = false;
+    this.worktreeEnabled = this.worktreeDeviceChoices.get(device) ?? false;
+    this.worktreeLoading = cwd.length > 0 && device.length > 0;
+    if (!this.worktreeLoading) return;
+    const current = (): boolean => this.pageActive && this.worktreeKey === key
+      && device === this.selectedDeviceId && this.workspaceKind === 'project'
+      && cwd === this.workingDir.trim();
+    const invoke = app.newSessionWorktree(device, current);
+    try {
+      const detectArgs: Record<string, Object> = {};
+      detectArgs['cwd'] = cwd;
+      const target = parseWorktreeTarget(await invoke('worktree:detect-cwd', [detectArgs]));
+      if (!current()) return;
+      this.worktreeTarget = target;
+      this.worktreeBranch = target.sourceBranch;
+      if (!target.supported) {
+        this.worktreeEnabled = false;
+        return;
+      }
+      try {
+        const defaults = recordOrEmpty(await invoke('maker:get-new-maker-defaults', [this.selectedAgentKind]));
+        if (current() && !this.worktreeDeviceChoices.has(device)) {
+          this.worktreeEnabled = defaults['worktreeEnabled'] === true;
+        }
+      } catch (_) {}
+      try {
+        const prefArgs: Record<string, Object> = {};
+        prefArgs['baseRepo'] = target.baseRepo;
+        const pref = recordOrEmpty(await invoke('maker:get-new-maker-worktree-branch-pref', [prefArgs]));
+        if (current()) this.worktreeBranch = readStr(pref, 'sourceBranch') || target.sourceBranch;
+      } catch (_) {}
+    } catch (_) {
+      // 不支持通道或无法验证目标时不允许预创建。
+      if (current()) this.worktreeEnabled = false;
+    } finally {
+      if (current()) this.worktreeLoading = false;
+    }
+  }
+
+  private async openWorktreeBranches(): Promise<void> {
+    if (!this.worktreeTarget.supported || this.creating || this.worktreeLoading) return;
+    const key = this.worktreeKey;
+    const generation = this.worktreeGeneration;
+    const baseRepo = this.worktreeTarget.baseRepo;
+    const cacheKey = JSON.stringify([key, baseRepo]);
+    const current = (): boolean => this.pageActive && this.worktreeKey === key && this.worktreeGeneration === generation;
+    this.worktreeBranchQuery = '';
+    this.openLocalPicker('branch');
+    this.worktreeBranches = this.worktreeBranchCache.get(cacheKey) ?? [];
+    if (this.worktreeBranchCache.has(cacheKey)) return;
+    try {
+      const invoke = AppServices.instance.newSessionWorktree(this.selectedDeviceId, current);
+      const branchesArgs: Record<string, Object> = {};
+      branchesArgs['baseRepo'] = baseRepo;
+      const rows = recordOrEmpty(await invoke('worktree:list-branches', [branchesArgs]))['branches'];
+      if (!current() || !Array.isArray(rows)) return;
+      const unique = (rows as Object[]).filter((row: Object): boolean => typeof row === 'string' && String(row).trim().length > 0)
+        .map((row: Object): string => String(row).trim());
+      this.worktreeBranches = Array.from(new Set(unique));
+      this.worktreeBranchCache.set(cacheKey, this.worktreeBranches);
+    } catch (_) {
+      if (current()) uiToast(this.getUIContext(), '暂时无法读取分支，请重试');
+    }
+  }
+
+  private toggleNewWorktree(): void {
+    if (!this.worktreeTarget.supported || this.worktreeLoading || this.creating) return;
+    this.worktreeEnabled = !this.worktreeEnabled;
+    const device = this.selectedDeviceId;
+    const key = this.worktreeKey;
+    const enabled = this.worktreeEnabled;
+    this.worktreeDeviceChoices.set(device, enabled);
+    const invoke = AppServices.instance.newSessionWorktree(device,
+      (): boolean => this.pageActive && key === this.worktreeKey);
+    const toggleArgs: Record<string, Object> = {};
+    toggleArgs['worktreeEnabled'] = enabled;
+    void invoke('maker:apply-new-maker-worktree-pref', [toggleArgs]).catch((): void => {});
+  }
+
+  private selectWorktreeBranch(branch: string): void {
+    const key = this.worktreeKey;
+    const baseRepo = this.worktreeTarget.baseRepo;
+    this.getUIContext().getFocusController().clearFocus();
+    this.worktreeBranchOpen = false;
+    if (this.worktreeBranch === branch) return;
+    this.worktreeBranch = branch;
+    const invoke = AppServices.instance.newSessionWorktree(this.selectedDeviceId,
+      (): boolean => this.pageActive && key === this.worktreeKey);
+    const branchArgs: Record<string, Object> = {};
+    branchArgs['baseRepo'] = baseRepo;
+    branchArgs['sourceBranch'] = branch;
+    void invoke('maker:apply-new-maker-worktree-branch-pref', [branchArgs])
+      .catch((): void => {});
   }
 
   private selectDialogue(): void {
@@ -927,21 +1073,25 @@ export struct NewSessionPageContent {
     this.contextSheetPage = page;
     if (page === 'model') void this.loadRouting();
     this.composerBlurGeneration += 1;
-    this.composerSurfaceVisible = true;
     this.modelEffortPickerKey = '';
     if (page === 'model') this.pendingPopupModelSelection = null;
     if (page === 'model') {
+      this.pickerAllProviders = false;
+      this.pickerModelSearch = '';
       this.modelPickerPositionPending = true;
       this.modelPickerUserMoved = false;
       this.modelPickerHeight = 0;
+      this.selectedModelArea = null;
       this.modelQuotaRequested.clear();
       this.modelQuotaValues = [];
     }
-    this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
     this.getUIContext().getFocusController().clearFocus();
     this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
+    if (page === 'model') this.openPickerExtras();
     if (page === 'model') this.refreshRemoteAgentCatalogs(true);
     if (page === 'model') void this.refreshModelQuotas();
   }
@@ -991,6 +1141,29 @@ export struct NewSessionPageContent {
     });
   }
 
+  private composerPickerOpen(): boolean {
+    return this.composerPermissionPopupOpen || this.composerAgentPopupOpen || this.composerModelPopupOpen
+      || this.localPickerTitle().length > 0;
+  }
+
+  private dismissActiveComposerPicker(): boolean {
+    if (this.composerModelPopupOpen && this.pickerDetails !== null) {
+      this.pickerDetails = null;
+      return true;
+    }
+    if (this.localPickerTitle()) {
+      this.getUIContext().getFocusController().clearFocus();
+      this.deviceMenuOpen = false;
+      this.workspacePopupOpen = false;
+      this.worktreeBranchOpen = false;
+      return true;
+    }
+    if (!this.composerPickerOpen()) return false;
+    this.dismissComposerControlPopup(this.composerPermissionPopupOpen ? 'permission'
+      : this.composerModelPopupOpen ? 'model' : 'agent');
+    return true;
+  }
+
   private dismissComposerControlPopup(page: string): void {
     let pendingModelSelection: RuntimeModelOption | null = null;
     if (page === 'permission') this.composerPermissionPopupOpen = false;
@@ -1003,20 +1176,6 @@ export struct NewSessionPageContent {
     }
     // Popup 自动退场与模型行主动关闭共用同一条模型提交、焦点恢复路径。
     if (pendingModelSelection !== null) this.selectModel(pendingModelSelection);
-    if (!this.composerPopupRestoreFocus || !this.pageActive) return;
-    this.composerPopupRestoreFocus = false;
-    this.composerBlurGeneration += 1;
-    this.composerSurfaceVisible = true;
-    this.composerFocused = true;
-    setTimeout(() => {
-      if (!this.pageActive || this.composerPermissionPopupOpen
-        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
-      try {
-        this.getUIContext().getFocusController().requestFocus('new-session-composer-input');
-      } catch (_err) {
-        // 页面退场时保持状态收口，不向已销毁的输入节点请求焦点。
-      }
-    }, 0);
   }
 
   private handleComposerFocusChange(focused: boolean): void {
@@ -1348,8 +1507,9 @@ export struct NewSessionPageContent {
   private canSend(): boolean {
     if (this.creating || !this.incomingRestored || this.incomingBusy || this.incomingBlocked || !this.incomingDraftMatchesTarget() || this.pickingImages || this.pickingFiles) return false;
     const routeChosen = this.selectedRouteId.length > 0 && this.selectedRouteDevice === this.selectedDeviceId;
+    const plugin = this.selectedPickerPlugin();
     if (!this.canCreateOnDevice(this.selectedDeviceId) || this.runtimeCatalogScope !== this.currentRuntimeScope()
-      || !this.runtimeDefaultsSettled || (!routeChosen && !newSessionRuntimeCanCreate(this.runtimeDefaultsSettled, this.runtimeCatalogReady,
+      || !this.runtimeDefaultsSettled || (!routeChosen && plugin?.availability !== 'available' && !newSessionRuntimeCanCreate(this.runtimeDefaultsSettled, this.runtimeCatalogReady,
         this.selectedAgentKind, this.currentRuntimeChoice(), this.modelVisibilityOverrides))) return false;
     let readyCount = 0;
     for (let i = 0; i < this.composerImages.length; i++) {
@@ -1524,6 +1684,7 @@ export struct NewSessionPageContent {
       const result = unwrapInvokeResult(envelope);
       if (!hasProviderCatalog(result)) throw new Error('Invalid provider catalog');
       this.runtimeCatalogReady = true;
+      this.pickerCatalogPayload = result;
       const providerOptions = this.parseProviderModelOptions(result, agent);
       this.providerModelOptions = providerOptions;
       if (!this.modelPickerUserMoved && this.composerModelPopupOpen) this.modelPickerPositionPending = true;
@@ -1628,6 +1789,130 @@ export struct NewSessionPageContent {
       this.remoteOptionsCache = remoteAgentModelOptions(this.remoteAgentCatalogList, agent, hint, selected);
     }
     return this.remoteOptionsCache;
+  }
+
+  @State private pickerAllProviders: boolean = false;
+  @State private pickerModelSearch: string = '';
+  @State private pickerDetails: ComposerModelOption | null = null;
+  @State private pickerCatalogPayload: Object | undefined = undefined;
+  @State private pickerFavoriteItems: Object[] = [];
+  @State private pickerFavoritesReady: boolean = false;
+  @State private pickerFavoritesBusy: boolean = false;
+  @State private pickerPluginProvider: string = '';
+  @State private pickerPluginModel: string = 'default';
+  @State private pickerPluginModelLabel: string = '';
+  private pickerPluginDevice: string = '';
+
+  private selectedPickerPlugin(): PluginEngine | undefined {
+    if (this.pickerPluginDevice !== this.selectedDeviceId || !this.pickerPluginProvider) return undefined;
+    return AppServices.instance.pluginEngines.find(this.selectedDeviceId, this.pickerPluginProvider);
+  }
+
+  private pickDraftPlugin(engine: PluginEngine, model: PluginEngineModel): void {
+    if (engine.availability !== 'available' || this.creating) return;
+    this.pickerPluginProvider = engine.providerId;
+    this.pickerPluginModel = model.id;
+    this.pickerPluginModelLabel = model.label;
+    this.pickerPluginDevice = this.selectedDeviceId;
+    this.selectedRouteId = '';
+    this.selectedRouteDevice = '';
+    this.dismissComposerControlPopup('model');
+  }
+
+  @State private pickerPluginRows: PluginEngine[] = [];
+  private pickerRefreshRevision: number = 0;
+  private pickerFavoriteUnsubscribe: (() => void) | undefined = undefined;
+
+  private pickerCurrentProvider(): ComposerModelGroup | undefined {
+    const groups = this.groupedModelOptions();
+    return groups.find((group: ComposerModelGroup): boolean =>
+      group.options.some((option: ComposerModelOption): boolean => this.modelOptionIsCurrent(option))) ?? groups[0];
+  }
+
+  private async refreshPickerFavorites(): Promise<void> {
+    const app = AppServices.instance;
+    const device = this.selectedDeviceId;
+    const revision = ++this.pickerRefreshRevision;
+    const current = (): boolean => this.composerModelPopupOpen && device === this.selectedDeviceId && revision === this.pickerRefreshRevision;
+    try {
+      const result = await app.modelPickerFavorites(device, 'maker:model-favorites:get', [], current);
+      if (current() && Array.isArray(result) && result.length <= 4096) {
+        this.pickerFavoriteItems = result as Object[];
+        this.pickerFavoritesReady = true;
+      }
+    } catch (_) {}
+  }
+
+  private openPickerExtras(): void {
+    this.pickerDetails = null;
+    this.pickerFavoriteItems = [];
+    this.pickerFavoritesReady = false;
+    this.pickerFavoritesBusy = false;
+    const device = this.selectedDeviceId;
+    const app = AppServices.instance;
+    const scope = app.moduleScope;
+    this.pickerPluginRows = app.pluginEngines.listCached(device);
+    void app.pluginEngines.load(device).then((rows: PluginEngine[]): void => {
+      if (this.composerModelPopupOpen && device === this.selectedDeviceId && scope === app.moduleScope) this.pickerPluginRows = rows;
+    });
+    void this.refreshPickerFavorites();
+  }
+
+  private pickerGroups(): ComposerModelGroup[] {
+    if (!this.pickerAllProviders) return pickerVisibleGroups(this.groupedModelOptions(),
+      this.pickerCurrentProvider()?.key ?? '', false, this.pickerModelSearch);
+    const options: ComposerModelOption[] = [];
+    for (const harness of NEW_AGENT_OPTIONS) {
+      if (harness !== this.selectedAgentKind && false) continue;
+      const rows = harness === this.selectedAgentKind ? this.visibleModelOptions()
+        : parseComposerProviderModelOptions(this.pickerCatalogPayload, harness, this.modelVisibilityOverrides, undefined, false).concat(
+          remoteAgentModelOptions(this.remoteAgentCatalogList, harness, undefined, null));
+      for (const row of rows) {
+        row.pickerHarness = harness;
+        options.push(row);
+      }
+    }
+    return pickerFavorites(pickerVisibleGroups(groupComposerModelOptions(options), '', true, this.pickerModelSearch),
+      this.pickerFavoriteItems);
+  }
+
+  private async togglePickerFavorite(option: ComposerModelOption): Promise<void> {
+    if (!this.pickerFavoritesReady || this.pickerFavoritesBusy || !option.providerId) return;
+    const device = this.selectedDeviceId;
+    const app = AppServices.instance;
+    const scope = app.moduleScope;
+    const current = (): boolean => this.composerModelPopupOpen && device === this.selectedDeviceId && scope === app.moduleScope;
+    this.pickerFavoritesBusy = true;
+    try {
+      const mutation = modelFavoriteMutation(option, this.selectedAgentKind, this.modelEffortForRow(option),
+        this.modelFastForRow(option), this.pickerFavoriteItems);
+      await app.modelPickerFavorites(device, 'maker:model-favorites:apply', [mutation], current);
+      if (current()) await this.refreshPickerFavorites();
+    } catch (_) {
+      if (current()) uiToast(this.getUIContext(), '收藏未保存，请重试');
+    } finally {
+      if (current()) this.pickerFavoritesBusy = false;
+    }
+  }
+
+  @Builder
+  pickerSearchHeader() {
+    Row({ space: 8 }) {
+      TextInput({ placeholder: '搜索模型…', text: this.pickerModelSearch })
+        .height(44).layoutWeight(1).fontColor($r('app.color.text_primary'))
+        .placeholderColor($r('app.color.text_secondary')).backgroundColor($r('app.color.bg_chip'))
+        .onChange((value: string) => { this.pickerModelSearch = value; })
+      Button() {
+        Text(this.pickerAllProviders ? '全部模型' : this.pickerCurrentProvider()?.name ?? '全部模型')
+          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .type(ButtonType.Normal).height(44).constraintSize({ maxWidth: '48%' })
+      .backgroundColor($r('app.color.bg_chip'))
+      .onClick(() => {
+        this.pickerAllProviders = !this.pickerAllProviders;
+        this.modelPickerScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false });
+      })
+    }.width('100%').padding({ left: 12, right: 12, bottom: 4 })
   }
 
   private groupedModelOptions(): ComposerModelGroup[] {
@@ -2272,8 +2557,18 @@ export struct NewSessionPageContent {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_defaults_loading');
       return;
     }
+    const plugin = this.selectedPickerPlugin();
+    const pluginChosen = plugin?.availability === 'available';
+    if (this.pickerPluginDevice === this.selectedDeviceId && this.pickerPluginProvider && !pluginChosen) {
+      this.error = '当前插件引擎不可用';
+      return;
+    }
+    if (pluginChosen && this.workspaceKind === 'project' && this.worktreeEnabled) {
+      this.error = '当前插件引擎暂不能与 worktree 一同创建';
+      return;
+    }
     const routeChosen = this.selectedRouteId.length > 0 && this.selectedRouteDevice === this.selectedDeviceId;
-    if (!routeChosen && !this.runtimeCatalogReady) {
+    if (!pluginChosen && !routeChosen && !this.runtimeCatalogReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       if (!this.runtimeToolbarLoadActive) void this.loadRuntimeDefaults(this.selectedDeviceId, this.selectedAgentKind);
       return;
@@ -2285,17 +2580,17 @@ export struct NewSessionPageContent {
     const isCurrent = (): boolean => this.runtimeRequestIsCurrent(deviceId, agent, generation)
       && ownerEpoch === AppServices.instance.auth.sessionEpoch && AppServices.instance.auth.isLoggedIn;
     this.creating = true;
-    if (!routeChosen) await this.loadProviderModelOptions(agent, deviceId, generation);
+    if (!pluginChosen && !routeChosen) await this.loadProviderModelOptions(agent, deviceId, generation);
     if (!isCurrent()) {
       this.creating = false;
       return;
     }
     this.creating = false;
-    if (!routeChosen && !this.runtimeCatalogReady) {
+    if (!pluginChosen && !routeChosen && !this.runtimeCatalogReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v131_catalog_retry');
       return;
     }
-    if (!routeChosen && this.hostModelNeedsReselection(agent)) {
+    if (!pluginChosen && !routeChosen && this.hostModelNeedsReselection(agent)) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_reselection_required');
       return;
     }
@@ -2303,7 +2598,7 @@ export struct NewSessionPageContent {
     const ordinaryModelReady = this.model.trim().length > 0 && selectedModel !== undefined
       && !selectedModel.suspended && selectedModel.availability !== 'requires_payment'
       && !this.hostModelNeedsReselection(agent);
-    if (!routeChosen && !ordinaryModelReady) {
+    if (!pluginChosen && !routeChosen && !ordinaryModelReady) {
       this.error = harmonyV12String(this.getUIContext().getHostContext(), 'v132_model_required');
       return;
     }
@@ -2314,12 +2609,52 @@ export struct NewSessionPageContent {
     }
     this.creating = true;
     this.error = '';
+    const worktreeRequested = this.workspaceKind === 'project' && this.worktreeEnabled;
+    const worktreeContext = this.getUIContext().getHostContext();
+    if (this.workspaceKind === 'project' && this.worktreeLoading) {
+      this.error = '正在检查项目的 worktree 设置，请稍候';
+      this.creating = false;
+      return;
+    }
+    if (worktreeRequested && (!this.worktreeTarget.supported || this.worktreeLoading || worktreeContext === undefined)) {
+      this.error = '当前项目暂不能创建 worktree';
+      this.creating = false;
+      return;
+    }
     const sessionId = util.generateRandomUUID();
     const firstMessageClientId = AppServices.instance.inputQueue.createDocumentClientId();
     const params = new NewSessionCreationParams();
     params.deviceId = this.selectedDeviceId;
     params.session = this.buildOptimisticSession(sessionId, text, readyImages, readyFiles);
     params.createOptions = this.createOptions(sessionId);
+    if (pluginChosen && plugin !== undefined) {
+      params.createOptions['agentKind'] = 'acp';
+      params.createOptions['providerId'] = plugin.providerId;
+      params.createOptions['model'] = this.pickerPluginModel;
+      params.createOptions['fastMode'] = false;
+      params.createOptions['effort'] = '';
+      const pluginOptions: Record<string, Object> = {};
+      for (const key of Object.keys(params.createOptions)) {
+        if (key !== 'agentDeviceId') pluginOptions[key] = params.createOptions[key];
+      }
+      params.createOptions = pluginOptions;
+      params.session.agentKind = 'acp';
+      params.session.providerId = plugin.providerId;
+      params.session.model = this.pickerPluginModel;
+      params.session.effort = '';
+      params.session.fastMode = false;
+      params.session.fastModeTier = '';
+    }
+    if (worktreeRequested && worktreeContext !== undefined) {
+      const app = AppServices.instance;
+      const owner = app.usageCardOwner;
+      const reservation = worktreeReservation(sessionId, this.worktreeTarget.baseRepo, this.worktreeBranch);
+      const invoke = app.newSessionWorktree(params.deviceId, (): boolean => owner === app.usageCardOwner);
+      const preparation = new WorktreePreparation(worktreeContext, app.newSessionWorktreeLedgerKey(params.deviceId),
+        invoke, reservation);
+      params.prepareWorktree = (current: () => boolean): Promise<string> => preparation.prepare(current);
+      params.finishWorktree = (claimed: boolean): Promise<void> => preparation.finish(claimed);
+    }
     params.firstMessageClientId = firstMessageClientId;
     params.firstMessageText = text;
     params.firstMessageImages = readyImages.slice();
@@ -2467,10 +2802,17 @@ export struct NewSessionPageContent {
           Blank()
             .width('100%')
             .layoutWeight(1)
-          this.composer()
+          this.worktreeOptions()
+          Column() { this.composer() }.width('100%').zIndex(3)
+          if (this.composerPickerOpen()) {
+            Row().width('100%').height('100%').position({ x: 0, y: 0 }).zIndex(2)
+              .accessibilityLevel('no')
+              .onClick(() => { this.dismissActiveComposerPicker(); })
+          }
         }
         .width('100%')
         .height('100%')
+        .onAreaChange((_old: Area, next: Area) => { this.composerPickerViewport = Number(next.height); })
         .backgroundColor($r('app.color.bg_page'))
       }
       .titleBar({
@@ -2586,7 +2928,7 @@ export struct NewSessionPageContent {
         .backgroundColor(Color.Transparent)
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .accessibilityText('返回任务列表')
-        .onClick(() => this.onClose())
+        .onClick(() => { if (!this.dismissActiveComposerPicker()) this.onClose(); })
       }
 
       Text('新任务')
@@ -2596,7 +2938,6 @@ export struct NewSessionPageContent {
         .fontColor($r('app.color.text_primary'))
         .maxLines(1)
 
-      this.workspaceSelector()
 
       Blank()
         .layoutWeight(1)
@@ -2626,132 +2967,164 @@ export struct NewSessionPageContent {
     .height(24)
   }
 
-  @Builder
-  workspaceSelector() {
-    Button() {
-      Row({ space: 4 }) {
-        Text(this.workspaceKind === 'dialogue' ? '对话' : this.projectDisplayTitle(this.workingDir, this.projectAliasRevision))
-          .fontSize(uiFontSize(13))
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 150 })
-        SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(11)
-          .fontColor([$r('app.color.text_tertiary')])
-      }.alignItems(VerticalAlign.Center)
-    }
-    .type(ButtonType.Normal)
-    .height(32)
-    .constraintSize({ maxWidth: 180 })
-    .padding({ left: 10, right: 8 })
-    .backgroundColor($r('app.color.bg_chip'))
-    .borderRadius(UI_RADIUS_CONTROL)
-    .clickEffect(UI_CLICK_EFFECT)
-    .enabled(!this.creating)
-    .accessibilityText(`工作目录：${this.workspaceKind === 'dialogue'
-      ? '对话' : this.workingDir}`)
-    .onClick(() => {
-      uiOverlayTrace('workspace-menu', 'open');
-      this.workspacePopupOpen = true;
-    })
-    .bindMenu(this.workspacePopupOpen, this.workspaceMenuContent(), this.workspaceMenuOptions())
+  private localPickerTitle(): string {
+    if (this.deviceMenuOpen) return '电脑';
+    if (this.workspacePopupOpen) return '项目';
+    return this.worktreeBranchOpen ? '来源分支' : '';
   }
 
-  /** 工作目录选择：系统操作菜单（docs/overlay-standard.md §3.1），标题沿用原「切换工作目录」。 */
-  private workspaceMenuOptions(): MenuOptions {
-    const options = uiMenuOptions((): void => { this.workspacePopupOpen = false; }, Placement.BottomLeft,
-      'workspace-menu');
-    options.title = '切换工作目录';
-    return options;
+  private openLocalPicker(kind: string): void {
+    this.composerBlurGeneration += 1;
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
+    this.getUIContext().getFocusController().clearFocus();
+    this.deviceMenuOpen = kind === 'device';
+    this.workspacePopupOpen = kind === 'workspace';
+    this.worktreeBranchOpen = kind === 'branch';
+  }
+
+  @Builder
+  optionLabel(icon: Resource, label: string, limit: number) {
+    Row({ space: 8 }) {
+      SymbolGlyph(icon).width(20).fontSize(17).fontColor([$r('app.color.text_secondary')])
+      Text(label).fontSize(uiFontSize(15)).fontColor($r('app.color.text_primary'))
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).constraintSize({ maxWidth: limit })
+      SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(11).fontColor([$r('app.color.text_secondary')])
+    }
+  }
+
+  @Builder
+  worktreeOptions() {
+    Column({ space: 4 }) {
+      Button() {
+        this.optionLabel($r('sys.symbol.computer'), this.devices.find((row: PresenceSnapshot): boolean =>
+          row.deviceId === this.selectedDeviceId)?.deviceName || '选择电脑', 180)
+      }.type(ButtonType.Normal).height(44).padding({ left: 8, right: 8 })
+        .backgroundColor(Color.Transparent).enabled(!this.creating && !this.incomingBusy && this.incomingDelivery === null)
+        .clickEffect(UI_CLICK_EFFECT).onClick(() => this.openLocalPicker('device'))
+      Button() {
+        this.optionLabel($r('sys.symbol.folder'), this.workspaceKind === 'dialogue'
+          ? '对话' : this.projectDisplayTitle(this.workingDir, this.projectAliasRevision), 180)
+      }.type(ButtonType.Normal).height(44).padding({ left: 8, right: 8 })
+        .backgroundColor(Color.Transparent).enabled(!this.creating)
+        .clickEffect(UI_CLICK_EFFECT).onClick(() => this.openLocalPicker('workspace'))
+      if (this.workspaceKind === 'project' && this.worktreeTarget.supported) {
+        Row() {
+          Button() {
+            this.optionLabel($r('sys.symbol.split'), this.worktreeBranch, 132)
+          }.type(ButtonType.Normal).height(44).padding({ left: 8, right: 8 }).backgroundColor(Color.Transparent)
+            .enabled(!this.creating && !this.worktreeLoading).clickEffect(UI_CLICK_EFFECT)
+            .onClick(() => { void this.openWorktreeBranches(); })
+          Divider().vertical(true).height(20).color($r('app.color.border'))
+          Button() {
+            Row({ space: 6 }) {
+              SymbolGlyph(this.worktreeEnabled ? $r('sys.symbol.checkmark_circle') : $r('sys.symbol.circle'))
+                .fontSize(17).fontColor([$r('app.color.text_secondary')])
+              Text('worktree').fontSize(uiFontSize(13)).fontColor($r('app.color.text_primary'))
+            }
+          }.type(ButtonType.Normal).height(44).backgroundColor(Color.Transparent).accessibilitySelected(this.worktreeEnabled)
+            .enabled(!this.creating && !this.worktreeLoading).clickEffect(UI_CLICK_EFFECT)
+            .onClick(() => this.toggleNewWorktree())
+        }.backgroundColor($r('app.color.bg_chip')).borderRadius(22)
+      }
+    }.width('100%').constraintSize({ maxWidth: 720 }).padding({ left: 12, right: 12, bottom: 12 })
+      .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  localPickerRow(label: ResourceStr, icon: Resource, selected: boolean, action: () => void) {
+    Button() {
+      Row({ space: 8 }) {
+        SymbolGlyph(icon).width(24).fontSize(17).fontColor([$r('app.color.text_secondary')])
+        Text(label).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary')).layoutWeight(1)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Start)
+        if (selected) {
+          SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.text_primary')])
+        }
+      }.width('100%')
+    }.type(ButtonType.Normal).height(44).width('100%').padding({ left: 12, right: 12 })
+      .backgroundColor(selected ? $r('app.color.bg_chip') : Color.Transparent)
+      .borderRadius(UI_RADIUS_CONTROL).accessibilitySelected(selected)
+      .clickEffect(UI_CLICK_EFFECT).onClick(action)
+  }
+
+  @Builder
+  localPickerContent(title: string) {
+    Column({ space: 2 }) {
+      if (title === '电脑') {
+        ForEach(this.devices, (row: PresenceSnapshot) => {
+          if (this.canCreateOnDevice(row.deviceId)) {
+            this.localPickerRow(row.deviceName || row.deviceId, $r('sys.symbol.computer'),
+              row.deviceId === this.selectedDeviceId, (): void => {
+                this.deviceMenuOpen = false;
+                this.refreshDevices(row.deviceId);
+              })
+          }
+        }, (row: PresenceSnapshot) => row.deviceId)
+      } else if (title === '项目') {
+        this.localPickerRow('对话', $r('sys.symbol.ellipsis_message'), this.workspaceKind === 'dialogue',
+          (): void => this.selectDialogue())
+        ForEach(this.recentProjects(), (project: RecentProject) => {
+          this.localPickerRow(project.title, $r('sys.symbol.folder'),
+            this.workspaceKind === 'project' && this.workingDir === project.path,
+            (): void => this.selectProject(project.path))
+        }, (project: RecentProject) => project.path)
+        if (this.recentProjects().length === 0) {
+          Text('还没有最近项目').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).padding(12)
+        }
+        this.localPickerRow('选择其他项目文件夹', $r('sys.symbol.folder'), false,
+          (): void => this.openProjectBrowse())
+        this.localPickerRow($r('app.string.v140_project_create'), $r('sys.symbol.folder_badge_plus'), false,
+          (): void => this.openProjectCreate())
+      } else {
+        TextInput({ placeholder: '搜索分支', text: this.worktreeBranchQuery }).height(44).width('100%')
+          .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+          .onChange((query: string) => { this.worktreeBranchQuery = query; })
+        ForEach(this.worktreeBranches.filter((branch: string): boolean =>
+          branch.toLowerCase().includes(this.worktreeBranchQuery.trim().toLowerCase())), (name: string) => {
+          this.localPickerRow(name, $r('sys.symbol.split'), name === this.worktreeBranch,
+            (): void => this.selectWorktreeBranch(name))
+        }, (name: string) => name)
+      }
+    }.width('100%').padding({ left: 8, right: 8, bottom: 8 })
   }
 
   @Builder
   agentPanel() {
-    Scroll() {
-      Column({ space: 2 }) {
-        ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
-          Row({ space: 10 }) {
-            this.selectorIcon(agentMark(kind))
-            Text(agentLabel(kind))
-              .fontSize(uiFontSize(15))
-              .fontColor($r('app.color.text_primary'))
-              .layoutWeight(1)
-            if (kind === this.selectedAgentKind) {
-              SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(uiFontSize(18))
-                .fontColor([$r('app.color.chat_cta')])
-            }
+    Column({ space: 2 }) {
+      ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
+        Row({ space: 10 }) {
+          this.selectorIcon(agentMark(kind))
+          Text(agentLabel(kind))
+            .fontSize(uiFontSize(15))
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          if (kind === this.selectedAgentKind) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(uiFontSize(18))
+              .fontColor([$r('app.color.chat_cta')])
           }
-          .width('100%')
-          .height(44)
-          .padding({ left: 10, right: 10 })
-          .backgroundColor(kind === this.selectedAgentKind
-            ? $r('app.color.bg_chip') : Color.Transparent)
-          .borderRadius(UI_RADIUS_CONTROL)
-          .clickEffect(UI_LIST_CLICK_EFFECT)
-          .onClick(() => {
-            this.selectAgent(kind);
-            this.composerAgentPopupOpen = false;
-          })
-        }, (kind: NewAgentKind) => `new-agent:${kind}`)
-      }
-      .width('100%')
-      .padding({ left: 10, right: 10, top: 4, bottom: 10 })
+        }
+        .width('100%')
+        .height(44)
+        .padding({ left: 10, right: 10 })
+        .backgroundColor(kind === this.selectedAgentKind
+          ? $r('app.color.bg_chip') : Color.Transparent)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .clickEffect(UI_LIST_CLICK_EFFECT)
+        .onClick(() => {
+          this.selectAgent(kind);
+          this.composerAgentPopupOpen = false;
+        })
+      }, (kind: NewAgentKind) => `new-agent:${kind}`)
     }
     .width('100%')
-    .layoutWeight(1)
+    .padding({ left: 10, right: 10, top: 4, bottom: 10 })
   }
 
   /**
    * 分组：对话 / 最近项目 / 选择其他项目文件夹与新建项目（对齐 Mobile 项目选择器，新建项目在末尾）。
    */
-  @Builder
-  workspaceMenuContent() {
-    Menu() {
-      MenuItemGroup() {
-        MenuItem({
-          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.ellipsis_message')),
-          content: '对话',
-        })
-          .selected(this.workspaceKind === 'dialogue')
-          .selectIcon(true)
-          .onClick(() => this.selectDialogue())
-      }
-      MenuItemGroup() {
-        ForEach(this.recentProjects(), (project: RecentProject) => {
-          MenuItem({
-            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder')),
-            content: project.title,
-          })
-            .selected(this.workspaceKind === 'project' && this.workingDir === project.path)
-            .selectIcon(true)
-            .accessibilityText(`${project.title} ${project.path}`)
-            .onClick(() => this.selectProject(project.path))
-        }, (project: RecentProject) => JSON.stringify(['recent-project', project.path, project.title,
-          this.workspaceKind === 'project' && this.workingDir === project.path]))
-        if (this.recentProjects().length === 0) {
-          MenuItem({ content: '还没有最近项目' })
-            .enabled(false)
-        }
-      }
-      MenuItemGroup() {
-        MenuItem({
-          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder')),
-          content: '选择其他项目文件夹',
-        })
-          .onClick(() => this.openProjectBrowse())
-        MenuItem({
-          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder_badge_plus')),
-          content: $r('app.string.v140_project_create'),
-        })
-          .enabled(!this.creating)
-          .onClick(() => this.openProjectCreate())
-      }
-    }
-    .id(uiOverlayBuildId('workspace-menu'))
-  }
-
   @Builder
   browsePanel() {
     Column() {
@@ -2964,7 +3337,7 @@ export struct NewSessionPageContent {
 
   private selectContextModel(option: RuntimeModelOption): void {
     if (this.composerModelPopupOpen) {
-      // Popup 锚点会随 visible 分支切换被直接销毁，不再等待系统浮层自行消费 false。
+      // 就地面板退场与模型提交共用同一条路径。
       this.pendingPopupModelSelection = option;
       this.dismissComposerControlPopup('model');
       return;
@@ -3045,52 +3418,48 @@ export struct NewSessionPageContent {
 
   @Builder
   permissionContextView() {
-    Scroll() {
-      Column({ space: 2 }) {
-        ForEach(this.permissionOptions, (option: RuntimeChoiceOption) => {
-          Row({ space: 10 }) {
-            SymbolGlyph($r('sys.symbol.lock'))
-              .fontSize(uiFontSize(16))
-              .fontColor([$r('app.color.text_secondary')])
-              .width(24)
-            Column({ space: 2 }) {
-              Text(option.label)
-                .fontSize(uiFontSize(14))
-                .fontWeight(option.id === this.permissionMode
-                  ? FontWeight.Medium : FontWeight.Normal)
-                .fontColor($r('app.color.text_primary'))
-              if (option.description.length > 0) {
-                Text(option.description)
-                  .fontSize(uiFontSize(11))
-                  .lineHeight(uiLineHeight(16))
-                  .fontColor($r('app.color.text_tertiary'))
-                  .maxLines(2)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-              }
-            }
-            .layoutWeight(1)
-            if (option.id === this.permissionMode) {
-              SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(uiFontSize(18))
-                .fontColor([$r('app.color.chat_cta')])
+    Column() {
+      ForEach(this.permissionOptions, (option: RuntimeChoiceOption) => {
+        Row({ space: 8 }) {
+          SymbolGlyph(composerPermissionSymbol(option.id))
+            .fontSize(uiFontSize(16))
+            .fontColor([composerPermissionTint(option.id)])
+            .width(24)
+          Column({ space: 1 }) {
+            Text(option.label)
+              .fontSize(uiFontSize(14))
+              .fontWeight(option.id === this.permissionMode
+                ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor($r('app.color.text_primary'))
+            if (option.description.length > 0) {
+              Text(option.description)
+                .fontSize(uiFontSize(11))
+                .lineHeight(uiLineHeight(14))
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
           }
-          .width('100%')
-          .constraintSize({ minHeight: 52 })
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .backgroundColor(option.id === this.permissionMode
-            ? $r('app.color.bg_chip') : Color.Transparent)
-          .borderRadius(UI_RADIUS_CONTROL)
-          .opacity(this.creating ? 0.55 : 1)
-          .clickEffect(UI_LIST_CLICK_EFFECT)
-          .onClick(() => this.selectContextPermission(option))
-        }, (option: RuntimeChoiceOption) => option.id)
-      }
-      .width('100%')
-      .padding({ left: 10, right: 10, top: 8, bottom: 14 })
+          .layoutWeight(1)
+          if (option.id === this.permissionMode) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(uiFontSize(18))
+              .fontColor([$r('app.color.chat_cta')])
+          }
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 44 })
+        .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+        .backgroundColor(option.id === this.permissionMode
+          ? $r('app.color.bg_chip') : Color.Transparent)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .opacity(this.creating ? 0.55 : 1)
+        .clickEffect(UI_LIST_CLICK_EFFECT)
+        .onClick(() => this.selectContextPermission(option))
+      }, (option: RuntimeChoiceOption) => option.id)
     }
     .width('100%')
-    .layoutWeight(1)
+    .padding({ left: 10, right: 10, top: 2, bottom: 8 })
   }
 
   @Builder
@@ -3134,8 +3503,28 @@ export struct NewSessionPageContent {
       ComposerModelProviderHeader({ name: group.name })
 
       ForEach(group.options, (option: RuntimeModelOption) => {
-        this.contextModelRow(option)
-      }, (option: RuntimeModelOption) => this.modelOptionKey(option))
+        Row() {
+          Column() {
+            if (option.pickerConfigurationId || (option.pickerHarness && option.pickerHarness !== this.selectedAgentKind)) {
+              Button(option.label + ' · ' + agentLabel(option.pickerHarness as NewAgentKind)
+                + (option.pickerEffort ? ' · ' + option.pickerEffort : '') + (option.pickerFast ? ' · Fast' : ''))
+                .height(44).width('100%').fontColor($r('app.color.text_primary'))
+                .backgroundColor($r('app.color.bg_chip')).enabled(!option.suspended && option.availability !== 'requires_payment')
+                .onClick(() => { void this.pickOtherHarnessModel(option); })
+            } else {
+          this.contextModelRow(option)
+            }
+          }.layoutWeight(1)
+          Button() {
+            SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(17)
+              .fontColor([$r('app.color.text_secondary')])
+          }.type(ButtonType.Circle).width(44).height(44).backgroundColor(Color.Transparent)
+            .accessibilityText('模型设置').enabled(!option.suspended && option.availability !== 'requires_payment'
+              && (!option.pickerHarness || option.pickerHarness === this.selectedAgentKind))
+            .onClick(() => { this.pickerDetails = option; })
+        }.width('100%')
+
+      }, (option: RuntimeModelOption) => this.modelOptionKey(option) + ':' + option.pickerHarness + ':' + option.pickerConfigurationId)
 
       Divider()
         .strokeWidth(0.5)
@@ -3145,11 +3534,161 @@ export struct NewSessionPageContent {
     .width('100%')
   }
 
+  private async pickOtherHarnessModel(option: ComposerModelOption): Promise<void> {
+    if (this.creating) return;
+    this.agentTouched = true;
+    const kind = option.pickerHarness ? option.pickerHarness as NewAgentKind : this.selectedAgentKind;
+    const device = this.selectedDeviceId;
+    if (this.selectedAgentKind !== kind) {
+      this.selectedAgentKind = kind;
+      await this.loadRuntimeDefaults(device, kind);
+    }
+    if (!this.composerModelPopupOpen || device !== this.selectedDeviceId || kind !== this.selectedAgentKind) return;
+    if (option.pickerConfigurationId) {
+      this.selectModelRowEffort(option, option.pickerEffort);
+      this.setModelRowFast(option, option.pickerFast);
+    }
+    this.selectContextModel(option);
+  }
+
+  private filteredPickerPluginRows(): PluginEngine[] {
+    const query = this.pickerModelSearch.trim().toLowerCase();
+    return this.pickerPluginRows.filter((engine: PluginEngine): boolean =>
+      engine.name.toLowerCase().includes(query) || engine.models.some((model: PluginEngineModel): boolean =>
+        model.label.toLowerCase().includes(query) || model.id.toLowerCase().includes(query)));
+  }
+
+  @Builder
+  pickerPluginSections() {
+    ForEach(this.filteredPickerPluginRows(), (engine: PluginEngine) => {
+      Column({ space: 4 }) {
+        Row({ space: 8 }) {
+          if (engine.iconDataUrl) {
+            Image(engine.iconDataUrl).width(22).height(22).objectFit(ImageFit.Contain)
+          }
+          Text(engine.name).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+        }.width('100%').height(32)
+        if (engine.availability !== 'available') {
+          Text(engine.availabilityMessage || '此电脑上的引擎不可用')
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).width('100%')
+        }
+        ForEach(pluginPickerModels(engine, this.selectedPickerPlugin()?.providerId === engine.providerId ? this.pickerPluginModel : ''), (model: PluginEngineModel) => {
+          Button(model.label).width('100%').height(44).fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.bg_chip'))
+            .enabled(engine.availability === 'available' && !this.creating)
+            .accessibilitySelected(model.id === (this.selectedPickerPlugin()?.providerId === engine.providerId ? this.pickerPluginModel : ''))
+            .onClick(() => { this.pickDraftPlugin(engine, model); })
+        }, (model: PluginEngineModel) => model.id)
+      }.width('100%').padding({ left: 12, right: 12 })
+    }, (engine: PluginEngine) => engine.providerId)
+  }
+
+  private pickerCompatibleHarnesses(option: ComposerModelOption): ComposerModelOption[] {
+    const choices: ComposerModelOption[] = [];
+    for (const harness of NEW_AGENT_OPTIONS) {
+      if (harness === this.selectedAgentKind) continue;
+      const rows = option.agentDeviceId
+        ? remoteAgentModelOptions(this.remoteAgentCatalogList, harness, undefined, null)
+        : parseComposerProviderModelOptions(this.pickerCatalogPayload, harness, this.modelVisibilityOverrides, undefined, false);
+      const matched = rows.find((row: ComposerModelOption): boolean => row.id === option.id
+        && row.providerId === option.providerId && row.agentDeviceId === option.agentDeviceId
+        && !row.suspended && row.availability !== 'requires_payment');
+      if (matched !== undefined) {
+        matched.pickerHarness = harness;
+        choices.push(matched);
+      }
+    }
+    return choices;
+  }
+
+  @Builder
+  pickerDetailsView(option: ComposerModelOption) {
+    Column({ space: 8 }) {
+      Button('‹  ' + option.label).height(44).fontColor($r('app.color.text_primary'))
+        .backgroundColor($r('app.color.bg_chip')).onClick(() => { this.pickerDetails = null; })
+      Text([option.providerName, option.agentDeviceName, option.contextWindow > 0
+        ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
+        .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+        .width('100%').padding(12).backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+      Column() {
+      Text('Harness · ' + agentLabel(this.selectedAgentKind))
+        .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+      ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
+        Button('切换到 ' + agentLabel(compatible.pickerHarness as NewAgentKind))
+          .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+          .onClick(() => { void this.pickOtherHarnessModel(compatible); })
+      }, (compatible: ComposerModelOption) => compatible.pickerHarness)
+        Divider().color($r('app.color.border'))
+        Button('推理强度 · ' + this.modelEffortForRow(option)).height(44).width('100%')
+          .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
+          .enabled(option.efforts.length > 0)
+          .onClick(() => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : this.modelOptionKey(option); })
+        if (this.modelEffortPickerKey === this.modelOptionKey(option)) {
+          ForEach(option.efforts, (level: string) => {
+            Button(level).height(44).width('100%').fontColor($r('app.color.text_primary'))
+              .backgroundColor(Color.Transparent).accessibilitySelected(level === this.modelEffortForRow(option))
+              .onClick(() => {
+                this.selectModelRowEffort(option, level)
+                this.modelEffortPickerKey = '';
+              })
+          }, (level: string) => level)
+        }
+        if (option.supportsFastMode) {
+          Divider().color($r('app.color.border'))
+          Row() {
+            Text('快速模式').layoutWeight(1).fontColor($r('app.color.text_primary'))
+            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+              .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+          }.height(44).width('100%')
+        }
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      Column() {
+      Button('使用推荐设定').height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+        .onClick(() => {
+          void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option)));
+        })
+      Text('恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。').fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_secondary'))
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      Text('目前设定').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      Column() {
+      Button(modelFavoriteMutation(option, this.selectedAgentKind, this.modelEffortForRow(option), this.modelFastForRow(option),
+        this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定')
+        .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+        .enabled(this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId)
+        .onClick(() => { void this.togglePickerFavorite(option); })
+      Text(this.modelEffortForRow(option) + (this.modelFastForRow(option) ? ' · Fast' : ''))
+        .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+      Text('储存这组参数，方便下次从收藏清单直接使用。').fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_secondary'))
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+    }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   modelContextView() {
     Column() {
+      if (this.pickerDetails === null) { this.pickerSearchHeader() }
       Scroll(this.modelPickerScroller) {
         Column() {
+          if (this.pickerDetails !== null) {
+            this.pickerDetailsView(this.pickerDetails)
+          } else {
+          if (this.pickerAllProviders) { this.pickerPluginSections() }
+          if (this.pickerAllProviders && !this.pickerModelSearch.trim()) {
+            Row({ space: 6 }) {
+              ForEach(NEW_AGENT_OPTIONS, (kind: NewAgentKind) => {
+                Button(agentLabel(kind)).height(44).fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+                  .accessibilitySelected(kind === this.selectedAgentKind).enabled(!this.creating)
+                  .onClick(() => this.selectAgent(kind))
+              }, (kind: NewAgentKind) => kind)
+            }.width('100%').padding({ left: 12, right: 12 })
+          }
+          if (this.pickerAllProviders && !this.pickerModelSearch.trim()) {
           ModelRoutingPanel({
             snapshot: this.routingSnapshot,
             labels: modelRoutingLabels(this.getUIContext().getHostContext()),
@@ -3164,7 +3703,8 @@ export struct NewSessionPageContent {
             onOrdinary: (): void => { this.selectedRouteId = ''; this.selectedRouteDevice = ''; },
             onRefresh: (): void => { void this.loadRouting(true); },
           })
-          if (this.groupedModelOptions().length === 0) {
+          }
+          if (this.pickerGroups().length === 0) {
             Text('当前电脑未提供模型列表')
               .fontSize(uiFontSize(14))
               .fontColor($r('app.color.text_secondary'))
@@ -3172,16 +3712,17 @@ export struct NewSessionPageContent {
               .textAlign(TextAlign.Center)
               .padding({ top: 28, bottom: 28 })
           } else {
-            ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
+            ForEach(this.pickerGroups(), (group: ComposerModelGroup) => {
               this.modelProviderGroup(group)
             }, (group: ComposerModelGroup) => group.key)
+          }
           }
         }
         .width('100%')
         .padding({ top: 2, bottom: 12 })
       }
       .width('100%')
-      .layoutWeight(1)
+      .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
       .scrollBar(BarState.Auto)
       .onTouch((event: TouchEvent) => {
         if (event.type === TouchType.Down) this.modelPickerUserMoved = true;
@@ -3193,7 +3734,7 @@ export struct NewSessionPageContent {
       })
     }
     .width('100%')
-    .layoutWeight(1)
+    .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
   }
 
   @Builder
@@ -3292,6 +3833,10 @@ export struct NewSessionPageContent {
           })
       }
       ConversationComposer({
+        pickerWindowHeight: this.composerPickerViewport + this.paneKeyboardInset,
+        externalPickerTitle: this.localPickerTitle(),
+        onExternalPickerDismiss: (): void => { this.dismissActiveComposerPicker(); },
+        externalPickerContent: (title: string): void => { this.localPickerContent(title); },
         input: this.input,
         focused: this.composerFocused,
         surfaceExpanded: this.composerSurfaceVisible,
@@ -3313,8 +3858,8 @@ export struct NewSessionPageContent {
         permissionMode: this.permissionMode,
         permissionLabel: this.currentPermissionModeLabel(),
         planModeEnabled: this.planModeEnabled,
-        agentLabel: agentLabel(this.selectedAgentKind),
-        modelLabel: this.currentModelLabel(),
+        agentLabel: this.selectedPickerPlugin()?.name ?? agentLabel(this.selectedAgentKind),
+        modelLabel: this.selectedPickerPlugin() ? this.pickerPluginModelLabel : this.currentModelLabel(),
         effortLabel: this.currentEffortLabel(),
         permissionPopupVisible: this.composerPermissionPopupOpen,
         agentPopupVisible: this.composerAgentPopupOpen,
@@ -3322,7 +3867,6 @@ export struct NewSessionPageContent {
         showAddButton: true,
         showStreamingStatus: false,
         floatingGlass: true,
-        compactToolbar: true,
         floatingBottomInset: this.paneComposerBottomInset,
         inputId: 'new-session-composer-input',
         onInputChange: (value: string): void => {
@@ -3431,9 +3975,18 @@ struct NewSessionPage {
     this.keyboardHeightListening = false;
   }
 
+  private composerBack: (() => boolean) | undefined = undefined;
+
+  onBackPress(): boolean {
+    return this.composerBack?.() ?? false;
+  }
+
   build() {
     Column() {
-      NewSessionPageContent({ paneKeyboardInset: this.keyboardHeight })
+      NewSessionPageContent({
+        paneKeyboardInset: this.keyboardHeight,
+        registerComposerBack: (handler): void => { this.composerBack = handler; },
+      })
     }
     .width('100%')
     .height('100%')

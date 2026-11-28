@@ -1,3 +1,4 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 /**
  * 任务（会话）Store：设备列表 + 每设备的会话列表。
@@ -376,6 +377,27 @@ export class TaskStore {
     }
   }
 
+  /** Same-account roster seeds presentation only, never overwrites verified detail. */
+  seedTeammateSession(deviceId: string, session: RemoteSession): boolean {
+    if (!session.id || session.source !== 'bot' || !this.devices.get(deviceId)?.remoteControlEnabled) return false;
+    const existing = this.findSessionById(session.id, deviceId);
+    if (existing !== undefined) return existing.status !== 'deleted' && existing.source === 'bot';
+    this.rememberBotSession(deviceId, session);
+    return true;
+  }
+
+  private rememberBotSession(deviceId: string, session: RemoteSession): void {
+    const details = this.botSessionDetails.get(deviceId) ?? new Map<string, RemoteSession>();
+    details.delete(session.id);
+    details.set(session.id, session);
+    if (details.size > 32) {
+      const oldest = details.keys().next();
+      if (!oldest.done) details.delete(oldest.value);
+    }
+    this.botSessionDetails.set(deviceId, details);
+    this.notify();
+  }
+
   /** 读取通过搜索或伙伴名册定位的会话。 */
   async loadSession(deviceId: string, sessionId: string, expectedSource: string = ''): Promise<RemoteSession | undefined> {
     const client = this.client;
@@ -388,7 +410,10 @@ export class TaskStore {
       opts.args = [sessionId];
       const result = unwrapInvokeResult(await client.invoke(deviceId, opts));
       if (stateGeneration !== this.stateGeneration
-        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) return undefined;
+        || revision !== (this.sessionLoadRevisions.get(deviceId) ?? 0)) {
+        if (expectedSource === 'bot') hilog.debug(0, 'CindyCompanionPerf', 'open_metadata_discard generation_or_list_revision');
+        return undefined;
+      }
       const device = this.devices.get(deviceId);
       if (device !== undefined && !device.remoteControlEnabled) return undefined;
       if (result === undefined || result === null || typeof result !== 'object'
@@ -401,20 +426,13 @@ export class TaskStore {
       }
       if (expectedSource && session.source !== expectedSource) return undefined;
       if (session.source === 'bot') {
-        const details = this.botSessionDetails.get(deviceId) ?? new Map<string, RemoteSession>();
-        details.delete(sessionId);
-        details.set(sessionId, session);
-        if (details.size > 32) {
-          const oldest = details.keys().next();
-          if (!oldest.done) details.delete(oldest.value);
-        }
-        this.botSessionDetails.set(deviceId, details);
-        this.notify();
+        this.rememberBotSession(deviceId, session);
       } else {
         this.upsertSession(deviceId, session);
       }
       return session;
     } catch (_error) {
+      if (expectedSource === 'bot') hilog.debug(0, 'CindyCompanionPerf', 'open_metadata_discard invoke_failed');
       // 搜索结果仍可用摘要打开；详情页的消息 Store 会继续按 sessionId 拉历史。
       return undefined;
     }
@@ -788,6 +806,7 @@ export class TaskStore {
     out['agentKind'] = s.agentKind;
     out['source'] = s.source;
     out['orcaRole'] = s.orcaRole;
+    out['orcaRemoteLead'] = s.orcaRemoteLead;
     out['parentSessionId'] = s.parentSessionId;
     out['pinnedAt'] = s.pinnedAt;
     out['userSendAt'] = s.userSendAt;

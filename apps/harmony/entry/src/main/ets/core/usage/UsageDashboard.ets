@@ -4,6 +4,40 @@ import { PresenceSnapshot } from '../device-link/DlProtocol';
 import { unwrapInvokeResult } from '../tasks/TaskStore';
 import { readNum, readObj, readStr, recordOrEmpty } from '../tasks/TaskModels';
 
+export class UsageWindow {
+  label: string = '';
+  color: string = '';
+  fraction: number = 0;
+}
+export class UsageDetail {
+  title: string = '';
+  plan: string = '';
+  windows: UsageWindow[] = [];
+}
+function parseUsageDetail(value: Object | undefined): UsageDetail | null {
+  const raw = recordOrEmpty(value);
+  const rings = raw['rings'];
+  const legend = raw['legend'];
+  const detail = new UsageDetail();
+  detail.title = readStr(raw, 'title');
+  detail.plan = readStr(raw, 'plan');
+  if (Array.isArray(rings)) {
+    const ringCount = rings.length;
+    (rings as Object[]).slice(0, 24).forEach((entry: Object, index: number): void => {
+      const ring = recordOrEmpty(entry);
+      const fraction = readNum(ring, 'fraction', NaN);
+      if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) return;
+      const key = recordOrEmpty(Array.isArray(legend) ? (legend as Object[])[index] : undefined);
+      const window = new UsageWindow();
+      window.label = readStr(key, 'label') || (ringCount === 1 ? readStr(raw, 'bigCaption') : '');
+      window.color = readStr(ring, 'color') || readStr(key, 'color');
+      window.fraction = fraction;
+      detail.windows.push(window);
+    });
+  }
+  return detail.title || detail.plan || detail.windows.length > 0 ? detail : null;
+}
+
 export class UsageSource {
   id: string = '';
   kind: string = '';
@@ -20,6 +54,8 @@ export class UsageSource {
   when: string = '';
   resetsAtMs: number = 0;
   stale: boolean = false;
+  unusedAtReset: boolean = false;
+  detail: UsageDetail | null = null;
 }
 export class UsageDay {
   date: string = '';
@@ -27,16 +63,18 @@ export class UsageDay {
   money: number[] = [];
   paid: number = 0;
   modelTokens: number[] = [];
-  modelCount: number = 0;
+  modelMoney: number[] = [];
 }
 export class UsageSnapshot {
   generatedAtMs: number = 0;
   updatedAtMs: number = 0;
   moneySymbol: string = '';
+  locale: string = '';
   scope: string = '';
   sources: UsageSource[] = [];
   days: UsageDay[] = [];
   models: string[] = [];
+  modelHarnesses: string[] = [];
   strings: Record<string, Object> = {};
 }
 export class UsageSeries {
@@ -44,6 +82,10 @@ export class UsageSeries {
   colorIndex: number = 0;
   values: number[] = [];
   total: number = 0;
+  estimated: number | null = null;
+  hasEstimate: boolean = false;
+  harness: string = '';
+  key: string = '';
   other: boolean = false;
 }
 export function usageSum(values: number[]): number {
@@ -52,10 +94,10 @@ export function usageSum(values: number[]): number {
 function nonnegative(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
-function numbers(value: Object | undefined): number[] {
+function numbers(value: Object | undefined, signed: boolean = false): number[] {
   if (!Array.isArray(value)) return [];
   return (value as Object[]).slice(0, 65).map((item: Object): number =>
-    typeof item === 'number' ? nonnegative(item as number) : 0);
+    typeof item === 'number' && Number.isFinite(item as number) ? (signed ? item as number : nonnegative(item as number)) : 0);
 }
 /** Missing snapshots are unavailable, never a fabricated zero balance. */
 export function parseUsageSnapshot(value: Object | undefined): UsageSnapshot | null {
@@ -67,6 +109,7 @@ export function parseUsageSnapshot(value: Object | undefined): UsageSnapshot | n
   out.generatedAtMs = nonnegative(readNum(root, 'generatedAtMs', 0));
   out.updatedAtMs = nonnegative(readNum(root, 'updatedAtMs', 0));
   out.moneySymbol = readStr(root, 'moneySymbol');
+  out.locale = readStr(root, 'locale');
   out.scope = readStr(usage, 'scope');
   out.strings = readObj(root, 'strings');
   (root['sources'] as Object[]).slice(0, 64).forEach((value: Object): void => {
@@ -81,11 +124,15 @@ export function parseUsageSnapshot(value: Object | undefined): UsageSnapshot | n
     item.when = readStr(raw, 'when'); item.resetsAtMs = nonnegative(readNum(raw, 'resetsAtMs', 0));
     item.reserve = raw['reserve'] === true; item.emphasized = raw['emphasized'] === true;
     item.stale = raw['stale'] === true;
+    item.unusedAtReset = raw['unusedAtReset'] === true;
+    item.detail = parseUsageDetail(raw['detail']);
     out.sources.push(item);
   });
   if (Array.isArray(usage['models'])) {
     out.models = (usage['models'] as Object[]).slice(0, 64).map((model: Object): string =>
       readStr(recordOrEmpty(model), 'name'));
+    out.modelHarnesses = (usage['models'] as Object[]).slice(0, 64).map((model: Object): string =>
+      readStr(recordOrEmpty(model), 'harness'));
   }
   const daily = usage['daily'] as Object[];
   const dates = usage['days'] as Object[];
@@ -94,39 +141,75 @@ export function parseUsageSnapshot(value: Object | undefined): UsageSnapshot | n
     const raw = recordOrEmpty(daily[i]);
     const day = new UsageDay();
     day.date = typeof dates[i] === 'string' ? dates[i] as string : '';
-    day.tokens = numbers(raw['tokens']); day.money = numbers(raw['money']);
-    day.paid = nonnegative(readNum(raw, 'paid', 0));
-    day.modelTokens = numbers(raw['modelTokens']); day.modelCount = numbers(raw['models']).length;
+    day.tokens = numbers(raw['tokens']); day.money = numbers(raw['money'], true);
+    day.paid = readNum(raw, 'paid', 0);
+    if (!Number.isFinite(day.paid)) day.paid = 0;
+    day.modelTokens = numbers(raw['modelTokens']); day.modelMoney = numbers(raw['models'], true);
     out.days.push(day);
   }
   return out;
 }
 
-/** Same bucket choice / top-three + other merge as Mobile, shared by chart and legend. */
-export function usageSeries(snapshot: UsageSnapshot, other: string): UsageSeries[] {
-  const modelMode = snapshot.models.length > 0 && snapshot.days.every((day: UsageDay): boolean =>
-    day.modelCount === snapshot.models.length + 1 && day.modelTokens.length === snapshot.models.length + 1);
+export function usageHasModels(snapshot: UsageSnapshot): boolean {
+  return snapshot.models.length > 0 && snapshot.days.length > 0 && snapshot.days.every((day: UsageDay): boolean =>
+    day.modelTokens.length === snapshot.models.length + 1);
+}
+
+export function usageRangeStart(snapshot: UsageSnapshot, days: number): number {
+  return Math.max(0, snapshot.days.length - Math.max(1, Math.min(30, days)));
+}
+
+/** Chart uses full daily series; legend and totals sum only the selected calendar buckets. */
+export function usageSeries(snapshot: UsageSnapshot, other: string, start: number = 0,
+  end: number = snapshot.days.length): UsageSeries[] {
+  const modelMode = usageHasModels(snapshot);
   const names = modelMode ? snapshot.models.concat([other]) : ['Codex', 'Claude Code', 'Pi'];
   const indices = modelMode ? names.map((_name: string, i: number): number => i) : [1, 0, 2];
-  const all: UsageSeries[] = [];
-  names.forEach((name: string, index: number): void => {
+  const days = snapshot.days.slice(start, end);
+  const pricedDays = days.filter((day: UsageDay): boolean => day.modelMoney.length === names.length);
+  const all = names.map((name: string, index: number): UsageSeries => {
     const series = new UsageSeries();
     series.name = name; series.colorIndex = index;
     series.other = modelMode && index === snapshot.models.length;
+    series.harness = snapshot.modelHarnesses[index] ?? '';
+    series.key = (modelMode ? 'model:' : 'harness:') + index + ':' + name + ':' + series.harness;
     series.values = snapshot.days.map((day: UsageDay): number =>
       (modelMode ? day.modelTokens : day.tokens)[indices[index]] ?? 0);
-    series.total = usageSum(series.values);
-    if (series.total > 0) all.push(series);
+    series.total = usageSum(series.values.slice(start, end));
+    if (modelMode && pricedDays.length > 0) {
+      series.estimated = pricedDays.reduce((sum: number, day: UsageDay): number => sum + day.modelMoney[index], 0);
+      series.hasEstimate = pricedDays.some((day: UsageDay): boolean => day.modelMoney[index] !== 0);
+    }
+    return series;
   });
-  if (all.length <= 4) return all;
-  const kept = all.filter((series: UsageSeries): boolean => !series.other)
-    .sort((a: UsageSeries, b: UsageSeries): number => b.total - a.total).slice(0, 3);
-  const rest = all.filter((series: UsageSeries): boolean => !kept.includes(series));
-  const merged = new UsageSeries(); merged.name = other; merged.other = true; merged.colorIndex = 5;
-  merged.values = snapshot.days.map((_day: UsageDay, i: number): number =>
-    rest.reduce((sum: number, series: UsageSeries): number => sum + series.values[i], 0));
-  merged.total = usageSum(merged.values);
-  return all.filter((series: UsageSeries): boolean => kept.includes(series)).concat([merged]);
+  return modelMode ? all : all.filter((series: UsageSeries): boolean => series.values.some((value: number) => value > 0));
+}
+
+export class UsageTotals {
+  tokens: number = 0;
+  estimated: number | null = null;
+  paid: number | null = null;
+  average: number = 0;
+}
+export function usageTotals(snapshot: UsageSnapshot, start: number, end: number,
+  filter: UsageSeries | undefined = undefined): UsageTotals {
+  const days = snapshot.days.slice(start, end);
+  const totals = new UsageTotals();
+  totals.tokens = filter === undefined
+    ? days.reduce((sum: number, day: UsageDay): number => sum + usageSum(day.tokens), 0)
+    : usageSum(filter.values.slice(start, end));
+  if (filter !== undefined) {
+    totals.estimated = filter.hasEstimate ? filter.estimated : null;
+  } else {
+    if (days.some((day: UsageDay): boolean => day.money.some((value: number): boolean => value !== 0))) {
+      totals.estimated = days.reduce((sum: number, day: UsageDay): number => sum + usageSum(day.money), 0);
+    }
+    if (days.some((day: UsageDay): boolean => day.paid !== 0)) {
+      totals.paid = days.reduce((sum: number, day: UsageDay): number => sum + day.paid, 0);
+    }
+  }
+  totals.average = days.length > 0 ? totals.tokens / days.length : 0;
+  return totals;
 }
 export function usageCompact(value: number): string {
   const n = nonnegative(value);

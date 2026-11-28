@@ -1,5 +1,9 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ResourceInvoke, resourceError } from '../resources/ResourceModels';
 import { recordOrEmpty, readStr, readNum } from '../tasks/TaskModels';
+
+const TAG = 'CindyProjectSettings';
+const READ_DEADLINE_MS = 20000;
 
 export const PROJECT_INFO_GET = 'sidebar-settings:get-project-aliases';
 export const PROJECT_INFO_SET = 'sidebar-settings:set-project-info';
@@ -103,25 +107,61 @@ export class ProjectStore {
   }
   setVisible(value: boolean): void { this.visible = value; if (value) void this.refresh(); }
   private current(generation: number): boolean { return generation === this.generation && this.online && !!this.scope && !!this.deviceId; }
+  // Bound only these single-peer reads, including link establishment. Never
+  // reset the link or replay a request. A late result cannot reach the store.
+  private async invokeRead(channel: string, args: Object[]): Promise<Object | undefined> {
+    const started = Date.now();
+    let timer = -1;
+    let result = 'ok';
+    hilog.info(0x0000, TAG, 'read_start operation=%{public}s', channel);
+    try {
+      const deadline = new Promise<Object | undefined>((_resolve, reject): void => {
+        timer = setTimeout((): void => reject(new Error('PROJECT_READ_TIMEOUT')), READ_DEADLINE_MS);
+      });
+      return await Promise.race([this.invoke(this.deviceId, channel, args, READ_DEADLINE_MS), deadline]);
+    } catch (error) {
+      result = error instanceof Error && error.message === 'PROJECT_READ_TIMEOUT' ? 'timeout' : resourceError(error as Object);
+      throw (error instanceof Error ? error : new Error(result));
+    } finally {
+      clearTimeout(timer);
+      hilog.info(0x0000, TAG, 'read_end operation=%{public}s result=%{public}s elapsed_ms=%{public}d',
+        channel, result, Date.now() - started);
+    }
+  }
+
   refresh(): Promise<void> {
     if (!this.online || !this.scope || !this.visible || !this.deviceId) return Promise.resolve();
     if (this.readOperation) { if (this.generation !== this.readGeneration) this.pending = true; return this.readOperation; }
+    hilog.info(0x0000, TAG, 'load_start');
     this.busy = true; const generation = this.generation; this.readGeneration = generation;
     const revision = this.readRevision;
     const operation = this.read(generation, revision).finally((): void => {
       if (this.readOperation !== operation) return;
-      this.readOperation = null; this.busy = false; this.emit();
+      this.readOperation = null; this.busy = false;
+      hilog.info(0x0000, TAG, 'load_end');
+      this.emit();
       if (this.pending) { this.pending = false; void this.refresh(); }
     });
     this.readOperation = operation; this.emit(); return operation;
   }
   private async read(generation: number, revision: number): Promise<void> {
     try {
-      const value = await this.invoke(this.deviceId, PROJECT_INFO_GET, []);
-      if (!this.current(generation) || revision !== this.readRevision) return;
+      const value = await this.invokeRead(PROJECT_INFO_GET, []);
+      if (!this.current(generation) || revision !== this.readRevision) {
+        hilog.info(0x0000, TAG, 'snapshot_result stale');
+        return;
+      }
       this.snapshot = parseProjectSnapshot(value);
+      hilog.info(0x0000, TAG, 'snapshot_result version=%{public}d owner_stamp=%{public}d',
+        this.snapshot.settingsVersion, this.snapshot.ownerStamp === null ? 0 : 1);
       this.issue = this.uncertain ? 'unknown' : '';
-    } catch (error) { if (this.current(generation)) { this.snapshot = null; this.issue = resourceError(error as Object); } }
+    } catch (error) {
+      if (this.current(generation)) {
+        this.snapshot = null;
+        this.issue = resourceError(error as Object);
+        hilog.info(0x0000, TAG, 'snapshot_result issue=%{public}s', this.issue);
+      }
+    }
   }
   async save(projectKey: string, profile: ProjectProfile, create: boolean = false, repositoryUrl: string = ''): Promise<boolean> {
     const snapshot = this.snapshot, location = projectLocation(this.deviceId, projectKey);
@@ -187,7 +227,7 @@ export class ProjectStore {
     const pending = this.iconRequests.get(key);
     if (pending) return pending;
     const request: ProjectIconRequest = { projectKey };
-    const operation = this.invoke(this.deviceId, automatic ? 'sidebar-settings:get-project-auto-icon' : 'sidebar-settings:get-project-icon-image', [request]);
+    const operation = this.invokeRead(automatic ? 'sidebar-settings:get-project-auto-icon' : 'sidebar-settings:get-project-icon-image', [request]);
     this.iconRequests.set(key, operation);
     operation.finally((): void => { if (this.iconRequests.get(key) === operation) this.iconRequests.delete(key); }).catch((): void => {});
     return operation;

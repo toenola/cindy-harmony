@@ -15,6 +15,14 @@ export class ComposerChoiceOption {
 
 export class ComposerModelOption {
   id: string = '';
+  pickerHarness: string = '';
+  pickerConfigurationId: string = '';
+  pickerEffort: string = '';
+  pickerFast: boolean = false;
+  pickerRecommendedHarness: string = '';
+  pickerNativeApi: string = '';
+  pickerOutboundApi: string = '';
+  pickerModelFamily: string = '';
   label: string = '';
   description: string = '';
   efforts: string[] = [];
@@ -409,6 +417,13 @@ export function parseProviderModelOptions(
       readEffortDisplayNames(model, option);
       option.providerId = providerId;
       option.providerName = providerName;
+      option.pickerRecommendedHarness = readStr(model, 'recommendedAgent');
+      option.pickerHarness = agent;
+      option.pickerNativeApi = model['nativeApi'] === null ? 'none' : readStr(model, 'nativeApi');
+      option.pickerOutboundApi = readStr(model, 'api') || (agent === 'pi' ? readStr(model, 'piApi') : '')
+        || readStr(readObj(model, 'route'), 'wireProtocol')
+        || readStr(readObj(readObj(provider, 'routing'), agent), 'wireProtocol');
+      option.pickerModelFamily = readStr(model, 'group');
       option.providerLogoKind = providerLogoKind;
       option.modelIcon = readStr(model, 'icon');
       option.subscription = subscription;
@@ -486,4 +501,178 @@ export function modelProviderKind(option: ComposerModelOption): string {
 
 export function providerCatalogUnavailable(error: string): boolean {
   return /CHANNEL_NOT_ALLOWED|UNSUPPORTED_CAPABILITY|not registered|No handler/i.test(error);
+}
+
+/** Picker presentation only. Identity stays keyed by provider and execution device. */
+export function pickerVisibleGroups(groups: ComposerModelGroup[], current: string, all: boolean,
+  query: string): ComposerModelGroup[] {
+  const text = query.trim().toLowerCase();
+  const result: ComposerModelGroup[] = [];
+  for (const group of groups) {
+    if (!all && group.key !== current) continue;
+    const matches = group.options.filter((option: ComposerModelOption): boolean => !text
+      || group.name.toLowerCase().includes(text) || option.label.toLowerCase().includes(text)
+      || option.id.toLowerCase().includes(text) || option.description.toLowerCase().includes(text));
+    if (matches.length === 0) continue;
+    const projected = new ComposerModelGroup();
+    projected.key = group.key;
+    projected.name = group.name;
+    projected.options = matches;
+    result.push(projected);
+  }
+  return result.sort((a: ComposerModelGroup, b: ComposerModelGroup): number => {
+    const first = a.options[0].agentDeviceId;
+    const second = b.options[0].agentDeviceId;
+    if (!first || !second) return Number(!!first) - Number(!!second);
+    return first.localeCompare(second);
+  });
+}
+
+export function modelFavoriteSource(option: ComposerModelOption): string {
+  if (!option.agentDeviceId) return option.providerId;
+  return 'agent-device-favorite:' + JSON.stringify([option.agentDeviceId, option.providerId]);
+}
+
+export function modelFavoriteMutation(option: ComposerModelOption, harness: string, effort: string, fast: boolean,
+  items: Object[]): Record<string, Object> {
+  const agent = harness === 'claude-code' ? 'cc' : harness;
+  const source = modelFavoriteSource(option);
+  const prior = items.find((item: Object): boolean => {
+    const row = recordOrEmpty(item);
+    return readStr(row, 'uid').length > 0 && readStr(row, 'providerId') === source
+      && readStr(row, 'modelId') === option.id && readStr(row, 'agent') === agent
+      && readStr(row, 'effort') === effort && (row['fast'] === true) === fast;
+  });
+  const mutation: Record<string, Object> = {};
+  if (prior !== undefined) {
+    mutation['kind'] = 'remove';
+    mutation['expected'] = prior;
+    return mutation;
+  }
+  const item: Record<string, Object> = {};
+  item['providerId'] = source;
+  item['modelId'] = option.id;
+  item['agent'] = agent;
+  if (effort) item['effort'] = effort;
+  if (fast) item['fast'] = true;
+  mutation['kind'] = 'add';
+  mutation['item'] = item;
+  return mutation;
+}
+
+export function recommendedPickerEffort(option: ComposerModelOption): string {
+  return option.efforts.includes(option.defaultEffort) ? option.defaultEffort : option.efforts[0] ?? '';
+}
+
+export function pickerConfiguredOption(option: ComposerModelOption, id: string, effort: string,
+  fast: boolean): ComposerModelOption {
+  const configured = new ComposerModelOption();
+  configured.id = option.id;
+  configured.pickerHarness = option.pickerHarness;
+  configured.pickerRecommendedHarness = option.pickerRecommendedHarness;
+  configured.pickerNativeApi = option.pickerNativeApi;
+  configured.pickerOutboundApi = option.pickerOutboundApi;
+  configured.pickerModelFamily = option.pickerModelFamily;
+  configured.label = option.label;
+  configured.description = option.description;
+  configured.efforts = option.efforts;
+  configured.defaultEffort = option.defaultEffort;
+  configured.supportsFastMode = option.supportsFastMode;
+  configured.supportsUltrafastMode = option.supportsUltrafastMode;
+  configured.effortDisplayNames = option.effortDisplayNames;
+  configured.providerId = option.providerId;
+  configured.providerName = option.providerName;
+  configured.providerLogoKind = option.providerLogoKind;
+  configured.modelIcon = option.modelIcon;
+  configured.subscription = option.subscription;
+  configured.availability = option.availability;
+  configured.contextWindow = option.contextWindow;
+  configured.suspended = option.suspended;
+  configured.selectedRoute = option.selectedRoute;
+  configured.openAiSubscription = option.openAiSubscription;
+  configured.newSessionDefaultAgents = option.newSessionDefaultAgents;
+  configured.sortOrder = option.sortOrder;
+  configured.agentDeviceId = option.agentDeviceId;
+  configured.agentDeviceName = option.agentDeviceName;
+  configured.pickerConfigurationId = id;
+  configured.pickerEffort = option.efforts.includes(effort) ? effort : recommendedPickerEffort(option);
+  configured.pickerFast = fast && option.supportsFastMode;
+  return configured;
+}
+
+function pickerProtocol(api: string): string {
+  if (api === 'openai-completions' || api === 'openai-chat') return 'openai-chat';
+  if (api === 'anthropic-messages' || api === 'anthropic') return 'anthropic-messages';
+  if (api === 'google-generative-ai' || api === 'google') return 'google-generative-ai';
+  return api;
+}
+
+function pickerUsesNativePath(row: ComposerModelOption): boolean {
+  const api = pickerProtocol(row.pickerOutboundApi);
+  if (row.pickerHarness === 'pi' || !api) return !!api;
+  return api === (row.pickerHarness === 'codex' ? 'openai-responses' : 'anthropic-messages');
+}
+
+/** Mobile resolves the recommended Harness first, then that Harness's default effort and Fast off. */
+export function pickerRecommendedOption(option: ComposerModelOption, compatible: ComposerModelOption[],
+  pinned: string = ''): ComposerModelOption {
+  const candidates = [option].concat(compatible);
+  const get = (harness: string): ComposerModelOption | undefined =>
+    candidates.find((row: ComposerModelOption): boolean => row.pickerHarness === harness);
+  const declared = candidates.map((row: ComposerModelOption): string => row.pickerRecommendedHarness)
+    .find((value: string): boolean => !!value);
+  const official = get(declared === 'cc' ? 'claude-code' : declared ?? '');
+  let preferred = pinned ? get(pinned) : undefined;
+  if (preferred === undefined && official !== undefined
+    && (!official.pickerOutboundApi || pickerUsesNativePath(official))) preferred = official;
+  const family = candidates.map((row: ComposerModelOption): string => row.pickerModelFamily)
+    .find((value: string): boolean => !!value) ?? '';
+  const id = option.id.toLowerCase().replace(/^.*[/:]/, '');
+  if (preferred === undefined && (family === 'grok' || (!family && id.startsWith('grok')))) preferred = get('pi');
+  const metadata = candidates.map((row: ComposerModelOption): string => pickerProtocol(row.pickerNativeApi))
+    .filter((api: string): boolean => ['none', 'anthropic-messages', 'openai-responses',
+      'openai-chat', 'google-generative-ai'].includes(api));
+  const nativeApis = Array.from(new Set(metadata));
+  const reference = nativeApis.length === 1 && nativeApis[0] !== 'none' ? nativeApis[0]
+    : nativeApis.length === 0 && option.providerId === 'anthropic' && get('claude-code') ? 'anthropic-messages'
+      : nativeApis.length === 0 && option.providerId === 'openai' && get('codex') ? 'openai-responses' : '';
+  if (preferred === undefined && reference) {
+    const direct = get(reference === 'anthropic-messages' ? 'claude-code'
+      : reference === 'openai-responses' ? 'codex' : 'pi');
+    const pi = get('pi');
+    if (direct !== undefined && pickerUsesNativePath(direct)) preferred = direct;
+    else if (pi !== undefined && pickerUsesNativePath(pi)) preferred = pi;
+  }
+  const pi = get('pi');
+  if (preferred === undefined && pi?.pickerOutboundApi === 'google-generative-ai') preferred = pi;
+  const nativeHarness = option.providerId === 'anthropic' || family === 'anthropic' || (!family && id.startsWith('claude'))
+    ? 'claude-code'
+    : option.providerId === 'openai' || family === 'gpt' || family === 'gpt-budget'
+      || option.id.startsWith('codex/') || (!family && /^gpt[-_]/.test(id)) ? 'codex' : '';
+  if (preferred === undefined && nativeHarness) preferred = get(nativeHarness);
+  if (preferred === undefined && !reference && !nativeHarness) preferred = pi;
+  return pickerConfiguredOption(preferred ?? get('claude-code') ?? get('codex') ?? pi ?? option, 'recommended', '', false);
+}
+
+export function pickerFavorites(rows: ComposerModelGroup[], items: Object[]): ComposerModelGroup[] {
+  const favorites = new ComposerModelGroup();
+  favorites.key = 'picker:favorites';
+  favorites.name = '收藏';
+  for (const item of items) {
+    const row = recordOrEmpty(item);
+    const uid = readStr(row, 'uid');
+    if (!uid) continue;
+    for (const group of rows) {
+      const option = group.options.find((candidate: ComposerModelOption): boolean => {
+        const harness = candidate.pickerHarness === 'claude-code' ? 'cc' : candidate.pickerHarness;
+        return readStr(row, 'providerId') === modelFavoriteSource(candidate) && readStr(row, 'modelId') === candidate.id
+          && readStr(row, 'agent') === harness;
+      });
+      if (option !== undefined) {
+        favorites.options.push(pickerConfiguredOption(option, uid, readStr(row, 'effort'), row['fast'] === true));
+        break;
+      }
+    }
+  }
+  return favorites.options.length > 0 ? [favorites].concat(rows) : rows;
 }

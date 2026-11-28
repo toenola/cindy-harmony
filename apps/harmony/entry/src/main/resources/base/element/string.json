@@ -1,5 +1,16 @@
 {
   "string": [
+    {"name": "image_viewer_previous", "value": "上一张"},
+    {"name": "image_viewer_next", "value": "下一张"},
+    {"name": "turn_status_thinking", "value": "思考中…"},
+    {"name": "turn_status_reconnect", "value": "正在重新连接…"},
+    {"name": "turn_status_overload", "value": "模型服务繁忙，正在重试…"},
+    {"name": "turn_status_rate_limit", "value": "请求受到限流，正在重试…"},
+    {"name": "turn_status_seconds", "value": "%d 秒"},
+    {"name": "turn_status_minutes", "value": "%d 分 %d 秒"},
+    {"name": "turn_status_hours", "value": "%d 小时 %d 分"},
+    {"name": "turn_status_days", "value": "%d 天 %d 小时 %d 分"},
+    {"name": "turn_status_tokens", "value": "%s tok"},
     {"name": "v139_home_back", "value": "返回"},
     {"name": "v139_home_cancel", "value": "取消"},
     {"name": "v139_home_confirm", "value": "继续操作"},
@@ -804,6 +815,12 @@
     {"name": "v140_companion_create_loading", "value": "正在加载…"},
     {"name": "v140_project_create", "value": "新建项目"},
     {"name": "workdir_show_ignored_dirs", "value": "显示被忽略的目录"},
-    {"name": "workdir_show_ignored_dirs_unsupported", "value": "对方设备的 Cindy 版本过旧，暂不支持显示被忽略的目录"}
+    {"name": "workdir_show_ignored_dirs_unsupported", "value": "对方设备的 Cindy 版本过旧，暂不支持显示被忽略的目录"},
+    {"name": "v138_collaboration_mode", "value": "协同模式"},
+    {"name": "home_companion_expand", "value": "展开伙伴列表"},
+    {"name": "home_companion_compact", "value": "收起为紧凑模式"},
+    {"name": "home_companion_show_all", "value": "显示全部 %d"},
+    {"name": "home_companion_show_less", "value": "收起列表"},
+    {"name": "composer_picker_permission", "value": "权限"}
   ]
 }

@@ -1,3 +1,5 @@
+import { ChatSegmented } from './chat/ChatChrome';
+import { uiToast } from './common/UiOverlay';
 import { PluginEngineMark } from './PluginEngineMark';
 import { PluginEngine, PluginUsage, PluginUsageBalance, PluginUsageWindow } from '../core/plugin-engines/PluginEngines';
 
@@ -6,7 +8,7 @@ import { AppServices } from '../core/AppServices';
 import { RelayRoute } from '../core/device-link/RelayRoute';
 import { harmonyV12String } from '../core/HarmonyStrings';
 import {
-  UsageSnapshot, UsageSource, UsageSeries, UsageDay, usageSum, usageCompact, usageSeries,
+  UsageSnapshot, UsageSource, UsageSeries, UsageDay, UsageWindow, UsageTotals, usageCompact, usageSeries, usageTotals, usageRangeStart, usageHasModels,
   usageResetLabel, readUsageDashboard, usageCandidates,
 } from '../core/usage/UsageDashboard';
 import { UI_RADIUS_CONTAINER } from './UiKit';
@@ -21,6 +23,13 @@ export struct UsageDashboardPanel {
   @Prop @Watch('contextChanged') active: boolean = false;
   @Prop @Watch('contextChanged') pinnedDeviceId: string = '';
   scroller: Scroller = new Scroller();
+  @State private rangeIndex: number = 0;
+  @State private pickedDay: number = -1;
+  @State private modelKey: string = '';
+  @State private expandedQuota: string = '';
+  @State private chartRows: UsageSeries[] = [];
+  @State private summary: UsageTotals = new UsageTotals();
+  @State private graphMax: number = 1;
   @State private snapshot: UsageSnapshot | null = null;
   @State private pluginQuotaRows: PluginQuotaRow[] = [];
   private pluginDeviceId: string = '';
@@ -31,7 +40,7 @@ export struct UsageDashboardPanel {
   @State private loading: boolean = false;
   @State private issue: string = '';
   @State private now: number = Date.now();
-  @State private contentWidth: number = 320;
+  @State private quotaGridWidth: number = 232;
   @State private chartWidth: number = 320;
   private mounted: boolean = false;
   private identity: string = '';
@@ -75,6 +84,7 @@ export struct UsageDashboardPanel {
     if (identity === this.identity) return;
     this.identity = identity; this.generation++;
     this.snapshot = null; this.deviceName = ''; this.issue = '';
+    this.pickedDay = -1; this.modelKey = ''; this.expandedQuota = ''; this.rebuildUsage();
     this.clearPluginQuota();
     this.pluginOpeningPending = this.active;
     if (this.request) this.reloadRequested = true;
@@ -119,7 +129,11 @@ export struct UsageDashboardPanel {
       if (!current()) return;
       this.issue = result.issue;
       if (result.snapshot !== null) {
+        if (this.pickedDay >= 0 && this.snapshot?.days[this.pickedDay]?.date !== result.snapshot.days[this.pickedDay]?.date) {
+          this.pickedDay = -1;
+        }
         this.snapshot = result.snapshot; this.deviceName = result.deviceName;
+        this.rebuildUsage();
         if (this.pluginDeviceId && this.pluginDeviceId !== result.deviceId) this.clearPluginQuota();
         if (loadPlugins && AppServices.instance.appInForeground) {
           this.pluginDeviceId = result.deviceId;
@@ -174,18 +188,68 @@ export struct UsageDashboardPanel {
 
   private data(): UsageSnapshot { return this.snapshot ?? new UsageSnapshot(); }
   private accounts(): UsageSource[] { return this.data().sources.filter((s: UsageSource): boolean => s.kind === 'subscription'); }
-  private series(): UsageSeries[] { return usageSeries(this.data(), this.text('usage_other')); }
-  private legend(): UsageSeries[] {
-    return this.series().sort((a: UsageSeries, b: UsageSeries): number => a.other ? 1 : b.other ? -1 : b.total - a.total);
+  private rangeStart(): number {
+    return usageRangeStart(this.data(), [1, 7, 30][this.rangeIndex]);
   }
-  private total(): number { return this.data().days.reduce((sum: number, day: UsageDay): number => sum + usageSum(day.tokens), 0); }
-  private average(): number { return this.data().days.length ? this.total() / this.data().days.length : 0; }
-  private chartMax(): number { return Math.max(1, ...this.data().days.map((day: UsageDay): number => usageSum(day.tokens))); }
+  private rebuildUsage(): void {
+    const snapshot = this.data();
+    const start = this.pickedDay >= 0 ? this.pickedDay : this.rangeStart();
+    const end = this.pickedDay >= 0 ? start + 1 : snapshot.days.length;
+    const series = usageSeries(snapshot, this.text('usage_other'), start, end);
+    const filter = usageHasModels(snapshot) ? series.find((row: UsageSeries): boolean => row.key === this.modelKey) : undefined;
+    if (filter === undefined) this.modelKey = '';
+    this.chartRows = series;
+    this.summary = usageTotals(snapshot, start, end, filter);
+    const displayed = filter === undefined ? series : [filter];
+    this.graphMax = Math.max(1, ...snapshot.days.map((_day: UsageDay, index: number): number =>
+      displayed.reduce((sum: number, row: UsageSeries): number => sum + (row.values[index] ?? 0), 0)));
+  }
+  private chartSeries(): UsageSeries[] {
+    return this.chartRows.filter((row: UsageSeries): boolean => !this.modelKey || row.key === this.modelKey).reverse();
+  }
+  private dayActive(index: number): boolean {
+    return this.pickedDay >= 0 ? this.pickedDay === index : index >= this.rangeStart();
+  }
+  private rangeLabels(): string[] {
+    const locale = this.data().locale.toLowerCase();
+    if (locale.startsWith('zh')) return [this.text('usage_today'), '近 7 天', '近 30 天'];
+    if (locale.startsWith('ja')) return [this.text('usage_today'), '過去7日', '過去30日'];
+    if (locale.startsWith('ko')) return [this.text('usage_today'), '최근 7일', '최근 30일'];
+    return [this.text('usage_today'), 'Last 7 days', 'Last 30 days'];
+  }
+  private usageCopy(key: string): string {
+    const locale = this.data().locale.toLowerCase();
+    if (key === 'models') {
+      if (locale.startsWith('zh')) return '僅顯示近 30 天常用模型，其餘合併為其他';
+      if (locale.startsWith('ja')) return '過去30日間の主要モデルのみ。残りは「その他」に集約します。';
+      if (locale.startsWith('ko')) return '최근 30일의 주요 모델만 표시하며 나머지는 기타로 합산합니다.';
+      return 'Shows top models from the last 30 days. The rest are grouped as Other.';
+    }
+    if (key === 'unused') {
+      if (locale.startsWith('zh')) return '依目前用量，重置時可能仍有剩餘額度';
+      if (locale.startsWith('ja')) return '現在のペースでは、リセット時に利用枠が残る見込みです';
+      if (locale.startsWith('ko')) return '현재 사용 속도라면 재설정 시 할당량이 남을 수 있습니다';
+      return 'Some quota may remain at reset at the current pace.';
+    }
+    if (locale.startsWith('zh')) return '窗口 ' + key;
+    if (locale.startsWith('ja')) return '期間 ' + key;
+    if (locale.startsWith('ko')) return '기간 ' + key;
+    return 'Window ' + key;
+  }
   private today(): UsageDay { const days = this.data().days; return days[days.length - 1] ?? new UsageDay(); }
+  private rangeCaption(): string {
+    if (this.pickedDay >= 0) return this.data().days[this.pickedDay]?.date ?? '';
+    const end = this.today().date;
+    const start = this.data().days[this.rangeStart()]?.date ?? '';
+    return start && start !== end ? start + ' – ' + end : end;
+  }
   private todayLabel(): string {
     const date = new Date(this.now);
     const local = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     return this.today().date && this.today().date !== local ? this.today().date : this.text('usage_today');
+  }
+  private showModelEstimates(): boolean {
+    return this.chartRows.some((row: UsageSeries): boolean => (!this.modelKey || row.key === this.modelKey) && row.hasEstimate);
   }
   private money(value: number): string { return this.data().moneySymbol + value.toFixed(2); }
   private stale(): boolean { const d = this.data(); return this.now - (d.updatedAtMs || d.generatedAtMs) >= 3600000; }
@@ -195,6 +259,17 @@ export struct UsageDashboardPanel {
       $r('app.color.usage_chart_purple'), $r('app.color.accent'), $r('app.color.warn')];
     return colors[series.colorIndex % colors.length];
   }
+  private windowTint(color: string): Resource {
+    if (color === 'claude' || color === 'claude2' || color === 'claude3') {
+      return color === 'claude2' ? $r('app.color.usage_chart_pink')
+        : color === 'claude3' ? $r('app.color.usage_chart_purple') : $r('app.color.warn');
+    }
+    if (color === 'codex') return $r('app.color.accent');
+    if (color === 'warn') return $r('app.color.warn');
+    if (color === 'crit' || color === 'error') return $r('app.color.danger');
+    if (color.startsWith('ink')) return $r('app.color.text_tertiary');
+    return $r('app.color.usage_quota_plenty');
+  }
   private quotaTint(source: UsageSource): Resource {
     return source.level === 'error' ? $r('app.color.danger') : source.level === 'warn'
       ? $r('app.color.warn') : $r('app.color.usage_quota_plenty');
@@ -202,7 +277,23 @@ export struct UsageDashboardPanel {
   private notice(): string { return this.text(this.issue === 'offline' ? 'usage_offline'
     : this.issue === 'unsupported' ? 'usage_unsupported' : 'usage_unavailable'); }
 
+  @State private pullRefreshing: boolean = false;
+
+  private async pullRefresh(): Promise<void> {
+    if (this.pullRefreshing || this.loading) return;
+    this.pullRefreshing = true;
+    try {
+      await this.refresh(true);
+      if (this.mounted && this.active && this.issue) uiToast(this.getUIContext(), this.notice());
+    } catch (_error) {
+      if (this.mounted && this.active) uiToast(this.getUIContext(), this.text('usage_unavailable'));
+    } finally {
+      this.pullRefreshing = false;
+    }
+  }
+
   build() {
+    Refresh({ refreshing: this.pullRefreshing }) {
     Scroll(this.scroller) {
       Column({ space: 18 }) {
         Row({ space: 12 }) {
@@ -232,10 +323,20 @@ export struct UsageDashboardPanel {
       }
       .width('100%').constraintSize({ maxWidth: 860 })
       .padding({ left: 20, right: 20, top: 12, bottom: 112 })
-      .onAreaChange((_old: Area, area: Area) => { this.contentWidth = Number(area.width); })
     }
     .width('100%').height('100%').scrollBar(BarState.Auto)
     .backgroundColor($r('app.color.bg_page'))
+    }
+    .onRefreshing((): void => { void this.pullRefresh(); }).width('100%').height('100%')
+
+  }
+
+  private quotaColumnCount(): number {
+    const count = this.accounts().length;
+    if (count <= 3) return Math.max(1, count);
+    // Mobile balances rows based on the available width, up to six columns.
+    const maxColumns = Math.max(1, Math.min(6, Math.floor(this.quotaGridWidth / 82)));
+    return Math.ceil(count / Math.ceil(count / maxColumns));
   }
 
   @Builder
@@ -247,12 +348,23 @@ export struct UsageDashboardPanel {
         if (this.stale()) Text($r('app.string.usage_stale')).fontSize(12).fontColor($r('app.color.warn'))
       }.width('100%')
       if (this.accounts().length > 0) {
-        Flex({ wrap: FlexWrap.Wrap }) {
+        GridRow({ columns: this.quotaColumnCount(), gutter: { y: 12 } }) {
           ForEach(this.accounts(), (source: UsageSource) => {
-            this.quotaColumn(source)
+            GridCol({ span: 1 }) {
+              this.quotaColumn(source, this.quotaGridWidth / this.quotaColumnCount() < 100)
+            }
           }, (source: UsageSource) => source.id)
         }.width('100%')
+          .onAreaChange((_old: Area, area: Area) => {
+            const width = Number(area.width);
+            if (width > 0 && width !== this.quotaGridWidth) this.quotaGridWidth = width;
+          })
       }
+      ForEach(this.accounts(), (source: UsageSource) => {
+        if (this.expandedQuota === source.id && source.detail !== null) {
+          this.quotaDetails(source)
+        }
+      }, (source: UsageSource) => 'detail:' + source.id)
       ForEach(this.pluginQuotaRows, (row: PluginQuotaRow) => {
         this.pluginQuotaRow(row)
       }, (row: PluginQuotaRow) => row.engine.providerId)
@@ -284,44 +396,81 @@ export struct UsageDashboardPanel {
   }
 
   @Builder
-  quotaColumn(source: UsageSource) {
+  quotaDetails(source: UsageSource) {
     Column({ space: 8 }) {
+      Text(source.detail?.title || source.name)
+        .fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+      if (source.detail?.plan) {
+        Text(source.detail?.plan ?? '').fontSize(13).fontColor($r('app.color.text_secondary'))
+      }
+      ForEach(source.detail?.windows ?? [], (window: UsageWindow, index: number) => {
+        Row({ space: 8 }) {
+          Circle().width(8).height(8).fill(this.windowTint(window.color))
+          Text(window.label || this.usageCopy(String(index + 1))).layoutWeight(1)
+            .fontSize(13).fontColor($r('app.color.text_primary'))
+          Text(String(Math.round(window.fraction * 100)) + '%')
+            .fontSize(13).fontColor($r('app.color.text_secondary'))
+        }.width('100%')
+      }, (window: UsageWindow, index: number) => String(index) + ':' + window.label)
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(12)
+      .backgroundColor($r('app.color.bg_chip')).borderRadius(8)
+  }
+
+  @Builder
+  quotaColumn(source: UsageSource, compact: boolean) {
+    Column({ space: compact ? 5 : 8 }) {
       Text((source.value || source.label || '—') + (source.reserve ? '' : source.unit))
-        .fontSize(28).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+        .fontSize(compact ? 21 : 28).minFontSize(compact ? 16 : 22).maxFontSize(compact ? 21 : 28).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
       if (source.reserve && source.unit) Text(source.unit).fontSize(12).fontColor($r('app.color.text_secondary'))
       Stack({ alignContent: Alignment.Bottom }) {
-        Column().width('100%').height(source.fill > 0 ? Math.max(3, 68 * source.fill) : 0)
+        Column().width('100%').height(source.fill > 0 ? Math.max(3, (compact ? 58 : 68) * source.fill) : 0)
           .backgroundColor(this.quotaTint(source)).borderRadius(10)
-      }.width(30).height(74).padding(3).clip(true).borderRadius(14)
+      }.width(compact ? 26 : 30).height(compact ? 64 : 74).padding(3).clip(true).borderRadius(14)
         .border({ width: source.emphasized ? 1.25 : 1, color: $r('app.color.border') })
         .backgroundColor($r('app.color.bg_chip')).opacity(this.stale() || source.stale ? 0.45 : 1)
-      Row({ space: 8 }) {
+      Row({ space: compact ? 2 : 8 }) {
         if (source.logo === 'codex' || source.logo === 'claude') {
           Image(source.logo === 'codex' ? $r('app.media.usage_provider_openai')
             : $r('app.media.usage_provider_anthropic'))
-            .width(24).height(24).objectFit(ImageFit.Contain).flexShrink(0)
+            .width(compact ? 16 : 24).height(compact ? 16 : 24).objectFit(ImageFit.Contain).flexShrink(0)
         } else {
           // MobileProviderMark uses the first code point of monogram, or of name when absent.
           Text((Array.from((source.monogram || source.name).trim())[0] ?? '?').toUpperCase())
             .fontSize(11).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-            .width(18).height(18).textAlign(TextAlign.Center).align(Alignment.Center).flexShrink(0)
+            .width(compact ? 16 : 18).height(compact ? 16 : 18).textAlign(TextAlign.Center).align(Alignment.Center).flexShrink(0)
             .border({ width: 1, color: $r('app.color.text_primary') }).borderRadius(4)
         }
-        Text(source.name).fontSize(16).lineHeight(24).fontColor($r('app.color.text_primary'))
-          .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
+        Text(source.name).fontSize(compact ? 12 : 16).lineHeight(compact ? 17 : 24).fontColor($r('app.color.text_primary'))
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
       }.alignItems(VerticalAlign.Center).justifyContent(FlexAlign.Center).width('100%')
       Text(usageResetLabel(source, this.data().strings, this.now, this.text('usage_reset_pending')))
-        .fontSize(12).fontColor($r('app.color.text_secondary')).maxLines(2).textAlign(TextAlign.Center)
+        .fontSize(compact ? 11 : 12).fontColor($r('app.color.text_secondary'))
+        .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Center)
+      if (source.stale) {
+        Text($r('app.string.usage_stale')).fontSize(11).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
+      }
+      if (source.unusedAtReset && !source.stale && !this.stale()) {
+        Text(this.usageCopy('unused')).fontSize(11).fontColor($r('app.color.warn')).textAlign(TextAlign.Center)
+      }
+      if (source.detail !== null) {
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph(this.expandedQuota === source.id ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+            .fontSize(14).fontColor([$r('app.color.text_secondary')])
+        }.height(44).width('100%').padding(0).backgroundColor(Color.Transparent)
+          .accessibilityText(source.detail?.title || source.name)
+          .onClick((): void => { this.expandedQuota = this.expandedQuota === source.id ? '' : source.id; })
+      }
     }
-    .width(this.contentWidth >= 600 && this.accounts().length > 2 ? '25%' : this.accounts().length === 1 ? '100%' : '50%')
-    .padding({ left: 4, right: 4, bottom: 12 })
+    .width('100%')
+    .padding({ left: compact ? 2 : 4, right: compact ? 2 : 4 })
   }
   @Builder
   tokenCard() {
     Column({ space: 20 }) {
       Row({ space: 12 }) {
-        Text(this.todayLabel()).fontSize(18).fontWeight(FontWeight.Medium)
+        Text(this.pickedDay >= 0 ? this.rangeCaption() : this.rangeIndex === 0 ? this.todayLabel()
+          : this.rangeLabels()[this.rangeIndex]).fontSize(18).fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary')).layoutWeight(1)
         if (this.data().scope !== 'local' || this.deviceName) {
           Text(this.data().scope === 'local'
@@ -331,35 +480,63 @@ export struct UsageDashboardPanel {
         }
       }.width('100%')
       if (this.data().days.length > 0) {
+        ChatSegmented({ labels: this.rangeLabels(), selected: this.rangeIndex,
+          onSelect: (index: number): void => {
+            this.rangeIndex = index; this.pickedDay = -1; this.rebuildUsage();
+          } })
         Column({ space: 6 }) {
-          Text(usageCompact(usageSum(this.today().tokens)) + ' token').fontSize(32).fontWeight(FontWeight.Medium)
+          Text(this.rangeCaption()).fontSize(12).fontColor($r('app.color.text_tertiary'))
+          Text(usageCompact(this.summary.tokens) + ' token').fontSize(32).fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
-          Text(this.text('usage_estimated') + ' ' + this.money(usageSum(this.today().money))
-            + ' · ' + this.text('usage_paid') + ' ' + this.money(this.today().paid))
-            .fontSize(13).fontColor($r('app.color.text_secondary'))
+          if (this.summary.estimated !== null) {
+            Text(this.text('usage_estimated') + ' ' + this.money(this.summary.estimated))
+              .fontSize(13).fontColor($r('app.color.text_secondary'))
+          }
+          if (this.summary.paid !== null) {
+            Text(this.text('usage_paid') + ' ' + this.money(this.summary.paid))
+              .fontSize(13).fontColor($r('app.color.text_secondary'))
+          }
         }.width('100%').alignItems(HorizontalAlign.Start)
         Column({ space: 8 }) {
-          Text(this.text('usage_average') + ' ' + usageCompact(this.average()) + ' token')
+          Text(this.text('usage_average') + ' ' + usageCompact(this.summary.average) + ' token')
             .fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.End)
           this.historyChart()
           Row() {
             Text(this.data().days[0].date).layoutWeight(1).fontSize(12).fontColor($r('app.color.text_tertiary'))
             Text(this.today().date).fontSize(12).fontColor($r('app.color.text_tertiary'))
-          }.width('100%')
+          }.width('100%').height(30)
+            .onClick((): void => { if (this.pickedDay >= 0) { this.pickedDay = -1; this.rebuildUsage(); } })
         }.width('100%')
         Divider().color($r('app.color.border'))
-        Row() {
-          Text($r('app.string.usage_total')).layoutWeight(1).fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-          Text(usageCompact(this.total())).fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-        }.width('100%')
-        Column({ space: 12 }) {
-          ForEach(this.legend(), (series: UsageSeries) => {
+        if (usageHasModels(this.data())) {
+          Text(this.usageCopy('models')).fontSize(12).fontColor($r('app.color.text_tertiary'))
+        }
+        Column({ space: 4 }) {
+          ForEach(this.chartRows, (series: UsageSeries) => {
             Row({ space: 8 }) {
               Circle().width(8).height(8).fill(this.tint(series))
-              Text(series.name).layoutWeight(1).maxLines(2).fontSize(14).fontColor($r('app.color.text_secondary'))
-              Text(`${this.total() ? Math.round(series.total / this.total() * 100) : 0}% · ${usageCompact(series.total)}`).fontSize(14).fontColor($r('app.color.text_secondary'))
-            }.width('100%')
-          }, (series: UsageSeries) => `${series.colorIndex}:${series.name}`)
+              Column({ space: 2 }) {
+                Text(series.name).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .fontSize(14).fontColor($r('app.color.text_primary'))
+                if (series.harness) Text(series.harness).fontSize(11).fontColor($r('app.color.text_tertiary'))
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              Column({ space: 2 }) {
+                Text(usageCompact(series.total)).fontSize(14).fontColor($r('app.color.text_secondary'))
+                if (this.showModelEstimates() && series.estimated !== null) Text(this.text('usage_estimated') + ' ' + this.money(series.estimated))
+                  .fontSize(11).fontColor($r('app.color.text_secondary'))
+              }.alignItems(HorizontalAlign.End)
+              if (usageHasModels(this.data())) {
+                SymbolGlyph(this.modelKey === series.key ? $r('sys.symbol.checkmark') : $r('sys.symbol.chevron_right'))
+                  .fontSize(12).fontColor([$r('app.color.text_secondary')])
+              }
+            }.width('100%').alignItems(VerticalAlign.Center).constraintSize({ minHeight: 44 }).padding({ left: 4, right: 4 })
+              .borderRadius(8).backgroundColor(this.modelKey === series.key ? $r('app.color.bg_chip') : Color.Transparent)
+              .onClick((): void => {
+                if (!usageHasModels(this.data())) return;
+                this.modelKey = this.modelKey === series.key ? '' : series.key;
+                this.rebuildUsage();
+              })
+          }, (series: UsageSeries) => series.key)
         }.width('100%')
       } else {
         Text($r('app.string.usage_no_history')).fontSize(14).fontColor($r('app.color.text_secondary'))
@@ -381,20 +558,24 @@ export struct UsageDashboardPanel {
       Row({ space: 3 }) {
         ForEach(this.data().days, (_day: UsageDay, index: number) => {
           Column() {
-            ForEach(this.series().slice().reverse(), (series: UsageSeries) => {
-              Column().width('100%').height(180 * (series.values[index] ?? 0) / this.chartMax())
+            ForEach(this.chartSeries(), (series: UsageSeries) => {
+              Column().width('100%').height(180 * (series.values[index] ?? 0) / this.graphMax)
                 .backgroundColor(this.tint(series))
             }, (series: UsageSeries) => `${series.colorIndex}:${series.name}`)
           }.layoutWeight(1).height(180).justifyContent(FlexAlign.End).borderRadius(2).clip(true)
+            .opacity(this.dayActive(index) ? 1 : 0.23)
+            .backgroundColor(this.pickedDay === index ? $r('app.color.bg_chip') : Color.Transparent)
+            .accessibilityText(_day.date)
+            .onClick((): void => { this.pickedDay = this.pickedDay === index ? -1 : index; this.rebuildUsage(); })
         }, (day: UsageDay, index: number) => `${index}:${day.date}`)
       }.width('100%').height(180)
-      if (this.average() > 0) {
+      if (this.summary.average > 0) {
         Row({ space: 4 }) {
           ForEach(this.averageDashes(), (index: number) => {
             Rect().width(4).height(1.5).fill($r('app.color.text_secondary'))
           }, (index: number) => String(index))
         }.width('100%').height(2).clip(true).zIndex(1)
-          .position({ x: 0, y: Math.min(178, 180 * (1 - this.average() / this.chartMax())) })
+          .position({ x: 0, y: Math.min(178, 180 * (1 - this.summary.average / this.graphMax)) })
           .hitTestBehavior(HitTestMode.None)
       }
     }.width('100%').height(180)

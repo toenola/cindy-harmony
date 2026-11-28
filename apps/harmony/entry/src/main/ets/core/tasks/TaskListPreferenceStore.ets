@@ -49,8 +49,7 @@ export function parseTaskListPreferences(raw: string): TaskListPreferences {
     out.selectedDeviceId = safeString(record, 'selectedDeviceId', 512);
     out.selectedDeviceName = safeString(record, 'selectedDeviceName', 256);
     const tab = safeString(record, 'activeListTab', 20);
-    if (tab === 'projects' || tab === 'dialogues' || tab === 'usage') out.activeListTab = tab;
-    if (tab === 'automations') out.activeListTab = 'dialogues';
+    if (tab === 'projects' || tab === 'dialogues' || tab === 'automations') out.activeListTab = tab;
     const sortMode = safeString(record, 'sortMode', 20);
     if (sortMode === 'default' || sortMode === 'recency' || sortMode === 'alphabetic') {
       out.sortMode = sortMode;

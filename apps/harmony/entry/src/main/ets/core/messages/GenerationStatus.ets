@@ -9,6 +9,10 @@
 export class SessionGenerationStatus {
   isRunning: boolean = false;
   status: string = '';
+  tokenUsage: number = 0;
+  sideTaskRunning: boolean = false;
+  retryPhase: string = '';
+  retryProgress: string = '';
   outputTokens: number = 0;
   generationDurationMs: number = 0;
   generationActive: boolean = false;
@@ -29,6 +33,10 @@ function copyStatus(source: SessionGenerationStatus): SessionGenerationStatus {
   const copy = new SessionGenerationStatus();
   copy.isRunning = source.isRunning;
   copy.status = source.status;
+  copy.tokenUsage = source.tokenUsage;
+  copy.sideTaskRunning = source.sideTaskRunning;
+  copy.retryPhase = source.retryPhase;
+  copy.retryProgress = source.retryProgress;
   copy.outputTokens = source.outputTokens;
   copy.generationDurationMs = source.generationDurationMs;
   copy.generationActive = source.generationActive;
@@ -41,6 +49,10 @@ export function resetGenerationMetricsForNewTurn(
   source: SessionGenerationStatus,
 ): SessionGenerationStatus {
   const next = copyStatus(source);
+  next.tokenUsage = 0;
+  next.sideTaskRunning = false;
+  next.retryPhase = '';
+  next.retryProgress = '';
   next.outputTokens = 0;
   next.generationDurationMs = 0;
   next.generationActive = false;
@@ -78,6 +90,13 @@ export function applyGenerationStatusEvent(
     || typeof data['generationReliable'] === 'boolean';
 
   current.isRunning = isRunning;
+  const tokenUsage = finiteMetric(data, 'tokenUsage');
+  if (tokenUsage !== undefined && tokenUsage > 0) {
+    current.tokenUsage = tokenUsage;
+  } else if (isTurnStart) {
+    current.tokenUsage = 0;
+  }
+  current.sideTaskRunning = isRunning && data['skipTurnReset'] === true;
   if (rawOutputTokens !== undefined) {
     current.outputTokens = rawOutputTokens;
   } else if (isTurnStart) {

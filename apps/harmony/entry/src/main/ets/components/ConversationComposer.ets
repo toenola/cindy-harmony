@@ -22,8 +22,7 @@ import {
   uiLineHeight,
   uiRevealTransition,
 } from './UiKit';
-import { LevelMode, uiMaterial } from '@kit.ArkUI';
-import { uiOverlayBuildId, uiOverlayTrace } from './common/UiOverlay';
+import { uiMaterial } from '@kit.ArkUI';
 
 /** 待发送图片（上传状态机：uploading → ready / failed）。 */
 export class ComposerImage {
@@ -37,6 +36,19 @@ export class ComposerImage {
   removed: boolean = false;
   /** 每次上传/重试/移除递增；旧异步回调不得覆盖新尝试。 */
   uploadRevision: number = 0;
+}
+
+export function composerPermissionSymbol(mode: string): Resource {
+  if (mode === 'bypassPermissions') return $r('sys.symbol.lock_open');
+  if (mode === 'auto') return $r('sys.symbol.wand_and_stars');
+  if (mode === 'ask' || mode === 'default') return $r('sys.symbol.hand_raised_fingers_spread');
+  if (mode === 'plan') return $r('sys.symbol.text_clipboard');
+  if (mode === 'acceptEdits') return $r('sys.symbol.code');
+  return $r('sys.symbol.checkmark_shield');
+}
+
+export function composerPermissionTint(mode: string): Resource {
+  return mode === 'bypassPermissions' ? $r('app.color.danger') : $r('app.color.text_secondary');
 }
 
 /**
@@ -76,15 +88,13 @@ export struct ConversationComposer {
   @Prop modelLabel: string = '';
   @Prop effortLabel: string = '';
   /** Agent / 模型选择器由页面持有业务状态，Composer 只统一锚点、材质与尺寸。 */
-  @Prop @Watch('syncPermissionPopupVisibility') permissionPopupVisible: boolean = false;
-  @Prop @Watch('syncAgentPopupVisibility') agentPopupVisible: boolean = false;
-  @Prop @Watch('syncModelPopupVisibility') modelPopupVisible: boolean = false;
+  @Prop @Watch('syncPicker') permissionPopupVisible: boolean = false;
+  @Prop @Watch('syncPicker') agentPopupVisible: boolean = false;
+  @Prop @Watch('syncPicker') modelPopupVisible: boolean = false;
   @Prop showAddButton: boolean = true;
   @Prop showStreamingStatus: boolean = true;
   /** 会话详情与新建任务共用华为官方浮动操作栏同款组件材质。 */
   @Prop floatingGlass: boolean = false;
-  /** 会话详情默认态使用完整工具栏；新建任务继续保留原有紧凑输入态。 */
-  @Prop compactToolbar: boolean = false;
   /** 浮动背板距当前可用区域底边的间距，由分栏父页面与 HdsTabs 共用同一口径。 */
   @Prop floatingBottomInset: number = 2;
   @Prop inputId: string = 'task-composer-input';
@@ -117,11 +127,19 @@ export struct ConversationComposer {
   @BuilderParam permissionPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam agentPopupContent: () => void = this.emptyPopupContent;
   @BuilderParam modelPopupContent: () => void = this.emptyPopupContent;
-  /** bindPopup 由组件自身的 State 驱动；直接绑定父级 Prop 会漏掉退场更新并留下孤儿浮层。 */
-  @State permissionPopupPresented: boolean = false;
-  @State agentPopupPresented: boolean = false;
-  @State modelPopupPresented: boolean = false;
-  /** 状态更新时复用同一材质对象，避免模型切换重绘期间反复重建系统材质与交互手势。 */
+  @Prop @Watch('syncPicker') externalPickerTitle: string = '';
+  @BuilderParam externalPickerContent: (title: string) => void = this.emptyExternalPickerContent;
+  onExternalPickerDismiss: () => void = () => {};
+
+  @Builder
+  emptyExternalPickerContent(_title: string) {}
+
+  @Prop pickerWindowHeight: number = 0;
+  @State private pickerPage: string = '';
+  @State private pickerVisible: boolean = false;
+  @State private inputVisible: boolean = true;
+  private pickerGeneration: number = 0;
+
   private readonly floatingGlassMaterial: uiMaterial.ImmersiveMaterial =
     new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
@@ -129,29 +147,61 @@ export struct ConversationComposer {
       // 容器内有横向列表和多个按钮，交互反馈由子控件承担，整块背板不参与形变。
       interactive: false,
     });
-  // 三个选择弹层按 docs/overlay-standard.md §3.1 例外条款用 bindPopup：mask:false，不设 systemMaterial
-  // （沉浸材质会带出空间动效，真机打开时明暗闪烁），使用系统默认 Popup 样式；内容由父页面通过 @BuilderParam 提供。
   @State inputMaxHeight: number = 120;
   @State resizing: boolean = false;
   private resizeStartY: number = 0;
   private resizeStartHeight: number = 120;
 
   aboutToAppear(): void {
-    this.permissionPopupPresented = this.permissionPopupVisible;
-    this.agentPopupPresented = this.agentPopupVisible;
-    this.modelPopupPresented = this.modelPopupVisible;
+    this.syncPicker();
   }
 
-  private syncPermissionPopupVisibility(): void {
-    this.permissionPopupPresented = this.permissionPopupVisible;
+  aboutToDisappear(): void {
+    this.pickerGeneration += 1;
   }
 
-  private syncAgentPopupVisibility(): void {
-    this.agentPopupPresented = this.agentPopupVisible;
+  private syncPicker(): void {
+    const next = this.permissionPopupVisible ? 'permission'
+      : this.modelPopupVisible ? 'model' : this.agentPopupVisible ? 'agent' : this.externalPickerTitle;
+    const generation = ++this.pickerGeneration;
+    if (next.length > 0) {
+      this.getUIContext().animateTo({
+        duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE, onFinish: (): void => {
+          if (generation !== this.pickerGeneration) return;
+          this.pickerPage = next;
+          this.getUIContext().animateTo({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE },
+            (): void => { this.pickerVisible = true; });
+        },
+      }, (): void => { this.inputVisible = false; });
+    } else if (this.pickerPage.length > 0) {
+      this.getUIContext().animateTo({
+        duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE, onFinish: (): void => {
+          if (generation !== this.pickerGeneration) return;
+          this.pickerPage = '';
+          this.getUIContext().animateTo({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE },
+            (): void => { this.inputVisible = true; });
+        },
+      }, (): void => { this.pickerVisible = false; });
+    } else {
+      this.inputVisible = true;
+    }
   }
 
-  private syncModelPopupVisibility(): void {
-    this.modelPopupPresented = this.modelPopupVisible;
+  private dismissPicker(): void {
+    if (this.permissionPopupVisible) this.onPermissionPopupDismiss();
+    else if (this.modelPopupVisible) this.onModelPopupDismiss();
+    else if (this.agentPopupVisible) this.onAgentPopupDismiss();
+    else this.onExternalPickerDismiss();
+  }
+
+  private pickerTitle(): ResourceStr {
+    if (this.pickerPage === 'permission') return $r('app.string.composer_picker_permission');
+    if (this.pickerPage === 'model') return $r('app.string.v138_models');
+    return this.pickerPage === 'agent' ? $r('app.string.v12_search_agent') : this.pickerPage;
+  }
+
+  private pickerSlide(): TransitionEffect {
+    return TransitionEffect.translate({ y: 40 }).combine(TransitionEffect.OPACITY);
   }
 
   private resizeInput(event: TouchEvent): void {
@@ -174,11 +224,11 @@ export struct ConversationComposer {
   }
 
   private hasModelChip(): boolean {
-    return this.hasModelOptions;
+    return this.hasModelOptions || this.modelLabel.length > 0;
   }
 
   private hasAgentChip(): boolean {
-    return this.hasAgentOptions;
+    return this.hasAgentOptions || this.agentLabel.length > 0;
   }
 
   private expanded(): boolean {
@@ -192,8 +242,13 @@ export struct ConversationComposer {
     setTimeout(() => focusControl.requestFocus(this.inputId), 0);
   }
 
+  private primaryShowsStop(): boolean {
+    // 单行优先停止；编辑中保留 Mobile 的草稿发送槽，仍可发送排队消息。
+    return this.streaming && (!this.expanded() || !this.hasContent);
+  }
+
   private tapPrimaryAction(): void {
-    if (this.streaming && !this.hasContent) {
+    if (this.primaryShowsStop()) {
       this.onAbort();
     } else if (this.canSend) {
       this.onSend();
@@ -357,8 +412,8 @@ export struct ConversationComposer {
         .fontColor([tint])
     }
     .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
+    .width(44)
+    .height(44)
     .padding(0)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_ICON_CLICK_EFFECT)
@@ -368,57 +423,24 @@ export struct ConversationComposer {
     .onClick(action)
   }
 
-  /** 权限模式与 Agent / 模型共用同一套按钮锚点和沉浸材质 Popup。 */
+  /** 权限图标保留档位读屏名，选项与确认仍由页面提供。 */
   @Builder
   composerPermissionButton() {
     Button() {
-      Row({ space: 4 }) {
-        Text(this.permissionLabel)
-          .fontSize(uiFontSize(12))
-          .fontColor(this.permissionMode === 'bypassPermissions' || this.permissionMode === 'auto'
-            ? $r('app.color.danger') : $r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 108 })
-        SymbolGlyph($r('sys.symbol.chevron_down'))
-          .fontSize(11)
-          .fontColor([$r('app.color.text_tertiary')])
-      }
-      .alignItems(VerticalAlign.Center)
+      SymbolGlyph(composerPermissionSymbol(this.permissionMode))
+        .fontSize(18)
+        .fontColor([composerPermissionTint(this.permissionMode)])
     }
-    .type(ButtonType.Normal)
-    .height(30)
-    .constraintSize({ maxWidth: 140 })
-    .padding({ left: 10, right: 8 })
-    .borderRadius(UI_RADIUS_PILL)
+    .type(ButtonType.Circle)
+    .width(44)
+    .height(44)
+    .padding(0)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
     .enabled(this.composerEnabled && !this.sending && !this.contextBusy)
     .opacity(this.composerEnabled && !this.sending && !this.contextBusy ? 1 : 0.4)
     .accessibilityText(`权限模式：${this.permissionLabel}`)
-    .onClick(() => {
-      uiOverlayTrace('composer-permission', 'open');
-      this.onPermission();
-    })
-    .bindPopup(this.permissionPopupPresented, {
-      builder: this.composerPermissionPopup,
-      placement: Placement.Top,
-      enableArrow: false,
-      targetSpace: 8,
-      offset: { x: 0, y: -20 },
-      autoCancel: true,
-      showInSubWindow: false,
-      followTransformOfTarget: true,
-      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
-      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
-      levelMode: LevelMode.EMBEDDED,
-      mask: false,
-      onStateChange: (event) => {
-        uiOverlayTrace('composer-permission', event.isVisible ? 'visible' : 'hidden');
-        this.permissionPopupPresented = event.isVisible;
-        if (!event.isVisible) this.onPermissionPopupDismiss();
-      },
-    })
+    .onClick(() => this.onPermission())
   }
 
   /** 工具栏里的模型胶囊；窄屏只压缩文字，不挤占上方输入区域。 */
@@ -426,6 +448,10 @@ export struct ConversationComposer {
   composerModelButton() {
     Button() {
       Row({ space: 4 }) {
+        if (this.agentLabel.length > 0) {
+          Text(this.agentLabel === 'Codex' ? '✣' : this.agentLabel === 'Pi' ? 'π' : '♟')
+            .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary')).accessibilityLevel('no')
+        }
         Text(this.effortLabel.length > 0
           ? `${this.modelLabel} · ${this.effortLabel}`
           : this.modelLabel)
@@ -442,41 +468,19 @@ export struct ConversationComposer {
       .alignItems(VerticalAlign.Center)
     }
     .type(ButtonType.Normal)
-    .height(30)
+    .height(44)
     .constraintSize({ maxWidth: uiScaledMaxWidth(208, 300) })
     .padding({ left: 12, right: 10 })
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
     // 读屏播报完整元信息：视觉可能省略，但强度不能只靠看。
-    .enabled(!this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
-    .opacity(this.runtimeRouteLocked ? 0.4 : 1)
+    .enabled(this.hasModelOptions && !this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
+    .opacity(!this.hasModelOptions || this.runtimeRouteLocked ? 0.4 : 1)
     .accessibilityText(this.effortLabel.length > 0
-      ? `模型：${this.modelLabel}，思考强度：${this.effortLabel}`
-      : `模型：${this.modelLabel}`)
-    .onClick(() => {
-      uiOverlayTrace('composer-model', 'open');
-      this.onModel();
-    })
-    .bindPopup(this.modelPopupPresented, {
-      builder: this.composerModelPopup,
-      placement: Placement.Top,
-      enableArrow: false,
-      targetSpace: 8,
-      offset: { x: 0, y: -20 },
-      autoCancel: true,
-      showInSubWindow: false,
-      followTransformOfTarget: true,
-      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
-      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
-      levelMode: LevelMode.EMBEDDED,
-      mask: false,
-      onStateChange: (event) => {
-        uiOverlayTrace('composer-model', event.isVisible ? 'visible' : 'hidden');
-        this.modelPopupPresented = event.isVisible;
-        if (!event.isVisible) this.onModelPopupDismiss();
-      },
-    })
+      ? `模型：${this.agentLabel} ${this.modelLabel}，思考强度：${this.effortLabel}`
+      : `模型：${this.agentLabel} ${this.modelLabel}`)
+    .onClick(() => this.onModel())
   }
 
   /** 工具栏里的独立 Agent 胶囊，位于模型胶囊之前。 */
@@ -497,88 +501,59 @@ export struct ConversationComposer {
       .alignItems(VerticalAlign.Center)
     }
     .type(ButtonType.Normal)
-    .height(30)
+    .height(44)
     .constraintSize({ maxWidth: 104 })
     .padding({ left: 10, right: 8 })
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .clickEffect(UI_CLICK_EFFECT)
-    .enabled(!this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
-    .opacity(this.runtimeRouteLocked ? 0.4 : 1)
+    .enabled(this.hasAgentOptions && !this.runtimeRouteLocked && this.composerEnabled && !this.sending && !this.contextBusy)
+    .opacity(!this.hasAgentOptions || this.runtimeRouteLocked ? 0.4 : 1)
     .accessibilityText(`Agent：${this.agentLabel}`)
-    .onClick(() => {
-      uiOverlayTrace('composer-agent', 'open');
-      this.onAgent();
-    })
-    .bindPopup(this.agentPopupPresented, {
-      builder: this.composerAgentPopup,
-      placement: Placement.Top,
-      enableArrow: false,
-      targetSpace: 8,
-      offset: { x: 0, y: -20 },
-      autoCancel: true,
-      showInSubWindow: false,
-      followTransformOfTarget: true,
-      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
-      avoidTarget: AvoidanceMode.AVOID_AROUND_TARGET,
-      levelMode: LevelMode.EMBEDDED,
-      mask: false,
-      onStateChange: (event) => {
-        uiOverlayTrace('composer-agent', event.isVisible ? 'visible' : 'hidden');
-        this.agentPopupPresented = event.isVisible;
-        if (!event.isVisible) this.onAgentPopupDismiss();
-      },
-    })
+    .onClick(() => this.onAgent())
   }
 
   @Builder
-  composerPopupHeader(title: string) {
-    Row() {
-      Text(title)
+  composerPickerPanel() {
+    Column() {
+      Text(this.pickerTitle())
         .fontSize(uiFontSize(14))
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .height(44)
+        .gesture(PanGesture({ direction: PanDirection.Down }).onActionEnd((event: GestureEvent) => {
+          if (event.offsetY > 24) this.dismissPicker();
+        }))
+      if (this.pickerPage === 'model') {
+        Column() {
+          this.modelPopupContent()
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: Math.max(1, this.pickerWindowHeight * 0.5 - 44) })
+      } else {
+        Scroll() {
+          Column() {
+            if (this.pickerPage === 'permission') {
+              this.permissionPopupContent()
+            } else if (this.pickerPage === 'agent') {
+              this.agentPopupContent()
+            } else {
+              this.externalPickerContent(this.pickerPage)
+            }
+          }.width('100%')
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: Math.max(1, this.pickerWindowHeight * 0.5 - 44) })
+        .scrollBar(BarState.Off)
+      }
     }
     .width('100%')
-    .height(38)
-    .padding({ left: 14, right: 14 })
-  }
-
-  @Builder
-  composerAgentPopup() {
-    Column() {
-      this.composerPopupHeader('切换智能体')
-      this.agentPopupContent()
-    }
-    .width(304)
-    .height(190)
+    .backgroundColor($r('app.color.bg_card'))
+    .borderRadius(UI_RADIUS_CONTAINER)
     .clip(true)
-    .id(uiOverlayBuildId('composer-agent'))
-  }
-
-  @Builder
-  composerPermissionPopup() {
-    Column() {
-      this.composerPopupHeader('切换权限模式')
-      this.permissionPopupContent()
-    }
-    .width(304)
-    .height(264)
-    .clip(true)
-    .id(uiOverlayBuildId('composer-permission'))
-  }
-
-  @Builder
-  composerModelPopup() {
-    Column() {
-      this.composerPopupHeader('切换模型')
-      this.modelPopupContent()
-    }
-    .width(304)
-    .height(352)
-    .clip(true)
-    .id(uiOverlayBuildId('composer-model'))
+    .transition(this.pickerSlide())
   }
 
   @Builder
@@ -589,10 +564,10 @@ export struct ConversationComposer {
           .width(15)
           .height(15)
           .color($r('app.color.text_primary'))
-      } else if (this.streaming && !this.hasContent) {
-        SymbolGlyph($r('sys.symbol.square'))
-          .fontSize(11)
-          .fontColor([$r('app.color.text_primary')])
+      } else if (this.primaryShowsStop()) {
+        SymbolGlyph($r('sys.symbol.square_fill'))
+          .fontSize(12)
+          .fontColor([$r('app.color.danger')])
       } else {
         SymbolGlyph($r('sys.symbol.arrow_up'))
           .fontSize(16)
@@ -602,63 +577,21 @@ export struct ConversationComposer {
       }
     }
     .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
+    .width(44)
+    .height(44)
     .padding(0)
     .borderRadius(UI_RADIUS_PILL)
     .backgroundColor(Color.Transparent)
     .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
     .clickEffect(UI_ICON_CLICK_EFFECT)
     .enabled(this.composerEnabled && !this.sending
-      && ((this.streaming && !this.hasContent) || this.canSend))
+      && ((this.primaryShowsStop()) || this.canSend))
     .accessibilityText(this.sending
       ? '发送中'
-      : this.streaming && !this.hasContent
+      : this.primaryShowsStop()
         ? '停止'
         : '发送')
     .onClick(() => this.tapPrimaryAction())
-  }
-
-  /** 收起工具栏末尾使用独立展开入口，不复用发送状态，避免空草稿时按钮失效。 */
-  @Builder
-  composerExpandButton() {
-    Button() {
-      SymbolGlyph($r('sys.symbol.chevron_up'))
-        .fontSize(16)
-        .fontColor([$r('app.color.text_primary')])
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(this.composerEnabled)
-    .opacity(this.composerEnabled ? 1 : 0.4)
-    .accessibilityText('展开输入框')
-    .onClick(() => this.onExpand())
-  }
-
-  /** 运行中的收起工具栏同时保留展开入口，因此停止操作使用独立按钮。 */
-  @Builder
-  composerCompactStopButton() {
-    Button() {
-      SymbolGlyph($r('sys.symbol.square_fill'))
-        .fontSize(12)
-        .fontColor([$r('app.color.danger')])
-    }
-    .type(ButtonType.Circle)
-    .width(40)
-    .height(40)
-    .padding(0)
-    .borderRadius(UI_RADIUS_PILL)
-    .backgroundColor(Color.Transparent)
-    .clickEffect(UI_ICON_CLICK_EFFECT)
-    .enabled(this.composerEnabled)
-    .opacity(this.composerEnabled ? 1 : 0.4)
-    .accessibilityText('停止')
-    .onClick(() => this.onAbort())
   }
 
   /** 打开态与关闭态使用不同的 ArkUI 分支，关闭时直接销毁承载原生 Popup 的锚点节点。 */
@@ -668,7 +601,7 @@ export struct ConversationComposer {
       Row() {
         this.composerModelButton()
       }
-      .height(40)
+      .height(44)
       .alignItems(VerticalAlign.Center)
     }
   }
@@ -679,28 +612,27 @@ export struct ConversationComposer {
       Row() {
         this.composerModelButton()
       }
-      .height(40)
+      .height(44)
       .alignItems(VerticalAlign.Center)
     }
   }
 
-  /** 工具栏左侧控制保持固定顺序；末尾主操作由外层 Row 独立固定到右侧。 */
+  @Builder
+  composerAddButton() {
+    this.composerIconButton(
+      $r('sys.symbol.plus'),
+      $r('app.color.text_primary'),
+      this.composerEnabled && !this.sending && !this.pickingImages && !this.pickingFiles,
+      '添加附件或上下文',
+      () => this.onAdd(),
+    )
+  }
+
+  /** 工具栏左侧控制保持固定顺序；末尾主操作固定到右侧。 */
   @Builder
   composerToolbarLeadingItems() {
     if (this.showAddButton) {
-      ListItem() {
-        Row() {
-          this.composerIconButton(
-            $r('sys.symbol.plus'),
-            $r('app.color.text_primary'),
-            this.composerEnabled && !this.sending && !this.pickingImages && !this.pickingFiles,
-            '添加附件或上下文',
-            () => this.onAdd(),
-          )
-        }
-        .height(40)
-        .alignItems(VerticalAlign.Center)
-      }
+      ListItem() { this.composerAddButton() }
     }
 
     if (this.hasPermissionOptions) {
@@ -708,7 +640,7 @@ export struct ConversationComposer {
         Row() {
           this.composerPermissionButton()
         }
-        .height(40)
+        .height(44)
         .alignItems(VerticalAlign.Center)
       }
     }
@@ -717,7 +649,7 @@ export struct ConversationComposer {
       ListItem() {
         Row() {
           Button('计划')
-            .height(30)
+            .height(44)
             .fontSize(uiFontSize(12))
             .fontColor($r('app.color.chat_cta_text'))
             .backgroundColor($r('app.color.chat_cta'))
@@ -728,17 +660,7 @@ export struct ConversationComposer {
             .accessibilityText('关闭计划模式')
             .onClick(() => this.onPlanToggle())
         }
-        .height(40)
-        .alignItems(VerticalAlign.Center)
-      }
-    }
-
-    if (this.hasAgentChip()) {
-      ListItem() {
-        Row() {
-          this.composerAgentButton()
-        }
-        .height(40)
+        .height(44)
         .alignItems(VerticalAlign.Center)
       }
     }
@@ -766,12 +688,13 @@ export struct ConversationComposer {
         .maxLines(1)
     }
     .width('100%')
-    .height(40)
+    .height(44)
     .padding({ left: 12, right: 12 })
     .alignItems(VerticalAlign.Center)
   }
 
-  build() {
+  @Builder
+  composerInputSurface() {
     Column({ space: 6 }) {
       if (this.showStreamingStatus && this.streaming && this.expanded()) {
         Row({ space: 6 }) {
@@ -894,86 +817,58 @@ export struct ConversationComposer {
           .width('100%')
           .alignItems(VerticalAlign.Center)
 
-          // 运行时目录完全落定后整排出现；所有按钮保持同一顺序并从左侧开始排列。
-          if (this.toolbarReady) {
-            Row({ space: 6 }) {
-              List({ space: 6 }) {
-                this.composerToolbarLeadingItems()
-              }
-              .listDirection(Axis.Horizontal)
-              .height(40)
-              .layoutWeight(1)
-              .scrollBar(BarState.Off)
-
-              this.composerPrimaryButton()
-            }
-            .width('100%')
-            .height(40)
-            .alignItems(VerticalAlign.Center)
-          } else {
-            this.composerToolbarLoading()
-          }
-        } else if (this.compactToolbar) {
-          // 默认态与展开态共用相同左对齐顺序，窄栏时整排可横向浏览。
-          if (this.toolbarReady) {
-            Row({ space: 6 }) {
-              List({ space: 6 }) {
-                this.composerToolbarLeadingItems()
-                if (this.sending || this.streaming) {
-                  ListItem() {
-                    Row() {
-                      this.composerCompactStopButton()
-                    }
-                    .height(40)
-                    .alignItems(VerticalAlign.Center)
-                  }
-                }
-              }
-              .listDirection(Axis.Horizontal)
-              .height(40)
-              .layoutWeight(1)
-              .scrollBar(BarState.Off)
-
-              this.composerExpandButton()
-            }
-            .width('100%')
-            .height(40)
-            .alignItems(VerticalAlign.Center)
-          } else {
-            this.composerToolbarLoading()
-          }
-        } else {
-          // 新建任务沿用原有紧凑输入态，避免共享组件的详情页改造改变其首屏交互。
+          // 目录加载只替换左侧工具，右侧发送或停止始终保留。
           Row({ space: 6 }) {
-            Column() {
-              TextArea({ placeholder: this.placeholder, text: this.input })
-                .id(this.inputId)
-                .enabled(this.composerEnabled)
-                .fontSize(uiFontSize(15))
-                .placeholderFont({ size: uiFontSize(15) })
-                .lineHeight(uiLineHeight(22))
-                .fontColor($r('app.color.text_primary'))
-                .placeholderColor($r('app.color.text_placeholder'))
-                .caretColor($r('app.color.chat_input_caret'))
-                .backgroundColor(Color.Transparent)
-                .maxLength(LONG_PASTE_MAX_CHARS)
-                .align(Alignment.Center)
-                .textAlign(TextAlign.Start)
-                .padding({ left: 4, right: 4 })
-                .width('100%')
-                .constraintSize({ minHeight: 40, maxHeight: 40 })
-                .onAppear(() => this.focusInputAfterAppear())
-                .onFocus(() => this.onFocusChange(true))
-                .onBlur(() => this.onFocusChange(false))
-                .onChange((value: string) => this.onInputChange(value))
+            if (this.toolbarReady) {
+              List({ space: 6 }) {
+                this.composerToolbarLeadingItems()
+              }
+              .listDirection(Axis.Horizontal)
+              .height(44)
+              .layoutWeight(1)
+              .scrollBar(BarState.Off)
+            } else {
+              Row() {
+                this.composerToolbarLoading()
+              }.layoutWeight(1)
             }
-            .layoutWeight(1)
-            .backgroundColor(Color.Transparent)
-            .animation({ duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE })
-
             this.composerPrimaryButton()
           }
           .width('100%')
+          .height(44)
+          .alignItems(VerticalAlign.Center)
+        } else {
+          Row({ space: 4 }) {
+            if (this.showAddButton) {
+              this.composerAddButton()
+            }
+            if (this.toolbarReady && this.hasPermissionOptions) {
+              this.composerPermissionButton()
+            }
+            Button() {
+              Text(this.input.length > 0 ? this.input : this.placeholder)
+                .fontSize(uiFontSize(15))
+                .fontColor(this.input.length > 0 ? $r('app.color.text_primary') : $r('app.color.text_placeholder'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .textAlign(TextAlign.Start)
+                .width('100%')
+            }
+            .type(ButtonType.Normal)
+            .layoutWeight(1)
+            .height(44)
+            .padding({ left: 4, right: 4 })
+            .backgroundColor(Color.Transparent)
+            .enabled(this.composerEnabled)
+            .accessibilityText(this.input.length > 0 ? this.input : this.placeholder)
+            .onClick(() => this.onExpand())
+
+            if (this.sending || this.streaming || this.canSend) {
+              this.composerPrimaryButton()
+            }
+          }
+          .width('100%')
+          .height(44)
           .alignItems(VerticalAlign.Center)
         }
         }
@@ -982,15 +877,15 @@ export struct ConversationComposer {
         .padding({
           left: 10,
           right: 10,
-          // 浮动收起态与左侧 HdsTabs/miniBar 共用 52vp：40vp 内容 + 6vp × 2。
-          top: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
-          bottom: this.expanded() ? 8 : (this.floatingGlass ? 6 : 4),
+          // 浮动收起态与左侧 HdsTabs/miniBar 共用 52vp：44vp 内容 + 4vp × 2。
+          top: this.expanded() ? 8 : 4,
+          bottom: this.expanded() ? 8 : 4,
         })
         // 只让系统材质作用于内容层；透明或不支持材质时由 Stack 底层兜底。
         .backgroundColor(Color.Transparent)
         .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
         .clip(true)
-        // 与工具栏 Popup 共用 THIN 沉浸光感；系统负责双模式与光感强度。
+        // 只对输入区使用浮动操作栏材质，工具栏 Popup 保持系统默认。
         .systemMaterial(this.floatingGlass
           ? this.floatingGlassMaterial
           : uiMaterial.Material.empty)
@@ -1008,6 +903,20 @@ export struct ConversationComposer {
       .borderRadius(this.expanded() ? UI_RADIUS_CONTAINER : 32)
       .clip(true)
       .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
+    }
+    .width('100%')
+    .transition(this.pickerSlide())
+  }
+
+  build() {
+    Column() {
+      if (this.pickerVisible) {
+        this.composerPickerPanel()
+      } else if (this.inputVisible) {
+        this.composerInputSurface()
+      } else {
+        Row().width('100%').height(52)
+      }
     }
     .width('100%')
     .constraintSize({ maxWidth: this.maxContentWidth > 0 ? this.maxContentWidth : (this.floatingGlass ? 720 : 760) })

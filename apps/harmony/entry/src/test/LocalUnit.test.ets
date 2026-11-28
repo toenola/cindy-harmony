@@ -5204,14 +5204,14 @@ export default function localUnitTest() {
       scheduler.workspaceKind = 'project';
       scheduler.workingDir = '/work/cindy-harmony';
       expect(taskIsAutomation(scheduler)).assertEqual(true);
-      expect(taskListCategory(scheduler)).assertEqual('dialogues');
+      expect(taskListCategory(scheduler)).assertEqual('automations');
 
       const legacySchedule = new RemoteSession();
       legacySchedule.title = '[Schedule] Weekly report';
       legacySchedule.workspaceKind = 'dialogue';
       legacySchedule.workingDir = '';
       expect(taskIsAutomation(legacySchedule)).assertEqual(true);
-      expect(taskListCategory(legacySchedule)).assertEqual('dialogues');
+      expect(taskListCategory(legacySchedule)).assertEqual('automations');
 
       const archived = new RemoteSession();
       archived.status = 'archived';
@@ -5250,14 +5250,14 @@ export default function localUnitTest() {
 
     it('persistsUsageTabAndMigratesAutomationIntoDialogues', 0, () => {
       const preferences = new TaskListPreferences();
-      preferences.activeListTab = 'usage';
+      preferences.activeListTab = 'automations';
       preferences.sortMode = 'alphabetic';
       preferences.projectOrder = 'custom';
       preferences.manualProjectOrder = ['desktop-a:/repo', 'desktop-a:/repo'];
       preferences.searchQuery = '巡检';
       const serialized = serializeTaskListPreferences(preferences);
       const roundTrip = parseTaskListPreferences(serialized);
-      expect(roundTrip.activeListTab).assertEqual('usage');
+      expect(roundTrip.activeListTab).assertEqual('automations');
       expect(roundTrip.sortMode).assertEqual('alphabetic');
       expect(roundTrip.projectOrder).assertEqual('custom');
       expect(roundTrip.manualProjectOrder.length).assertEqual(1);
@@ -5276,7 +5276,7 @@ export default function localUnitTest() {
         activityFilter: '7d',
       }));
       expect(legacy.activeListTab).assertEqual('dialogues');
-      expect(parseTaskListPreferences('{"activeListTab":"automations"}').activeListTab).assertEqual('dialogues');
+      expect(parseTaskListPreferences('{"activeListTab":"automations"}').activeListTab).assertEqual('automations');
       const migrated = serializeTaskListPreferences(legacy);
       expect(migrated.indexOf('statusFilter')).assertEqual(-1);
       expect(migrated.indexOf('projectFilterKeys')).assertEqual(-1);

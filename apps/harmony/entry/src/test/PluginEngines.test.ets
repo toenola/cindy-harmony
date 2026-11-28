@@ -12,6 +12,20 @@ const provider = 'acp-plugin:com.example:agy';
 // usage, and a repeated same-device read vs. switching devices/accounts. No network or waits.
 export default function pluginEnginesTests(): void {
   describe('PluginEngines', () => {
+    // Unit: picker-visible catalog keeps wire IDs and the host reason, unlike the icon-only projection.
+    it('retains valid model IDs, display names, effort levels and unavailable reason', 0, (): void => {
+      const raw = JSON.parse('[{"providerId":"acp-plugin:plugin:engine","name":"Engine",'
+        + '"availability":{"state":"unavailable","message":"CLI not found"},'
+        + '"models":[{"id":"wire/model","displayName":"Model","efforts":["high","bad","low"]},'
+        + '{"id":"alt","label":"Alternative"}]}]') as Object;
+      const engine = normalizePluginEngines(raw)[0];
+      expect(engine.availabilityMessage).assertEqual('CLI not found');
+      expect(engine.models.length).assertEqual(2);
+      expect(engine.models[0].id).assertEqual('wire/model');
+      expect(engine.models[0].efforts.join(',')).assertEqual('low,high');
+      expect(engine.models[1].label).assertEqual('Alternative');
+    });
+
     it('matches_acp_using_the_full_provider_identity_and_never_relabels_builtins', 0, () => {
       const raw = JSON.parse('[{"providerId":"acp-plugin:other:agy","name":"Other"},'
         + '{"providerId":"acp-plugin:com.example:agy","name":" Antigravity ","iconDataUrl":"data:image/png;base64,AA==",'

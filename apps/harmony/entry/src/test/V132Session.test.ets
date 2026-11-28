@@ -1,11 +1,11 @@
 import { describe, expect, it } from '@ohos/hypium';
 import { RemoteSession, parseSession } from '../main/ets/core/tasks/TaskModels';
-import { agentLocationLabel, effectiveAgentDeviceId, parseSessionAgentSwitchIntent, runtimeRouteNeedsRemoteCatalog, sessionAgentSwitchIntentApplied, sessionSendNeedsModelReselection, supportsSessionAgentSwitch } from '../main/ets/core/tasks/SessionAgentSwitch';
+import { agentLocationLabel, effectiveAgentDeviceId, parseSessionAgentSwitchIntent, runtimeRouteNeedsRemoteCatalog, sessionAgentSwitchIntentApplied, sessionSendNeedsModelReselection, supportsSessionAgentSwitch, supportsAgentRelocation, isOrcaAgentSession, sendSessionAgentIntent } from '../main/ets/core/tasks/SessionAgentSwitch';
 import {
   RemoteAgentCatalog, RemoteAgentDevice, remoteAgentLocationSupported, remoteAgentModelOptions, remoteAgentProviderList,
   resolveAgentLocationPick, selectRemoteAgentDevices,
 } from '../main/ets/core/tasks/RemoteAgentCatalogs';
-import { ComposerModelGroup, ComposerModelOption, composerModelKey, groupComposerModelOptions } from '../main/ets/core/ComposerCatalog';
+import { ComposerModelGroup, ComposerModelOption, composerModelKey, groupComposerModelOptions, pickerVisibleGroups, pickerFavorites, recommendedPickerEffort, modelFavoriteMutation, modelFavoriteSource, pickerRecommendedOption } from '../main/ets/core/ComposerCatalog';
 import { PresenceSnapshot } from '../main/ets/core/device-link/DlProtocol';
 
 function wireRecord(value: string): Record<string, Object> {
@@ -32,6 +32,98 @@ const REMOTE_CATALOG = '{"providers":['
 
 export default function v132SessionTests() {
   describe('V132Session', () => {
+    // Unit: the production reset resolves a target before resolving effort and turns off Fast.
+    it('prefers a matching protocol or family without requiring an explicit recommendation', 0, (): void => {
+      const claude = new ComposerModelOption();
+      claude.pickerHarness = 'claude-code';
+      claude.id = 'vendor/model';
+      claude.pickerNativeApi = 'openai-responses';
+      claude.pickerOutboundApi = 'openai-responses';
+      const codex = new ComposerModelOption();
+      codex.pickerHarness = 'codex';
+      codex.pickerOutboundApi = 'openai-responses';
+      codex.efforts = ['low', 'high'];
+      codex.defaultEffort = 'high';
+      const pi = new ComposerModelOption();
+      pi.pickerHarness = 'pi';
+      const inferred = pickerRecommendedOption(claude, [pi, codex]);
+      expect(inferred.pickerHarness).assertEqual('codex');
+      expect(inferred.pickerEffort).assertEqual('high');
+      expect(inferred.pickerFast).assertFalse();
+      claude.pickerModelFamily = 'grok';
+      expect(pickerRecommendedOption(claude, [codex, pi]).pickerHarness).assertEqual('pi');
+    });
+
+    // Unit: production favorite projection, recommendation and plugin intent wire shape.
+    it('retains multiple combinations and resets to the declared compatible harness', 0, (): void => {
+      const codex = new ComposerModelOption();
+      codex.pickerHarness = 'codex';
+      codex.id = 'gpt';
+      codex.providerId = 'p';
+      codex.efforts = ['low', 'high'];
+      codex.defaultEffort = 'low';
+      codex.supportsFastMode = true;
+      codex.pickerRecommendedHarness = 'pi';
+      const pi = new ComposerModelOption();
+      pi.pickerHarness = 'pi';
+      pi.efforts = ['medium'];
+      const favorites = pickerFavorites(groupComposerModelOptions([codex]), [
+        wireRecord('{"uid":"one","providerId":"p","modelId":"gpt","agent":"codex","effort":"low"}'),
+        wireRecord('{"uid":"two","providerId":"p","modelId":"gpt","agent":"codex","effort":"high","fast":true}'),
+      ]);
+      expect(favorites[0].options.length).assertEqual(2);
+      expect(favorites[0].options[0].pickerFast).assertFalse();
+      expect(favorites[0].options[1].pickerEffort).assertEqual('high');
+      expect(favorites[0].options[1].pickerFast).assertTrue();
+      expect(pickerRecommendedOption(codex, [pi]).pickerHarness).assertEqual('pi');
+      expect(pickerRecommendedOption(codex, [pi]).pickerEffort).assertEqual('medium');
+      expect(pickerRecommendedOption(codex, [pi], 'codex').pickerHarness).assertEqual('codex');
+    });
+
+    it('uses six arguments for a same-location ACP switch with the full provider ID', 0, async (): Promise<void> => {
+      await sendSessionAgentIntent(async (_host: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+        expect(channel).assertEqual('maker:switch-session-agent');
+        expect(args.length).assertEqual(6);
+        expect(args[1]).assertEqual('acp');
+        expect(args[3]).assertEqual('acp-plugin:plugin:harness');
+        return undefined;
+      }, 'host', 'session', 'acp', 'default', 'acp-plugin:plugin:harness', '', false, undefined);
+    });
+
+    // Unit: production picker projection and host mutation contract. Previous directory tests
+    // do not exercise current-only visibility or remote favorites whose provider IDs overlap.
+    it('filters the focused source and ranks favorites ahead of local and remote matches', 0, (): void => {
+      const local = new ComposerModelOption();
+      local.id = 'model';
+      local.label = 'Local model';
+      local.providerId = 'shared';
+      const remote = new ComposerModelOption();
+      remote.id = 'model';
+      remote.label = 'Remote model';
+      remote.providerId = 'shared';
+      remote.agentDeviceId = 'computer';
+      remote.pickerHarness = 'codex';
+      remote.efforts = ['low', 'high'];
+      remote.defaultEffort = 'high';
+      const rows = groupComposerModelOptions([remote, local]);
+      expect(pickerVisibleGroups(rows, rows[0].key, false, '')[0].options[0].label).assertEqual('Remote model');
+      expect(pickerVisibleGroups(rows, '', true, 'remote').length).assertEqual(1);
+      const all = pickerVisibleGroups(rows, '', true, '');
+      expect(all[0].options[0].label).assertEqual('Local model');
+      const stored = wireRecord('{"uid":"u","providerId":"unused","modelId":"model","agent":"codex","effort":"high"}');
+      stored['providerId'] = modelFavoriteSource(remote);
+      expect(pickerFavorites(all, [stored])[0].key).assertEqual('picker:favorites');
+      expect(recommendedPickerEffort(remote)).assertEqual('high');
+      const add = modelFavoriteMutation(remote, 'codex', 'high', false, []);
+      expect(add['kind']).assertEqual('add');
+      const item = add['item'] as Record<string, Object>;
+      expect(item['providerId']).assertEqual(stored['providerId']);
+      expect(item['fast'] === undefined).assertTrue();
+      const remove = modelFavoriteMutation(remote, 'codex', 'high', false, [stored]);
+      expect(remove['kind']).assertEqual('remove');
+      expect(remove['expected'] === stored).assertTrue();
+    });
+
     it('keeps_same_model_relocation_pending_until_location_really_changes', 0, () => {
       const session = parseSession(wireRecord('{"id":"task","agentKind":"codex","model":"model"}'));
       const intent = parseSessionAgentSwitchIntent(wireRecord('{"targetAgentKind":"codex","model":"model","agentDeviceId":"remote"}'));
@@ -167,11 +259,34 @@ export default function v132SessionTests() {
       const pending = parseSessionAgentSwitchIntent(wireRecord('{"targetAgentKind":"codex","model":"model","agentDeviceId":"remote"}'));
       expect(runtimeRouteNeedsRemoteCatalog(session, pending)).assertTrue();
       expect(agentLocationLabel(session, pending, new Map<string, string>([['remote', 'Office']]))).assertEqual('Office');
-      session.orcaRole = 'worker';
-      expect(supportsSessionAgentSwitch(session, true)).assertFalse();
+      session.agentDeviceId = 'remote';
+      for (const role of ['lead', 'worker']) {
+        session.orcaRole = role;
+        expect(supportsSessionAgentSwitch(session, true)).assertTrue();
+        expect(isOrcaAgentSession(session)).assertTrue();
+        expect(supportsAgentRelocation(session, true, true, false, true)).assertFalse();
+        expect(supportsAgentRelocation(session, true, true, true, false)).assertTrue();
+      }
       session.orcaRole = '';
+      session.orcaRemoteLead = true;
+      expect(supportsSessionAgentSwitch(session, true)).assertTrue();
+      expect(supportsAgentRelocation(session, true, true, true, false)).assertFalse();
+      expect(supportsAgentRelocation(session, true, true, false, true)).assertTrue();
+      session.orcaRemoteLead = false;
       session.remoteHostId = 'ssh';
       expect(supportsSessionAgentSwitch(session, true)).assertFalse();
+    });
+    // Unit: pass distinct pane hosts to the production sender and observe destination and wire args.
+    it('writes_to_each_orca_task_host_and_only_adds_location_when_moving', 0, async () => {
+      const requests: string[] = [];
+      const send = async (host: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+        requests.push(JSON.stringify([host, channel, args]));
+        return undefined;
+      };
+      await sendSessionAgentIntent(send, 'lead-host', 'lead', 'claude-code', 'model', 'provider', 'high', false, undefined);
+      await sendSessionAgentIntent(send, 'worker-host', 'worker', 'codex', 'model', 'provider', 'medium', false, null);
+      expect(requests[0]).assertEqual('["lead-host","maker:switch-session-agent",["lead","claude-code","model","provider","high",false]]');
+      expect(requests[1]).assertEqual('["worker-host","maker:switch-session-agent",["worker","codex","model","provider","medium",false,{"agentDeviceId":null}]]');
     });
   });
 }

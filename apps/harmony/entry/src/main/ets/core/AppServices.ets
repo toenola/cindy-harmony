@@ -1,3 +1,4 @@
+import { NEW_SESSION_WORKTREE_CHANNELS, NewSessionWorktreeInvoke } from './tasks/NewSessionWorktree';
 import { isWorkdirRead, safeWorkdirRelative, WorkdirRequest, WorkdirWatchListener } from './files/WorkdirFiles';
 import { PluginEngineStore } from './plugin-engines/PluginEngineStore';
 import { parseOfficialSharedTaskInvitation } from './shared-tasks/SharedTaskInvitation';
@@ -777,6 +778,54 @@ export class AppServices {
     await this.client.unsubscribe(device, ['fs-watch:' + workdir]);
   }
 
+  async modelPickerFavorites(device: string, channel: 'maker:model-favorites:get' | 'maker:model-favorites:apply',
+    args: Object[], current: () => boolean): Promise<Object | undefined> {
+    const scope = this.moduleScope;
+    const check = (): void => {
+      if (!scope || scope !== this.moduleScope || !current() || this.isSharedTaskPeer(device)
+        || !this.tasks.deviceList.some((row: PresenceSnapshot): boolean => row.deviceId === device && row.remoteControlEnabled)) {
+        throw new Error('REMOTE_DISABLED');
+      }
+    };
+    if (channel !== 'maker:model-favorites:get' && channel !== 'maker:model-favorites:apply') throw new Error('REMOTE_DISABLED');
+    check();
+    await this.openLink(device);
+    check();
+    const request = new DlInvokeOptions();
+    request.channel = channel;
+    request.args = args;
+    request.preSend = check;
+    const result = unwrapInvokeResult(await this.client.invoke(device, request));
+    check();
+    return result;
+  }
+
+  newSessionWorktreeLedgerKey(device: string): string {
+    return JSON.stringify([this.usageCardOwner, RelayRoute.instance.cacheScope(this.auth.cacheAccountId), device]);
+  }
+
+  newSessionWorktree(device: string, current: () => boolean): NewSessionWorktreeInvoke {
+    const scope = this.moduleScope;
+    const owned = (): boolean => current() && scope.length > 0 && scope === this.moduleScope
+      && !this.isSharedTaskPeer(device) && this.tasks.deviceList.some((row: PresenceSnapshot): boolean =>
+        row.deviceId === device && row.remoteControlEnabled);
+    return async (channel, args): Promise<Object | undefined> => {
+      if (!NEW_SESSION_WORKTREE_CHANNELS.includes(channel) || !owned()) throw new Error('REMOTE_DISABLED');
+      await this.openLink(device);
+      const requireOwner = (): void => { if (!owned()) throw new Error('OWNER_CHANGED'); };
+      requireOwner();
+      const options = new DlInvokeOptions();
+      options.channel = channel;
+      options.args = args;
+      options.timeoutMs = channel === 'worktree:create' ? 300000
+        : channel === 'worktree:cancel-precreated' || channel === 'worktree:discard-precreated' ? 60000 : 10000;
+      options.preSend = requireOwner;
+      const reply = await this.client.invoke(device, options);
+      requireOwner();
+      return unwrapInvokeResult(reply);
+    };
+  }
+
   async invokeOwnedModule(device: string, channel: string, args: Object[], timeoutMs?: number): Promise<Object | undefined> {
     const allowed = ['sidebar-settings:get-project-aliases', 'sidebar-settings:set-project-info',
       'sidebar-settings:get-project-icon-image', 'sidebar-settings:get-project-auto-icon',
@@ -1402,7 +1451,8 @@ export class AppServices {
       }
       return;
     }
-    if (channel === 'maker:remote-resources:changed' || channel === PROJECT_ALIASES_CHANGED) {
+    if (channel === 'maker:remote-resources:changed' || channel === PROJECT_ALIASES_CHANGED
+      || channel === 'maker:model-favorites:changed') {
       this.modulePushListeners.forEach((listener): void => listener(deviceId, channel, payload));
     }
     switch (channel) {

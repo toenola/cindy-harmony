@@ -2,7 +2,7 @@ import { harmonyV12String } from '../core/HarmonyStrings';
 import { AppServices } from '../core/AppServices';
 import { TeammateSettingForm } from '../core/tasks/TeammateRoster';
 import { readStr } from '../core/tasks/TaskModels';
-import { UI_RADIUS_CONTROL, uiFontSize } from './UiKit';
+import { UI_LIST_CLICK_EFFECT, UI_RADIUS_CONTAINER, UI_RADIUS_CONTROL, UI_RADIUS_PILL, uiFontSize } from './UiKit';
 
 @Component
 export struct TeammateSettingsPanel {
@@ -120,20 +120,61 @@ export struct TeammateSettingsPanel {
     }
   }
 
+  private modelPreview(): string {
+    const form = this.forms.get('models');
+    if (form?.values['followsDefault'] === true) return this.label('v138_follow_model');
+    // The existing model summary starts each line with the model ID, followed by route metadata.
+    return (form?.summary ?? '').split('\n')[0].split(' · ')[0].trim();
+  }
+
   @Builder
-  menuItem(id: string, title: string) {
-    if (this.forms.has(id)) {
-      Button() {
-        Row() {
-          Text(title).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(14).fontColor([$r('app.color.text_secondary')])
-        }.width('100%')
-      }
-      .type(ButtonType.Normal).height(44).width('100%')
-      .backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
-      .enabled(!this.busy && !this.deviceDisabled && !this.error)
-      .onClick(() => { this.saved = false; this.selectPage(id); })
+  divider(inset: number) {
+    Divider().strokeWidth(1).color($r('app.color.border')).margin({ left: inset, right: 12 })
+  }
+
+  @Builder
+  menuItem(id: string, title: string, icon: Resource, value: string) {
+    Button() {
+      Row({ space: 10 }) {
+        SymbolGlyph(icon).width(24).fontSize(uiFontSize(17)).fontColor([$r('app.color.text_secondary')])
+        Text(title).fontSize(uiFontSize(15)).fontColor($r('app.color.text_primary')).layoutWeight(1)
+          .textAlign(TextAlign.Start)
+        if (value.length > 0) {
+          Text(value).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+            .constraintSize({ maxWidth: '50%' }).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(12).fontColor([$r('app.color.text_secondary')])
+      }.width('100%')
     }
+    .type(ButtonType.Normal).constraintSize({ minHeight: 48 }).width('100%')
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTROL)
+    .clickEffect(UI_LIST_CLICK_EFFECT)
+    .enabled(!this.busy && !this.deviceDisabled && !this.error)
+    .onClick(() => { this.saved = false; this.selectPage(id); })
+  }
+
+  @Builder
+  settingsList() {
+    Column() {
+      if (this.forms.has('profile')) {
+        this.menuItem('profile', this.label('v138_profile'), $r('sys.symbol.person_head_on_circle'),
+          readStr(this.forms.get('profile')?.values, 'name'))
+      }
+      if (this.forms.has('memory')) {
+        if (this.forms.has('profile')) {
+          this.divider(46)
+        }
+        this.menuItem('memory', this.label('v138_memory'), $r('sys.symbol.AI_memory'), '')
+      }
+      if (this.forms.has('models')) {
+        if (this.forms.has('profile') || this.forms.has('memory')) {
+          this.divider(46)
+        }
+        this.menuItem('models', this.label('v138_models'), $r('sys.symbol.slider_horizontal_2'), this.modelPreview())
+      }
+    }
+    .width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTAINER).clip(true)
   }
 
   @Builder
@@ -143,57 +184,82 @@ export struct TeammateSettingsPanel {
       Toggle({ type: ToggleType.Switch, isOn: checked })
         .accessibilityText(label).enabled(!this.busy && !this.deviceDisabled && !this.error)
         .onChange(update)
-    }.width('100%').constraintSize({ minHeight: 44 })
+    }.width('100%').constraintSize({ minHeight: 48 }).padding({ left: 12, right: 12 })
+  }
+
+  @Builder
+  profileForm() {
+    Column({ space: 8 }) {
+      Text(this.label('v138_name')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      TextInput({ text: this.name }).width('100%').height(44).maxLength(200)
+        .backgroundColor($r('app.color.bg_card')).fontColor($r('app.color.text_primary'))
+        .accessibilityText(this.label('v138_teammate_name')).enabled(!this.busy && !this.deviceDisabled && !this.error)
+        .onChange((value: string) => { this.name = value; this.saved = false; })
+      Text(this.label('v138_description')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      TextArea({ text: this.description }).width('100%').constraintSize({ minHeight: 76, maxHeight: 124 }).maxLength(12000)
+        .backgroundColor($r('app.color.bg_card')).fontColor($r('app.color.text_primary')).borderRadius(UI_RADIUS_CONTROL)
+        .accessibilityText(this.label('v138_teammate_description')).enabled(!this.busy && !this.deviceDisabled && !this.error)
+        .onChange((value: string) => { this.description = value; this.saved = false; })
+    }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
+      .backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTAINER)
+  }
+
+  @Builder
+  pageHeader() {
+    Row({ space: 8 }) {
+      Button() {
+        SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(16).fontColor([$r('app.color.text_primary')])
+      }.type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor($r('app.color.bg_page'))
+        .accessibilityText(this.label('v138_settings_back')).enabled(!this.busy)
+        .onClick(() => { this.saved = false; this.selectPage(''); })
+      Text(this.label(this.page === 'profile' ? 'v138_profile' : this.page === 'models' ? 'v138_models' : 'v138_memory'))
+        .fontSize(uiFontSize(16)).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+    }.width('100%')
   }
 
   build() {
     Scroll() {
-      Column({ space: 10 }) {
-        Row({ space: 8 }) {
-          if (this.page) {
-            Button() {
-              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(16).fontColor([$r('app.color.text_primary')])
-            }.type(ButtonType.Circle).width(44).height(44).padding(0).backgroundColor(Color.Transparent)
-              .accessibilityText(this.label('v138_settings_back')).enabled(!this.busy)
-              .onClick(() => { this.saved = false; this.selectPage(''); })
-          }
-          Text(this.page === 'profile' ? this.label('v138_profile') : this.page === 'models' ? this.label('v138_models') : this.page === 'memory' ? this.label('v138_memory') : this.label('v138_settings'))
-            .fontSize(uiFontSize(16)).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-        }.width('100%')
+      Column({ space: 12 }) {
+        if (this.page) {
+          this.pageHeader()
+        }
         if (this.page === 'profile') {
-          Text(this.label('v138_name')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-          TextInput({ text: this.name }).height(44).maxLength(200).accessibilityText(this.label('v138_teammate_name'))
-            .enabled(!this.busy && !this.deviceDisabled && !this.error)
-            .onChange((value: string) => { this.name = value; this.saved = false; })
-          Text(this.label('v138_description')).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-          TextArea({ text: this.description }).constraintSize({ minHeight: 76, maxHeight: 124 }).maxLength(12000)
-            .accessibilityText(this.label('v138_teammate_description')).enabled(!this.busy && !this.deviceDisabled && !this.error)
-            .onChange((value: string) => { this.description = value; this.saved = false; })
+          this.profileForm()
         } else if (this.page === 'memory') {
-          this.toggleRow(this.label('v138_memory_enabled'), this.memory, (value: boolean) => { this.memory = value; this.saved = false; })
+          Column() {
+            this.toggleRow(this.label('v138_memory_enabled'), this.memory, (value: boolean) => {
+              this.memory = value;
+              this.saved = false;
+            })
+          }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTAINER)
         } else if (this.page === 'models') {
-          this.toggleRow(this.label('v138_follow_model'), this.followsDefault, (value: boolean) => {
-            this.followsDefault = value;
-            this.saved = false;
-          })
-          if ((this.forms.get('models')?.summary ?? '').length > 0) {
-            Text(this.forms.get('models')?.summary ?? '').fontSize(uiFontSize(13))
-              .fontColor($r('app.color.text_secondary')).width('100%')
-          }
-        } else {
-          this.menuItem('profile', this.label('v138_profile'))
-          this.menuItem('models', this.label('v138_models'))
-          this.menuItem('memory', this.label('v138_memory'))
+          Column() {
+            this.toggleRow(this.label('v138_follow_model'), this.followsDefault, (value: boolean) => {
+              this.followsDefault = value;
+              this.saved = false;
+            })
+            if ((this.forms.get('models')?.summary ?? '').length > 0) {
+              this.divider(12)
+              Text(this.forms.get('models')?.summary ?? '').fontSize(uiFontSize(13))
+                .fontColor($r('app.color.text_secondary')).width('100%').padding(12)
+            }
+          }.width('100%').backgroundColor($r('app.color.bg_page')).borderRadius(UI_RADIUS_CONTAINER)
+        } else if (this.forms.size > 0) {
+          this.settingsList()
         }
         if (this.busy) {
           LoadingProgress().width(24).height(24).color($r('app.color.accent')).accessibilityText(this.label('v138_sync_settings'))
         } else if (this.error) {
           Text(this.error).fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
-          Button(this.label('v138_refresh_settings')).height(44).enabled(!this.deviceDisabled).onClick(() => void this.load())
+          Button(this.label('v138_refresh_settings')).height(44)
+            .backgroundColor($r('app.color.bg_chip')).fontColor($r('app.color.text_primary'))
+            .enabled(!this.deviceDisabled).onClick(() => void this.load())
         } else if (this.page) {
-          Button(this.saved ? this.label('v138_saved') : this.label('v138_save')).height(44).enabled(this.canSave()).onClick(() => void this.save())
+          Button(this.saved ? this.label('v138_saved') : this.label('v138_save')).width('100%').height(50)
+            .borderRadius(UI_RADIUS_PILL).backgroundColor($r('app.color.chat_cta')).fontColor($r('app.color.chat_cta_text'))
+            .opacity(this.canSave() ? 1 : 0.45).enabled(this.canSave()).onClick(() => void this.save())
         }
-      }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
+      }.width('100%').alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .constraintSize({ maxHeight: 460 })

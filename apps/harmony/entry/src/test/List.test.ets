@@ -1,3 +1,4 @@
+import newSessionWorktreeTests from './NewSessionWorktree.test';
 import workdirFilesTests from './WorkdirFiles.test';
 import pluginEnginesTests from './PluginEngines.test';
 import sharedTaskMediaTests from './SharedTaskMedia.test';
@@ -34,6 +35,7 @@ import v133PresentationTests from './V133Presentation.test';
 
 export default function testsuite() {
   workdirFilesTests();
+  newSessionWorktreeTests();
   localUnitTest();
   pluginEnginesTests();
   sharedTaskMediaTests();

@@ -1,3 +1,4 @@
+import { sessionActivityRetry } from './SessionActivityPresentation';
 import { invokePhysicalPeerId } from '../device-link/InvokeScheduler';
 import { RemoteReadRetries } from './RemoteReadRetries';
 import { fastModeWireValue } from '../tasks/ModelSpeed';
@@ -1251,6 +1252,10 @@ export class MessageStore {
     const source = this.generationStatusBySession.get(sessionId) ?? new SessionGenerationStatus();
     status.isRunning = this.runningBySession.get(sessionId) === true;
     status.status = source.status;
+    status.tokenUsage = source.tokenUsage;
+    status.sideTaskRunning = source.sideTaskRunning;
+    status.retryPhase = source.retryPhase;
+    status.retryProgress = source.retryProgress;
     status.outputTokens = source.outputTokens;
     status.generationDurationMs = source.generationDurationMs;
     status.generationActive = source.generationActive;
@@ -1682,7 +1687,16 @@ export class MessageStore {
       this.resubscribeOperations.delete(id); this.runningStateOperations.delete(id); this.subscriptionAckedSessions.delete(id);
       const coverage = this.historyCoverageBySession.get(id); if (coverage) coverage.liveTailTrusted = false;
       const status = this.generationStatusBySession.get(id);
-      if (status) { status.outputTokens = 0; status.generationDurationMs = 0; status.generationActive = false; status.generationReliable = true; }
+      if (status) {
+        status.tokenUsage = 0;
+        status.retryPhase = '';
+        status.retryProgress = '';
+        status.sideTaskRunning = false;
+        status.outputTokens = 0;
+        status.generationDurationMs = 0;
+        status.generationActive = false;
+        status.generationReliable = true;
+      }
     }
     if (ids.length) this.notify();
   }
@@ -1707,8 +1721,13 @@ export class MessageStore {
     });
     let generationChanged = false;
     this.generationStatusBySession.forEach((status: SessionGenerationStatus) => {
-      if (status.outputTokens === 0 && status.generationDurationMs === 0
+      if (status.tokenUsage === 0 && status.retryPhase.length === 0 && !status.sideTaskRunning
+        && status.outputTokens === 0 && status.generationDurationMs === 0
         && !status.generationActive && status.generationReliable) return;
+      status.tokenUsage = 0;
+      status.retryPhase = '';
+      status.retryProgress = '';
+      status.sideTaskRunning = false;
       status.outputTokens = 0;
       status.generationDurationMs = 0;
       status.generationActive = false;
@@ -1861,6 +1880,19 @@ export class MessageStore {
     const data = readObj(ev, 'data');
     const eventSource = readStr(ev, 'source');
     this.bumpRunningStateRevision(sessionId);
+
+    const generation = this.generationStatusBySession.get(sessionId);
+    if (generation !== undefined && generation.retryPhase.length > 0
+      && type.length > 0 && type !== 'error' && type !== 'done') {
+      generation.retryPhase = '';
+      generation.retryProgress = '';
+    }
+
+    if (type === 'status' && readStr(ev, 'turnScope') === 'background') {
+      // A previous turn's background compaction must not overwrite current usage or stop its clock.
+      this.notify();
+      return;
+    }
 
     if (type === 'agent_task_update') {
       const rawSource = eventSource;
@@ -2064,6 +2096,14 @@ export class MessageStore {
         this.finalizeSessionStreaming(sessionId);
       } else {
         this.markSessionRunning(sessionId, true);
+        const status = this.generationStatusBySession.get(sessionId);
+        if (status !== undefined) {
+          const retry = readBool(data, 'willRetry', false)
+            ? sessionActivityRetry(readStr(data, 'message'), readStr(data, 'reason'))
+            : sessionActivityRetry('', '');
+          status.retryPhase = retry.phase;
+          status.retryProgress = retry.progress;
+        }
       }
       this.notify();
     }
@@ -2225,6 +2265,9 @@ export class MessageStore {
       if (generation !== undefined) {
         generation.isRunning = false;
         generation.generationActive = false;
+        generation.sideTaskRunning = false;
+        generation.retryPhase = '';
+        generation.retryProgress = '';
       }
     }
     if (wasRunning !== running) this.notifyRunningStateChanged();
@@ -2246,6 +2289,10 @@ export class MessageStore {
   private clearGenerationMetrics(sessionId: string): void {
     const current = this.generationStatusBySession.get(sessionId);
     if (current === undefined) return;
+    current.tokenUsage = 0;
+    current.retryPhase = '';
+    current.retryProgress = '';
+    current.sideTaskRunning = false;
     current.outputTokens = 0;
     current.generationDurationMs = 0;
     current.generationActive = false;

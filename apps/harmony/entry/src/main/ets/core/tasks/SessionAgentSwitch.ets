@@ -77,7 +77,7 @@ export function agentLocationLabel(
   return deviceId === null ? '' : deviceNames.get(deviceId)?.trim() || deviceId;
 }
 
-/** SSH 与 Orca 会话保持单 Agent；能力未明确声明时也不展示切换入口。 */
+/** SSH and managed bots do not expose Agent switching. Orca is gated separately for relocation. */
 export function supportsSessionAgentSwitch(
   session: RemoteSession | undefined,
   capabilitySupported: boolean,
@@ -85,7 +85,36 @@ export function supportsSessionAgentSwitch(
   return session !== undefined
     && capabilitySupported
     && session.remoteHostId.length === 0
-    && session.orcaRole.length === 0;
+    && session.source !== 'bot';
+}
+
+export function isOrcaAgentSession(session: RemoteSession | undefined): boolean {
+  return session !== undefined && (session.orcaRole.length > 0 || session.orcaRemoteLead);
+}
+
+export function supportsAgentRelocation(session: RemoteSession | undefined, switchSupported: boolean,
+  locationSupported: boolean, orcaRelocation: boolean, remoteWorkerRelocation: boolean): boolean {
+  return session !== undefined && locationSupported && supportsSessionAgentSwitch(session, switchSupported)
+    && (!session.orcaRole || orcaRelocation) && (!session.orcaRemoteLead || remoteWorkerRelocation);
+}
+
+class SwitchLocation {
+  agentDeviceId: string | null = null;
+}
+
+export type SendSessionAgentIntent = (host: string, channel: string, args: Object[]) => Promise<Object | undefined>;
+
+/** Mutation always targets the task owner, never the execution peer from its provider row. */
+export function sendSessionAgentIntent(send: SendSessionAgentIntent, taskHost: string, sessionId: string,
+  agent: string, model: string, provider: string, effort: string, fast: boolean | string,
+  relocation: string | null | undefined): Promise<Object | undefined> {
+  const args: Object[] = [sessionId, agent, model, provider, effort, fast];
+  if (relocation !== undefined) {
+    const location = new SwitchLocation();
+    location.agentDeviceId = relocation;
+    args.push(location);
+  }
+  return send(taskHost, 'maker:switch-session-agent', args);
 }
 
 /** 将不可信 device-link 返回收窄成公开 intent；非法值按“无意图”处理。 */

@@ -1,3 +1,4 @@
+import { uiToast } from '../common/UiOverlay';
 import { uiConfirm, uiConfirmCopy } from '../common/UiOverlay';
 import { ChatHomeAuthIdentity, captureChatHomeAccount } from '../../core/chat/ChatHomeAccount';
 import { ChatHostMediaResolver, ChatHostMediaOpen } from '../../core/chat/ChatHostMedia';
@@ -263,6 +264,25 @@ export struct ChatHomePanel {
   cloudTabs(){
     ChatSegmented({labels:this.tabLabels(),selected:this.selectedTabIndex(),disabledIndexes:this.disabledTabs(),onSelect:(index:number):void=>{this.selectTab(index);}})
   }
+  @State private pullRefreshing: boolean = false;
+
+  private async pullHostRefresh(): Promise<void> {
+    if (this.pullRefreshing) return;
+    this.pullRefreshing = true;
+    try {
+      if (!this.directory) { this.hostSource = ''; this.sourceChanged(); }
+      const directory = this.directory;
+      if (directory) await directory.refresh();
+      if (this.alive && this.mode === 'host-list' && (!directory || directory.error)) {
+        uiToast(this.getUIContext(), chatErrorText(this.locale, directory?.error || 'CHAT_UNAVAILABLE'));
+      }
+    } catch (_error) {
+      if (this.alive && this.mode === 'host-list') uiToast(this.getUIContext(), chatErrorText(this.locale, 'CHAT_UNAVAILABLE'));
+    } finally {
+      this.pullRefreshing = false;
+    }
+  }
+
   build(){
     Column(){
       if(!this.inCloudConversation()&&this.mode!=='host'){
@@ -292,10 +312,13 @@ export struct ChatHomePanel {
       }else if(this.mode==='host-list'){
         if(this.version>=0&&this.directory?.loading){LoadingProgress().width(32).height(32)}
         if(this.version>=0&&this.directory?.error){Text(chatErrorText(this.locale,this.directory.error)).fontSize(13).fontColor($r('app.color.danger')).width('100%').padding({left:16,right:16,top:4,bottom:4})}
+        Refresh({ refreshing: this.pullRefreshing }) {
         List(){
           ForEach(this.version>=0?this.directory?.items??[]:[],(item:ResourceItem)=>{ListItem(){Column({space:2}){Text(item.title).fontSize(16).lineHeight(22).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis});Text(item.preview||item.subtitle).fontSize(13).lineHeight(18).fontColor($r('app.color.text_secondary')).maxLines(2).textOverflow({overflow:TextOverflow.Ellipsis})}.width('100%').alignItems(HorizontalAlign.Start).padding({left:16,right:16,top:10,bottom:10}).constraintSize({minHeight:68}).justifyContent(FlexAlign.Center).onClick(():void=>{this.openHost(item.ref.id);})}},(item:ResourceItem):string=>item.ref.id)
           if(this.directory?.nextCursor){ListItem(){Row(){ChatTextButton({label:chatStrings(this.locale).older,onTap:():void=>{this.directory?.refresh(true);}})}.width('100%').justifyContent(FlexAlign.Center)}}
         }.width('100%').layoutWeight(1).scrollBar(BarState.Off).divider({strokeWidth:0.5,color:$r('app.color.border'),startMargin:16,endMargin:16})
+        }
+        .onRefreshing((): void => { void this.pullHostRefresh(); }).layoutWeight(1).width('100%')
       }else if(this.mode==='host-settings'){
         Column({space:8}){
           TextInput({text:this.hostName,placeholder:chatActionStrings(this.locale).name}).height(44).enabled(!this.hostBusy&&this.hostAction('update')).onChange((value:string):void=>{this.hostName=value;})

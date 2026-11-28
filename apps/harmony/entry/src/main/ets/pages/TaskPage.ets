@@ -1,3 +1,6 @@
+import { PluginEngine, PluginEngineModel, pluginPickerModels } from '../core/plugin-engines/PluginEngines';
+import { pickerVisibleGroups, pickerFavorites, modelFavoriteMutation, recommendedPickerEffort, pickerRecommendedOption } from '../core/ComposerCatalog';
+import { SPLIT_HANDLE_HIT_WIDTH, SplitHandle } from '../components/common/SplitHandle';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { WorkdirEntry, WorkdirRequest, workdirEntries, workdirName, workdirParent, workdirRelative } from '../core/files/WorkdirFiles';
@@ -110,7 +113,7 @@ import { UsageLimitWaitState } from '../core/messages/UsageLimitWait';
 import { isRemoteBusyError, isRemoteBusyMessage } from '../core/device-link/RemoteInvokePresentation';
 import { GoalModeState } from '../core/goals/GoalModels';
 import { GoalStartOptions } from '../core/goals/GoalStore';
-import { ComposerImage, ConversationComposer } from '../components/ConversationComposer';
+import { ComposerImage, ConversationComposer, composerPermissionSymbol, composerPermissionTint } from '../components/ConversationComposer';
 import {
   ComposerModelOptionRow,
   ComposerModelProviderHeader,
@@ -120,7 +123,6 @@ import {
   UI_ICON_CLICK_EFFECT,
   UI_LIST_CLICK_EFFECT,
   UI_CURVE_MOVE,
-  UI_MOTION_BASE,
   UI_MOTION_FAST,
   UI_RADIUS_CONTAINER,
   UI_RADIUS_CONTROL,
@@ -162,8 +164,6 @@ import {
   handoffTaskSplitRouteSelection,
   effectiveTaskSafeWindow,
   isWideTaskLayout,
-  TaskHeaderTitleInsets,
-  taskHeaderTitleInsets,
   TaskSafeWindowSize,
 } from './TaskSplitLayout';
 import { readTaskWindowMetrics } from './TaskWindowMetrics';
@@ -183,6 +183,9 @@ import {
   isRuntimeRouteMutation,
   parseSessionAgentSwitchIntent,
   supportsSessionAgentSwitch,
+  supportsAgentRelocation,
+  isOrcaAgentSession,
+  sendSessionAgentIntent,
 } from '../core/tasks/SessionAgentSwitch';
 import {
   MessageEditRewindOptions,
@@ -194,7 +197,6 @@ import {
   messageEditRollbackHint,
 } from '../core/messages/MessageEdit';
 import {
-  AgentLocationArgument,
   RemoteAgentCatalog,
   RemoteAgentDevice,
   remoteAgentLocationSupported,
@@ -272,10 +274,8 @@ import {
   deriveSessionTailPresentation,
   isContinuationText,
 } from '../core/messages/SessionTailPresentation';
-import {
-  formatSessionActivityElapsed,
-  sessionActivityElapsedMs,
-} from '../core/messages/SessionActivityPresentation';
+import { TurnStatusBar } from '../components/TurnStatusBar';
+import { ImageViewer } from '../components/ImageViewer';
 import {
   generationStatusLabel,
   SessionGenerationStatus,
@@ -578,8 +578,7 @@ export struct TaskPageContent {
   /** 宽屏双栏中由父页面传入；为空时沿用独立详情页的路由参数。 */
   @Prop paneDeviceId: string = '';
   @Prop paneSessionId: string = '';
-  @Prop collabLabel: string = '';
-  @Prop collabReturnsToLead: boolean = false;
+  @Prop collabModeEntry: boolean = false;
   @Prop collabRole: string = '';
   @Prop standaloneDetail: boolean = false;
   /**
@@ -591,6 +590,7 @@ export struct TaskPageContent {
   @BuilderParam collabHeader: () => void = emptyCollabHeader;
   onCollab: () => void = (): void => {};
   onDetailBack: (() => void) | undefined = undefined;
+  registerComposerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
   @Prop @Watch('onPaneMessageChanged') paneMessageClientId: string = '';
   /** 父页面每次选择任务递增；同一条消息再次选择时也要重新定位。 */
   @Prop @Watch('onPaneMessageChanged') paneMessageRevision: number = 0;
@@ -599,9 +599,7 @@ export struct TaskPageContent {
   @Prop paneListCollapsed: boolean = false;
   /** 双栏父页面提供；存在时标题栏最左侧显示收起 / 展开任务列表按钮（D-015）。 */
   onTogglePaneList: (() => void) | undefined = undefined;
-  @State headerBarWidth: number = 0;
-  @State headerLeadingWidth: number = 0;
-  @State headerTrailingWidth: number = 0;
+  @State private compactHeaderCollab: boolean = true;
   @State paneActivationRevision: number = 0;
   /** 分栏父页面传入，供展开后的 Composer 对齐可用底边。 */
   @Prop paneComposerBottomInset: number = 16;
@@ -765,10 +763,6 @@ export struct TaskPageContent {
   /** 页面重进后，旧任务的异步回包不能改写新任务的 Composer 或操作锁。 */
   private pageLifecycleGeneration: number = 0;
   /** 标题栏只展示可信的 branch HEAD；非 Git / detached HEAD 均保持为空。 */
-  @State gitBranchName: string = '';
-  private gitBranchContextKey: string = '';
-  private gitBranchGeneration: number = 0;
-  private gitBranchRefreshTimer: number = -1;
   private unsubs: Array<() => void> = [];
   private listScroller: Scroller = new Scroller();
   private initialScrolled: boolean = false;
@@ -849,7 +843,6 @@ export struct TaskPageContent {
   private modelPickerUserMoved: boolean = false;
   private selectedModelArea: Area | null = null;
   /** 仅当打开选择器前键盘可见时，关闭 Popup 后才恢复输入焦点。 */
-  private composerPopupRestoreFocus: boolean = false;
   private restoreComposerFocusOnSheetDisappear: boolean = false;
   @State contextSheetPage: string = 'main';
   /** 每个模型行自己的思考强度和 Fast 选择；非当前行在选中模型时一并写入。 */
@@ -936,6 +929,9 @@ export struct TaskPageContent {
   @State alternateModelOptions: ComposerModelOption[] = [];
   @State alternateEffortOptions: ComposerChoiceOption[] = [];
   @State alternateFastModeCapability: boolean = false;
+  @State private orcaRelocationSupported: boolean = false;
+  @State private remoteWorkerRelocationSupported: boolean = false;
+  private modelCapabilityReads: Map<string, Promise<Object | undefined>> = new Map<string, Promise<Object | undefined>>();
   @State sessionAgentSwitchSupported: boolean = false;
   /** 被控端公开的 pending intent；仅用于提示，不提前改任务行的 agent/model。 */
   @State pendingAgentSwitchIntent: SessionAgentSwitchIntent | null = null;
@@ -993,6 +989,11 @@ export struct TaskPageContent {
   @State workClockNowMs: number = Date.now();
   private workClockTimer: number = -1;
   /** 服务端生成指标；只有明确可靠且仍在生成时才显示 tok/s。 */
+  @State turnStartedAtMs: number = 0;
+  @State turnTokenUsage: number = 0;
+  @State turnSideTaskRunning: boolean = false;
+  @State turnRetryPhase: string = '';
+  @State turnRetryProgress: string = '';
   @State generationOutputTokens: number = 0;
   @State generationDurationMs: number = 0;
   @State generationActive: boolean = false;
@@ -1019,8 +1020,6 @@ export struct TaskPageContent {
       this.refreshNewSessionCreation();
       this.incomingHandoff = false; this.incomingImportBusy = false;
       if (!this.incomingDraftRestored) this.restoreComposerDraft(); else void this.consumeIncomingShare();
-      this.refreshGitBranch(true);
-      this.startGitBranchRefresh();
       return;
     }
     this.pageLifecycleGeneration += 1;
@@ -1048,7 +1047,6 @@ export struct TaskPageContent {
     this.messageActionBusyId = '';
     this.fileShareBusy = false;
     this.closeContextSheet();
-    this.composerPopupRestoreFocus = false;
     this.restoreComposerFocusOnSheetDisappear = false;
     this.composerPaletteGeneration += 1;
     this.composerPaletteMode = '';
@@ -1074,7 +1072,6 @@ export struct TaskPageContent {
     // 同时恢复编辑前的草稿，让下面的收起逻辑照常保存它。
     this.cancelQueueEdit();
     this.collapseComposerSurface();
-    this.stopGitBranchRefresh();
     // 恢复时 refreshItems 会按流式状态重新启动计时。
     this.stopWorkClock();
     if (this.inputQueueActivated) {
@@ -1121,6 +1118,17 @@ export struct TaskPageContent {
   }
 
   aboutToAppear(): void {
+    this.pickerFavoriteUnsubscribe = AppServices.instance.onModulePush((device: string, channel: string): void => {
+      if (channel === 'maker:model-favorites:changed' && this.composerModelPopupOpen && !this.pickerFavoritesBusy
+        && device === this.deviceId) void this.refreshPickerFavorites();
+    });
+    this.registerComposerBack?.((): boolean => {
+      if (this.previewImageUrl.length > 0) {
+        this.closeImagePreview();
+        return true;
+      }
+      return this.dismissActiveComposerPicker();
+    });
     this.pageLifecycleGeneration += 1;
     this.unsubs.push(AppServices.instance.modelRouting.onChanged((): void => {
       this.routingSnapshot = AppServices.instance.modelRouting.snapshot(this.deviceId);
@@ -1145,6 +1153,11 @@ export struct TaskPageContent {
     this.composerPaletteLoading = false;
     this.pendingModelSelectionKey = '';
     this.stopWorkClock();
+    this.turnStartedAtMs = 0;
+    this.turnTokenUsage = 0;
+    this.turnSideTaskRunning = false;
+    this.turnRetryPhase = '';
+    this.turnRetryProgress = '';
     this.generationOutputTokens = 0;
     this.generationDurationMs = 0;
     this.generationActive = false;
@@ -1304,7 +1317,6 @@ export struct TaskPageContent {
       this.deviceDisabled = this.checkDeviceDisabled();
       this.syncMessageCount();
       this.syncComposerContextState();
-      this.refreshGitBranch();
     }));
     this.deviceDisabled = this.checkDeviceDisabled();
     this.syncMessageCount();
@@ -1326,11 +1338,13 @@ export struct TaskPageContent {
       this.refreshNewSessionCreation();
     }));
     this.refreshNewSessionCreation();
-    this.refreshGitBranch(true);
-    this.startGitBranchRefresh();
   }
 
   aboutToDisappear(): void {
+    this.pickerFavoriteUnsubscribe?.();
+    this.pickerFavoriteUnsubscribe = undefined;
+    this.pickerRefreshRevision += 1;
+    this.registerComposerBack?.(undefined);
     this.detailMounted = false;
     if (AppServices.instance.isSharedTaskPeer(this.deviceId)) AppServices.instance.sharedTasks?.setTaskVisible(false);
     if (this.routingTicket !== null) AppServices.instance.modelRouting.cancel(this.routingTicket);
@@ -1390,10 +1404,6 @@ export struct TaskPageContent {
     this.agentSwitchReadGeneration += 1;
     this.agentSwitchWriteGeneration += 1;
     this.composerCapabilitiesGeneration += 1;
-    this.stopGitBranchRefresh();
-    this.gitBranchGeneration += 1;
-    this.gitBranchContextKey = '';
-    this.gitBranchName = '';
     this.composerToolbarReady = false;
     this.initialScrollSettling = false;
     this.restoreComposerFocusOnSheetDisappear = false;
@@ -1734,6 +1744,7 @@ export struct TaskPageContent {
       this.modelVisibilityOverrides = parseModelVisibilityOverrides(result);
       // Agent 在其他电脑时，当前模型属于那台的目录，不能拿来匹配被控电脑的同名模型。
       const hint = this.currentAgentDeviceId() === null ? this.currentModelSelectionHint() : undefined;
+      this.pickerCatalogPayload = result;
       this.providerModelOptions = parseProviderModelOptions(
         result, agent, this.modelVisibilityOverrides, hint, hint !== undefined);
       if (!this.modelPickerUserMoved && this.composerModelPopupOpen) this.modelPickerPositionPending = true;
@@ -1757,6 +1768,9 @@ export struct TaskPageContent {
   /** 新主机用 planMode.supported；旧主机以 permissionModes 含 plan 兼容。 */
   private async loadComposerCapabilities(): Promise<void> {
     const generation = ++this.composerCapabilitiesGeneration;
+    this.modelCapabilityReads.clear();
+    this.orcaRelocationSupported = false;
+    this.remoteWorkerRelocationSupported = false;
     this.composerToolbarReady = false;
     const session = this.session();
     if (session === undefined) {
@@ -1779,6 +1793,8 @@ export struct TaskPageContent {
       await this.loadProviderModelOptions(this.currentAgentTab(), generation);
       if (generation !== this.composerCapabilitiesGeneration) return;
       this.sessionAgentSwitchSupported = readBool(capabilities, 'supportsSessionAgentSwitch', false);
+      this.orcaRelocationSupported = readBool(capabilities, 'supportsOrcaAgentRelocation', false);
+      this.remoteWorkerRelocationSupported = readBool(capabilities, 'supportsOrcaRemoteWorkerAgentRelocation', false);
       this.modelAgentTab = this.currentAgentTab();
       await this.loadPendingAgentSwitchIntent();
       if (generation !== this.composerCapabilitiesGeneration) return;
@@ -1833,9 +1849,12 @@ export struct TaskPageContent {
    * 否则保持 v1.3.2 的只读防护，不能静默改回本机。SSH 与 Orca 不支持换位置，仍只读。
    */
   private runtimeRouteLocked(): boolean {
-    if (AppServices.instance.isSharedTaskPeer(this.deviceId)) return true;
-    return runtimeRouteNeedsRemoteCatalog(this.session(), this.pendingAgentSwitchIntent)
-      && !this.agentLocationMovable();
+    const session = this.session();
+    if (AppServices.instance.isSharedTaskPeer(this.deviceId) || session?.source === 'bot') return true;
+    if (isOrcaAgentSession(session)) {
+      return !supportsSessionAgentSwitch(session, this.sessionAgentSwitchSupported);
+    }
+    return runtimeRouteNeedsRemoteCatalog(session, this.pendingAgentSwitchIntent) && !this.agentLocationMovable();
   }
 
   /** Agent 现在所在的电脑；null = 被控电脑。 */
@@ -1856,8 +1875,9 @@ export struct TaskPageContent {
 
   /** 能把 Agent 换到其他电脑：被控电脑认得位置参数，且任务支持切换 Agent（对齐 Mobile agentLocationMovable）。 */
   private agentLocationMovable(): boolean {
-    return this.remoteAgentLocationSupported
-      && supportsSessionAgentSwitch(this.session(), this.sessionAgentSwitchSupported);
+    return !AppServices.instance.isSharedTaskPeer(this.deviceId)
+      && supportsAgentRelocation(this.session(), this.sessionAgentSwitchSupported, this.remoteAgentLocationSupported,
+        this.orcaRelocationSupported, this.remoteWorkerRelocationSupported);
   }
 
   /**
@@ -1976,20 +1996,22 @@ export struct TaskPageContent {
     return false;
   }
 
-  private async invokeContextRpc(channel: string, args: Object[]): Promise<Object | undefined> {
+  private async invokeContextRpc(channel: string, args: Object[], capabilityDevice: string | undefined = undefined): Promise<Object | undefined> {
     if (this.isCreationBlockingRemoteOps()) {
       throw new Error('任务创建完成后才能修改任务设置');
     }
-    const deviceId = this.deviceId;
+    const hostDevice = this.deviceId;
+    const deviceId = capabilityDevice ?? hostDevice;
     const options = new DlInvokeOptions();
     options.channel = channel;
     options.args = args;
     const sessionId = this.sessionId;
     const lifecycle = this.pageLifecycleGeneration;
     const accountId = AppServices.instance.auth.cacheAccountId;
+    const route = RelayRoute.instance.generation;
     options.preSend = (): void => {
-      if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== deviceId
-        || this.sessionId !== sessionId || AppServices.instance.auth.cacheAccountId !== accountId) {
+      if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== hostDevice
+        || this.sessionId !== sessionId || RelayRoute.instance.generation !== route || AppServices.instance.auth.cacheAccountId !== accountId) {
         throw new DlError('CANCELLED', 'Task scope changed');
       }
       if (isRuntimeRouteMutation(channel) && this.runtimeRouteLocked()) {
@@ -1999,8 +2021,8 @@ export struct TaskPageContent {
     await AppServices.instance.openLink(deviceId);
     options.preSend();
     const envelope = await AppServices.instance.client.invoke(deviceId, options);
-    if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== deviceId
-      || this.sessionId !== sessionId || AppServices.instance.auth.cacheAccountId !== accountId) {
+    if (!this.isCurrentPageLifecycle(lifecycle) || this.deviceId !== hostDevice
+      || this.sessionId !== sessionId || RelayRoute.instance.generation !== route || AppServices.instance.auth.cacheAccountId !== accountId) {
       throw new DlError('CANCELLED', 'Task scope changed');
     }
     return unwrapInvokeResult(envelope);
@@ -2008,66 +2030,6 @@ export struct TaskPageContent {
 
   private invokeFailureText(error: Object | undefined, fallback: string): string {
     return isRemoteBusyError(error) ? this.v12String('v132_remote_busy') : fallback;
-  }
-
-  /**
-   * 按会话解析真实 Git HEAD。返回的 workdir 可能来自 agent 遥测、
-   * live worktree 或 SSH 主机，因此不在 Harmony 端自行对 workingDir 做本地探测。
-   */
-  private gitBranchRequestKeyFor(session: RemoteSession): string {
-    return `${session.id}\n${session.workingDir}\n${session.worktreePath}\n${session.remoteHostId}`;
-  }
-
-  private refreshGitBranch(force: boolean = false): void {
-    const session = this.session();
-    if (session === undefined || session.workspaceKind !== 'project'
-      || this.isCreationBlockingRemoteOps()) {
-      this.gitBranchGeneration += 1;
-      this.gitBranchContextKey = '';
-      this.gitBranchName = '';
-      return;
-    }
-
-    const requestKey = this.gitBranchRequestKeyFor(session);
-    if (!force && requestKey === this.gitBranchContextKey) return;
-
-    this.gitBranchContextKey = requestKey;
-    this.gitBranchName = '';
-    const generation = ++this.gitBranchGeneration;
-    const request: Record<string, Object> = {};
-    request['sessionId'] = session.id;
-    request['workingDir'] = session.workingDir;
-    request['worktreePath'] = session.worktreePath;
-    if (session.remoteHostId.length > 0) request['remoteHostId'] = session.remoteHostId;
-
-    void this.invokeContextRpc('git-context:get-for-session', [request])
-      .then((result: Object | undefined) => {
-        if (generation !== this.gitBranchGeneration
-          || requestKey !== this.gitBranchContextKey) return;
-        const head = readObj(recordOrEmpty(result), 'head');
-        const branch = readStr(head, 'kind') === 'branch' ? readStr(head, 'branch').trim() : '';
-        this.gitBranchName = branch;
-      })
-      .catch(() => {
-        if (generation === this.gitBranchGeneration
-          && requestKey === this.gitBranchContextKey) {
-          this.gitBranchName = '';
-        }
-      });
-  }
-
-  private startGitBranchRefresh(): void {
-    this.stopGitBranchRefresh();
-    this.gitBranchRefreshTimer = setInterval(() => {
-      this.refreshGitBranch(true);
-    }, GIT_BRANCH_REFRESH_INTERVAL_MS);
-  }
-
-  private stopGitBranchRefresh(): void {
-    if (this.gitBranchRefreshTimer >= 0) {
-      clearInterval(this.gitBranchRefreshTimer);
-      this.gitBranchRefreshTimer = -1;
-    }
   }
 
   private async togglePlanMode(): Promise<void> {
@@ -2140,7 +2102,24 @@ export struct TaskPageContent {
     return this.modelAgentTab.length === 0 || this.modelAgentTab === this.currentAgentTab();
   }
 
+  private modelCapabilitiesOn(agent: string, device: string | null): Promise<Object | undefined> {
+    const app = AppServices.instance;
+    const key = JSON.stringify([app.auth.sessionEpoch, RelayRoute.instance.generation, device || this.deviceId, agent]);
+    const cached = this.modelCapabilityReads.get(key);
+    if (cached !== undefined) return cached;
+    const run = this.invokeContextRpc('maker:get-capabilities', [agent], device ?? undefined).catch((error: Error) => {
+      this.modelCapabilityReads.delete(key);
+      throw new Error(String(error));
+    });
+    this.modelCapabilityReads.set(key, run);
+    return run;
+  }
+
   private visibleModelOptions(): ComposerModelOption[] {
+    const current = this.currentAgentDeviceId();
+    if (current !== null && isOrcaAgentSession(this.session()) && !this.agentLocationMovable()) {
+      return this.remoteModelOptions().filter((row: ComposerModelOption): boolean => row.agentDeviceId === current);
+    }
     if (this.providerModelAgent.length > 0 && this.providerModelAgent === this.composerAgentKind()) {
       const remote = this.remoteModelOptions();
       return remote.length > 0 ? this.providerModelOptions.concat(remote) : this.providerModelOptions;
@@ -2154,6 +2133,109 @@ export struct TaskPageContent {
 
   private visibleFastModeCapability(): boolean {
     return this.browsingCurrentAgent() ? this.fastModeCapability : this.alternateFastModeCapability;
+  }
+
+  @State private pickerAllProviders: boolean = false;
+  @State private pickerModelSearch: string = '';
+  @State private pickerDetails: ComposerModelOption | null = null;
+  @State private pickerCatalogPayload: Object | undefined = undefined;
+  @State private pickerFavoriteItems: Object[] = [];
+  @State private pickerFavoritesReady: boolean = false;
+  @State private pickerFavoritesBusy: boolean = false;
+  @State private pickerPluginRows: PluginEngine[] = [];
+  private pickerRefreshRevision: number = 0;
+  private pickerFavoriteUnsubscribe: (() => void) | undefined = undefined;
+
+  private pickerCurrentProvider(): ComposerModelGroup | undefined {
+    const groups = this.groupedModelOptions();
+    return groups.find((group: ComposerModelGroup): boolean =>
+      group.options.some((option: ComposerModelOption): boolean => this.modelOptionIsCurrent(option))) ?? groups[0];
+  }
+
+  private async refreshPickerFavorites(): Promise<void> {
+    const app = AppServices.instance;
+    const device = this.deviceId;
+    const revision = ++this.pickerRefreshRevision;
+    const current = (): boolean => this.composerModelPopupOpen && device === this.deviceId && revision === this.pickerRefreshRevision;
+    try {
+      const result = await app.modelPickerFavorites(device, 'maker:model-favorites:get', [], current);
+      if (current() && Array.isArray(result) && result.length <= 4096) {
+        this.pickerFavoriteItems = result as Object[];
+        this.pickerFavoritesReady = true;
+      }
+    } catch (_) {}
+  }
+
+  private openPickerExtras(): void {
+    this.pickerDetails = null;
+    this.pickerFavoriteItems = [];
+    this.pickerFavoritesReady = false;
+    this.pickerFavoritesBusy = false;
+    const device = this.deviceId;
+    const app = AppServices.instance;
+    const scope = app.moduleScope;
+    this.pickerPluginRows = app.pluginEngines.listCached(device);
+    void app.pluginEngines.load(device).then((rows: PluginEngine[]): void => {
+      if (this.composerModelPopupOpen && device === this.deviceId && scope === app.moduleScope) this.pickerPluginRows = rows;
+    });
+    void this.refreshPickerFavorites();
+  }
+
+  private pickerGroups(): ComposerModelGroup[] {
+    if (!this.pickerAllProviders) return pickerVisibleGroups(this.groupedModelOptions(),
+      this.pickerCurrentProvider()?.key ?? '', false, this.pickerModelSearch);
+    const options: ComposerModelOption[] = [];
+    for (const harness of MODEL_AGENT_KINDS) {
+      if (harness !== this.composerAgentKind() && !this.canSwitchSessionAgent()) continue;
+      const rows = harness === this.composerAgentKind() ? this.visibleModelOptions()
+        : parseProviderModelOptions(this.pickerCatalogPayload, harness, this.modelVisibilityOverrides, undefined, false).concat(
+          remoteAgentModelOptions(this.remoteAgentCatalogList, harness, undefined, null));
+      for (const row of rows) {
+        row.pickerHarness = harness;
+        options.push(row);
+      }
+    }
+    return pickerFavorites(pickerVisibleGroups(groupComposerModelOptions(options), '', true, this.pickerModelSearch),
+      this.pickerFavoriteItems);
+  }
+
+  private async togglePickerFavorite(option: ComposerModelOption): Promise<void> {
+    if (!this.pickerFavoritesReady || this.pickerFavoritesBusy || !option.providerId) return;
+    const device = this.deviceId;
+    const app = AppServices.instance;
+    const scope = app.moduleScope;
+    const current = (): boolean => this.composerModelPopupOpen && device === this.deviceId && scope === app.moduleScope;
+    this.pickerFavoritesBusy = true;
+    try {
+      const mutation = modelFavoriteMutation(option, this.composerAgentKind(), this.modelEffortForRow(option),
+        this.modelFastForRow(option), this.pickerFavoriteItems);
+      await app.modelPickerFavorites(device, 'maker:model-favorites:apply', [mutation], current);
+      if (current()) await this.refreshPickerFavorites();
+    } catch (_) {
+      if (current()) uiToast(this.getUIContext(), '收藏未保存，请重试');
+    } finally {
+      if (current()) this.pickerFavoritesBusy = false;
+    }
+  }
+
+  @Builder
+  pickerSearchHeader() {
+    Row({ space: 8 }) {
+      TextInput({ placeholder: '搜索模型…', text: this.pickerModelSearch })
+        .height(44).layoutWeight(1).fontColor($r('app.color.text_primary'))
+        .placeholderColor($r('app.color.text_secondary')).backgroundColor($r('app.color.bg_chip'))
+        .onChange((value: string) => { this.pickerModelSearch = value; })
+      Button() {
+        Text(this.pickerAllProviders ? '全部模型' : this.pickerCurrentProvider()?.name ?? '全部模型')
+          .fontColor($r('app.color.text_primary')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .type(ButtonType.Normal).height(44).constraintSize({ maxWidth: '48%' })
+      .backgroundColor($r('app.color.bg_chip'))
+      .onClick(() => {
+        this.pickerAllProviders = !this.pickerAllProviders;
+        this.modelPickerScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false });
+      })
+    }.width('100%').padding({ left: 12, right: 12, bottom: 4 })
   }
 
   private groupedModelOptions(): ComposerModelGroup[] {
@@ -2443,9 +2525,12 @@ export struct TaskPageContent {
       || this.isCreationBlockingRemoteOps()) return;
     if (this.modelAgentTab.length === 0) this.modelAgentTab = this.currentAgentTab();
     if (page === 'model') {
+      this.pickerAllProviders = false;
+      this.pickerModelSearch = '';
       this.modelPickerPositionPending = true;
       this.modelPickerUserMoved = false;
       this.modelPickerHeight = 0;
+      this.selectedModelArea = null;
       this.modelQuotaRequested.clear();
       this.modelQuotaValues = [];
       this.refreshRemoteAgentCatalogs(true);
@@ -2460,12 +2545,14 @@ export struct TaskPageContent {
     this.contextSheetPage = page;
     this.composerBlurGeneration += 1;
     this.modelEffortPickerKey = '';
-    this.composerPopupRestoreFocus = this.composerFocused || this.paneKeyboardInset > 0;
+    this.composerFocused = false;
+    this.composerSurfaceVisible = false;
     // Popup 需要使用键盘占用的垂直空间；已展开的 Composer 由 surfaceVisible 保持。
     this.getUIContext().getFocusController().clearFocus();
     this.composerPermissionPopupOpen = page === 'permission';
     this.composerAgentPopupOpen = page === 'agent';
     this.composerModelPopupOpen = page === 'model';
+    if (page === 'model') this.openPickerExtras();
   }
 
   private async refreshModelQuotas(): Promise<void> {
@@ -2517,6 +2604,21 @@ export struct TaskPageContent {
     });
   }
 
+  private composerPickerOpen(): boolean {
+    return this.composerPermissionPopupOpen || this.composerAgentPopupOpen || this.composerModelPopupOpen;
+  }
+
+  private dismissActiveComposerPicker(): boolean {
+    if (this.composerModelPopupOpen && this.pickerDetails !== null) {
+      this.pickerDetails = null;
+      return true;
+    }
+    if (!this.composerPickerOpen()) return false;
+    this.dismissComposerControlPopup(this.composerPermissionPopupOpen ? 'permission'
+      : this.composerModelPopupOpen ? 'model' : 'agent');
+    return true;
+  }
+
   private dismissComposerControlPopup(page: string): void {
     if (page === 'permission') this.composerPermissionPopupOpen = false;
     if (page === 'agent') this.composerAgentPopupOpen = false;
@@ -2524,25 +2626,6 @@ export struct TaskPageContent {
       this.composerModelPopupOpen = false;
       this.modelEffortPickerKey = '';
     }
-    this.restoreComposerFocusAfterPopupDismiss();
-  }
-
-  private restoreComposerFocusAfterPopupDismiss(): void {
-    if (!this.composerPopupRestoreFocus || this.leavingDetailPage || !this.paneActive) return;
-    this.composerPopupRestoreFocus = false;
-    this.composerBlurGeneration += 1;
-    this.composerSurfaceVisible = true;
-    this.composerFocused = true;
-    const generation = this.pageLifecycleGeneration;
-    setTimeout(() => {
-      if (!this.isCurrentPageLifecycle(generation) || this.composerPermissionPopupOpen
-        || this.composerAgentPopupOpen || this.composerModelPopupOpen) return;
-      try {
-        this.getUIContext().getFocusController().requestFocus(this.composerInputId);
-      } catch (_err) {
-        // 页面或分栏在 Popup 退场期间切换时，只保留展开态，不向已销毁节点请求焦点。
-      }
-    }, 0);
   }
 
   private returnToComposerAfterModelSheet(): void {
@@ -2553,7 +2636,6 @@ export struct TaskPageContent {
     this.closeContextSheet();
     if (!surfaceWasExpanded) {
       this.restoreComposerFocusOnSheetDisappear = false;
-      this.composerPopupRestoreFocus = false;
       return;
     }
     if (popupWasOpen) {
@@ -2588,7 +2670,9 @@ export struct TaskPageContent {
     this.modelAgentTab = kind;
     this.contextRpcBusy = true;
     try {
-      const result = await this.invokeContextRpc('maker:get-capabilities', [kind]);
+      const result = isOrcaAgentSession(this.session())
+        ? await this.modelCapabilitiesOn(kind, this.currentAgentDeviceId())
+        : await this.invokeContextRpc('maker:get-capabilities', [kind]);
       if (!this.isCurrentPageLifecycle(lifecycleGeneration)) return false;
       if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error('capabilities unavailable');
@@ -2760,7 +2844,8 @@ export struct TaskPageContent {
 
   private async selectComposerModel(option: ComposerModelOption, windowConfirmed: boolean = false,
     locationConfirmed: boolean = false, ticket: ModelRoutingTicket | null = null, offer: ModelRoutingOffer | null = null): Promise<void> {
-    if (this.runtimeRouteLocked()) return;
+    if (this.runtimeRouteLocked() || this.deviceDisabled || this.isCreationBlockingRemoteOps()
+      || pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) return;
     const session = this.session();
     if (session === undefined || this.contextRpcBusy) {
       return;
@@ -2775,12 +2860,15 @@ export struct TaskPageContent {
       uiToast(this.getUIContext(), this.v12String('v139_route_unavailable')); return;
     }
     const lifecycleGeneration = this.pageLifecycleGeneration;
-    const targetAgent = this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
+    const targetAgent = option.pickerHarness === 'acp' ? 'acp'
+      : this.modelAgentTab.length > 0 ? this.modelAgentTab : this.currentAgentTab();
     const currentAgent = this.currentAgentTab();
     // 远程 Agent：选另一台电脑（或被控电脑）目录里的模型 = 把 Agent 挪过去，先确认，下一条消息生效；
     // 同一台电脑内换模型直接切（对齐 Mobile confirmAgentLocationForPick）。
     const pick = resolveAgentLocationPick(this.currentAgentDeviceId(), this.nextAgentDeviceId(),
       this.optionAgentDeviceId(option));
+    if (targetAgent === 'acp' && (pick.relocates
+      || AppServices.instance.pluginEngines.find(this.deviceId, option.providerId)?.availability !== 'available')) return;
     if (pick.relocates && !this.agentLocationMovable()) {
       uiToast(this.getUIContext(), this.v12String('v132_remote_runtime_read_only'));
       return;
@@ -2807,7 +2895,7 @@ export struct TaskPageContent {
         });
       return;
     }
-    if (this.modelOptionIsCurrent(option) && targetAgent === currentAgent && ticket === null && offer === null) {
+    if (!option.pickerConfigurationId && targetAgent !== 'acp' && this.modelOptionIsCurrent(option) && targetAgent === currentAgent && ticket === null && offer === null) {
       if (this.routingSession.binding !== null) await this.stopRouting();
       this.returnToComposerAfterModelSheet();
       return;
@@ -2830,10 +2918,11 @@ export struct TaskPageContent {
       return;
     }
     const route = ticket !== null ? AppServices.instance.modelRouting.routeFor(ticket) : offer?.route ?? null;
-    const nextEffort = route !== null ? (option.efforts.includes(route.effort) ? route.effort : '') : reconcileModelEffort(option, this.modelEffortForRow(option));
+    const nextEffort = route !== null ? (option.efforts.includes(route.effort) ? route.effort : '') : reconcileModelEffort(option, option.pickerConfigurationId ? option.pickerEffort : this.modelEffortForRow(option));
     const nextFastWire = route !== null ? (this.visibleFastModeCapability() && option.supportsFastMode
       && (route.fastMode !== 'ultrafast' || (targetAgent === 'codex' && option.supportsUltrafastMode)) ? route.fastMode : false)
-      : fastModeWireValue(this.modelFastForRow(option), this.modelFastTierForRow(option));
+      : option.pickerConfigurationId ? option.pickerFast && this.visibleFastModeCapability()
+        : fastModeWireValue(this.modelFastForRow(option), this.modelFastTierForRow(option));
     const nextFastMode = nextFastWire === true || nextFastWire === 'ultrafast';
     const nextFastTier = nextFastWire === 'ultrafast' ? 'ultrafast' : '';
     const selectionKey = this.modelRuntimeKey(option);
@@ -2842,16 +2931,28 @@ export struct TaskPageContent {
     this.contextRpcBusy = true;
     try {
       let result: Object | undefined;
-      if (targetAgent !== currentAgent || pick.relocates) {
+      const staged = isOrcaAgentSession(session);
+      if (staged || targetAgent === 'acp' || targetAgent !== currentAgent || pick.relocates) {
         const writeGeneration = ++this.agentSwitchWriteGeneration;
-        const effort = nextEffort;
-        const args: Object[] = [session.id, targetAgent, option.id, option.providerId, effort, nextFastWire];
-        if (pick.relocates) {
-          const location = new AgentLocationArgument();
-          location.agentDeviceId = pick.relocateTo;
-          args.push(location);
+        const taskHost = this.deviceId;
+        if (staged && targetAgent !== 'acp') {
+          const initialLocation = this.currentAgentDeviceId();
+          const target = await this.modelCapabilitiesOn(targetAgent, this.optionAgentDeviceId(option));
+          if (!this.isCurrentPageLifecycle(lifecycleGeneration) || this.deviceId !== taskHost || this.sessionId !== session.id
+            || this.runtimeRouteLocked() || this.deviceDisabled || pendingInteractionsBlockRemoteComposer(this.pendingInteractions)
+            || initialLocation !== this.currentAgentDeviceId() || (pick.relocates && !this.agentLocationMovable())) {
+            if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.pendingModelSelectionKey = '';
+            return;
+          }
+          if (Object.keys(recordOrEmpty(target)).length === 0 || (nextFastMode && !readBool(recordOrEmpty(target), 'hasFastMode', false))) {
+            throw new Error('Target capabilities unavailable');
+          }
         }
-        result = await this.invokeContextRpc('maker:switch-session-agent', args);
+        result = await sendSessionAgentIntent((host: string, channel: string, args: Object[]): Promise<Object | undefined> => {
+          if (host !== this.deviceId) return Promise.reject(new Error('Task host changed'));
+          return this.invokeContextRpc(channel, args);
+        }, taskHost, session.id, targetAgent, option.id, option.providerId, nextEffort, nextFastWire,
+          pick.relocates ? pick.relocateTo : undefined);
         if (!this.isCurrentPageLifecycle(lifecycleGeneration)
           || writeGeneration !== this.agentSwitchWriteGeneration || this.sessionId !== session.id) {
           if (this.isCurrentPageLifecycle(lifecycleGeneration)) this.pendingModelSelectionKey = '';
@@ -2893,7 +2994,7 @@ export struct TaskPageContent {
       } else if (this.routingSession.binding !== null) await this.stopRouting();
       if (result !== undefined && result !== null && typeof result === 'object' && !Array.isArray(result)
         && readBool(result as Record<string, Object>, 'deferred', false)) {
-        uiToast(this.getUIContext(), '将在当前运行结束后切换模型');
+        if (!staged) uiToast(this.getUIContext(), '将在当前运行结束后切换模型');
       }
       setTimeout(() => {
         if (this.isCurrentPageLifecycle(lifecycleGeneration)
@@ -5009,16 +5110,13 @@ export struct TaskPageContent {
     return item.durationMs;
   }
 
-  /** 底部“思考中”按产品 turn 独立计时，不复用某一个 work_group 的 startedAt。 */
-  private sessionActivityElapsedText(): string {
-    const startedAt = AppServices.instance.messages.getSessionRunStartedAt(this.sessionId, this.deviceId);
-    const elapsed = formatSessionActivityElapsed(sessionActivityElapsedMs(this.workClockNowMs, startedAt));
-    const generation = this.generationStatusText();
-    return generation.length > 0 ? `${elapsed} · ${generation}` : elapsed;
-  }
-
   private syncGenerationStatus(): void {
     const status = AppServices.instance.messages.getGenerationStatus(this.sessionId, this.deviceId);
+    this.turnStartedAtMs = AppServices.instance.messages.getSessionRunStartedAt(this.sessionId, this.deviceId);
+    this.turnTokenUsage = status.tokenUsage;
+    this.turnSideTaskRunning = status.sideTaskRunning;
+    this.turnRetryPhase = status.retryPhase;
+    this.turnRetryProgress = status.retryProgress;
     this.generationOutputTokens = status.outputTokens;
     this.generationDurationMs = status.generationDurationMs;
     this.generationActive = status.generationActive;
@@ -6280,6 +6378,19 @@ export struct TaskPageContent {
           .padding({ left: 16, right: 16, top: 12, bottom: 16 })
           .border({ width: { top: 1 }, color: { top: $r('app.color.chat_header_divider') } })
       } else if (!pendingInteractionsBlockRemoteComposer(this.pendingInteractions)) {
+        if (this.paneActive && this.teammate === undefined) {
+          TurnStatusBar({
+            running: (this.sessionStreaming || this.sending || this.newSessionCreationStatus === 'running')
+              && (this.initialLoadResolved || this.items.length > 0 || this.sending),
+            startedAtMs: this.turnStartedAtMs,
+            tokenUsage: this.sending && !this.sessionStreaming ? 0 : this.turnTokenUsage,
+            sideTaskRunning: this.turnSideTaskRunning,
+            retryPhase: this.turnRetryPhase,
+            retryProgress: this.turnRetryProgress,
+          })
+          .constraintSize({ maxWidth: CHAT_STREAM_MAX_WIDTH })
+          .alignSelf(ItemAlign.Center)
+        }
         // 只有 Mobile 本端可终结的 pending 接管 Composer；桌面专属/未知卡仅作提示。
         if (this.composerPaletteMode.length > 0) {
           this.composerPalettePanel()
@@ -6289,59 +6400,15 @@ export struct TaskPageContent {
             this.composerBar()
           }
           .width('100%')
+          .zIndex(3)
           .transition(uiRevealTransition())
         }
       }
 
-      // 全屏图片预览层
-      if (this.previewImageUrl.length > 0) {
-        Stack() {
-          Image(this.previewImageUrl)
-            .width('100%')
-            .height('100%')
-            .objectFit(ImageFit.Contain)
-          if (this.previewImageOptions().length > 1) {
-            Column() {
-              Blank().layoutWeight(1)
-              Row({ space: 16 }) {
-                Button('上一张')
-                  .fontColor($r('app.color.chat_overlay_text'))
-                  .backgroundColor($r('app.color.overlay'))
-                  .onClick(() => this.stepImagePreview(-1))
-                Text(`${this.previewImageOptions().indexOf(this.previewImageUrl) + 1} / ${this.previewImageOptions().length}`)
-                  .fontColor($r('app.color.chat_overlay_text'))
-                Button('下一张')
-                  .fontColor($r('app.color.chat_overlay_text'))
-                  .backgroundColor($r('app.color.overlay'))
-                  .onClick(() => this.stepImagePreview(1))
-              }
-              .width('100%')
-              .justifyContent(FlexAlign.Center)
-              .padding({ bottom: 42 })
-            }
-            .width('100%')
-            .height('100%')
-          }
-          Button() {
-            SymbolGlyph($r('sys.symbol.xmark'))
-              .fontSize(uiFontSize(16))
-              .fontColor([$r('app.color.chat_overlay_text')])
-          }
-          .type(ButtonType.Circle)
-          .width(40)
-          .height(40)
-          .padding(0)
-          .backgroundColor($r('app.color.overlay'))
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .position({ x: 16, y: 48 })
-          .onClick(() => this.closeImagePreview())
-        }
-        .width('100%')
-        .height('100%')
-        .position({ x: 0, y: 0 })
-        .zIndex(99)
-        .backgroundColor($r('app.color.chat_overlay_surface'))
-        .transition(uiOverlayTransition())
+      if (this.composerPickerOpen()) {
+        Row().width('100%').height('100%').position({ x: 0, y: 0 }).zIndex(2)
+          .accessibilityLevel('no')
+          .onClick(() => { this.dismissActiveComposerPicker(); })
       }
 
       if (this.filePreviewOpen) {
@@ -6544,6 +6611,20 @@ export struct TaskPageContent {
             this.sharedManagementOpen = false;
             if (device !== this.deviceId || session !== this.sessionId) this.leaveDetailPage();
           } })
+      }
+      if (this.previewImageUrl.length > 0) {
+        // Key the viewer by source so switching pages resets zoom, pan and decoded image size.
+        ForEach([this.previewImageUrl], (source: string) => {
+          ImageViewer({
+            source,
+            imageIndex: this.previewImageOptions().indexOf(source),
+            imageCount: this.previewImageOptions().length,
+            onClose: (): void => this.closeImagePreview(),
+            onStep: (direction: number): void => this.stepImagePreview(direction),
+          })
+          .zIndex(99)
+          .transition(uiOverlayTransition())
+        }, (source: string) => source)
       }
       if (this.mermaidViewerSource.length > 0) {
         this.mermaidViewer()
@@ -7226,18 +7307,42 @@ export struct TaskPageContent {
     return !AppServices.instance.isSharedTaskPeer(this.deviceId) && (this.session()?.workingDir ?? '').length > 0;
   }
 
-  /** 协同会话（Lead / Worker）不显示分支标签，由角色标签占它的位置；普通会话照旧显示分支。 */
-  private headerShowsBranch(): boolean {
-    return this.collabRole.length === 0;
-  }
-
-  /** 协同角色标签：放在原分支标签的位置，比分支标签更轻，只有描边没有底色。 */
+  /** 主控使用同款标签外观，但用 44vp 按钮承载点击热区。 */
   @Builder
   collabRoleBadge() {
+    if (this.collabModeEntry) {
+      Button() {
+        if (this.compactHeaderCollab) {
+          SymbolGlyph($r('sys.symbol.person_2')).fontSize(uiFontSize(18))
+            .fontColor([$r('app.color.text_secondary')])
+        } else {
+          this.collabBadgeText()
+        }
+      }
+      .type(ButtonType.Normal)
+      .width(this.compactHeaderCollab ? 44 : 76)
+      .height(44)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .borderRadius(UI_RADIUS_PILL)
+      .flexShrink(0)
+      .clickEffect(UI_ICON_CLICK_EFFECT)
+      .accessibilityText(this.collabRole)
+      .enabled(!this.shareSelectionActive)
+      .onClick(() => this.onCollab())
+    } else {
+      this.collabBadgeText()
+    }
+  }
+
+  @Builder
+  collabBadgeText() {
     Text(this.collabRole)
       .fontSize(uiFontSize(12))
       .fontColor($r('app.color.text_secondary'))
       .maxLines(1)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .constraintSize({ maxWidth: 76 })
       .height(24)
       .padding({ left: 8, right: 8 })
       .border({ width: 1, color: $r('app.color.border') })
@@ -7246,26 +7351,6 @@ export struct TaskPageContent {
       .accessibilityText(this.collabRole)
   }
 
-  /** Git 分支只做标题栏辅助信息，限宽后不参与项目菜单交互。 */
-  @Builder
-  gitBranchBadge() {
-    Row({ space: 4 }) {
-      SymbolGlyph($r('sys.symbol.split'))
-        .fontSize(uiFontSize(14))
-        .fontColor([$r('app.color.text_secondary')])
-      Text(this.gitBranchName)
-        .fontSize(uiFontSize(12))
-        .fontColor($r('app.color.text_secondary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .constraintSize({ maxWidth: 92 })
-    }
-    .height(28)
-    .constraintSize({ maxWidth: 128 })
-    .padding({ left: 8, right: 8 })
-    .backgroundColor($r('app.color.bg_chip'))
-    .borderRadius(UI_RADIUS_PILL)
-  }
 
   /** 会话菜单直接锚定标题栏按钮；系统 Menu（bindMenu）自己处理避让和材质。 */
   @Builder
@@ -7311,58 +7396,57 @@ export struct TaskPageContent {
 
   @Builder
   taskHeader() {
-    // 标题单独一层并居中；按钮层叠在上方，左右两组各自贴边（D-015）。
-    Stack() {
-      Row({ space: 8 }) {
-        if (this.teammate !== undefined) {
-          TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 36 })
-        }
-        Column({ space: 1 }) {
-          Text(this.sessionTitle())
-            .fontSize(uiFontSize(16))
-            .lineHeight(uiLineHeight(22))
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
-            .width('100%')
-          if (this.headerNotice().length > 0) {
-            Text(this.headerNotice())
-              .fontSize(uiFontSize(11))
-              .lineHeight(uiLineHeight(16))
-              .fontColor(this.sessionStreaming
-                ? $r('app.color.chat_status_accent')
-                : $r('app.color.chat_text_secondary'))
+    // 标题按整栏中心对齐，左右对称预留按钮空间，不等待按钮测量回流。
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Row({ space: 8 }) {
+          if (this.teammate !== undefined) {
+            TeammateAvatar({ teammate: this.teammate, online: this.teammateOnline, diameter: 36 })
+          }
+          Column({ space: 1 }) {
+            Text(this.sessionTitle())
+              .fontSize(uiFontSize(16))
+              .lineHeight(uiLineHeight(22))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
-              .width('100%')
+            if (this.headerNotice().length > 0) {
+              Text(this.headerNotice())
+                .fontSize(uiFontSize(11))
+                .lineHeight(uiLineHeight(16))
+                .fontColor(this.sessionStreaming
+                  ? $r('app.color.chat_status_accent')
+                  : $r('app.color.chat_text_secondary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .textAlign(this.teammate === undefined ? TextAlign.Center : TextAlign.Start)
+            }
           }
+          .flexShrink(1)
+          .alignItems(this.teammate === undefined ? HorizontalAlign.Center : HorizontalAlign.Start)
         }
-        .layoutWeight(1)
+        .constraintSize({ maxWidth: '100%' })
+        .alignItems(VerticalAlign.Center)
       }
-      .width('100%')
-      .height('100%')
-      .alignItems(VerticalAlign.Center)
-      .padding(this.headerTitlePadding())
+      .width('100%').height('100%').justifyContent(FlexAlign.Center)
+      .padding({ left: this.headerTitleInset(), right: this.headerTitleInset() })
 
       Row() {
-        Row() {
+        Row({ space: 4 }) {
           if (this.onDetailBack !== undefined) {
             this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => {
+              if (this.dismissActiveComposerPicker()) return;
               this.collapseComposerSurface();
               this.onDetailBack?.();
             })
           } else if (!this.isEmbedded()) {
-            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => this.leaveDetailPage())
+            this.taskIconButton($r('sys.symbol.chevron_left'), 44, false, true, () => { if (!this.dismissActiveComposerPicker()) this.leaveDetailPage(); })
           } else if (this.onTogglePaneList !== undefined) {
             this.paneListToggleButton()
           }
         }
-        .onAreaChange((_old: Area, next: Area) => {
-          this.headerLeadingWidth = Number(next.width);
-        })
 
         Blank()
 
@@ -7370,10 +7454,6 @@ export struct TaskPageContent {
           if (this.collabRole.length > 0) {
             this.collabRoleBadge()
           }
-          if (this.gitBranchName.length > 0 && this.headerShowsBranch()) {
-            this.gitBranchBadge()
-          }
-
           if (this.headerFolderVisible()) {
             this.taskIconButton($r('sys.symbol.folder'), 40, false,
               !this.isCreationBlockingRemoteOps(), () => this.showProjectActions())
@@ -7383,19 +7463,17 @@ export struct TaskPageContent {
         }
         .bindSheet($$this.workdirBrowserOpen, this.workdirBrowserSheet(),
           workdirBrowserSheetOptions((): void => { this.workdirBrowserOpen = false; }))
-        .onAreaChange((_old: Area, next: Area) => {
-          this.headerTrailingWidth = Number(next.width);
-        })
       }
       .width('100%')
       .height('100%')
     }
     .width('100%')
     .height(44)
-    .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+    .padding({ left: 8, right: 8, top: this.collabModeEntry ? 0 : 2, bottom: this.collabModeEntry ? 0 : 2 })
     .backgroundColor(Color.Transparent)
-    .onAreaChange((_old: Area, next: Area) => {
-      this.headerBarWidth = Math.max(0, Number(next.width) - 16);
+    .onAreaChange((_old: Area, area: Area) => {
+      const compact = Number(area.width) < 408;
+      if (compact !== this.compactHeaderCollab) this.compactHeaderCollab = compact;
     })
   }
 
@@ -7403,7 +7481,8 @@ export struct TaskPageContent {
   @Builder
   paneListToggleButton() {
     Button() {
-      SymbolGlyph(this.paneListCollapsed ? $r('sys.symbol.open_sidebar') : $r('sys.symbol.close_sidebar'))
+      SymbolGlyph(this.paneListCollapsed ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
+        : $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
         .fontSize(uiFontSize(20))
         .fontColor([$r('app.color.text_primary')])
     }
@@ -7417,29 +7496,10 @@ export struct TaskPageContent {
     .onClick(() => this.onTogglePaneList?.())
   }
 
-  private headerTitlePadding(): Padding {
-    const insets = this.headerTitleInsets();
-    const padding: Padding = { left: insets.left, right: insets.right };
-    return padding;
-  }
-
-  /** 标题与第二行提示中较宽者的实际宽度，用于判断能否严格居中。 */
-  private headerTitleInsets(): TaskHeaderTitleInsets {
-    const measure = this.getUIContext().getMeasureUtils();
-    let titleWidth = Number(measure.measureTextSize({
-      textContent: this.sessionTitle(),
-      fontSize: uiFontSize(16),
-      fontWeight: FontWeight.Medium,
-    }).width);
-    const notice = this.headerNotice();
-    if (notice.length > 0) {
-      titleWidth = Math.max(titleWidth, Number(measure.measureTextSize({
-        textContent: notice,
-        fontSize: uiFontSize(11),
-      }).width));
-    }
-    return taskHeaderTitleInsets(this.headerBarWidth, this.headerLeadingWidth, this.headerTrailingWidth,
-      this.getUIContext().px2vp(titleWidth), 4);
+  private headerTitleInset(): number {
+    // Folder + menu, their spacing, and a gap. Reserve the folder slot even before its data arrives.
+    if (this.collabRole.length === 0) return 88;
+    return this.collabModeEntry && this.compactHeaderCollab ? 136 : 168;
   }
 
   @Builder
@@ -8017,22 +8077,6 @@ export struct TaskPageContent {
       }
 
       Column({ space: 8 }) {
-        if (!this.shareSelectionActive && this.collabLabel.length > 0) {
-          Button() {
-            SymbolGlyph(this.collabReturnsToLead ? $r('sys.symbol.chevron_left') : $r('sys.symbol.person_2'))
-              .fontSize(uiFontSize(18))
-              .fontColor([$r('app.color.chat_text_secondary')])
-          }
-          .type(ButtonType.Circle)
-          .width(44)
-          .height(44)
-          .padding(0)
-          .backgroundColor($r('app.color.chat_fab_surface'))
-          .border({ width: 1, color: $r('app.color.chat_fab_border') })
-          .clickEffect(UI_ICON_CLICK_EFFECT)
-          .accessibilityText(this.collabLabel)
-          .onClick(() => this.onCollab())
-        }
         if ((this.items.length > 0 || this.queueBubbles.length > 0) && !this.followingLatest) {
           Button() {
             Stack({ alignContent: Alignment.Center }) {
@@ -8215,6 +8259,7 @@ export struct TaskPageContent {
           .onClick((): void => { if (!this.incomingDraftRestored) this.restoreComposerDraft(); else void this.consumeIncomingShare(); })
       }
       ConversationComposer({
+        pickerWindowHeight: this.interactionViewportHeight + this.paneKeyboardInset,
         input: this.input,
         focused: this.composerFocused,
         surfaceExpanded: this.composerSurfaceVisible,
@@ -8223,7 +8268,6 @@ export struct TaskPageContent {
         atoms: composerAtomPresentations(this.composerDocument),
         sending: this.sending,
         streaming: this.sessionStreaming,
-        streamingElapsedText: this.sessionActivityElapsedText(),
         hasContent: this.hasComposerContent(),
         canSend: this.canSend(),
         composerEnabled: this.incomingDraftRestored && !this.incomingImportBusy && !this.incomingHandoff && !this.deviceDisabled && !this.leavingForCreationEdit
@@ -8247,10 +8291,9 @@ export struct TaskPageContent {
         agentPopupVisible: this.composerAgentPopupOpen,
         modelPopupVisible: this.composerModelPopupOpen,
         showAddButton: true,
-        showStreamingStatus: this.teammate === undefined,
+        showStreamingStatus: false,
         floatingGlass: true,
         maxContentWidth: CHAT_COMPOSER_MAX_WIDTH,
-        compactToolbar: true,
         floatingBottomInset: this.paneComposerBottomInset,
         inputId: this.composerInputId,
         onInputChange: (value: string): void => {
@@ -8458,54 +8501,50 @@ export struct TaskPageContent {
 
   @Builder
   permissionContextView() {
-    Scroll() {
-      Column({ space: 2 }) {
-        ForEach(this.permissionOptions, (option: ComposerChoiceOption) => {
-          Row({ space: 10 }) {
-            SymbolGlyph($r('sys.symbol.lock'))
-              .fontSize(uiFontSize(16))
-              .fontColor([$r('app.color.text_secondary')])
-              .width(24)
-            Column({ space: 2 }) {
-              Text(option.label)
-                .fontSize(uiFontSize(14))
-                .lineHeight(uiLineHeight(20))
-                .fontWeight(option.id === this.effectivePermissionMode()
-                  ? FontWeight.Medium : FontWeight.Normal)
-                .fontColor($r('app.color.text_primary'))
-              if (option.description.length > 0) {
-                Text(option.description)
-                  .fontSize(uiFontSize(11))
-                  .lineHeight(uiLineHeight(16))
-                  .fontColor($r('app.color.text_tertiary'))
-                  .maxLines(2)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-              }
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-            if (option.id === this.effectivePermissionMode()) {
-              SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(uiFontSize(18))
-                .fontColor([$r('app.color.chat_cta')])
+    Column() {
+      ForEach(this.permissionOptions, (option: ComposerChoiceOption) => {
+        Row({ space: 8 }) {
+          SymbolGlyph(composerPermissionSymbol(option.id))
+            .fontSize(uiFontSize(16))
+            .fontColor([composerPermissionTint(option.id)])
+            .width(24)
+          Column({ space: 1 }) {
+            Text(option.label)
+              .fontSize(uiFontSize(14))
+              .lineHeight(uiLineHeight(18))
+              .fontWeight(option.id === this.effectivePermissionMode()
+                ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor($r('app.color.text_primary'))
+            if (option.description.length > 0) {
+              Text(option.description)
+                .fontSize(uiFontSize(11))
+                .lineHeight(uiLineHeight(14))
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
           }
-          .width('100%')
-          .constraintSize({ minHeight: 52 })
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .backgroundColor(option.id === this.effectivePermissionMode()
-            ? $r('app.color.bg_chip') : Color.Transparent)
-          .borderRadius(UI_RADIUS_CONTROL)
-          .opacity(this.contextRpcBusy ? 0.55 : 1)
-          .clickEffect(UI_LIST_CLICK_EFFECT)
-          .onClick(() => this.requestPermissionMode(option))
-        }, (option: ComposerChoiceOption) => option.id)
-      }
-      .width('100%')
-      .padding({ left: 10, right: 10, top: 8, bottom: 14 })
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          if (option.id === this.effectivePermissionMode()) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(uiFontSize(18))
+              .fontColor([$r('app.color.chat_cta')])
+          }
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 44 })
+        .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+        .backgroundColor(option.id === this.effectivePermissionMode()
+          ? $r('app.color.bg_chip') : Color.Transparent)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .opacity(this.contextRpcBusy ? 0.55 : 1)
+        .clickEffect(UI_LIST_CLICK_EFFECT)
+        .onClick(() => this.requestPermissionMode(option))
+      }, (option: ComposerChoiceOption) => option.id)
     }
     .width('100%')
-    .layoutWeight(1)
+    .padding({ left: 10, right: 10, top: 2, bottom: 8 })
   }
 
   @Builder
@@ -8560,41 +8599,37 @@ export struct TaskPageContent {
 
   @Builder
   agentContextView() {
-    Scroll() {
-      Column({ space: 2 }) {
-        ForEach(MODEL_AGENT_KINDS, (kind: string) => {
-          Row({ space: 10 }) {
-            this.modelAgentMark(kind, false)
-            Text(modelAgentLabel(kind))
-              .fontSize(uiFontSize(16))
-              .fontWeight(this.modelAgentIsActive(kind) ? FontWeight.Medium : FontWeight.Normal)
-              .fontColor($r('app.color.text_primary'))
-              .layoutWeight(1)
-            if (this.modelAgentIsActive(kind)) {
-              SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(uiFontSize(18))
-                .fontColor([$r('app.color.chat_cta')])
-            }
+    Column({ space: 2 }) {
+      ForEach(MODEL_AGENT_KINDS, (kind: string) => {
+        Row({ space: 10 }) {
+          this.modelAgentMark(kind, false)
+          Text(modelAgentLabel(kind))
+            .fontSize(uiFontSize(16))
+            .fontWeight(this.modelAgentIsActive(kind) ? FontWeight.Medium : FontWeight.Normal)
+            .fontColor($r('app.color.text_primary'))
+            .layoutWeight(1)
+          if (this.modelAgentIsActive(kind)) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(uiFontSize(18))
+              .fontColor([$r('app.color.chat_cta')])
           }
-          .width('100%')
-          .height(48)
-          .padding({ left: 14, right: 14 })
-          .backgroundColor(this.modelAgentIsActive(kind)
-            ? $r('app.color.bg_chip') : Color.Transparent)
-          .borderRadius(UI_RADIUS_CONTROL)
-          .enabled(!this.contextRpcBusy
-            && (this.modelAgentIsActive(kind) || this.canSwitchSessionAgent()))
-          .clickEffect(UI_LIST_CLICK_EFFECT)
-          .onClick(() => {
-            void this.selectComposerAgent(kind);
-          })
-        }, (kind: string) => kind)
-      }
-      .width('100%')
-      .padding({ left: 12, right: 12, top: 10, bottom: 18 })
+        }
+        .width('100%')
+        .height(48)
+        .padding({ left: 14, right: 14 })
+        .backgroundColor(this.modelAgentIsActive(kind)
+          ? $r('app.color.bg_chip') : Color.Transparent)
+        .borderRadius(UI_RADIUS_CONTROL)
+        .enabled(!this.contextRpcBusy
+          && (this.modelAgentIsActive(kind) || this.canSwitchSessionAgent()))
+        .clickEffect(UI_LIST_CLICK_EFFECT)
+        .onClick(() => {
+          void this.selectComposerAgent(kind);
+        })
+      }, (kind: string) => kind)
     }
     .width('100%')
-    .layoutWeight(1)
+    .padding({ left: 12, right: 12, top: 10, bottom: 18 })
   }
 
   @Builder
@@ -8603,8 +8638,28 @@ export struct TaskPageContent {
       ComposerModelProviderHeader({ name: group.name })
 
       ForEach(group.options, (option: ComposerModelOption) => {
-        this.modelOptionRow(option)
-      }, (option: ComposerModelOption) => composerModelKey(option))
+        Row() {
+          Column() {
+            if (option.pickerConfigurationId || (option.pickerHarness && option.pickerHarness !== this.composerAgentKind())) {
+              Button(option.label + ' · ' + modelAgentLabel(option.pickerHarness)
+                + (option.pickerEffort ? ' · ' + option.pickerEffort : '') + (option.pickerFast ? ' · Fast' : ''))
+                .height(44).width('100%').fontColor($r('app.color.text_primary'))
+                .backgroundColor($r('app.color.bg_chip')).enabled(!option.suspended && option.availability !== 'requires_payment')
+                .onClick(() => { void this.pickOtherHarnessModel(option); })
+            } else {
+          this.modelOptionRow(option)
+            }
+          }.layoutWeight(1)
+          Button() {
+            SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(17)
+              .fontColor([$r('app.color.text_secondary')])
+          }.type(ButtonType.Circle).width(44).height(44).backgroundColor(Color.Transparent)
+            .accessibilityText('模型设置').enabled(!option.suspended && option.availability !== 'requires_payment'
+              && (!option.pickerHarness || option.pickerHarness === this.composerAgentKind()))
+            .onClick(() => { this.pickerDetails = option; })
+        }.width('100%')
+
+      }, (option: ComposerModelOption) => composerModelKey(option) + ':' + option.pickerHarness + ':' + option.pickerConfigurationId)
 
       Divider()
         .strokeWidth(0.5)
@@ -8651,11 +8706,163 @@ export struct TaskPageContent {
     })
   }
 
+  private async pickOtherHarnessModel(option: ComposerModelOption): Promise<void> {
+    if (option.pickerHarness && option.pickerHarness !== this.composerAgentKind()
+      && (!this.canSwitchSessionAgent() || !await this.browseModelAgent(option.pickerHarness))) return;
+    await this.selectComposerModel(option);
+  }
+
+
+  private async pickTaskPlugin(engine: PluginEngine, model: PluginEngineModel): Promise<void> {
+    if (engine.availability !== 'available' || !this.canSwitchSessionAgent() || this.currentAgentDeviceId() !== null) return;
+    const option = new ComposerModelOption();
+    option.id = model.id;
+    option.label = model.label;
+    option.providerId = engine.providerId;
+    option.pickerHarness = 'acp';
+    await this.selectComposerModel(option);
+  }
+
+  private filteredPickerPluginRows(): PluginEngine[] {
+    const query = this.pickerModelSearch.trim().toLowerCase();
+    return this.pickerPluginRows.filter((engine: PluginEngine): boolean =>
+      engine.name.toLowerCase().includes(query) || engine.models.some((model: PluginEngineModel): boolean =>
+        model.label.toLowerCase().includes(query) || model.id.toLowerCase().includes(query)));
+  }
+
+  @Builder
+  pickerPluginSections() {
+    ForEach(this.filteredPickerPluginRows(), (engine: PluginEngine) => {
+      Column({ space: 4 }) {
+        Row({ space: 8 }) {
+          if (engine.iconDataUrl) {
+            Image(engine.iconDataUrl).width(22).height(22).objectFit(ImageFit.Contain)
+          }
+          Text(engine.name).fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+        }.width('100%').height(32)
+        if (engine.availability !== 'available') {
+          Text(engine.availabilityMessage || '此电脑上的引擎不可用')
+            .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary')).width('100%')
+        }
+        ForEach(pluginPickerModels(engine, this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''), (model: PluginEngineModel) => {
+          Button(model.label).width('100%').height(44).fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.bg_chip'))
+            .enabled(engine.availability === 'available' && this.canSwitchSessionAgent() && this.currentAgentDeviceId() === null)
+            .accessibilitySelected(model.id === (this.session()?.providerId === engine.providerId ? this.session()?.model ?? '' : ''))
+            .onClick(() => { void this.pickTaskPlugin(engine, model); })
+        }, (model: PluginEngineModel) => model.id)
+      }.width('100%').padding({ left: 12, right: 12 })
+    }, (engine: PluginEngine) => engine.providerId)
+  }
+
+  private pickerCompatibleHarnesses(option: ComposerModelOption): ComposerModelOption[] {
+    const choices: ComposerModelOption[] = [];
+    for (const harness of MODEL_AGENT_KINDS) {
+      if (harness === this.composerAgentKind()) continue;
+      if (!this.canSwitchSessionAgent()) continue;
+      const rows = option.agentDeviceId
+        ? remoteAgentModelOptions(this.remoteAgentCatalogList, harness, undefined, null)
+        : parseProviderModelOptions(this.pickerCatalogPayload, harness, this.modelVisibilityOverrides, undefined, false);
+      const matched = rows.find((row: ComposerModelOption): boolean => row.id === option.id
+        && row.providerId === option.providerId && row.agentDeviceId === option.agentDeviceId
+        && !row.suspended && row.availability !== 'requires_payment');
+      if (matched !== undefined) {
+        matched.pickerHarness = harness;
+        choices.push(matched);
+      }
+    }
+    return choices;
+  }
+
+  @Builder
+  pickerDetailsView(option: ComposerModelOption) {
+    Column({ space: 8 }) {
+      Button('‹  ' + option.label).height(44).fontColor($r('app.color.text_primary'))
+        .backgroundColor($r('app.color.bg_chip')).onClick(() => { this.pickerDetails = null; })
+      Text([option.providerName, option.agentDeviceName, option.contextWindow > 0
+        ? String(option.contextWindow) + ' 上下文' : ''].filter((item: string): boolean => !!item).join(' · '))
+        .fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+        .width('100%').padding(12).backgroundColor($r('app.color.bg_chip')).borderRadius(UI_RADIUS_CONTROL)
+      Column() {
+      Text('Harness · ' + modelAgentLabel(this.composerAgentKind()))
+        .fontSize(uiFontSize(14)).fontColor($r('app.color.text_primary'))
+      ForEach(this.pickerCompatibleHarnesses(option), (compatible: ComposerModelOption) => {
+        Button('切换到 ' + modelAgentLabel(compatible.pickerHarness))
+          .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+          .onClick(() => { void this.pickOtherHarnessModel(compatible); })
+      }, (compatible: ComposerModelOption) => compatible.pickerHarness)
+        Divider().color($r('app.color.border'))
+        Button('推理强度 · ' + this.modelEffortForRow(option)).height(44).width('100%')
+          .fontColor($r('app.color.text_primary')).backgroundColor(Color.Transparent)
+          .enabled(option.efforts.length > 0)
+          .onClick(() => { this.modelEffortPickerKey = this.modelEffortPickerKey ? '' : composerModelKey(option); })
+        if (this.modelEffortPickerKey === composerModelKey(option)) {
+          ForEach(option.efforts, (level: string) => {
+            Button(level).height(44).width('100%').fontColor($r('app.color.text_primary'))
+              .backgroundColor(Color.Transparent).accessibilitySelected(level === this.modelEffortForRow(option))
+              .onClick(() => {
+                this.setModelRowEffortById(option, level)
+                this.modelEffortPickerKey = '';
+              })
+          }, (level: string) => level)
+        }
+        if (option.supportsFastMode) {
+          Divider().color($r('app.color.border'))
+          Row() {
+            Text('快速模式').layoutWeight(1).fontColor($r('app.color.text_primary'))
+            Toggle({ type: ToggleType.Switch, isOn: this.modelFastForRow(option) })
+              .accessibilityText('快速模式').onChange((enabled: boolean) => this.setModelRowFast(option, enabled))
+          }.height(44).width('100%')
+        }
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      Column() {
+      Button('使用推荐设定').height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+        .onClick(() => {
+          void this.pickOtherHarnessModel(pickerRecommendedOption(option, this.pickerCompatibleHarnesses(option),
+            this.currentAgentTab()));
+        })
+      Text('恢复推荐会重设 Harness、推理强度和 Fast，已有收藏保持不变。').fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_secondary'))
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+      Text('目前设定').fontSize(uiFontSize(13)).fontColor($r('app.color.text_secondary'))
+      Column() {
+      Button(modelFavoriteMutation(option, this.composerAgentKind(), this.modelEffortForRow(option), this.modelFastForRow(option),
+        this.pickerFavoriteItems)['kind'] === 'remove' ? '取消收藏此设定' : '收藏此设定')
+        .height(44).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+        .enabled(this.pickerFavoritesReady && !this.pickerFavoritesBusy && !!option.providerId)
+        .onClick(() => { void this.togglePickerFavorite(option); })
+      Text(this.modelEffortForRow(option) + (this.modelFastForRow(option) ? ' · Fast' : ''))
+        .fontSize(uiFontSize(12)).fontColor($r('app.color.text_secondary'))
+      Text('储存这组参数，方便下次从收藏清单直接使用。').fontSize(uiFontSize(12))
+        .fontColor($r('app.color.text_secondary'))
+      }.width('100%').padding(12).backgroundColor($r('app.color.bg_chip'))
+        .borderRadius(UI_RADIUS_CONTROL).alignItems(HorizontalAlign.Start)
+    }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   modelContextView() {
     Column() {
+      if (this.pickerDetails === null) { this.pickerSearchHeader() }
       Scroll(this.modelPickerScroller) {
         Column({ space: 12 }) {
+          if (this.pickerDetails !== null) {
+            this.pickerDetailsView(this.pickerDetails)
+          } else {
+          if (this.pickerAllProviders) { this.pickerPluginSections() }
+          if (this.pickerAllProviders && this.canSwitchSessionAgent() && !this.pickerModelSearch.trim()) {
+            Row({ space: 6 }) {
+              ForEach(MODEL_AGENT_KINDS, (kind: string) => {
+                Button(modelAgentLabel(kind)).height(44).fontSize(uiFontSize(12))
+                  .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.bg_chip'))
+                  .accessibilitySelected(this.modelAgentIsActive(kind)).enabled(!this.contextRpcBusy)
+                  .onClick(() => { void this.browseModelAgent(kind); })
+              }, (kind: string) => kind)
+            }.width('100%').padding({ left: 12, right: 12 })
+          }
+          if (this.pickerAllProviders && !this.pickerModelSearch.trim()) {
           ModelRoutingPanel({
             snapshot: this.routingSnapshot,
             binding: this.routingSession.binding,
@@ -8669,6 +8876,7 @@ export struct TaskPageContent {
             onUnbind: (): void => { void this.stopRouting(); },
             onOrdinary: (): void => { void this.stopRouting(); },
           })
+          }
           if (this.pendingAgentSwitchIntent !== null) {
             Row({ space: 9 }) {
               SymbolGlyph($r('sys.symbol.clock'))
@@ -8723,7 +8931,7 @@ export struct TaskPageContent {
           }
 
           Column() {
-            if (this.groupedModelOptions().length === 0) {
+            if (this.pickerGroups().length === 0) {
               Text(this.contextRpcBusy ? '正在加载模型...' : '没有可用模型')
                 .fontSize(uiFontSize(14))
                 .fontColor($r('app.color.text_secondary'))
@@ -8731,18 +8939,19 @@ export struct TaskPageContent {
                 .textAlign(TextAlign.Center)
                 .padding({ top: 28, bottom: 28 })
             } else {
-              ForEach(this.groupedModelOptions(), (group: ComposerModelGroup) => {
+              ForEach(this.pickerGroups(), (group: ComposerModelGroup) => {
                 this.modelProviderGroup(group)
               }, (group: ComposerModelGroup) => group.key)
             }
           }
           .width('100%')
           .padding({ top: 2, bottom: 12 })
+          }
         }
         .width('100%')
       }
       .width('100%')
-      .layoutWeight(1)
+      .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
       .scrollBar(BarState.Auto)
       .onTouch((event: TouchEvent) => {
         if (event.type === TouchType.Down) this.modelPickerUserMoved = true;
@@ -8754,7 +8963,7 @@ export struct TaskPageContent {
       })
     }
     .width('100%')
-    .layoutWeight(1)
+    .layoutWeight(this.composerModelPopupOpen ? 0 : 1)
   }
 
   @Builder
@@ -14982,46 +15191,17 @@ struct TaskPage {
   }
 }
 
-/** 层叠标签里一个 Worker 的位置：未选中的只露图标，离选中项越远露出越少、越小、越淡、越靠后。 */
-class WorkerTabSlot {
-  x: number = 0;
-  scale: number = 1;
-  opacity: number = 1;
-  z: number = 0;
-  visible: boolean = true;
-}
+const WORKER_TAB_GAP = 2;
+const WORKER_TAB_GESTURE_STEP = 68;
+const WORKER_TAB_REST = -1;
 
-class WorkerTabLayout {
-  slots: WorkerTabSlot[] = [];
-  selectedWidth: number = 0;
-  /** 两端放不下时收进「+N」的个数、位置和点击后要切到的最近一个。 */
-  leftMore: number = 0;
-  rightMore: number = 0;
-  leftMoreX: number = 0;
-  rightMoreX: number = 0;
-  leftMoreIndex: number = -1;
-  rightMoreIndex: number = -1;
+class WorkerWheelSlot {
+  chipWidth: number = 0;
+  focus: number = 0;
+  centerX: number = 0;
 }
-
-const WORKER_TAB_CHIP = 28;
-const WORKER_TAB_GAP = 4;
-const WORKER_TAB_MORE = 30;
-const WORKER_TAB_SELECTED_MIN = 72;
-
-/** 距选中项第 k 个（k≥2）图标比前一个多露出的宽度；第 1 个完整露出。 */
-function workerTabStep(distance: number): number {
-  const steps: number[] = [0, WORKER_TAB_CHIP, 18, 12, 8, 6];
-  return distance < steps.length ? steps[distance] : 4;
-}
-
-function workerTabSideWidth(count: number, hidden: number): number {
-  let width = 0;
-  if (count > 0) {
-    width = WORKER_TAB_GAP + WORKER_TAB_CHIP;
-    for (let k = 2; k <= count; k++) width += workerTabStep(k);
-  }
-  return width + (hidden > 0 ? WORKER_TAB_GAP + WORKER_TAB_MORE : 0);
-}
+const WORKER_TAB_MIN_WIDTH = 28;
+const WORKER_DIVIDER_TRIGGER_VP = 44;
 
 /** Both layouts use the same task content and host-owned Worker identities. */
 @Component
@@ -15038,23 +15218,30 @@ export struct OrcaTaskDetail {
   onTogglePaneList: (() => void) | undefined = undefined;
   onBack: (() => void) | undefined = undefined;
   registerBack: ((handler: (() => boolean) | undefined) => void) | undefined = undefined;
+  private leadComposerBack: (() => boolean) | undefined = undefined;
+  private workerComposerBack: (() => boolean) | undefined = undefined;
   @State role: string = '';
-  @State workers: OrcaWorker[] = [];
+  @State @Watch('resetWorkerWheel') workers: OrcaWorker[] = [];
   @State selected: OrcaWorker[] = [];
-  @State compactWorkerPaneOpen: boolean = false;
+  @State workerPaneOpen: boolean = false;
   @State loadState: string = '';
   @State widthVp: number = 0;
   @State folded: boolean = false;
-  @State workerPaneCollapsed: boolean = false;
   /** 并排时协同面板临时占满主控 + 协同两栏；不持久化，切换任务、收起面板或角色变化时复位。 */
   @State workerExpanded: boolean = false;
   @State private workerTabsWidth: number = 0;
-  private workerTabLayoutKey: string = '';
-  private workerTabLayoutCache: WorkerTabLayout = new WorkerTabLayout();
+  @State private workerWheelPosition: number = WORKER_TAB_REST;
+  private workerWheelStart: number = WORKER_TAB_REST;
+  private workerWheelGeneration: number = 0;
+  private workerWheelLayoutPosition: number = -2;
+  private workerWheelLayoutWidth: number = 0;
+  private workerWheelSlots: WorkerWheelSlot[] = [];
+  private workerWheelNaturalWidths: number[] = [];
   @State leadPaneFraction: number = 0.5;
   private dividerStartX: number = 0;
   private dividerStartWidth: number = 0;
   private dividerDragging: boolean = false;
+  @State private dividerOverrun: number = 0;
   private foldListening: boolean = false;
   private foldChanged: (state: display.FoldStatus) => void = (state: display.FoldStatus): void => {
     this.folded = state === display.FoldStatus.FOLD_STATUS_FOLDED;
@@ -15102,7 +15289,7 @@ export struct OrcaTaskDetail {
         // Window width still controls the layout when fold status is unavailable.
       }
     }
-    this.registerBack?.((): boolean => this.returnToLead());
+    this.registerBack?.((): boolean => this.workerComposerBack?.() || this.leadComposerBack?.() || this.returnToLead());
     this.updateRole();
   }
 
@@ -15121,14 +15308,22 @@ export struct OrcaTaskDetail {
   }
 
   private taskChanged(): void {
+    this.workerPaneOpen = false;
     this.workerExpanded = false;
+    this.readGeneration += 1;
+    this.workers = [];
+    this.selected = [];
+    this.loadState = '';
+    if (this.mounted && !this.updateRole()) void this.refreshWorkers();
   }
 
   private activationChanged(): void {
     if (!this.mounted) return;
     if (!this.paneActive) {
       this.readGeneration += 1;
-      this.compactWorkerPaneOpen = false;
+      this.workerPaneOpen = false;
+      this.workerExpanded = false;
+      this.syncVisibleWorkerSelection();
     } else if (!this.updateRole()) {
       void this.refreshWorkers();
     }
@@ -15142,12 +15337,11 @@ export struct OrcaTaskDetail {
     const nextRole = current?.orcaRole ?? '';
     if (nextRole === this.role) return false;
     this.role = nextRole;
-    this.workerPaneCollapsed = false;
     this.workerExpanded = false;
     this.readGeneration += 1;
     this.workers = [];
     this.loadState = '';
-    this.compactWorkerPaneOpen = false;
+    this.workerPaneOpen = false;
     this.selected = [];
     if (nextRole === 'lead') void this.refreshWorkers();
     return true;
@@ -15197,6 +15391,10 @@ export struct OrcaTaskDetail {
   }
 
   private syncVisibleWorkerSelection(): void {
+    if (!this.sideBySide()) {
+      this.dividerDragging = false;
+      this.dividerOverrun = 0;
+    }
     if (this.workerVisible() && this.selected.length === 0 && this.workers.length > 0) {
       this.reconcileWorkerSelection(this.workers);
     }
@@ -15207,12 +15405,11 @@ export struct OrcaTaskDetail {
   }
 
   private sideBySide(): boolean {
-    return this.supportsSideBySide() && !this.workerPaneCollapsed;
+    return this.supportsSideBySide() && this.workerPaneOpen;
   }
 
   private workerVisible(): boolean {
-    return this.role === 'lead'
-      && (this.supportsSideBySide() ? this.sideBySide() : this.compactWorkerPaneOpen);
+    return this.role === 'lead' && this.workerPaneOpen;
   }
 
   private leadVisible(): boolean {
@@ -15227,6 +15424,7 @@ export struct OrcaTaskDetail {
     if (!this.sideBySide()) return;
     this.getUIContext().getFocusController().clearFocus();
     this.dividerDragging = false;
+    this.dividerOverrun = 0;
     uiAnimateState(this.getUIContext(), () => { this.workerExpanded = !this.workerExpanded; });
   }
 
@@ -15235,27 +15433,53 @@ export struct OrcaTaskDetail {
   }
 
   private dragWorkerDivider(event: TouchEvent): void {
-    if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+    if (event.type === TouchType.Cancel || !this.sideBySide() || this.workerExpanded) {
       this.dividerDragging = false;
+      this.dividerOverrun = 0;
       return;
     }
-    if (!this.sideBySide() || this.workerExpanded || event.changedTouches.length === 0) return;
+    if (event.changedTouches.length === 0) {
+      if (event.type === TouchType.Up) {
+        this.dividerDragging = false;
+        this.dividerOverrun = 0;
+      }
+      return;
+    }
     const x = event.changedTouches[0].displayX;
     if (event.type === TouchType.Down) {
       this.dividerStartX = x;
       this.dividerStartWidth = this.leadPaneWidth();
       this.dividerDragging = true;
-    } else if (event.type === TouchType.Move && this.dividerDragging) {
-      const width = orcaLeadPaneWidth(this.widthVp, (this.dividerStartWidth + x - this.dividerStartX) / this.widthVp);
-      this.leadPaneFraction = width / this.widthVp;
+      this.dividerOverrun = 0;
+      return;
+    }
+    if (!this.dividerDragging || (event.type !== TouchType.Move && event.type !== TouchType.Up)) return;
+
+    const requested = this.dividerStartWidth + x - this.dividerStartX;
+    const clamped = orcaLeadPaneWidth(this.widthVp, requested / this.widthVp);
+    const overrun = requested - clamped;
+    if (event.type === TouchType.Move) {
+      this.leadPaneFraction = clamped / this.widthVp;
+      this.dividerOverrun = overrun;
+      return;
+    }
+    this.dividerDragging = false;
+    this.dividerOverrun = 0;
+    if (Math.abs(overrun) > WORKER_DIVIDER_TRIGGER_VP) {
+      // 双栏恢复时保留手势开始前的宽度，不把拖到极限的比例作为新布局。
+      this.leadPaneFraction = this.dividerStartWidth / this.widthVp;
+      if (overrun < 0) this.toggleExpanded();
+      else this.returnToLead();
+    } else {
+      this.leadPaneFraction = clamped / this.widthVp;
     }
   }
 
   private collapseWorkerPane(): void {
     this.getUIContext().getFocusController().clearFocus();
     this.dividerDragging = false;
-    this.compactWorkerPaneOpen = false;
-    this.workerPaneCollapsed = true;
+    this.dividerOverrun = 0;
+    this.workerPaneOpen = false;
     this.workerExpanded = false;
   }
 
@@ -15281,12 +15505,8 @@ export struct OrcaTaskDetail {
   private openWorkers(): void {
     if (this.role !== 'lead' || this.returnToLead()) return;
     this.getUIContext().getFocusController().clearFocus();
-    if (this.supportsSideBySide()) {
-      this.workerPaneCollapsed = false;
-    } else {
-      this.compactWorkerPaneOpen = true;
-      if (this.loadState !== 'loading') void this.refreshWorkers();
-    }
+    this.workerPaneOpen = true;
+    if (!this.supportsSideBySide() && this.loadState !== 'loading') void this.refreshWorkers();
     this.syncVisibleWorkerSelection();
   }
 
@@ -15407,154 +15627,134 @@ export struct OrcaTaskDetail {
     return worker.displayName || worker.name;
   }
 
-  private workerTabNameWidth(worker: OrcaWorker): number {
-    const measure = this.getUIContext().getMeasureUtils();
-    return this.getUIContext().px2vp(Number(measure.measureTextSize({
-      textContent: this.workerTabName(worker), fontSize: uiFontSize(13), fontWeight: FontWeight.Medium,
-    }).width));
+  private resetWorkerWheel(): void {
+    this.workerWheelGeneration += 1;
+    this.workerWheelStart = WORKER_TAB_REST;
+    this.workerWheelPosition = WORKER_TAB_REST;
+    this.workerWheelLayoutPosition = -2;
+    this.workerWheelNaturalWidths = [];
   }
 
-  /**
-   * 层叠排布：选中项完整显示「图标 + 名字」，两侧其余 Worker 只露图标，按距离依次压缩叠压。
-   * 总宽超出标签栏时先压缩选中项名字，再把最远的收进两端「+N」，两侧轮流收，保证不溢出。
-   */
-  private workerTabLayout(): WorkerTabLayout {
-    const selected = this.selectedWorkerTabIndex();
-    const key = JSON.stringify([this.workers.map((worker: OrcaWorker) => worker.id),
-      this.workers.length > 0 ? this.workerTabName(this.workers[selected]) : '', selected, this.workerTabsWidth]);
-    if (key === this.workerTabLayoutKey) return this.workerTabLayoutCache;
-    const layout = this.computeWorkerTabLayout(selected);
-    this.workerTabLayoutKey = key;
-    this.workerTabLayoutCache = layout;
-    return layout;
+  private workerWheelCenter(): number {
+    // 静止态直接使用现有选择，不等 Scroller 布局或滚动回调纠偏。
+    return this.workerWheelPosition === WORKER_TAB_REST ? this.selectedWorkerTabIndex() : this.workerWheelPosition;
   }
 
-  private computeWorkerTabLayout(selected: number): WorkerTabLayout {
-    const layout = new WorkerTabLayout();
+  private workerWheelClamp(position: number): number {
+    return Math.min(this.workers.length - 1, Math.max(0, position));
+  }
+
+  private workerWheelSlot(index: number): WorkerWheelSlot {
+    const center = this.workerWheelCenter();
+    const viewport = this.workerTabsWidth;
     const count = this.workers.length;
-    if (count === 0) return layout;
-    const available = this.workerTabsWidth > 0 ? this.workerTabsWidth : Number.MAX_VALUE;
-    const natural = 6 + 20 + 6 + Math.min(160, this.workerTabNameWidth(this.workers[selected])) + 12;
-    const neighbours = (selected > 0 ? 1 : 0) + (selected < count - 1 ? 1 : 0);
-    layout.selectedWidth = Math.max(WORKER_TAB_SELECTED_MIN,
-      Math.min(natural, available - neighbours * (WORKER_TAB_GAP + WORKER_TAB_CHIP)));
-    let left = selected;
-    let right = count - 1 - selected;
-    let hiddenLeft = 0;
-    let hiddenRight = 0;
-    while ((left > 0 || right > 0) && workerTabSideWidth(left, hiddenLeft) + layout.selectedWidth
-      + workerTabSideWidth(right, hiddenRight) > available) {
-      if (left > 0 && (left >= right || right === 0)) {
-        left -= 1;
-        hiddenLeft += 1;
-      } else {
-        right -= 1;
-        hiddenRight += 1;
+    if (this.workerWheelLayoutPosition !== center || this.workerWheelLayoutWidth !== viewport) {
+      if (this.workerWheelNaturalWidths.length !== count) {
+        const context = this.getUIContext();
+        const measure = context.getMeasureUtils();
+        this.workerWheelNaturalWidths = this.workers.map((worker: OrcaWorker): number => Math.ceil(
+          context.px2vp(Number(measure.measureTextSize({
+            textContent: this.workerTabName(worker), fontSize: uiFontSize(13), fontWeight: FontWeight.Medium,
+          }).width))) + 40);
       }
-    }
-    const selectedX = workerTabSideWidth(left, hiddenLeft);
-    for (let index = 0; index < count; index++) {
-      const slot = new WorkerTabSlot();
-      const distance = Math.abs(index - selected);
-      if (distance === 0) {
-        slot.x = selectedX;
-        slot.z = 200;
-      } else {
-        const shown = index < selected ? left : right;
-        const k = Math.min(distance, Math.max(shown, 1));
-        let offset = WORKER_TAB_GAP;
-        for (let j = 2; j <= k; j++) offset += workerTabStep(j);
-        slot.x = index < selected ? selectedX - offset - WORKER_TAB_CHIP : selectedX + layout.selectedWidth + offset;
-        slot.visible = distance <= shown;
-        slot.scale = Math.max(0.72, 1 - 0.07 * (distance - 1));
-        slot.opacity = slot.visible ? Math.max(0.5, 1 - 0.12 * (distance - 1)) : 0;
-        slot.z = 100 - distance;
+      const slots: WorkerWheelSlot[] = [];
+      let edge = 0;
+      for (let j = 0; j < count; j++) {
+        const slot = new WorkerWheelSlot();
+        const t = Math.max(0, 1 - Math.abs(j - center) / 2);
+        slot.focus = count <= 2 ? 1 : t * t;
+        const maxWidth = count <= 2 ? (viewport - WORKER_TAB_GAP * (count - 1)) / count : viewport - 4;
+        const natural = Math.max(WORKER_TAB_MIN_WIDTH, Math.min(maxWidth, this.workerWheelNaturalWidths[j]));
+        slot.chipWidth = WORKER_TAB_MIN_WIDTH + (natural - WORKER_TAB_MIN_WIDTH) * slot.focus;
+        const visualWidth = slot.chipWidth * (0.85 + 0.15 * slot.focus);
+        slot.centerX = edge + visualWidth / 2;
+        edge += visualWidth + WORKER_TAB_GAP;
+        slots.push(slot);
       }
-      layout.slots.push(slot);
+      const left = Math.floor(center);
+      const right = Math.min(count - 1, left + 1);
+      const origin = slots[left].centerX + (slots[right].centerX - slots[left].centerX) * (center - left);
+      const maxOffset = Math.max(0, edge - WORKER_TAB_GAP - viewport);
+      const offset = count <= 2 ? 0 : Math.max(0, Math.min(maxOffset, origin - viewport / 2));
+      slots.forEach((slot: WorkerWheelSlot): void => { slot.centerX -= offset; });
+      this.workerWheelLayoutPosition = center;
+      this.workerWheelLayoutWidth = viewport;
+      this.workerWheelSlots = slots;
     }
-    layout.leftMore = hiddenLeft;
-    layout.rightMore = hiddenRight;
-    layout.leftMoreIndex = hiddenLeft > 0 ? selected - left - 1 : -1;
-    layout.rightMoreIndex = hiddenRight > 0 ? selected + right + 1 : -1;
-    layout.leftMoreX = 0;
-    layout.rightMoreX = selectedX + layout.selectedWidth + workerTabSideWidth(right, 0) + WORKER_TAB_GAP;
-    return layout;
+    return this.workerWheelSlots[index] ?? new WorkerWheelSlot();
   }
 
-  private workerTabSlot(worker: OrcaWorker): WorkerTabSlot {
-    const index = this.workers.findIndex((item: OrcaWorker) => item.id === worker.id);
-    const slots = this.workerTabLayout().slots;
-    return index >= 0 && index < slots.length ? slots[index] : new WorkerTabSlot();
+  private workerTabKey(worker: OrcaWorker, index: number): string {
+    return JSON.stringify([worker.id, index, this.workerTabName(worker), worker.agentKind, worker.providerId,
+      worker.reachable, this.workerStatus(worker), this.pluginIconRevision]);
+  }
+
+  private settleWorkerWheel(index: number): void {
+    const worker = this.workers[index];
+    if (!worker) return;
+    this.workerWheelStart = WORKER_TAB_REST;
+    if (this.workers.length <= 2 || this.workerWheelCenter() === index) {
+      this.selectWorker(worker.id);
+      this.workerWheelPosition = WORKER_TAB_REST;
+      return;
+    }
+    const generation = ++this.workerWheelGeneration;
+    this.getUIContext().animateTo({
+      duration: UI_MOTION_FAST, curve: UI_CURVE_MOVE,
+      onFinish: (): void => {
+        if (generation !== this.workerWheelGeneration) return;
+        if (this.paneActive && this.workerVisible()) this.selectWorker(worker.id);
+        this.workerWheelPosition = WORKER_TAB_REST;
+      },
+    }, (): void => { this.workerWheelPosition = index; });
   }
 
   @Builder
-  workerMoreBadge(count: number, x: number, target: number) {
-    Text('+' + count)
-      .fontSize(uiFontSize(11))
-      .fontWeight(FontWeight.Medium)
-      .fontColor($r('app.color.text_secondary'))
-      .textAlign(TextAlign.Center)
-      .width(WORKER_TAB_MORE)
-      .height(24)
-      .backgroundColor($r('app.color.bg_chip'))
+  workerTabButton(worker: OrcaWorker, index: number, slot: WorkerWheelSlot, active: boolean) {
+    Stack() {
+      Row() {
+        this.workerMark(worker, active)
+        Text(this.workerTabName(worker))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+          .margin({ left: 6 * slot.focus, right: 4 * slot.focus })
+          .opacity(Math.min(1, slot.focus * 4))
+          .fontSize(uiFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(active ? $r('app.color.chat_cta_text') : $r('app.color.text_primary'))
+      }
+      .padding({ left: 4, right: 4 })
+      .width('100%')
+      .height(32)
+      .backgroundColor(active ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
+      .border({ width: active ? 0 : 1, color: $r('app.color.border') })
       .borderRadius(UI_RADIUS_PILL)
-      .translate({ x: x })
-      .zIndex(1)
-      .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
-      .accessibilityText('+' + count)
-      .onClick(() => {
-        if (target >= 0 && target < this.workers.length) this.selectWorker(this.workers[target].id);
-      })
+      .clip(true)
+      .scale({ x: 0.85 + 0.15 * slot.focus, y: 0.85 + 0.15 * slot.focus })
+      .opacity(active ? 1 : (0.5 + 0.5 * slot.focus) * (worker.reachable ? 1 : 0.5))
+    }
+    .width(slot.chipWidth)
+    .height(44)
+    .position({ x: slot.centerX - slot.chipWidth / 2, y: 0 })
+    .clickEffect(UI_CLICK_EFFECT)
+    .hitTestBehavior(slot.centerX + slot.chipWidth / 2 <= 0 || slot.centerX - slot.chipWidth / 2 >= this.workerTabsWidth
+      ? HitTestMode.None : HitTestMode.Default)
+    .accessibilityGroup(true)
+    .accessibilityText(this.workerTabName(worker) + ', ' + this.workerStatus(worker))
+    .accessibilityLevel('yes')
+    .accessibilitySelected(this.workerSelected(worker))
+    .onClick(() => this.settleWorkerWheel(index))
   }
 
-  /**
-   * 层叠标签：用 Stack + 按距选中项的距离计算 translate / scale / opacity / zIndex 代替横向 List。
-   * 切换时各项位置随隐式动画平滑重排；ForEach 的 key 不含选中状态，保证切换时是同一节点在移动。
-   */
   @Builder
   workerTabs() {
-    Stack({ alignContent: Alignment.Start }) {
-      ForEach(this.workers, (worker: OrcaWorker) => {
-        Row({ space: 6 }) {
-          this.workerMark(worker, this.workerSelected(worker))
-          if (this.workerSelected(worker)) {
-            Text(this.workerTabName(worker))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-              .fontSize(uiFontSize(13))
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.chat_cta_text'))
-          }
-        }
-        .width(this.workerSelected(worker) ? this.workerTabLayout().selectedWidth : WORKER_TAB_CHIP)
-        .height(this.workerSelected(worker) ? 32 : WORKER_TAB_CHIP)
-        .padding({ left: this.workerSelected(worker) ? 6 : 4, right: this.workerSelected(worker) ? 12 : 4 })
-        .justifyContent(this.workerSelected(worker) ? FlexAlign.Start : FlexAlign.Center)
-        .backgroundColor(this.workerSelected(worker) ? $r('app.color.chat_cta') : $r('app.color.bg_chip'))
-        .border({ width: this.workerSelected(worker) ? 0 : 1, color: $r('app.color.border') })
-        .borderRadius(UI_RADIUS_PILL)
-        .clip(true)
-        .translate({ x: this.workerTabSlot(worker).x })
-        .scale({ x: this.workerTabSlot(worker).scale, y: this.workerTabSlot(worker).scale })
-        .opacity(this.workerTabSlot(worker).opacity * (worker.reachable ? 1 : 0.5))
-        .animation({ duration: UI_MOTION_BASE, curve: UI_CURVE_MOVE })
-        .zIndex(this.workerTabSlot(worker).z)
-        .hitTestBehavior(this.workerTabSlot(worker).visible ? HitTestMode.Default : HitTestMode.None)
-        .clickEffect(UI_CLICK_EFFECT)
-        .accessibilityGroup(true)
-        .accessibilityText(this.workerTabName(worker) + ', ' + this.workerStatus(worker))
-        .accessibilitySelected(this.workerSelected(worker))
-        .onClick(() => this.selectWorker(worker.id))
-      }, (worker: OrcaWorker) => JSON.stringify([worker.id, worker.displayName, worker.agentKind, worker.providerId,
-        worker.reachable, this.workerStatus(worker), this.pluginIconRevision]))
-      if (this.workerTabLayout().leftMore > 0) {
-        this.workerMoreBadge(this.workerTabLayout().leftMore, this.workerTabLayout().leftMoreX,
-          this.workerTabLayout().leftMoreIndex)
-      }
-      if (this.workerTabLayout().rightMore > 0) {
-        this.workerMoreBadge(this.workerTabLayout().rightMore, this.workerTabLayout().rightMoreX,
-          this.workerTabLayout().rightMoreIndex)
+    Stack({ alignContent: Alignment.TopStart }) {
+      if (this.workerTabsWidth > 0) {
+        ForEach(this.workers, (worker: OrcaWorker, index: number) => {
+          this.workerTabButton(worker, index, this.workerWheelSlot(index), this.workers.length <= 2
+            ? this.workerSelected(worker) : index === Math.round(this.workerWheelCenter()))
+        }, (worker: OrcaWorker, index: number) => this.workerTabKey(worker, index))
       }
     }
     .layoutWeight(1)
@@ -15564,10 +15764,31 @@ export struct OrcaTaskDetail {
       const width = Number(area.width);
       if (width > 0 && Math.abs(width - this.workerTabsWidth) >= 1) this.workerTabsWidth = width;
     })
+    .onDisAppear(() => this.resetWorkerWheel())
+    .gesture(
+      PanGesture({ direction: PanDirection.Horizontal })
+        .onActionStart(() => {
+          if (this.workers.length <= 2) return;
+          this.workerWheelGeneration += 1;
+          this.workerWheelStart = this.workerWheelCenter();
+        })
+        .onActionUpdate((event: GestureEvent) => {
+          if (this.workerWheelStart === WORKER_TAB_REST) return;
+          this.workerWheelPosition = this.workerWheelClamp(this.workerWheelStart - event.offsetX / WORKER_TAB_GESTURE_STEP);
+        })
+        .onActionEnd((event: GestureEvent) => {
+          if (this.workerWheelStart === WORKER_TAB_REST) return;
+          const momentum = Math.max(-1.25, Math.min(1.25, event.velocityX * 0.08 / WORKER_TAB_GESTURE_STEP));
+          this.settleWorkerWheel(Math.round(this.workerWheelClamp(this.workerWheelCenter() - momentum)));
+        })
+        .onActionCancel(() => {
+          if (this.workerWheelStart !== WORKER_TAB_REST) this.resetWorkerWheel();
+        }),
+    )
   }
 
   /**
-   * 协同面板顶部：Worker 层叠标签 + 右侧展开按钮。选中 Worker 时这一行放进该 Worker 会话的标题栏，
+   * 协同面板顶部：左侧导航按钮 + Worker 滚轮标签。选中 Worker 时这一行放进该 Worker 会话的标题栏，
    * 沿用标题栏的沉浸渐变模糊，消息从下面滚过；没有 Worker 会话时直接放在面板顶部。
    * 展开按钮只在并排时显示：单栏时协同面板本来就占满详情区，按钮按下也不会有变化。
    * 单栏没有并排的主控，保留左侧返回图标回到主控（系统返回手势同样有效）。
@@ -15587,25 +15808,27 @@ export struct OrcaTaskDetail {
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .accessibilityText(this.label('v138_return_to_lead'))
         .onClick(() => { this.returnToLead(); })
-      }
-      if (this.workers.length > 0) {
-        this.workerTabs()
       } else {
-        Blank()
-      }
-      if (this.sideBySide()) {
-        Button({ type: ButtonType.Circle, stateEffect: true }) {
+        Button() {
           SymbolGlyph(this.workerExpanded ? $r('sys.symbol.arrow_down_right_and_arrow_up_left')
             : $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
-            .fontSize(uiFontSize(18))
+            .fontSize(uiFontSize(20))
             .fontColor([$r('app.color.text_primary')])
         }
+        .type(ButtonType.Circle)
         .width(44)
         .height(44)
+        .padding(0)
         .backgroundColor(Color.Transparent)
         .clickEffect(UI_ICON_CLICK_EFFECT)
         .accessibilityText(this.label(this.workerExpanded ? 'v138_collapse' : 'v138_expand'))
         .onClick(() => this.toggleExpanded())
+      }
+      // 标签填充按钮之后的剩余宽度，由标签自身的 onAreaChange 实测。
+      if (this.workers.length > 0) {
+        this.workerTabs()
+      } else {
+        Blank()
       }
     }
     .width('100%')
@@ -15639,9 +15862,11 @@ export struct OrcaTaskDetail {
         paneListCollapsed: this.paneListCollapsed, onTogglePaneList: this.onTogglePaneList,
         standaloneDetail: this.onBack !== undefined && !this.sideBySide(),
         onDetailBack: this.onBack,
+        registerComposerBack: (handler): void => { this.leadComposerBack = handler; },
         paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
-        collabRole: this.role === 'lead' ? this.label('v138_lead') : (this.role === 'worker' ? this.label('v138_worker') : ''),
-        collabLabel: this.role === 'lead' ? (this.workerPaneCollapsed ? this.label('v138_expand') : this.summary()) : '',
+        collabRole: this.role === 'lead' ? this.label('v138_collaboration_mode')
+          : (this.role === 'worker' ? this.label('v138_worker') : ''),
+        collabModeEntry: this.role === 'lead',
         onCollab: (): void => this.openWorkers(),
       })
         .width(this.sideBySide() ? this.leadPaneWidth() : '100%')
@@ -15661,12 +15886,12 @@ export struct OrcaTaskDetail {
               paneActive: this.paneActive && this.workerVisible(),
               standaloneDetail: !this.sideBySide(),
               collabEmbedded: true,
+              registerComposerBack: (handler): void => { this.workerComposerBack = handler; },
               collabHeader: (): void => {
                 this.collabBar();
               },
               paneComposerBottomInset: this.paneComposerBottomInset, paneKeyboardInset: this.paneKeyboardInset,
-              collabRole: this.label('v138_worker'), collabLabel: this.label('v138_return_to_lead'),
-              collabReturnsToLead: true,
+              collabRole: this.label('v138_worker'),
               onCollab: (): void => { this.returnToLead(); },
               onDetailBack: (): void => { this.returnToLead(); },
             }).width('100%').layoutWeight(1)
@@ -15684,14 +15909,9 @@ export struct OrcaTaskDetail {
     .height('100%')
     if (this.sideBySide() && !this.workerExpanded) {
       Column() {
-        Row() {
-          Row().width(2).height(24).backgroundColor($r('app.color.text_tertiary'))
-            .borderRadius(UI_RADIUS_PILL)
-        }.justifyContent(FlexAlign.Center).width(16).height(56)
-          .backgroundColor($r('app.color.bg_chip'))
-          .border({ width: 1, color: $r('app.color.border') }).borderRadius(UI_RADIUS_PILL)
-      }.width(24).height('100%').justifyContent(FlexAlign.Center)
-        .position({ x: this.leadPaneWidth() - 12, y: 0 })
+        SplitHandle({ overrun: this.dividerOverrun })
+      }.width(SPLIT_HANDLE_HIT_WIDTH).height('100%').justifyContent(FlexAlign.Center)
+        .position({ x: this.leadPaneWidth() - SPLIT_HANDLE_HIT_WIDTH / 2, y: 0 })
         .accessibilityText(this.label('v138_resize'))
         .onTouch((event: TouchEvent) => this.dragWorkerDivider(event))
     }
