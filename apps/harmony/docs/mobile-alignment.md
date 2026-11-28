@@ -1,6 +1,6 @@
 # 行为对齐 Mobile（iOS / Android）的实现原则
 
-> 状态：已决定（2026-08-04）
+> 状态：已决定（2026-08-04）；本文说明行为事实源与 Harmony 专属对齐要求，修改任何用户可见行为前阅读。
 >
 > 本文件是 Harmony 客户端**用户可见行为**的实现准绳：实现任何消息 / 交互 /
 > 渲染 / 加载行为前，先读对应的 Mobile 或共享纯逻辑源码，确认语义后再写
@@ -37,16 +37,16 @@
 | 长消息自动收起（行数阈值） | `apps/mobile/src/session/userMessageCollapse.ts` | `core/messages/MessageRender.ets` |
 | 消息渲染组件（气泡 / 折叠 / 动作栏 / 菜单） | `apps/mobile/src/session/MessageRenderer.tsx` | `pages/TaskPage.ets` |
 | 历史加载 / 流式合并 / 去重 / push 应用 | `apps/mobile/src/session/remoteSessionStore.ts` | `core/messages/MessageStore.ets` |
-| 断线补齐（gap healing） | `apps/mobile/src/session/historyWindowGap.ts` | 切片 5 |
-| 消息滚动（分页触发 / 锚点 / 阅读位置） | `apps/mobile/src/session/messageScroll.ts` | 切片 2.4 |
+| 断线补齐（gap healing） | `apps/mobile/src/session/historyWindowGap.ts` | `core/messages/HistoryGap.ets`、`HistoryWindowCoverage.ets`、`MessageStore.ets` |
+| 消息滚动（分页触发 / 锚点 / 阅读位置） | `apps/mobile/src/session/messageScroll.ts` | `pages/TaskPage.ets`、`core/messages/MessagePaging.ets` |
 | 回复后的输入建议 | `apps/mobile/src/session/usePromptRecommendation.ts`、`promptRecommendationPreference.ts`、`usePromptRecommendationVisibility.ts`、`PromptRecommendation.tsx` | `core/messages/PromptRecommendation*.ets`、`components/PromptRecommendationPanel.ets` |
-| 输入投影（发送中 / 队列 / 失败重试 / 暂停） | `apps/mobile/src/session/inputProjection.ts` | 切片 3 |
-| 行内原子（quote / 粘贴段 / slash） | `apps/mobile/src/session/sentMessageAtoms.ts` | 后续增强 |
-| Composer 文档模型（手打 / 粘贴 / 引用恢复） | `apps/mobile/src/session/composerDocument.ts` | 切片 3 |
+| 输入投影（发送中 / 队列 / 失败重试 / 暂停） | `apps/mobile/src/session/inputProjection.ts` | `core/messages/InputQueueStore.ets`、`ComposerDocument.ets`；附件见 `core/attachments/` |
+| 行内原子（quote / 粘贴段 / slash） | `apps/mobile/src/session/sentMessageAtoms.ts` | `core/messages/ComposerDocument.ets`、`MessageRender.ets` |
+| Composer 文档模型（手打 / 粘贴 / 引用恢复） | `apps/mobile/src/session/composerDocument.ts` | `core/messages/ComposerDocument.ets`、`ComposerDraftStore.ets` |
 | 用量概览（额度 / 30 天趋势 / 模型分组） | `apps/mobile/src/widgets/UsageDashboard.tsx`、`UsageQuotaColumns.tsx`、`usageWidgetSync.ts`；共享 `deviceLinkContract.ts` | `core/usage/UsageDashboard.ets`、`components/UsageDashboardPanel.ets` |
-| 图片 / 附件（选择 / 压缩 / 上传 / 恢复） | `apps/mobile/src/session/mobileImageAttachment.ts`、`mobileImagePreprocess.ts`、`mobileAttachmentUpload.ts`、`messageAttachments.ts` | 切片 3 |
-| 会话引用 / 历史窗口 | `apps/mobile/src/session/sessionReferences.ts` | 后续 |
-| 交互确认（Permission / Ask User / Plan Review） | 切片 4 开始时查 `apps/mobile/src` 对应实现 | 切片 4 |
+| 图片 / 附件（选择 / 压缩 / 上传 / 恢复） | `apps/mobile/src/session/mobileImageAttachment.ts`、`mobileImagePreprocess.ts`、`mobileAttachmentUpload.ts`、`messageAttachments.ts` | `core/attachments/ComposerImageQueue.ets`、`ImagePreprocess.ets`、`AttachmentUpload.ets`；`core/messages/MessagePayload.ets` |
+| 会话引用 / 历史窗口 | `apps/mobile/src/session/sessionReferences.ts` | `core/messages/HistoryViewAdapter.ets`、`pages/TaskPage.ets` |
+| 交互确认（Permission / Ask User / Plan Review） | `apps/mobile/src/session/` 的交互实现；共享交互契约 | `core/interactions/InteractionStore.ets`、`InteractionPresentation.ets`、`pages/TaskPage.ets` |
 
 ## 4. 已踩坑案例（教训）
 
@@ -57,7 +57,7 @@
 
 ## 5. 例外与边界
 
-- 一期明确不做的能力（语音 / 推送 / 视频上传等）不适用本对齐要求；
+- 尚未移植的能力不因本规则自动进入开发范围；已经存在的入口仍须对齐，不再沿用一期排除清单判断现状；
 - 若 Mobile 行为本身有 bug 或明显不适配鸿蒙（如依赖 iOS 私有能力），
   记录差异到 `decision-log.md` 再偏离；
 - 跨端协议层（Device Link / 认证）仍以 `packages/device-link-protocol` 与

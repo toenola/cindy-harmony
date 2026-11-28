@@ -1,6 +1,6 @@
 # Harmony UI 设计
 
-> 状态：Draft
+本文说明 Harmony 页面、主题与资源的落地约束；修改界面、布局、样式或文案前阅读，同时按仓库 [DESIGN 阅读路由](../../../docs/design-rules/DESIGN.md)进入相关规范。弹层 API 与例外以[弹层标准](overlay-standard.md)为正本，行为以 [Mobile 对齐](mobile-alignment.md)为准。
 
 ## 1. 设计目标
 
@@ -10,7 +10,7 @@ Harmony 端不是把 iOS / Android 页面原样搬过来，也不是把桌面端
 
 ## 2. 页面结构
 
-一期页面：
+主要页面 / 交互入口：
 
 ```text
 LoginPage
@@ -33,32 +33,13 @@ Pending Interaction / Composer
 
 ## 3. ArkUI 原生组件
 
-优先使用：
-
-- Navigation。
-- List / ListItem。
-- Scroll。
-- Text / Span。
-- TextInput。
-- Button。
-- Dialog / Sheet。
-- Image。
-- LoadingProgress。
-
 复杂 Markdown 或媒体内容可以局部使用 ArkWeb，不把 ArkWeb 作为整个应用的 UI 框架。
 
 ## 4. Cindy 设计系统约束
 
-跨端可以复用 Cindy 的设计原则：
+Light / Dark 使用 `base/element/color.json` / `dark/element/color.json` 同名语义 token，不在页面硬编码颜色或用主题判断补丁。字体、圆角、动效、点击反馈优先复用 `components/UiKit.ets`；浮层走 `components/common/UiOverlay.ets`。
 
-- Light / Dark 两种模式同时实现。
-- 颜色通过语义 token，不直接散落硬编码颜色。
-- 默认使用克制的中性色。
-- 主要交互使用清晰的触控区域。
-- 重点状态才使用语义色。
-- 不使用无必要的阴影和渐变。
-- 内容优先，减少解释性状态卡。
-- 控件、容器和弹层使用统一的圆角层级。
+任务详情包含 Header、消息流和交互 / Composer，宽屏阈值与三任务常驻见[架构](architecture.md)，分屏及列表收起等有意差异见 D-014 / D-015。
 
 具体 Cindy 设计规则以根目录 `docs/design-rules/DESIGN.md` 为准；Harmony 特有的系统组件和交互遵循 HarmonyOS 官方规范。
 

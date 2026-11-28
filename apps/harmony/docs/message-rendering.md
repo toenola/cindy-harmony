@@ -1,10 +1,10 @@
 # 消息流与渲染
 
-> 状态：Draft
+本文说明历史、实时与渲染之间的契约；修改消息解析、分页、滚动或卡片呈现前阅读。先按 [Mobile 对齐](mobile-alignment.md)核对共享实现。
 
 ## 1. 目标
 
-一期不做“纯文本消息 Demo”，而是完整承载 Cindy 核心 AI 交互产生的消息类型和历史状态。
+消息保留 Cindy 的结构化内容与历史状态，不能简化为纯文本。
 
 消息流应与桌面端同源、与现有 Mobile 的展示语义对齐，但 UI 使用 ArkUI 原生布局。
 
@@ -13,17 +13,17 @@
 ```text
 Device Link invoke / push
         ↓
-RemoteMessageStore
+core/messages/MessageStore.ets
         ↓
-Raw message preservation
+原始消息、历史窗口与 push 合并
         ↓
-MessageNormalizer
+MessageRender.ets / MessagePayload.ets
         ↓
-RenderItem builder
+渲染项投影（含 RichAnswer.ets）
         ↓
 Message window / paging
         ↓
-ArkUI MessageList
+TaskPage.ets / RichAnswerView.ets
 ```
 
 原始数据不能在第一步被压扁为纯文本。至少保留：
@@ -117,11 +117,11 @@ ArkWeb 或专用 renderer：
 - 复杂 HTML。
 - 需要浏览器布局的媒体或文档内容。
 
-复杂内容不能因为一期没有完整编辑能力而在历史消息中丢失；可以先提供源码、摘要或查看入口。
+复杂内容不得在历史消息中丢失；尚无专用 renderer 的内容提供源码、摘要或查看入口。具体已落地的文件预览及安全限制见[决策记录](decision-log.md#文件预览与导出差异)。
 
 ## 6. 消息动作
 
-一期核心动作：
+核心动作：
 
 - 复制消息。
 - 复制代码。
@@ -149,3 +149,9 @@ Rewind 和 Fork 属于改变任务上下文的动作，必须有确认、防重�
 - 错误消息。
 - 交互等待。
 - 断线期间产生的消息。
+
+## 8. 当前扩展入口
+
+富组件回答解析 `RichAnswer.ets` 对齐共享 `richAnswer.ts`，经 `MessageRender.ets.richParts` 投影，`RichAnswerView.ets` 原生呈现；本机控件值由 `RichInteractionMemory.ets` 管理，有意差异见 D-011。
+工具过程媒体和生图交付重试走 `ToolProcessMedia.ets`；历史摘要 / 详情走 `HistoryViewAdapter.ets`，读请求去重与独立重试走 `SnapshotReadPool.ets` / `RemoteReadRetries.ets`，连接代次来自 DlClient。
+修改这些路径同时检查历史和实时输入，不能只验证重新打开任务后的结果。

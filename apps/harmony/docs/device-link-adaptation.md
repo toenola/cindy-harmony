@@ -1,6 +1,6 @@
 # Device Link 适配
 
-> 状态：Draft
+本文说明 Harmony 连接适配与恢复不变量；修改网络、invoke、订阅或重连前阅读。跨端契约以共享协议为准；加入、路由和凭证细节见[中转专题](self-hosted-relay-plan.md)。
 
 ## 1. 目标
 
@@ -17,7 +17,7 @@ Harmony 端继续使用当前 Cindy Device Link，不重新设计协议。
 
 ## 2. Harmony Host Adapter
 
-需要实现一个由 Harmony 原生网络能力驱动的 WebSocket adapter：
+`network/HarmonyWsAdapter.ets` 实现 `WsAdapter.ets` 接口，由 `core/device-link/DlClient.ets` 驱动：
 
 ```text
 connect(url, headers)
@@ -29,7 +29,7 @@ onClose
 onError
 ```
 
-必须优先确认：
+系统适配与设备验证需覆盖：
 
 - `wss`。
 - 连接握手时的 `Authorization: Bearer <token>`。
@@ -54,11 +54,11 @@ onError
 - 撤权。
 - 重连后重新订阅和补齐消息。
 
-第一版可以不暴露全部高级 UI，但底层不应为了省事删除可靠传输和消息恢复语义。
+UI 未暴露某能力不允许底层删除可靠传输和消息恢复语义。
 
 ## 4. 远程业务通道
 
-一期优先使用现有桌面端能力：
+业务 Store 使用既有电脑端通道：
 
 - 设备发现。
 - 任务列表。
@@ -89,7 +89,7 @@ onError
 
 ## 6. 服务端边界
 
-一期原则上不修改服务端和桌面 Agent。如果发现：
+本工程不因平台适配擅改服务端或桌面 Agent。如果发现：
 
 - `platform` 字段被固定枚举校验。
 - Harmony WebSocket 无法完成安全认证。
@@ -97,3 +97,10 @@ onError
 - 现有协议无法表达消息或交互状态。
 
 必须先记录协议缺口和兼容方案，再决定是否修改共享协议。
+
+## 7. 路由与请求调度入口
+
+`AppServices.ets` 组装连接并分发 push；`DlClient.ets` 管连接代次、pending 请求、订阅与恢复；
+`InvokePolicy.ets` / `InvokeScheduler.ets` 区分请求策略与调度。`ConnectionAttemptState.ets` 管连接尝试，不能把某台电脑的超时升级为共享 WS 故障。
+传统自建路线用 `LegacyRelaySocket.ets`，加密路线用 `AgentNetSocket.ets` / `AgentNetEngine.ets`，选择由 `RelayRoute.ets` 负责。
+改协议前先读[兼容规则](../../../docs/dev-rules/protocol-compatibility.md)、[远程恢复规则](../../../docs/dev-rules/remote-and-mobile-adaptation.md)和[服务器通道审查](../../../docs/dev-rules/server-channel-review.md)，不能只凭单端通过认定互通成立。

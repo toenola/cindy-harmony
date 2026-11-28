@@ -1,6 +1,6 @@
 # 交互确认流程
 
-> 状态：一期必须实现
+本文说明交互请求的状态、草稿与提交边界；修改交互卡片或 resolve 前阅读。生产入口为 `core/interactions/InteractionStore.ets` / `InteractionPresentation.ets` 和 `pages/TaskPage.ets`，回归入口为 `V132Interactions.test.ets`。视觉与高度规则同时读 [Mobile 对齐](mobile-alignment.md)和[弹层标准](overlay-standard.md)。
 
 ## 1. 通用状态机
 
@@ -80,13 +80,14 @@ resolved / rejected / expired / failed
 
 ## 5. issue_confirm
 
-当前策略：
+当前 `TaskPage.issueConfirmCard` 提供公开反馈预览和编辑，通过 `issueDecision` 返回明确决策，电脑端负责实际提交。
 
-- Harmony 端识别 `issue_confirm`。
-- 显示它需要回桌面处理。
-- 不在 Harmony 端提交 GitHub Issue。
+- 展示即将公开的标题、正文和署名；可选问题 / 建议，支持平台公开署名或请求允许的 GitHub 身份。
+- 标题最多 200 字符、正文 4500、公开署名 100；标题与正文不能为空，平台署名不能为空且不含控制字符。
+- 编辑中不可公开提交，用户明确点击“公开提交”才发送 confirmed 决策；取消只返回拒绝确认。
+- 复用请求去重、草稿、busy 锁和错误显示，不从手机直接调用 GitHub。
 
-如果以后需要在手机端提交 Issue，必须新增独立产品决策，不应在一期偷偷扩展。
+这已取代 D-007 的一期“回电脑处理”策略；保留原决策及后续说明便于理解变化。
 
 ## 6. 测试矩阵
 

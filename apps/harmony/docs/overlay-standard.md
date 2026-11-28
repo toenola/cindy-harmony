@@ -2,6 +2,8 @@
 
 > 状态：已决定（2026-11-28）
 >
+> 本文是四类弹层的 API、材质、例外和验收正本；新增、修改或排查弹层前阅读。
+>
 > 适用：`apps/harmony` 内所有浮在内容之上的界面。新增或修改弹层前先读本文；视觉以鸿蒙官方
 > 弹层为准，信息组织（分组、当前值、二级箭头）借鉴 iOS。共享封装在
 > `entry/src/main/ets/components/common/UiOverlay.ets`。
@@ -120,7 +122,7 @@
   willAppear / didAppear / willDisappear / disappear。
 - 弹层 builder 根节点加 `.id(uiOverlayBuildId(tag))`，每次内容被重新创建记一条 `build`。
 - 每条日志带距 open 的毫秒数、构建次数、当前深浅色（`colorMode`）。真机排查：
-  `hdc hilog | grep CindyOverlay`。正常一次打开应为 open → build(1) → willAppear → didAppear；
+  `hdc -t "$HARMONY_TARGET_ID" hilog | rg CindyOverlay`。正常一次打开应为 open → build(1) → willAppear → didAppear；
   多次 build 说明打开过程中被重建，colorMode 变化说明深浅色在切换。
 
 ## 6. 迁移检查单

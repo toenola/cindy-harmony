@@ -1,37 +1,12 @@
 # Cindy Harmony
 
-HarmonyOS 原生远程控制客户端，使用 ArkUI + ArkTS 开发，面向 HarmonyOS 7.0 / API 26+。
+HarmonyOS 7.0 / API 26+ 原生客户端，使用 ArkUI + ArkTS。本文供首次进入工程时阅读；开发前从[开发指南](项目鸿蒙端开发指南.md)开始，按[文档索引](docs/README.md)进入专题。
 
-本应用不在鸿蒙设备本地运行 Claude Code、Codex、Pi 或 Agent。Agent、任务数据、工作目录和工具仍然运行在桌面 Cindy；Harmony 端通过 Device Link 进行远程控制。
+任务执行、工作目录、CLI、MCP 与插件运行在电脑端，鸿蒙通过 Device Link 控制电脑；厂商信息也必须经电脑端获取，不在手机直连厂商。
 
-## 当前阶段
+- 工程与工具：[开发指南](项目鸿蒙端开发指南.md)（command-line-tools、DevEco CLI、hvigorw、签名安装、日志）。
+- 功能入口：[架构与代码地图](docs/architecture.md)。
+- 用户可见行为：[Mobile 对齐](docs/mobile-alignment.md)；有意差异见[决策记录](docs/decision-log.md)。
+- 交付：[验证清单](docs/verification-plan.md)；分版本范围和证据留在[版本资料](docs/version/README.md)。
 
-当前为 [v1.3.1 候选版本](./docs/version/v1.3.1/README.md)：四项 Mobile 对齐实现与 Harmony Local Test 已完成，可构建签名 HAP；API 26 设备交互验收待完成。
-
-[v1.3.2 开发资料](./docs/version/v1.3.2/README.md)已建立：上游合并及 Mobile 增量评估完成，功能范围待确认；当前应用内版本仍为 1.3.1。
-
-## 文档
-
-- [文档索引](./docs/README.md)
-- [一期产品范围](./docs/product-scope.md)
-- [实施计划](./docs/implementation-plan.md)
-- [架构方案](./docs/architecture.md)
-- [开发环境](./docs/dev-environment.md)
-- [Device Link 适配](./docs/device-link-adaptation.md)
-- [消息流与渲染](./docs/message-rendering.md)
-- [图片附件](./docs/image-attachment.md)
-- [交互确认](./docs/interaction-flows.md)
-- [UI 设计](./docs/ui-design.md)
-- [验证计划](./docs/verification-plan.md)
-- [决策记录](./docs/decision-log.md)
-
-## 相关代码
-
-现有实现主要参考：
-
-- `apps/mobile/src/device-link/`
-- `apps/mobile/src/session/`
-- `packages/device-link/`
-- `packages/maker-shared/`
-- `packages/auth-client/`
-- `packages/device-link-protocol/`
+开发和验证范围限 `apps/harmony`。安装只用现有签名生成的 signed HAP；签名错误停止交由用户处理，禁止 unsigned 覆盖、卸载绕过、清数据或重置模拟器。

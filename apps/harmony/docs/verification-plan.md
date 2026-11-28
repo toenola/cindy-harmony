@@ -1,6 +1,6 @@
-# Harmony 验证计划
+# Harmony 验证清单
 
-> 状态：待 DevEco 环境可用后执行
+本文用于选择改动相关的单测、系统能力测试和设备交互场景；准备验证或交付时阅读。它是验收条件，不表示这些场景已经通过。命令、签名和目标选择见[开发指南](../项目鸿蒙端开发指南.md)。
 
 ## 1. 验证层级
 
@@ -85,6 +85,17 @@
 - Permission / Ask User / Plan Review 提交中不能重复点击。
 - 小屏和折叠屏没有横向溢出。
 
-## 5. 当前限制
+## 5. 测试入口与剩余验收
 
-在 DevEco、模拟器或真机环境准备好之前，只能完成源码、协议和 fixture 级检查，不能宣称 Harmony 构建、安装或真机验证通过。
+`entry/src/test/List.test.ets` 聚合当前本地用例；`LocalUnit.test.ets` 不是唯一入口。
+历史和输入队列覆盖见 `V132History` / `V132Queue` / `V132Delivery`，交互见 `V132Interactions`，
+富回答与速度档见 `V133*`，新增能力见 `WorkdirFiles` / `PluginEngines` / `UsageCard` / `PromptRecommendation` 等测试。
+系统 API 使用 `ohosTest` 与真实操作验证；主机 fixture 或互通测试不能代替系统网络、Asset Store、NAPI 加载和设备 UI 验收。
+
+- 双栏姿态、分屏单栏、列表收起、三任务常驻与阅读位置：按 D-014 / D-015 实测。
+- 中转传统 / 仅 Agent-Net / 混合加入、安全保存、切换和故障隔离：按[中转清单](self-hosted-relay-plan.md#真机清单)实测。
+- 用量、插件额度与输入建议：按 [Mobile 对齐](mobile-alignment.md) §6–9 验证读取时机、旧结果隔离与双模式。
+- 文件预览：HTML 网络封锁顺序、Draw.io 多页 / 压缩、GLTF 文件 URI / 光照 / 编码仍按[决策记录](decision-log.md)验证，不能从纯逻辑测试推断系统表现。
+- 早期切片中相机、Ask User 多题 / 草稿、Issue Confirm、补窗等已存在生产入口，不再作为“待实现”任务；新增回归仍检查媒体失败提示、手打 / 粘贴原子、工作组与 Thinking 标题、工具折叠、长消息收起及角色时间呈现是否对齐 Mobile。
+
+安装与运行必须有目标和回执，未跑的模式、设备、链路与场景明确记为未验证，不沿用旧版本的通过结论。
