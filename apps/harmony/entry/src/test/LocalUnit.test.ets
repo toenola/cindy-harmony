@@ -1,3 +1,4 @@
+import { splitHandlePreviewProgress, splitHandleStep } from '../main/ets/components/common/SplitHandleInteraction';
 import { describe, it, expect } from '@ohos/hypium';
 import { parseOrcaWorkers } from '../main/ets/core/tasks/OrcaCollaboration';
 import { parseTeammateRoster } from '../main/ets/core/tasks/TeammateRoster';
@@ -5009,6 +5010,26 @@ export default function localUnitTest() {
       expect(orcaLeadPaneWidth(800, 0.6)).assertEqual(476);
       expect(orcaLeadPaneWidth(800, 0.2)).assertEqual(324);
       expect(orcaLeadPaneWidth(648, 0.8)).assertEqual(324);
+    });
+
+    // Unit, Harmony UI audit P1-11. Existing pointer geometry does not cover discrete keyboard
+    // or menu actions. A width one vp from the edge must stop at the edge, not snap to full-pane.
+    it('resizes the splitter in discrete steps without overshooting either pane', 0, () => {
+      expect(splitHandleStep(330, 300, 420, 'widen')).assertEqual(346);
+      expect(splitHandleStep(301, 300, 420, 'narrow')).assertEqual(300);
+      expect(splitHandleStep(419, 300, 420, 'widen')).assertEqual(420);
+      expect(splitHandleStep(330, 300, 420, 'minimum')).assertEqual(300);
+      expect(splitHandleStep(330, 300, 420, 'maximum')).assertEqual(420);
+      expect(splitHandleStep(330, 420, 300, 'widen')).assertEqual(330);
+    });
+
+    // Unit, splitter affordance. Legacy drag math does not exercise the visual preview curve.
+    // At the first and last thresholds the handle must be straight and fully bent respectively.
+    it('only bends the handle between its preview and full-overrun thresholds', 0, () => {
+      expect(splitHandlePreviewProgress(16)).assertEqual(0);
+      expect(splitHandlePreviewProgress(-30)).assertEqual(0.5);
+      expect(splitHandlePreviewProgress(44)).assertEqual(1);
+      expect(splitHandlePreviewProgress(Number.NaN)).assertEqual(0);
     });
 
     it('usesMediumWidthSplitLayoutAndClampsDrag', 0, () => {

@@ -65,16 +65,58 @@
 | 图标按钮热区 | 系统 Button 原生互动与辅助语义 | `UI_TOUCH_TARGET_MIN` = 44vp，常用按钮宽高均从这档起。glyph 不等于热区，扩展区不得抢相邻控件，带可朗读动作名、focus 与按压反馈。分隔把手例外需有等效操作 |
 | 动效 | 首选系统 Navigation、Menu、Sheet、原生按压和系统偏好 | 自绘反馈 80ms、轻量显隐 150ms、布局 200ms、加载循环 1000ms，两态同值；`UI_MOTION_*_MS` 在 UiKit，保留旧名称。入场 EaseOut、退场 EaseIn、布局 EaseInOut，跟手不补间，弹性复位单独核对。没有通用 250ms 档。减弱动效时用轻淡入或立即完成，不影响状态提交 |
 
-## 3. 组件选型
+## 3. 组件选型表
 
-| 场景 | 首选 | 产品约束 |
+先用系统组件的焦点、按压、选中、无障碍、深浅色和系统字号。封装只固定 Cindy 的语义、Token、状态输入和本地化文案，业务回调仍归调用方。仅在系统组件无法表达既定语义、内容槽或大屏状态时自组，并保留等效的触控、键鼠和读屏操作。没有额外语义就直接用原生，不为每种控件另造一个组件。
+
+| 场景 | 原生首选与薄封装 | 存量迁移和允许的例外 |
 | --- | --- | --- |
-| 首页、详情、设置、新建 | HdsNavigation 标题栏及原生返回；首页保留 HdsTabs | 会话和伙伴名称位于左侧，返回之后是标题/副标识，尾部保留相关操作；面板标题与内容起点对齐。 |
-| 任务、设置、目录和会话列表 | List/ListItem 与系统状态，可复用 HarmonySettingsRow 的信息槽 | 行使用标题、说明、状态、尾部动作；动态增高；紧凑态不改变内容优先级。 |
-| 卡片、按钮、选择与表单 | ArkUI 卡面、Button、Toggle、TextInput，分段优先系统组件 | 主次明确，危险动作按 Cindy 后果与确认语义；分段不代替页面导航，去掉复制 iOS 皮肤的包层。 |
-| 操作菜单、表单、确认与轻提示 | [现有弹层标准](./overlay-standard.md) | 继续用系统弹层和该文档的材质退回；标题靠左。 |
-| 输入就地面板 | 原生编辑器、列表和可用材质组合成锚定面板 | 保留输入上下文、模型/权限/设备选择状态和返回逻辑；仅需要锚定关系时自组，不拿来替代系统确认。 |
-| 空态、状态、媒体 | 文本＋系统状态组件；图片、业务图表和富卡按内容自定义 | 空态引导下一步，媒体不改原图颜色，数据和运行状态不能只靠颜色表达。 |
+| 页面标题栏 | HdsNavigation/HdsNavDestination 原生 title，统一入口 `UiNavigation`；内嵌和选项面板用 `UiPanelHeading`（SubHeader） | 首页、任务、新建保留已有 HDS 壳，用左侧原生 title 替换居中 builder。不要为一个标题另建嵌套路由。编辑/选择/页签语义分别考虑 EditableTitleBar / SelectTitleBar / TabTitleBar，不拿来模拟通用标题栏。 |
+| 一级、二级和危险按钮 | Button + EMPHASIZED / NORMAL / ERROR，`UiActionButton` | 替换各页不同样式的主次动作。危险色不替代 Cindy 的风险确认，成功与失败文案由调用处提供。异步真实进度可直接用 ProgressButton，不模拟百分比。 |
+| 图标按钮 | Button + HMSymbol，`UiIconButton` | 替换 ChatIconButton 和各页透明圆按钮，44vp 是命中区。只用图标仍需本地化的行动名称，调用方可补禁用原因。 |
+| 列表行 / 分组标题 | List/ListItem/ListItemGroup + ComposeListItem，`UiListRow / UiListGroup`（SubHeader） | HarmonySettingsRow/Group 调用迁移时换公共组件，当前先并存，不修改调用方。复杂任务行保留业务内容，需原生横滑操作可选 HdsListItem；整行与尾部独立动作要分别确认读屏和键盘。 |
+| 卡片 | 列表专用卡优先 HdsListItemCard，任意内容容器用 `UiCard` | 用量或设置卡可逐步收敛，图表等保留自有内容；不叠加系统样式已有的阴影。 |
+| 空状态、异常 | ExceptionPrompt 用于异常，`UiInlineError`；`UiEmptyState` 用原生 Text/Button 组合 | 空不等于错，说明下一步；错误重试由调用方在可恢复时提供，别将既有空态一起换成告警。 |
+| 分段控件 | CapsuleSegmentButtonV2，`UiSegmented` | 替换 ChatSegmented。调用方控制选中索引，组件管输入和原生选中动画。不要用 Tabs 实现同一区域的短筛选。 |
+| 搜索框、表单编辑 | Search / TextInput | 任务搜索直接使用原生 Search，普通输入使用 TextInput；保留搜索提交、清除与键盘行为。 |
+| 开关 | Toggle(Switch) | 设置/伙伴/群聊开关保留原生语义；不要用颜色模拟开关状态。 |
+| 标签与筛选 | Chip / ChipGroup、Filter | 可选 Chip 用原生选中，静态标签不做按钮。多个独立维度可用 Filter；复杂任务筛选仍可依弹层标准使用选择表单。 |
+| 底部工具栏 | HdsActionBar / ToolBar；一级导航 HdsTabs | 通用操作栏与底部页签区分；不会用固定 ToolBar 替代含编辑、发送、锚定面板的 composer。 |
+| 分栏容器 | 普通列表详情可用 Navigation Auto / HdsSideBar；本首页保留 TaskSplitLayout 与 `UiSplitHandle` | 两个自定义分隔在迁移时接入等效单击菜单、焦点与键盘步进。视觉 SplitHandle 保留。详情布局外壳不因三栏而改用 SplitLayout。见下节评估。 |
+| 下拉刷新 | Refresh | 有刷新语义的列表优先系统控件，调用方继续控制刷新请求和并发，不能因为页面上拉而偷换成轮询。 |
+| 操作菜单、底部表单、确认框、轻提示 | [现有弹层标准](./overlay-standard.md) | 沿用 UiOverlay。工具提示用 bindTips；若结果确需要立即执行另一个非危险动作，评估 HdsSnackBar，不替代纯轻提示或确认。 |
+| 锚定提示/输入面板 | 短提示用 bindPopup，复杂内容可用原生 Popup/自定义 Builder | 输入区域自定义仅在锚定与上下文保持必须时允许，编辑/列表仍原生；不拿它代替确认。 |
+
+### 3.1 API 26 工程核对
+
+本工程为 API 26 Stage。下表路径相对 SDK 的 `default/`。高级组件实际声明多数是 **.d.ets**，由对应 kit .d.ts 转导出。表中的版本为组件最早 SDK 声明或官方版本，较新的重载、Stage/设备或跨平台支持可另有起始版本。已核实符号与声明，不把它当作本批构建已通过。
+
+| 组件 | 最早 API 与声明证据 | 本工程接入 |
+| --- | --- | --- |
+| SegmentButton / CapsuleSegmentButtonV2 | 11 / 18，`openharmony/ets/api/@ohos.arkui.advanced.{SegmentButton,SegmentButtonV2}.d.ets` | `@kit.ArkUI`，优先受控的 V2 |
+| ComposeListItem / SubHeader | 10 / 10，同路径 `{ComposeListItem,SubHeader}.d.ets` | `@kit.ArkUI`；ComposeListItemV2 为 26，不是行迁移前置条件 |
+| EditableTitleBar / SelectTitleBar / TabTitleBar | 10，各自同名高级声明 | `@kit.ArkUI`，限定对应语义 |
+| ToolBar / Chip / ChipGroup | 10 / 11 / 12，各自同名高级声明 | `@kit.ArkUI`，不混用 Web 版 toolbar |
+| ExceptionPrompt / Filter / ProgressButton | 11 / 10 / 10（SDK 历史声明，下同；SDK 当前声明块对应 12 / 22 / 22），各自同名高级声明 | `@kit.ArkUI`；本批异常样式使用 PromptOptions 的最小子集 |
+| FoldSplitContainer / SplitLayout | 12 / 10（SplitLayout 的当前声明块为 22，官方手机文档覆盖 12+），各自同名高级声明 | `@kit.ArkUI`；前者适合折叠分区，后者是图文内容模板 |
+| Popup / Dialog / DialogV2 | 11 / 10 / 18，各自同名高级声明（本 SDK ConfirmDialog 类型当前块标 18，V2 从 18 起） | `@kit.ArkUI`，正常弹层按项目标准选 API |
+| HdsNavigation / HdsTabs | 18 / 20，`hms/ets/kits/@kit.UIDesignKit.d.ts` 与 HMS 编译器 `build-tools/ets-loader/components/{hdsnavigation,hds_tabs}.json` | `@kit.UIDesignKit`，已经用于现有页面 |
+| HdsSideBar / HdsActionBar / HdsSnackBar / HdsListItem / HdsListItemCard | 均 20，`hms/ets/api/@hms.hds.{HdsSideBar,HdsActionBar,HdsSnackBar,HdsStyle}.d.ets`（最后两项在 HdsStyle），以及同 UIDesignKit 出口 | `@kit.UIDesignKit`，注意官方设备能力范围 |
+| Button / Toggle / Search / TextInput / Refresh | 7 / 8 / 8 / 7 / 8，`openharmony/ets/component/{button,toggle,search,text_input,refresh}.d.ts`；ButtonStyleMode 11、ButtonRole 12 | 声明式全局组件，不额外 import |
+| List / ListItem / ListItemGroup / Menu | 7 / 7 / 9 / 9，`openharmony/ets/component/{list,list_item,list_item_group,menu,menu_item}.d.ts` | 声明式全局组件 |
+| bindMenu / bindSheet / bindTips / 键盘与悬停 | bindMenu 7（受控重载 11）/ 10 / 19，`openharmony/ets/component/common.d.ts`；KeyCode 在 `openharmony/ets/api/@ohos.multimodalInput.keyCode.d.ts` | 全局修饰器，KeyCode 从 `@kit.InputKit` 引入 |
+| 对话框与 Toast | `openharmony/ets/component/{alert_dialog,custom_dialog_controller}.d.ts`，`openharmony/ets/api/@ohos.arkui.UIContext.d.ts` 的 `UIContext.getPromptAction`（10） | 项目用上下文的 PromptAction，不新增其他全局调用方式 |
+
+DevEco 文档依据：[系统预置 UI 组件库](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/system-preset-ui-component-library)、[HDS 组件](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/ui-design-arkts-component)；CLI 读到的条目包括 HdsNavigation、HdsTabs、设置列表卡片样式、ComposeListItem、SegmentButtonV2、弹出框概述与折叠屏悬停态。
+
+### 3.2 FoldSplitContainer 评估
+
+**不作为首页双／三栏的替代容器。可以考虑仅在半折特定场景做小范围原型。** [FoldSplitContainer 官方参考](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/ohos-arkui-advanced-foldsplitcontainer)说明主区、次区、可选扩展区，主要/次要区域按高度比上下排列，扩展区可以贯穿上下或位于其一侧。宽度 ≤600vp 的默认布局还是二分栏，并非 Cindy 要的单栈。宽度 >600vp 的横屏半折可进入悬停，上屏展示、下屏操作，并避让折痕，悬停可隐藏扩展区。
+
+- API 的比例能配置，不等于有两条独立横向 resize rail。SDK 未提供拖拽手柄、每栏最小宽/约束、双阈值越限、拖动取消或“还原原宽”行为。无 Worker 全幅/返回栈或任务开合状态交接契约。直接套用会丢单栈与并排三列，或者反过来在系统容器内重造整套现有状态机。
+- 2A 保持 TaskSplitLayout 等窗口和状态计算。除非半折真机证实有明确的“读内容/在下方操作”需求，暂不引入 FoldSplitContainer。原型即便成功也只在符合系统横屏半折条件的子场景使用。任务、草稿、Worker、宽度偏好和焦点置于外层，退出姿态不重建业务状态。
+- SplitLayout 是主图/三段文案/内容 Builder 的自适应模板，不提供任务主从导航或拖动。普通页可用系统 Navigation 分栏、侧边栏，不能用模板替代任务首页。
+- `UiSplitHandle` 保留原把手动画并用系统 Button 承载可朗读标签、焦点、键盘方向步进、Home/End、Enter/Space/鼠标或单击菜单。离散步进只夹限，不触发全幅。菜单单独暴露两侧全幅或返回的本地化动作。父级继续拥有拖动、越限、可见状态及焦点回归。2A 接入时保证父级轨道和中央按钮不互相拦截，并实机测菜单开关与 TalkBack。旧 `SplitHandle` 继续只装饰，现有页面不改变。
 
 ## 4. 窗口与折叠形态
 
